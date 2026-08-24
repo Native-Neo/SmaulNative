@@ -215,6 +215,8 @@ def init_worker(config_dict: Dict) -> None:
     Every ProcessPoolExecutor worker receives its own compiled Python module
     state and optionally loads one fastText language model.
     """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     global _WORKER_CONFIG
     global _WORKER_FASTTEXT_MODEL
 
@@ -647,7 +649,7 @@ def has_ngram_repetition(
 
 def detect_language(text: str) -> Optional[str]:
     """
-    Worker-local language detection.
+    Worker-local language detection with built-in script heuristic fallback.
     """
     global _WORKER_FASTTEXT_MODEL
 
@@ -662,13 +664,21 @@ def detect_language(text: str) -> Optional[str]:
         if labels and probabilities:
             return labels[0].replace("__label__", "")
 
-        return None
-
     if HAVE_LANGDETECT:
         try:
             return detect(text[:5000])
         except Exception:
-            return None
+            pass
+
+    # Built-in zero-dependency fallback heuristic for Hindi & English
+    hindi_count = sum(1 for char in text if "\u0900" <= char <= "\u097F")
+    ascii_count = sum(1 for char in text if ("a" <= char.lower() <= "z"))
+    total_len = max(len(text), 1)
+
+    if (hindi_count / total_len) > 0.05:
+        return "hi"
+    elif (ascii_count / total_len) > 0.2:
+        return "en"
 
     return None
 
@@ -1764,7 +1774,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-chars",
         type=int,
-        default=50,
+        default=10,
     )
 
     parser.add_argument(
@@ -1776,7 +1786,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-tokens",
         type=int,
-        default=10,
+        default=2,
     )
 
     parser.add_argument(
