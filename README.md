@@ -62,3 +62,9 @@ python3 Merge.py
 ## 📄 License
 
 MIT License.
+
+## README Author :
+gemini made this :D
+
+## Code Author :
+[`Native`](https://github.com/Native-Neo/) 
