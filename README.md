@@ -72,4 +72,4 @@ MIT License.
 ## Authors
 
 - **Code Author**: [Native](https://github.com/Native-Neo/)
-- **README**: Clean ASCII Edition
+- **README**: GEMINI 3.6 FLASH PROVIDED BY GOOGLE VERTEX AI (ANTIGRAVITY CLI)
