@@ -5,7 +5,7 @@ SmaulNative is an experimental language-model development project focused on bui
 The repository contains three architecture paths:
 
 - The root pipeline: a custom RWKV-style recurrent model with its own trainer and MoE upcycling tools.
-- `actual_rwkv_proto`: a faithful pure-PyTorch reimplementation of the real howard-hou/RWKV-X model math (RWKV-7 TimeMix + MOBA sparse attention), CPU-safe, with pretraining/SFT, tokenizer training, and MoE upcycling that can also merge tokenizers.
+- `actual_rwkv_proto`: a pure-PyTorch reimplementation of the real howard-hou/RWKV-X model math (RWKV-7 TimeMix + MOBA sparse attention), CPU-safe, with pretraining/SFT, tokenizer training, and MoE upcycling that can also merge tokenizers.
 - `Transformer-Basic`: a Llama-style dense Transformer path with its own training, merging, and tokenizer, including 2-bit simulated QAT experiments.
 
 SmaulNative is intended as a practical experimentation environment for training and modifying language models without depending entirely on a large external training framework.
@@ -35,7 +35,7 @@ SmaulNative/
 │
 ├── SmaulNative/            # Trained tokenizer artifacts (tokenizer.json + config)
 │
-├── actual_rwkv_proto/      # Faithful RWKV-X prototype path
+├── actual_rwkv_proto/      # RWKV-X prototype path
 │   ├── rwkv_x_core.py      # Pure-PyTorch RWKV-X model math (RWKV-7 + MOBA hybrid)
 │   ├── train.py            # Single entrypoint for pretraining + SFT
 │   ├── dataset.py          # Universal recursive dataset loader (pretrain stream + SFT)
@@ -140,7 +140,7 @@ python merge.py --config config.yaml
 
 ---
 
-## 2. `actual_rwkv_proto` — Faithful RWKV-X Prototype
+## 2. `actual_rwkv_proto` — RWKV-X Prototype
 
 This directory reimplements the **real** howard-hou/RWKV-X training model math in pure PyTorch so it runs on a CPU-only box. The WKV-7 recurrence here is not guessed — it is upstream's own CUDA-free reference loop made batched and differentiable, algebraically verified against their CUDA kernel's decay formula (`w_eff = exp(-exp(w_raw))` closed form).
 
@@ -270,7 +270,7 @@ The `actual_rwkv_proto` path additionally exports an upstream-shaped `.pth` (`rw
 # Design Goals
 
 - Training language models from scratch, including on modest CPU-only hardware.
-- Supporting experimentation with multiple architectures (custom RWKV-style, faithful RWKV-X, Llama-style).
+- Supporting experimentation with multiple architectures (custom RWKV-style, RWKV-X, Llama-style).
 - Keeping model tooling understandable and modifiable.
 - Resumable training and checkpointing everywhere (model + optimizer + dataset position).
 - Safetensors and Hugging Face-style model formats.
