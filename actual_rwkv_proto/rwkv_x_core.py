@@ -54,7 +54,7 @@ class RWKVXConfig:
     head_size_divisor: int = 8
     ctx_len_hint: int = 1024       # training BPTT window; does NOT cap inference (state is O(1)/token)
     # MoE (only used by merge_moe.py output / MoE-upcycled checkpoints)
-    is_moe: bool = False
+    is_moe: bool = True
     num_experts: int = 1
     num_experts_per_tok: int = 1
 
