@@ -5,7 +5,7 @@ SmaulNative is an experimental language-model development project focused on bui
 The repository contains two primary architecture paths:
 
 - The root pipeline, centered around the RWKV-X / recurrent architecture and its MoE upcycling tools.
-- `Transformer-Varient`, an alternative Transformer-based implementation with its own training, merging, synthetic-data, tokenizer, data-processing, and downloading tools.
+- `Transformer-Basic`, an alternative also Transformer-based implementation with its own training, merging and tokenizer.
 
 SmaulNative is intended as a practical experimentation environment for training and modifying language models without depending entirely on a large external training framework.
 
@@ -15,6 +15,9 @@ The project is hosted at:
 
 https://github.com/Native-Neo/SmaulNative
 
+## NOTE:
+This README.MD file is outdated after some recent commits 
+
 ## Current Repository Layout
 
 ```text
@@ -22,22 +25,20 @@ SmaulNative/
 ├── .gitignore
 ├── README.md
 │
-├── Data.py
+├── data_g.py
 ├── Tokenizer.py
-├── download.py
+├── download_g.py
 ├── merge.py
 ├── train.py
+├── syntheticdata_g.py
 │
 └── Transformer-Varient/
-    ├── Data.py
     ├── Merge.py
-    ├── SyntheticData.py
     ├── Tokenizer.py
-    ├── Train.py
-    └── download.py
+    └── Train.py
 ```
 
-The root and `Transformer-Varient` directories represent separate model-development paths. Some utility scripts currently appear in both pipelines because each architecture path maintains its own workflow.
+The root and `Transformer-Basic` directories represent separate model-development paths. Some utility scripts currently appear in both pipelines because each architecture path maintains its own workflow.
 
 ---
 
@@ -45,25 +46,26 @@ The root and `Transformer-Varient` directories represent separate model-developm
 
 ## 1. RWKV-X / Recurrent Path
 
-The repository root contains the primary RWKV-style implementation:
+The repository root contains the primary RWKV-style transformers implementation:
 
 ```text
-Data.py
+data_g.py
 Tokenizer.py
-download.py
+download_g.py
 merge.py
 train.py
+syntheticdata_g.py
 ```
 
 This path covers the workflow from dataset acquisition through tokenizer training, model pre-training, checkpoint handling, and Mixture of Experts upcycling.
 
-### `download.py`
+### `download_g.py`
 
 Handles dataset acquisition and downloading for the root training pipeline.
 
 The goal is to provide a dedicated dataset-entry point rather than mixing downloading logic directly into training.
 
-### `Data.py`
+### `data_g.py`
 
 Processes datasets for training.
 
@@ -490,5 +492,8 @@ Because the project contains separate architecture paths, changes should clearly
 ---
 
 # License
-
-See the repository for the current license information.
+### ARR (All-Rights-Reserved) and you must:
+- Not need to ask for permission to use the repo for your own open-source projects.
+- Keep the project open-source without any paid/monitised content (such as enhanced versions of this code but paid).
+- Always give credit to this repository's rightful owners.
+- Don't distribute as your own product.
