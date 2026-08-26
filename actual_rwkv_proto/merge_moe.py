@@ -1,38 +1,27 @@
 #!/usr/bin/env python3
-########################################################################################################
 # merge_moe.py
-#
 # Combines any number of RWKV-X checkpoints produced by train.py (same base architecture -- same
 # n_layer/n_embd/n_moba_layer/vocab_size, e.g. one base pretrain + several SFT/domain fine-tunes)
 # into a single Mixture-of-Experts checkpoint:
-#
 #   - Everything EXCEPT the Channel-Mix FFN (RWKV_CMix_x070) is taken from the base checkpoint and
 #     shared: embeddings, RWKV-7 TimeMix, MOBA attention, layernorms, output head.
 #   - Each branch's Channel-Mix FFN (key/value/x_k) becomes one expert.
 #   - A learned router (blocks.N.ffn.gate.weight) is added per FFN, top-k routed.
-#
 # This "MoE-upcycled Channel-Mix" is THIS PROJECT'S OWN EXTENSION (rwkv_x_core.RWKV_CMix_MoE) --
 # it is not part of upstream howard-hou/RWKV-X, which has no MoE support. A merged checkpoint from
 # this script can only be loaded back with RWKVXModel (rwkv_x_core.py, is_moe=True in config.json),
 # not with the real `rwkv-x` pip package.
-########################################################################################################
-
-import argparse
-import json
+import argparse, json
 from pathlib import Path
 from typing import List
-
 import torch
 from safetensors.torch import load_file, save_file
-
 from rwkv_x_core import RWKVXConfig, RWKVXModel
-
 
 def load_checkpoint(d: Path):
     cfg = RWKVXConfig.load(d / "config.json")
     sd = load_file(str(d / "model.safetensors"))
     return cfg, sd
-
 
 def assert_compatible(base_cfg: RWKVXConfig, branch_cfg: RWKVXConfig, branch_path: Path):
     for field in ("n_embd", "n_layer", "n_moba_layer", "head_size", "vocab_size"):
@@ -43,13 +32,11 @@ def assert_compatible(base_cfg: RWKVXConfig, branch_cfg: RWKVXConfig, branch_pat
                 "All branches must share the exact same architecture to merge."
             )
 
-
 def cmix_prefixes(cfg: RWKVXConfig) -> List[str]:
     """Every ffn.* prefix across both rwkv_blocks and moba_blocks -- both use RWKV_CMix_x070."""
     prefixes = [f"rwkv_blocks.{i}.ffn" for i in range(cfg.n_layer - cfg.n_moba_layer)]
     prefixes += [f"moba_blocks.{i}.ffn" for i in range(cfg.n_moba_layer)]
     return prefixes
-
 
 def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1):
     base_cfg, base_sd = load_checkpoint(base_dir)
@@ -58,7 +45,6 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
         cfg, sd = load_checkpoint(bd)
         assert_compatible(base_cfg, cfg, bd)
         branches.append((bd, sd))
-
     num_experts = len(branches)
     print(f"[MERGE] base={base_dir}, {num_experts} expert branches, top_k={top_k}")
 
@@ -102,7 +88,7 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     moe_model.save_pretrained(out_dir)
 
     meta = {
-        "engine": "rwkv-x godfather merge_moe.py",
+        "engine": "rwkv-x merge_moe.py",
         "base_model": str(base_dir),
         "branches": [str(b) for b in branch_dirs],
         "num_experts": num_experts,
@@ -112,7 +98,6 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     }
     (out_dir / "merge_config.json").write_text(json.dumps(meta, indent=2))
     print(f"[DONE] merged model -> {out_dir} ({moe_model.num_parameters()/1e6:.1f}M params)")
-
 
 def main():
     p = argparse.ArgumentParser(description="Merge N RWKV-X checkpoints into a Channel-Mix MoE model")
@@ -124,7 +109,6 @@ def main():
     args = p.parse_args()
 
     merge(Path(args.base), [Path(b) for b in args.branches], Path(args.out), top_k=args.top_k)
-
 
 if __name__ == "__main__":
     main()
