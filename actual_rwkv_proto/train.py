@@ -35,8 +35,8 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 from rwkv_x_core import RWKVXConfig, RWKVXModel, config_for_target_params
-from universal_dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDataset
-from train_tokenizer import train_tokenizer
+from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDataset
+from tokenizer import train_tokenizer
 
 STOP_REQUESTED = False
 
