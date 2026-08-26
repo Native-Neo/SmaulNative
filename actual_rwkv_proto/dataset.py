@@ -1,25 +1,65 @@
-# dataset.py
+########################################################################################################
+# universal_dataset.py
+#
 # Recursively walks --dataset_dir (including subfolders, e.g. ./datasets/some_random_dataset/*)
-# for .txt / .jsonl / .json / .csv / .parquet / common source-code extensions, tokenizes with the
-# real RWKV World TRIE tokenizer (tokenizer/rwkv_tokenizer.py, same one upstream ships), and yields
-# fixed-length ctx_len chunks for pretraining, or masked (input_ids, labels) pairs for SFT.
+# for .txt / .jsonl / .json / .csv / .parquet / common source-code extensions, tokenizes with a
+# self-trained BPE tokenizer (see train_tokenizer.py -- a single merged tokenizer.json, no dependency
+# on upstream's fixed-vocab TRIE tokenizer), and yields fixed-length ctx_len chunks for pretraining,
+# or masked (input_ids, labels) pairs for SFT.
+########################################################################################################
 
-import csv, json, os
+import csv
+import json
+import os
 from pathlib import Path
 from typing import Iterator, List, Tuple, Optional, Dict, Any
+
 import torch
 from torch.utils.data import IterableDataset, Dataset
-from tokenizer.rwkv_tokenizer import TRIE_TOKENIZER
 
-STOP_TOKEN_INDEX = 261  # matches upstream sft/src/dataset.py
+from tokenizers import Tokenizer as HFTokenizer
+
 IGNORE_INDEX = -100
 
-def load_tokenizer(vocab_path: Path) -> TRIE_TOKENIZER:
-    tok = TRIE_TOKENIZER(str(vocab_path))
-    return tok
 
-def tokenizer_vocab_size(tok: TRIE_TOKENIZER) -> int:
-    return max(tok.idx2token.keys()) + 1
+class TokenizerWrapper:
+    """Thin wrapper around a trained tokenizers.Tokenizer (see train_tokenizer.py) so the rest of
+    this file, train.py, and merge_moe.py only ever deal with plain encode()/decode() + two special
+    token ids -- no dependency on the old TRIE_TOKENIZER / fixed-vocab-file setup."""
+
+    def __init__(self, hf_tokenizer: HFTokenizer):
+        self._tok = hf_tokenizer
+        self.pad_token_id = hf_tokenizer.token_to_id("<pad>")
+        self.eos_token_id = hf_tokenizer.token_to_id("<eos>")
+        if self.pad_token_id is None or self.eos_token_id is None:
+            raise ValueError(
+                "tokenizer.json is missing <pad>/<eos> special tokens. "
+                "Train it with train_tokenizer.py (which adds them automatically), "
+                "don't point --tokenizer_path at an unrelated tokenizer.json."
+            )
+
+    def encode(self, text: str) -> List[int]:
+        return self._tok.encode(text).ids
+
+    def decode(self, ids: List[int]) -> str:
+        return self._tok.decode(ids)
+
+    def get_vocab_size(self) -> int:
+        return self._tok.get_vocab_size()
+
+
+def load_tokenizer(path: Path) -> TokenizerWrapper:
+    if not Path(path).exists():
+        raise FileNotFoundError(
+            f"No tokenizer found at {path}. Run train_tokenizer.py first "
+            f"(train.py will also auto-train one if --tokenizer_path is missing)."
+        )
+    return TokenizerWrapper(HFTokenizer.from_file(str(path)))
+
+
+def tokenizer_vocab_size(tok: TokenizerWrapper) -> int:
+    return tok.get_vocab_size()
+
 
 TEXT_KEYS = ("text", "content", "document", "body", "code", "prompt", "completion")
 
@@ -31,6 +71,7 @@ SUPPORTED_SUFFIXES = {
 }
 PLAIN_TEXT_SUFFIXES = SUPPORTED_SUFFIXES - {".jsonl", ".json", ".csv", ".parquet"}
 
+
 def discover_files(dataset_dir: Path) -> List[Path]:
     if not dataset_dir.exists():
         raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
@@ -38,6 +79,7 @@ def discover_files(dataset_dir: Path) -> List[Path]:
              if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES]
     files.sort()
     return files
+
 
 def extract_text(obj: Any) -> str:
     if isinstance(obj, str):
@@ -51,6 +93,7 @@ def extract_text(obj: Any) -> str:
     if isinstance(obj, list):
         return "\n".join(extract_text(x) for x in obj)
     return str(obj)
+
 
 def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                resume_record: int = 0) -> Iterator[Tuple[str, str, int]]:
@@ -120,11 +163,15 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
             print(f"[WARN] skipping {path}: {e}")
         start_idx = 0  # resume offset only applies to the exact resume file
 
+
+########################################################################################################
 # Pretraining: token-chunk stream
+########################################################################################################
+
 class PretrainStream(IterableDataset):
     """Streams (input_ids, labels) fixed-length chunks of size ctx_len for causal LM training."""
 
-    def __init__(self, dataset_dir: Path, tokenizer: TRIE_TOKENIZER, ctx_len: int,
+    def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int,
                  resume_file: Optional[str] = None, resume_record: int = 0):
         self.files = discover_files(dataset_dir)
         if not self.files:
@@ -139,7 +186,7 @@ class PretrainStream(IterableDataset):
         buf: List[int] = []
         for text, path, rec_idx in iter_texts(self.files, self.resume_file, self.resume_record):
             ids = self.tokenizer.encode(text)
-            ids.append(STOP_TOKEN_INDEX)
+            ids.append(self.tokenizer.eos_token_id)
             buf.extend(ids)
             self.last_pos = (path, rec_idx)
             while len(buf) >= self.ctx_len + 1:
@@ -149,8 +196,13 @@ class PretrainStream(IterableDataset):
                 y = torch.tensor(chunk[1:], dtype=torch.long)
                 yield x, y, self.last_pos
 
+
+########################################################################################################
 # SFT: conversation JSON/JSONL with loss masking (mirrors upstream sft/src/dataset.py)
+########################################################################################################
+
 DEFAULT_STOP_TOKEN = "\n\n"
+
 
 def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
     out = []
@@ -163,8 +215,9 @@ def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
         out.append(new)
     return out
 
-def _preprocess_conversation(conversations: List[Dict], tokenizer: TRIE_TOKENIZER, ctx_len: int,
-                              pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
+
+def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrapper, ctx_len: int,
+                              pad_token_id: int) -> Dict[str, torch.Tensor]:
     conversations = _add_speaker_and_signal(conversations)
     input_ids: List[int] = []
     tokenized_lens: List[int] = []
@@ -198,6 +251,7 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TRIE_TOKENIZE
         "labels": torch.tensor(targets, dtype=torch.long),
     }
 
+
 def discover_sft_records(dataset_dir: Path) -> List[Dict]:
     """SFT data must be conversation-style JSON/JSONL: [{"conversations":[{"from":"user","value":..},
     {"from":"assistant","value":..}, ...]}], possibly nested in subfolders, any number of files."""
@@ -225,8 +279,9 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
         )
     return records
 
+
 class SFTDataset(Dataset):
-    def __init__(self, dataset_dir: Path, tokenizer: TRIE_TOKENIZER, ctx_len: int):
+    def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int):
         self.records = discover_sft_records(dataset_dir)
         self.tokenizer = tokenizer
         self.ctx_len = ctx_len
@@ -236,5 +291,6 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, idx):
         rec = self.records[idx]
-        d = _preprocess_conversation(rec["conversations"], self.tokenizer, self.ctx_len)
+        d = _preprocess_conversation(rec["conversations"], self.tokenizer, self.ctx_len,
+                                      pad_token_id=self.tokenizer.pad_token_id)
         return d["input_ids"], d["labels"]
