@@ -1,60 +1,30 @@
 # SmaulNative
 
-SmaulNative is an experimental language-model development project focused on building and training models from scratch with custom data pipelines, tokenizer training, memory-aware training loops, RWKV-style architectures, Transformer variants, and Mixture of Experts model merging.
+- SmaulNative is an experimental language-model development project focused on building and training models from scratch with custom data pipelines, tokenizer training, memory-aware training loops, RWKV-style architectures, Transformer variants, and Mixture of Experts model merging.
 
-The repository contains three architecture paths:
-
-- The root pipeline: a custom RWKV-style recurrent model with its own trainer and MoE upcycling tools.
-- `actual_rwkv_proto`: a pure-PyTorch reimplementation of the real howard-hou/RWKV-X model math (RWKV-7 TimeMix + MOBA sparse attention), CPU-safe, with pretraining/SFT, tokenizer training, and MoE upcycling that can also merge tokenizers.
-- `Transformer-Basic`: a Llama-style dense Transformer path with its own training, merging, and tokenizer, including 2-bit simulated QAT experiments.
+- a pure-PyTorch reimplementation of the real howard-hou/RWKV-X model math (RWKV-7 TimeMix + MOBA sparse attention), CPU-safe, with pretraining/SFT, tokenizer training, and MoE upcycling that can also merge tokenizers.
 
 SmaulNative is intended as a practical experimentation environment for training and modifying language models without depending entirely on a large external training framework.
 
 ## Repository
-
 The project is hosted at:
-
 https://github.com/Native-Neo/SmaulNative
 
 ## Current Repository Layout
-
 ```text
 SmaulNative/
 ├── .gitignore
 ├── README.md
-│
-├── data_g.py               # PyArrow-accelerated dataset cleaning/filtering/dedup
-├── download_g.py           # Streaming dataset downloader with per-dataset GB caps
-├── syntheticdata_g.py      # Synthetic bilingual instruction-data generator
-├── Tokenizer.py            # 128K-vocab BPE tokenizer training (root pipeline)
-├── train.py                # Root RWKV-style trainer
-├── merge.py                # Root MoE-upcycling merge engine
-│
-├── datasets/
-│   └── synthetic_bilingual.parquet
-│
-├── SmaulNative/            # Trained tokenizer artifacts (tokenizer.json + config)
-│
-├── actual_rwkv_proto/      # RWKV-X prototype path
-│   ├── rwkv_x_core.py      # Pure-PyTorch RWKV-X model math (RWKV-7 + MOBA hybrid)
-│   ├── train.py            # Single entrypoint for pretraining + SFT
-│   ├── dataset.py          # Universal recursive dataset loader (pretrain stream + SFT)
-│   ├── tokenizer.py        # Byte-level BPE tokenizer training -> single tokenizer.json
-│   └── merge_moe.py        # MoE upcycling + tokenizer union-merging
-│
-└── Transformer-Basic/      # Llama-style Transformer path
-    ├── Train.py            # ~256M Llama pretrainer w/ 2-bit simulated QAT
-    ├── Merge.py            # Base + branches -> sparse MoE conversion
-    └── Tokenizer.py        # 128K-vocab BPE tokenizer training
+├── data_g.py           # PyArrow-accelerated dataset cleaning/filtering/dedup
+├── download_g.py             # Streaming dataset downloader with per-dataset GB caps
+├── syntheticdata_g.py  # Synthetic bilingual instruction-data generator
+├── rwkv_x_core.py            # Pure-PyTorch RWKV-X model math (RWKV-7 + MOBA hybrid)
+├── train.py            # Single entrypoint for pretraining + SFT
+├── dataset.py                # Universal recursive dataset loader (pretrain stream + SFT)
+├── tokenizer.py        # Byte-level BPE tokenizer training -> single tokenizer.json
+└── merge_moe.py              # MoE upcycling + tokenizer union-merging
 ```
-
----
-
-# Architecture Paths
-
-## 1. Root Pipeline — Custom RWKV-Style Trainer
-
-The repository root contains the original in-house RWKV-style implementation:
+This directory reimplements the **real** howard-hou/RWKV-X training model math in pure PyTorch so it runs on a CPU-only box. The WKV-7 recurrence here is not guessed — it is upstream's own CUDA-free reference loop made batched and differentiable, algebraically verified against their CUDA kernel's decay formula (`w_eff = exp(-exp(w_raw))` closed form).
 
 ```text
 download_g.py    data_g.py    syntheticdata_g.py    Tokenizer.py    train.py    merge.py
@@ -86,63 +56,6 @@ Generates millions of unique bilingual (English/Hindi) instruction-response pair
 - Chain-of-thought `<think>...</think>` reasoning traces.
 - ChatML-style formatting (`<|im_start|>`, `<|im_end|>`).
 - High-throughput ZSTD Parquet / JSONL export (a sample lives in `datasets/synthetic_bilingual.parquet`).
-
-### `Tokenizer.py`
-
-Trains a byte-level BPE tokenizer (128K vocab) on `./datasets` and exports it as an HF-compatible tokenizer into `./SmaulNative`. Special tokens include ChatML markers (`<|im_start|>`, `<|im_end|>`, role tokens) and thinking tags (`<think>`, `</think>`).
-
-### `train.py`
-
-RWKV-style causal language model trainer with:
-
-- Hugging Face `PreTrainedModel` / `PretrainedConfig` compatibility and safetensors export.
-- RWKV-style recurrent linear attention with state passing for arbitrarily long streams.
-- Lion optimizer (lighter on RAM than Adam).
-- Streaming datasets from txt/jsonl/json/csv/parquet/source files.
-- Byte-level resume for seekable files, row-group resume for Parquet.
-- Dataset transition via `--new-data`, optimizer resume, and Ctrl-C-only checkpoint saving.
-
-Example:
-
-```bash
-python train.py \
-    --dataset_dir ./datasets \
-    --output_dir ./SmaulNative-RWKV \
-    --checkpoint_dir ./checkpoints \
-    --batch_size 1 \
-    --learning_rate 1e-4
-```
-
-### Dense vs MoE Channel-Mix
-
-Blocks follow the classic RWKV split of Time-Mix (sequence mixing) + Channel-Mix (FFN). The MoE path replaces each Channel-Mix with top-k routed experts plus a gate:
-
-```text
-blocks.N.channel_mix.experts.0.*   # one expert per branch checkpoint
-blocks.N.channel_mix.experts.1.*
-blocks.N.channel_mix.gate.weight   # learned router
-```
-
-### `merge.py`
-
-RWKV-X MergeKit / MoE upcycling engine. Converts multiple fine-tuned checkpoints sharing a common base into a single MoE checkpoint:
-
-- Embeddings, Time-Mix, LayerNorms, and output head stay shared from the base.
-- Each branch's Channel-Mix becomes one expert; a router gate is added per layer.
-- Memory-aware: indexes checkpoints, converts layer by layer, never holds all tensors at once.
-- YAML-driven configuration (base model, branches, density, weights, shard size, seed).
-
-Run:
-
-```bash
-python merge.py --config config.yaml
-```
-
----
-
-## 2. `actual_rwkv_proto` — RWKV-X Prototype
-
-This directory reimplements the **real** howard-hou/RWKV-X training model math in pure PyTorch so it runs on a CPU-only box. The WKV-7 recurrence here is not guessed — it is upstream's own CUDA-free reference loop made batched and differentiable, algebraically verified against their CUDA kernel's decay formula (`w_eff = exp(-exp(w_raw))` closed form).
 
 ### `rwkv_x_core.py`
 
@@ -189,36 +102,6 @@ Note: MoE-upcycled checkpoints are this project's own extension and load only vi
 
 ---
 
-## 3. `Transformer-Basic` — Llama-Style Path
-
-An alternative standard-Transformer development path.
-
-### `Transformer-Basic/Train.py`
-
-Single-file CPU pre-training script for a ~256M parameter Llama model:
-
-- Standard HF `LlamaConfig` + `LlamaForCausalLM`.
-- 2-bit simulated QAT (fake quantization) on `nn.Linear` weights.
-- Custom FP32 Lion optimizer.
-- Streaming IterableDataset with on-demand tokenization.
-- 128K configured context length with RoPE scaling; sliding-window attention keeps training memory bounded.
-- Gradient checkpointing and automatic checkpoint/export on Ctrl-C or exceptions.
-- HF-compatible export to `./SmaulNative`.
-
-### `Transformer-Basic/Merge.py`
-
-Converts a base model plus specialized branch checkpoints (cyber, math, code, tool-calling, thinking, etc.) into a sparse MoE:
-
-- Shared attention backbone from the base; 10 FFN experts per layer; Top-2 routing.
-- Merged/deduplicated tokenizer with resized embedding/lm_head matrices.
-- Streams tensors into sharded safetensors output — never loads all checkpoints at once.
-
-### `Transformer-Basic/Tokenizer.py`
-
-Same 128K-vocab BPE tokenizer training flow as the root pipeline, scoped to this path.
-
----
-
 # Typical Workflow
 
 ```text
@@ -228,16 +111,16 @@ Dataset Sources
 download_g.py  -->  data_g.py (clean/filter/dedup)  -->  syntheticdata_g.py
       |                                                        |
       v                                                        v
-Tokenize (Tokenizer.py / tokenizer.py)  <-----------  Synthetic corpora
+Tokenize ( tokenizer.py )  <-----------  Synthetic corpora
       |
       v
-Pretrain: train.py  /  actual_rwkv_proto/train.py  /  Transformer-Basic/Train.py
+Pretrain: train.py 
       |
       v
 Fine-tune domain branches (SFT)
       |
       v
-Merge: merge.py  /  actual_rwkv_proto/merge_moe.py  /  Transformer-Basic/Merge.py
+Merge: merge_moe.py
       |
       v
 MoE / Merged Model
@@ -263,14 +146,14 @@ model/
 
 Large checkpoints may use multiple Safetensors shards with a `model.safetensors.index.json`. All merge pipelines are designed to process checkpoints in a memory-aware manner rather than loading every tensor simultaneously.
 
-The `actual_rwkv_proto` path additionally exports an upstream-shaped `.pth` (`rwkvx_upstream_compatible.pth`) so real `rwkv-x` package inference can run on a CUDA box later.
+This additionally exports an upstream-shaped `.pth` (`rwkvx_upstream_compatible.pth`) so real `rwkv-x` package inference can run on a CUDA box later.
 
 ---
 
 # Design Goals
 
 - Training language models from scratch, including on modest CPU-only hardware.
-- Supporting experimentation with multiple architectures (custom RWKV-style, RWKV-X, Llama-style).
+- Supporting experimentation with multiple architectures (`custom RWKV-style, RWKV-X, Llama-style` **See other branches**).
 - Keeping model tooling understandable and modifiable.
 - Resumable training and checkpointing everywhere (model + optimizer + dataset position).
 - Safetensors and Hugging Face-style model formats.
@@ -302,25 +185,11 @@ Root pipeline:
 python download_g.py                       # fetch datasets
 python data_g.py --input ./datasets --output ./cleaned_datasets
 python syntheticdata_g.py --count 250000 --format both
-python Tokenizer.py                        # train tokenizer -> ./SmaulNative
-python train.py                            # root RWKV-style training (resumes automatically)
-python merge.py --config config.yaml       # MoE upcycle
-```
-
-RWKV-X prototype:
-
-```bash
-python actual_rwkv_proto/train.py --mode pretrain
-python actual_rwkv_proto/train.py --mode sft
-python actual_rwkv_proto/merge_moe.py --help
-```
-
-Transformer-Basic:
-
-```bash
-python Transformer-Basic/Train.py
-python Transformer-Basic/Merge.py
-python Transformer-Basic/Tokenizer.py
+python tokenizer.py                        # train tokenizer -> ./SmaulNative
+python train.py --mode pretrain            # Runs pretraining with the RWKV-X achitecture 
+python train.py --mode sft                 # Runs SFT (SUper vised FineTuning)
+python merge_moe.py --help                 # MoE upcycle
+python rwkv_x_core.py                      # Just a core requirement of train.py
 ```
 
 The available command-line arguments depend on the individual script (`--help` works everywhere).
@@ -329,9 +198,9 @@ The available command-line arguments depend on the individual script (`--help` w
 
 # Project Status
 
-SmaulNative is an experimental and actively evolving project. The repository contains multiple architecture implementations and independent tooling paths; model formats, training behavior, merging logic, dataset pipelines, and configuration formats may change as development continues. Compatibility between checkpoints depends on the model architecture and the version of the corresponding training or merging implementation.
+SmaulNative is an experimental and actively evolving project. The repository contains multiple architecture implementations (See other branches) and independent tooling paths; model formats, training behavior, merging logic, dataset pipelines, and configuration formats may change as development continues. Compatibility between checkpoints depends on the model architecture and the version of the corresponding training or merging implementation.
 
-Recent work has centered on the `actual_rwkv_proto` path: verified RWKV-X math, self-training tokenizers, tokenizer bundling in checkpoints, and tokenizer-aware MoE merging.
+Recent work has centered on verified RWKV-X math, self-training tokenizers, tokenizer bundling in checkpoints, and tokenizer-aware MoE merging.
 
 ---
 
@@ -341,9 +210,9 @@ Contributions, experiments, architecture improvements, training optimizations, d
 
 Because the project contains separate architecture paths, changes should clearly indicate whether they target:
 
-- The root RWKV-style implementation.
-- The `actual_rwkv_proto` implementation.
-- The `Transformer-Basic` implementation.
+- The root RWKV-X implementation.
+- The `trnasformer` implementation.
+- The `transformers-based-RWKV` implementation.
 - Shared data or tokenizer tooling.
 - Model merging infrastructure.
 
