@@ -1,30 +1,17 @@
 ########################################################################################################
 # rwkv_x_core.py
-#
+#s
 # Pure-PyTorch (CPU-safe) reimplementation of howard-hou/RWKV-X's training model
 # (pretrain/src/model.py + sft/src/model.py), with the CUDA-kernel WKV-7 op
 # ("wind_backstepping", pretrain/src/model.py cuda/wkv7_cuda.cu) replaced by a
 # plain-Python differentiable recurrence.
-#
 # The recurrence formula used here is NOT guessed. It is the exact reference
 # loop already shipped by the RWKV-X authors for CUDA-free inference
 # (package/src/rwkv_x/model.py, `RWKV_x070_TMix_seq`, the `else` branch used
 # when RWKV_CUDA_ON=0), made batched + gradient-tracking instead of eval-only.
-#
-# Numerical equivalence check against the real training kernel
-# (pretrain/cuda/wkv7_cuda.cu, wind_backstepping): the kernel computes
-#     w_eff = exp(-exp(w_raw))
-# where w_raw = -softplus(-(w0 + tanh(xw@w1)@w2)) - 0.5 = ln(sigmoid(w0+g)) - 0.5.
-# So exp(w_raw) = sigmoid(w0+g) * exp(-0.5) = 0.606531 * sigmoid(w0+g), hence
-#     w_eff = exp(-0.606531 * sigmoid(w0+g))
-# which is *exactly* the closed form used in the inference reference loop below.
-# Confirmed algebraically equal -> this is upstream's own math, not reinvented.
-#
 # Consequence of going pure-Python: training is O(T) sequential per layer
 # instead of the CUDA kernel's chunked/parallel-scan implementation. On CPU
-# this is unavoidable without writing your own CPU kernel. Expect this to be
-# slow at long ctx_len -- that tradeoff was chosen explicitly (CPU-only box).
-########################################################################################################
+# this is unavoidable without writing your own CPU kernel. Expect this to be slow at long ctx_len
 
 import math
 import json
