@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-
+# merge_moe.py
 import argparse
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -16,774 +15,274 @@ from rwkv_x_core import RWKVXConfig, RWKVXModel
 def load_checkpoint(directory: Path):
     config_path = directory / "config.json"
     model_path = directory / "model.safetensors"
-
     if not config_path.exists():
-        raise FileNotFoundError(
-            f"Missing config.json: {config_path}"
-        )
-
+        raise FileNotFoundError(f"Missing config.json: {config_path}")
     if not model_path.exists():
-        raise FileNotFoundError(
-            f"Missing model.safetensors: {model_path}"
-        )
-
-    config = RWKVXConfig.load(config_path)
-
-    state_dict = load_file(
-        str(model_path),
-        device="cpu",
-    )
-
-    return config, state_dict
+        raise FileNotFoundError(f"Missing model.safetensors: {model_path}")
+    return RWKVXConfig.load(config_path), load_file(str(model_path), device="cpu")
 
 
 def load_tokenizer(directory: Path) -> dict:
     path = directory / "tokenizer.json"
-
     if not path.exists():
-        raise FileNotFoundError(
-            f"Missing tokenizer.json: {path}"
-        )
-
-    with open(
-        path,
-        "r",
-        encoding="utf-8",
-    ) as file:
-        return json.load(file)
+        raise FileNotFoundError(f"Missing tokenizer.json: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def assert_compatible(
-    base_config: RWKVXConfig,
-    branch_config: RWKVXConfig,
-    branch_path: Path,
-):
-    fields = (
-        "n_embd",
-        "n_layer",
-        "n_moba_layer",
-        "head_size",
-    )
-
-    for field in fields:
-        base_value = getattr(base_config, field)
-        branch_value = getattr(branch_config, field)
-
+def assert_compatible(base_config: RWKVXConfig, branch_config: RWKVXConfig, branch_path: Path):
+    for field in ("n_embd", "n_layer", "n_moba_layer", "head_size"):
+        base_value, branch_value = getattr(base_config, field), getattr(branch_config, field)
         if base_value != branch_value:
-            raise ValueError(
-                f"{branch_path}: incompatible {field}: "
-                f"base={base_value}, "
-                f"branch={branch_value}"
-            )
+            raise ValueError(f"{branch_path}: incompatible {field}: base={base_value}, branch={branch_value}")
 
 
-def get_vocab(
-    tokenizer: dict,
-) -> Dict[str, int]:
+def get_vocab(tokenizer: dict) -> Dict[str, int]:
     try:
         vocab = tokenizer["model"]["vocab"]
-    except KeyError as error:
-        raise ValueError(
-            "tokenizer.json does not contain model.vocab"
-        ) from error
-
+    except KeyError as e:
+        raise ValueError("tokenizer.json does not contain model.vocab") from e
     if not isinstance(vocab, dict):
-        raise ValueError(
-            "tokenizer model.vocab must be a dictionary"
-        )
-
+        raise ValueError("tokenizer model.vocab must be a dictionary")
     return vocab
 
 
-def get_merges(
-    tokenizer: dict,
-) -> List:
-    model = tokenizer.get("model", {})
-
-    merges = model.get(
-        "merges",
-        [],
-    )
-
+def get_merges(tokenizer: dict) -> List:
+    merges = tokenizer.get("model", {}).get("merges", [])
     if not isinstance(merges, list):
-        raise ValueError(
-            "tokenizer model.merges must be a list"
-        )
-
+        raise ValueError("tokenizer model.merges must be a list")
     return merges
 
 
-def merge_tokenizers(
-    base_dir: Path,
-    branch_dirs: List[Path],
-) -> Tuple[dict, int, dict]:
-    base_tokenizer = load_tokenizer(
-        base_dir
-    )
-
-    base_vocab = get_vocab(
-        base_tokenizer
-    )
-
-    base_merges = get_merges(
-        base_tokenizer
-    )
-
-    merged_vocab = dict(
-        base_vocab
-    )
-
-    merged_merges = list(
-        base_merges
-    )
-
-    merge_set = {
-        tuple(merge)
-        if isinstance(merge, list)
-        else merge
-        for merge in merged_merges
-    }
-
-    next_token_id = (
-        max(
-            merged_vocab.values(),
-            default=-1,
-        )
-        + 1
-    )
-
-    added_tokens = 0
-    added_merges = 0
+def merge_tokenizers(base_dir: Path, branch_dirs: List[Path]) -> Tuple[dict, int, dict]:
+    base_tokenizer = load_tokenizer(base_dir)
+    merged_vocab = dict(get_vocab(base_tokenizer))
+    merged_merges = list(get_merges(base_tokenizer))
+    merge_set = {tuple(m) if isinstance(m, list) else m for m in merged_merges}
+    next_token_id = max(merged_vocab.values(), default=-1) + 1
+    added_tokens = added_merges = 0
 
     for branch_dir in branch_dirs:
-        if (
-            branch_dir.resolve()
-            == base_dir.resolve()
-        ):
+        if branch_dir.resolve() == base_dir.resolve():
             continue
 
-        branch_tokenizer = load_tokenizer(
-            branch_dir
-        )
+        branch_tokenizer = load_tokenizer(branch_dir)
 
-        branch_vocab = get_vocab(
-            branch_tokenizer
-        )
-
-        branch_merges = get_merges(
-            branch_tokenizer
-        )
-
-        for token, branch_id in branch_vocab.items():
+        for token, branch_id in get_vocab(branch_tokenizer).items():
             if token in merged_vocab:
                 existing_id = merged_vocab[token]
-
                 if existing_id != branch_id:
                     raise ValueError(
                         "Tokenizer ID conflict detected.\n"
-                        f"Checkpoint: {branch_dir}\n"
-                        f"Token: {token!r}\n"
-                        f"Merged/base ID: {existing_id}\n"
-                        f"Branch ID: {branch_id}\n\n"
-                        "This checkpoint cannot be safely merged "
-                        "without remapping embedding and output "
-                        "weight rows."
+                        f"Checkpoint: {branch_dir}\nToken: {token!r}\n"
+                        f"Merged/base ID: {existing_id}\nBranch ID: {branch_id}\n\n"
+                        "This checkpoint cannot be safely merged without remapping "
+                        "embedding and output weight rows."
                     )
-
                 continue
-
             merged_vocab[token] = next_token_id
             next_token_id += 1
             added_tokens += 1
 
-        for merge in branch_merges:
-            key = (
-                tuple(merge)
-                if isinstance(merge, list)
-                else merge
-            )
-
+        for merge in get_merges(branch_tokenizer):
+            key = tuple(merge) if isinstance(merge, list) else merge
             if key in merge_set:
                 continue
-
             merge_set.add(key)
-            merged_merges.append(
-                merge
-            )
-
+            merged_merges.append(merge)
             added_merges += 1
 
-    merged_tokenizer = dict(
-        base_tokenizer
-    )
-
-    merged_model = dict(
-        base_tokenizer["model"]
-    )
-
-    merged_model["vocab"] = (
-        merged_vocab
-    )
-
-    merged_model["merges"] = (
-        merged_merges
-    )
-
-    merged_tokenizer["model"] = (
-        merged_model
-    )
+    merged_tokenizer = dict(base_tokenizer)
+    merged_model = dict(base_tokenizer["model"])
+    merged_model["vocab"] = merged_vocab
+    merged_model["merges"] = merged_merges
+    merged_tokenizer["model"] = merged_model
 
     stats = {
-        "base_vocab_size": len(base_vocab),
-        "merged_vocab_size": len(
-            merged_vocab
-        ),
+        "base_vocab_size": len(get_vocab(base_tokenizer)),
+        "merged_vocab_size": len(merged_vocab),
         "added_tokens": added_tokens,
         "added_merges": added_merges,
     }
-
-    return (
-        merged_tokenizer,
-        len(merged_vocab),
-        stats,
-    )
+    return merged_tokenizer, len(merged_vocab), stats
 
 
-def resize_vocab_matrix(
-    tensor: torch.Tensor,
-    target_size: int,
-) -> torch.Tensor:
+def resize_vocab_matrix(tensor: torch.Tensor, target_size: int) -> torch.Tensor:
     current_size = tensor.shape[0]
-
     if target_size == current_size:
         return tensor
-
     if target_size < current_size:
         return tensor[:target_size].clone()
 
-    output = torch.empty(
-        (
-            target_size,
-            *tensor.shape[1:],
-        ),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-
-    output[:current_size].copy_(
-        tensor
-    )
+    output = torch.empty((target_size, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+    output[:current_size].copy_(tensor)
 
     source = tensor.float()
+    mean, std = source.mean(), source.std(unbiased=False)
+    if not torch.isfinite(std) or std.item() <= 1e-12:
+        std = torch.tensor(0.02, dtype=torch.float32)
 
-    mean = source.mean()
-    std = source.std(
-        unbiased=False
-    )
-
-    if (
-        not torch.isfinite(std)
-        or std.item() <= 1e-12
-    ):
-        std = torch.tensor(
-            0.02,
-            dtype=torch.float32,
-        )
-
-    extra = torch.normal(
-        mean=float(mean),
-        std=float(std),
-        size=(
-            target_size - current_size,
-            *tensor.shape[1:],
-        ),
-    )
-
-    output[current_size:].copy_(
-        extra.to(
-            dtype=tensor.dtype
-        )
-    )
-
+    extra = torch.normal(mean=float(mean), std=float(std), size=(target_size - current_size, *tensor.shape[1:]))
+    output[current_size:].copy_(extra.to(dtype=tensor.dtype))
     return output
 
 
-def cmix_prefixes(
-    config: RWKVXConfig,
-) -> List[str]:
-    prefixes = []
-
-    rwkv_layers = (
-        config.n_layer
-        - config.n_moba_layer
-    )
-
-    for index in range(
-        rwkv_layers
-    ):
-        prefixes.append(
-            f"rwkv_blocks.{index}.ffn"
-        )
-
-    for index in range(
-        config.n_moba_layer
-    ):
-        prefixes.append(
-            f"moba_blocks.{index}.ffn"
-        )
-
-    return prefixes
+def cmix_prefixes(config: RWKVXConfig) -> List[str]:
+    rwkv_layers = config.n_layer - config.n_moba_layer
+    return [f"rwkv_blocks.{i}.ffn" for i in range(rwkv_layers)] + \
+           [f"moba_blocks.{i}.ffn" for i in range(config.n_moba_layer)]
 
 
-def copy_shared_weights(
-    base_state: Dict[str, torch.Tensor],
-    output_state: Dict[str, torch.Tensor],
-    target_vocab_size: int,
-):
+def copy_shared_weights(base_state: Dict[str, torch.Tensor], output_state: Dict[str, torch.Tensor], target_vocab_size: int):
     copied = set()
-
     for key, value in base_state.items():
         if ".ffn." in key:
             continue
-
         if key not in output_state:
-            raise KeyError(
-                f"Output model is missing shared tensor: {key}"
-            )
+            raise KeyError(f"Output model is missing shared tensor: {key}")
 
-        if key in (
-            "emb.weight",
-            "head.weight",
-        ):
-            value = resize_vocab_matrix(
-                value,
-                target_vocab_size,
-            )
+        if key in ("emb.weight", "head.weight"):
+            value = resize_vocab_matrix(value, target_vocab_size)
 
-        if (
-            output_state[key].shape
-            != value.shape
-        ):
+        if output_state[key].shape != value.shape:
             raise ValueError(
-                f"Shape mismatch for {key}: "
-                f"expected "
-                f"{tuple(output_state[key].shape)}, "
-                f"got {tuple(value.shape)}"
+                f"Shape mismatch for {key}: expected {tuple(output_state[key].shape)}, got {tuple(value.shape)}"
             )
-
         output_state[key] = value
         copied.add(key)
-
     return copied
 
 
-def copy_expert(
-    output_state: Dict[str, torch.Tensor],
-    branch_state: Dict[str, torch.Tensor],
-    prefix: str,
-    expert_id: int,
-    branch_path: Path,
-):
-    source_prefix = (
-        f"{prefix}."
-    )
-
-    destination_prefix = (
-        f"{prefix}.experts.{expert_id}."
-    )
-
+def copy_expert(output_state: Dict[str, torch.Tensor], branch_state: Dict[str, torch.Tensor],
+                 prefix: str, expert_id: int, branch_path: Path):
+    source_prefix = f"{prefix}."
+    destination_prefix = f"{prefix}.experts.{expert_id}."
     copied = 0
 
     for key, value in branch_state.items():
-        if not key.startswith(
-            source_prefix
-        ):
+        if not key.startswith(source_prefix):
             continue
-
-        suffix = key[
-            len(source_prefix):
-        ]
-
-        destination_key = (
-            destination_prefix
-            + suffix
-        )
+        destination_key = destination_prefix + key[len(source_prefix):]
 
         if destination_key not in output_state:
-            raise KeyError(
-                f"MoE model is missing expert tensor: "
-                f"{destination_key}"
-            )
-
-        if (
-            output_state[
-                destination_key
-            ].shape
-            != value.shape
-        ):
+            raise KeyError(f"MoE model is missing expert tensor: {destination_key}")
+        if output_state[destination_key].shape != value.shape:
             raise ValueError(
-                f"Shape mismatch in {branch_path}\n"
-                f"Source: {key} "
-                f"{tuple(value.shape)}\n"
-                f"Target: {destination_key} "
-                f"{tuple(output_state[destination_key].shape)}"
+                f"Shape mismatch in {branch_path}\nSource: {key} {tuple(value.shape)}\n"
+                f"Target: {destination_key} {tuple(output_state[destination_key].shape)}"
             )
-
-        output_state[
-            destination_key
-        ] = value
-
+        output_state[destination_key] = value
         copied += 1
 
     if copied == 0:
-        raise ValueError(
-            f"{branch_path} contains no FFN weights "
-            f"for {prefix}"
-        )
-
+        raise ValueError(f"{branch_path} contains no FFN weights for {prefix}")
     return copied
 
 
-def atomic_json_save(
-    data: dict,
-    path: Path,
-):
-    temporary_path = path.with_suffix(
-        path.suffix + ".tmp"
-    )
-
-    with open(
-        temporary_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            data,
-            file,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-        file.flush()
-        os.fsync(
-            file.fileno()
-        )
-
-    os.replace(
-        temporary_path,
-        path,
-    )
+def atomic_json_save(data: dict, path: Path):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
-def atomic_tokenizer_save(
-    tokenizer: dict,
-    output_path: Path,
-):
-    temporary_path = output_path.with_suffix(
-        output_path.suffix + ".tmp"
-    )
-
-    with open(
-        temporary_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            tokenizer,
-            file,
-            ensure_ascii=False,
-        )
-
-        file.flush()
-        os.fsync(
-            file.fileno()
-        )
-
-    os.replace(
-        temporary_path,
-        output_path,
-    )
+def atomic_tokenizer_save(tokenizer: dict, output_path: Path):
+    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(tokenizer, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, output_path)
 
 
-def merge(
-    base_dir: Path,
-    branch_dirs: List[Path],
-    output_dir: Path,
-    top_k: int,
-):
+def merge(base_dir: Path, branch_dirs: List[Path], output_dir: Path, top_k: int):
     if not branch_dirs:
-        raise ValueError(
-            "At least one branch is required."
-        )
-
+        raise ValueError("At least one branch is required.")
     if top_k < 1:
-        raise ValueError(
-            "--top_k must be at least 1."
-        )
+        raise ValueError("--top_k must be at least 1.")
 
     base_dir = base_dir.resolve()
-
-    branch_dirs = [
-        branch.resolve()
-        for branch in branch_dirs
-    ]
-
+    branch_dirs = [b.resolve() for b in branch_dirs]
     output_dir = output_dir.resolve()
 
     if output_dir == base_dir:
-        raise ValueError(
-            "--out cannot overwrite --base."
-        )
-
+        raise ValueError("--out cannot overwrite --base.")
     for branch_dir in branch_dirs:
         if output_dir == branch_dir:
-            raise ValueError(
-                "--out cannot overwrite a branch."
-            )
+            raise ValueError("--out cannot overwrite a branch.")
 
-    base_config, base_state = (
-        load_checkpoint(
-            base_dir
-        )
-    )
-
+    base_config, base_state = load_checkpoint(base_dir)
     branches = []
-
     for branch_dir in branch_dirs:
-        branch_config, branch_state = (
-            load_checkpoint(
-                branch_dir
-            )
-        )
+        branch_config, branch_state = load_checkpoint(branch_dir)
+        assert_compatible(base_config, branch_config, branch_dir)
+        branches.append((branch_dir, branch_config, branch_state))
 
-        assert_compatible(
-            base_config,
-            branch_config,
-            branch_dir,
-        )
+    merged_tokenizer, merged_vocab_size, tokenizer_stats = merge_tokenizers(base_dir, branch_dirs)
 
-        branches.append(
-            (
-                branch_dir,
-                branch_config,
-                branch_state,
-            )
-        )
+    num_experts = len(branches)
+    top_k = min(top_k, num_experts)
 
-    (
-        merged_tokenizer,
-        merged_vocab_size,
-        tokenizer_stats,
-    ) = merge_tokenizers(
-        base_dir,
-        branch_dirs,
-    )
+    print(f"[MERGE] Base: {base_dir}")
+    print(f"[MERGE] Branches: {num_experts}")
+    print(f"[MERGE] Top-K: {top_k}")
+    print(f"[MERGE] Vocabulary: {tokenizer_stats['base_vocab_size']} -> {merged_vocab_size}")
 
-    num_experts = len(
-        branches
-    )
-
-    if top_k > num_experts:
-        top_k = num_experts
-
-    print(
-        f"[MERGE] Base: {base_dir}"
-    )
-
-    print(
-        f"[MERGE] Branches: {num_experts}"
-    )
-
-    print(
-        f"[MERGE] Top-K: {top_k}"
-    )
-
-    print(
-        f"[MERGE] Vocabulary: "
-        f"{tokenizer_stats['base_vocab_size']} "
-        f"-> {merged_vocab_size}"
-    )
-
-    config_data = dict(
-        base_config.__dict__
-    )
-
-    config_data.update(
-        {
-            "is_moe": True,
-            "vocab_size": merged_vocab_size,
-            "num_experts": num_experts,
-            "num_experts_per_tok": top_k,
-        }
-    )
-
-    moe_config = RWKVXConfig(
-        **config_data
-    )
-
-    moe_model = RWKVXModel(
-        moe_config
-    )
-
+    config_data = dict(base_config.__dict__)
+    config_data.update(is_moe=True, vocab_size=merged_vocab_size, num_experts=num_experts, num_experts_per_tok=top_k)
+    moe_config = RWKVXConfig(**config_data)
+    moe_model = RWKVXModel(moe_config)
     output_state = moe_model.state_dict()
 
-    print(
-        "[MERGE] Copying shared weights..."
-    )
+    print("[MERGE] Copying shared weights...")
+    copy_shared_weights(base_state, output_state, merged_vocab_size)
 
-    copy_shared_weights(
-        base_state,
-        output_state,
-        merged_vocab_size,
-    )
+    print("[MERGE] Copying experts...")
+    for prefix in cmix_prefixes(base_config):
+        for expert_id, (branch_dir, _, branch_state) in enumerate(branches):
+            copy_expert(output_state, branch_state, prefix, expert_id, branch_dir)
 
-    prefixes = cmix_prefixes(
-        base_config
-    )
-
-    print(
-        "[MERGE] Copying experts..."
-    )
-
-    for prefix in prefixes:
-        for expert_id, (
-            branch_dir,
-            _,
-            branch_state,
-        ) in enumerate(
-            branches
-        ):
-            copy_expert(
-                output_state,
-                branch_state,
-                prefix,
-                expert_id,
-                branch_dir,
-            )
-
-    missing, unexpected = (
-        moe_model.load_state_dict(
-            output_state,
-            strict=False,
-        )
-    )
-
+    missing, unexpected = moe_model.load_state_dict(output_state, strict=False)
     if missing:
-        raise RuntimeError(
-            "Missing model tensors:\n"
-            + "\n".join(missing)
-        )
-
+        raise RuntimeError("Missing model tensors:\n" + "\n".join(missing))
     if unexpected:
-        raise RuntimeError(
-            "Unexpected model tensors:\n"
-            + "\n".join(unexpected)
-        )
+        raise RuntimeError("Unexpected model tensors:\n" + "\n".join(unexpected))
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    print(
-        "[SAVE] Writing merged model..."
-    )
-
-    moe_model.save_pretrained(
-        output_dir
-    )
-
-    atomic_tokenizer_save(
-        merged_tokenizer,
-        output_dir / "tokenizer.json",
-    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print("[SAVE] Writing merged model...")
+    moe_model.save_pretrained(output_dir)
+    atomic_tokenizer_save(merged_tokenizer, output_dir / "tokenizer.json")
 
     metadata = {
         "base_model": str(base_dir),
-        "branches": [
-            str(branch)
-            for branch in branch_dirs
-        ],
+        "branches": [str(b) for b in branch_dirs],
         "num_experts": num_experts,
         "top_k": top_k,
         "vocab_size": merged_vocab_size,
         "tokenizer_merge": tokenizer_stats,
     }
+    atomic_json_save(metadata, output_dir / "merge_config.json")
 
-    atomic_json_save(
-        metadata,
-        output_dir / "merge_config.json",
-    )
-
-    parameter_count = (
-        moe_model.num_parameters()
-        / 1_000_000
-    )
-
-    print()
-    print("[DONE]")
-    print(
-        f"Model: {output_dir}"
-    )
-    print(
-        f"Parameters: {parameter_count:.1f}M"
-    )
-    print(
-        f"Experts: {num_experts}"
-    )
-    print(
-        f"Top-K: {top_k}"
-    )
-    print(
-        f"Vocabulary: {merged_vocab_size}"
-    )
+    parameter_count = moe_model.num_parameters() / 1_000_000
+    print(f"\n[DONE]\nModel: {output_dir}\nParameters: {parameter_count:.1f}M\n"
+          f"Experts: {num_experts}\nTop-K: {top_k}\nVocabulary: {merged_vocab_size}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Merge RWKV-X checkpoints into "
-            "a Channel-Mix MoE model."
-        )
-    )
-
-    parser.add_argument(
-        "--base",
-        required=True,
-        type=str,
-    )
-
-    parser.add_argument(
-        "--branches",
-        required=True,
-        nargs="+",
-        type=str,
-    )
-
-    parser.add_argument(
-        "--out",
-        required=True,
-        type=str,
-    )
-
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        default=1,
-    )
-
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Merge RWKV-X checkpoints into a Channel-Mix MoE model.")
+    p.add_argument("--base", required=True, type=str)
+    p.add_argument("--branches", required=True, nargs="+", type=str)
+    p.add_argument("--out", required=True, type=str)
+    p.add_argument("--top_k", type=int, default=1)
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
-
     merge(
         base_dir=Path(args.base),
-        branch_dirs=[
-            Path(branch)
-            for branch in args.branches
-        ],
+        branch_dirs=[Path(b) for b in args.branches],
         output_dir=Path(args.out),
         top_k=args.top_k,
     )
