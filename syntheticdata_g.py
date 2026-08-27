@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SyntheticData.py
+syntheticdata.py
 
 Massive Synthetic Dataset Generator for SmaulNative LLM.
 Generates millions of 100% unique bilingual (English and Hindi) instruction-response pairs
