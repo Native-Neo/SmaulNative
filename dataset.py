@@ -1,12 +1,5 @@
-########################################################################################################
-# universal_dataset.py
-#
-# Recursively walks --dataset_dir (including subfolders, e.g. ./datasets/some_random_dataset/*)
-# for .txt / .jsonl / .json / .csv / .parquet / common source-code extensions, tokenizes with a
-# self-trained BPE tokenizer (see train_tokenizer.py -- a single merged tokenizer.json, no dependency
-# on upstream's fixed-vocab TRIE tokenizer), and yields fixed-length ctx_len chunks for pretraining,
-# or masked (input_ids, labels) pairs for SFT.
-########################################################################################################
+#!usr/bin/env python3
+# dataset.py
 
 import csv
 import json
