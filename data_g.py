@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Data.py
+data.py
 
 PyArrow C++ Accelerated Dataset & Code Filtering Pipeline for LLMs.
 Processes Parquet, JSON, JSONL, CSV, Text, and Source Code files at million-row scale
