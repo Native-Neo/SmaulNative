@@ -18,8 +18,9 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 from rwkv_x_core import RWKVXConfig, RWKVXModel, config_for_target_params
-from data import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDataset
+from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDataset, iter_texts, discover_files
 from tokenizer import train_tokenizer
+import qat
 
 STOP_REQUESTED = False
 
@@ -72,6 +73,7 @@ class ResumeState:
         self.file_path: Optional[str] = None  # pretrain: last-consumed file
         self.record_index = 0                 # pretrain: last-consumed record within that file
         self.epoch = 0                        # sft: next epoch to run
+        self.buffer_tokens = []               # pretrain: leftover tokens in buffer
 
     @classmethod
     def load(cls, path: Path):
@@ -84,6 +86,7 @@ class ResumeState:
                 s.file_path = d.get("file_path")
                 s.record_index = d.get("record_index", 0)
                 s.epoch = d.get("epoch", 0)
+                s.buffer_tokens = d.get("buffer_tokens", [])
             except Exception as e:
                 print(f"[WARN] could not load resume state: {e}")
         return s
@@ -97,6 +100,7 @@ class ResumeState:
             "file_path": self.file_path,
             "record_index": self.record_index,
             "epoch": self.epoch,
+            "buffer_tokens": self.buffer_tokens,
         }, indent=2))
         os.replace(tmp, path)
 
@@ -129,7 +133,8 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
 
 def train_pretrain(args, model, optimizer, resume, device, tokenizer):
     stream = PretrainStream(Path(args.dataset_dir), tokenizer, args.ctx_len,
-                             resume_file=resume.file_path, resume_record=resume.record_index)
+                             resume_file=resume.file_path, resume_record=resume.record_index,
+                             buffer_tokens=resume.buffer_tokens)
     model.train()
     batch_x, batch_y = [], []
     t0 = time.perf_counter()
@@ -158,6 +163,7 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
         resume.global_step += 1
         resume.total_tokens += xb.numel()
         resume.file_path, resume.record_index = pos
+        resume.buffer_tokens = list(stream.buffer_tokens)
         tok_since += xb.numel()
 
         if resume.global_step % args.log_every == 0:
@@ -204,9 +210,9 @@ def train_sft(args, model, optimizer, resume, device, tokenizer):
 
             if STOP_REQUESTED:
                 break
-        resume.epoch = epoch + 1
         if STOP_REQUESTED:
             break
+        resume.epoch = epoch + 1
 
 
 # CLI
@@ -237,6 +243,17 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=200)
     p.add_argument("--new_data", action="store_true",
                     help="reset dataset position, keep model/optimizer weights")
+
+    p.add_argument("--qat", action="store_true",
+                    help="fake-quantize the Channel-Mix (FFN) linears at 3-bit (int3) precision -- weight "
+                         "(per-channel symmetric) + activation (per-tensor asymmetric); emb/head/attention "
+                         "stay FP32. Calibrates on --qat_calib_batches batches, then trains as usual.")
+    p.add_argument("--qat_calib_batches", type=int, default=64,
+                    help="pretrain-set batches used to settle the fake-quant observer ranges before training")
+    p.add_argument("--qat_export_dir", type=str, default=None,
+                    help="after training finishes, convert a --qat model's FFN linears to real packed "
+                         "int3 weights and save that (separate) checkpoint here; the training "
+                         "checkpoint in --output_dir stays fake-quantized/fine-tunable")
     return p.parse_args()
 
 
@@ -279,6 +296,16 @@ def main():
     tokenizer = load_tokenizer(tokenizer_path)
     model = build_model(args, tokenizer).to(device)
 
+    if args.qat:
+        n = qat.prepare_qat(model)
+        print(f"[QAT] fake-quantizing {n} Channel-Mix linear(s); calibrating on "
+              f"{args.qat_calib_batches} batches from {args.dataset_dir} ...")
+        calib_files = discover_files(Path(args.dataset_dir))
+        calib_texts = (text for text, _path, _idx in iter_texts(calib_files))
+        done = qat.calibrate(model, tokenizer, calib_texts, args.ctx_len, device,
+                              max_batches=args.qat_calib_batches)
+        print(f"[QAT] calibrated on {done} batches")
+
     opt_cls = Lion if args.optimizer == "lion" else torch.optim.AdamW
     optimizer = opt_cls(model.parameters(), lr=args.learning_rate)
 
@@ -304,6 +331,15 @@ def main():
             train_sft(args, model, optimizer, resume, device, tokenizer)
     finally:
         save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path)
+
+    if args.qat and args.qat_export_dir:
+        import copy
+        print(f"[QAT] converting to real packed int3 weights -> {args.qat_export_dir}")
+        exported = copy.deepcopy(model).cpu()
+        n = qat.convert_qat(exported)
+        exported.save_pretrained(Path(args.qat_export_dir))
+        shutil.copy2(tokenizer_path, Path(args.qat_export_dir) / "tokenizer.json")
+        print(f"[QAT] converted {n} linear(s), exported to {args.qat_export_dir}")
 
 
 if __name__ == "__main__":
