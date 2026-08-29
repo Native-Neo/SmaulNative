@@ -1,5 +1,4 @@
-#!usr/bin/env python3
-# dataset.py
+# dataset.py -- recursive multi-format (txt/jsonl/json/csv/parquet/source) dataset loader, pretrain + SFT.
 
 import csv
 import json
@@ -16,7 +15,7 @@ IGNORE_INDEX = -100
 
 
 class TokenizerWrapper:
-    """Thin wrapper around a trained tokenizers.Tokenizer (see train_tokenizer.py) so the rest of
+    """Thin wrapper around a trained tokenizers.Tokenizer (see tokenizer.py) so the rest of
     this file, train.py, and merge_moe.py only ever deal with plain encode()/decode() + two special
     token ids -- no dependency on the old TRIE_TOKENIZER / fixed-vocab-file setup."""
 
@@ -27,7 +26,7 @@ class TokenizerWrapper:
         if self.pad_token_id is None or self.eos_token_id is None:
             raise ValueError(
                 "tokenizer.json is missing <pad>/<eos> special tokens. "
-                "Train it with train_tokenizer.py (which adds them automatically), "
+                "Train it with tokenizer.py (which adds them automatically), "
                 "don't point --tokenizer_path at an unrelated tokenizer.json."
             )
 
@@ -44,7 +43,7 @@ class TokenizerWrapper:
 def load_tokenizer(path: Path) -> TokenizerWrapper:
     if not Path(path).exists():
         raise FileNotFoundError(
-            f"No tokenizer found at {path}. Run train_tokenizer.py first "
+            f"No tokenizer found at {path}. Run tokenizer.py first "
             f"(train.py will also auto-train one if --tokenizer_path is missing)."
         )
     return TokenizerWrapper(HFTokenizer.from_file(str(path)))
@@ -154,18 +153,16 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                         yield text, str(path), i + 1
         except Exception as e:
             print(f"[WARN] skipping {path}: {e}")
-        start_idx = 0  # resume offset only applies to the exact resume file
 
 
-########################################################################################################
 # Pretraining: token-chunk stream
-########################################################################################################
 
 class PretrainStream(IterableDataset):
     """Streams (input_ids, labels) fixed-length chunks of size ctx_len for causal LM training."""
 
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int,
-                 resume_file: Optional[str] = None, resume_record: int = 0):
+                 resume_file: Optional[str] = None, resume_record: int = 0,
+                 buffer_tokens: Optional[List[int]] = None):
         self.files = discover_files(dataset_dir)
         if not self.files:
             raise RuntimeError(f"No supported files found under {dataset_dir}")
@@ -173,10 +170,11 @@ class PretrainStream(IterableDataset):
         self.ctx_len = ctx_len
         self.resume_file = resume_file
         self.resume_record = resume_record
+        self.buffer_tokens = list(buffer_tokens) if buffer_tokens is not None else []
         self.last_pos: Tuple[Optional[str], int] = (None, 0)  # updated as we go, read by trainer for checkpointing
 
     def __iter__(self):
-        buf: List[int] = []
+        buf: List[int] = list(self.buffer_tokens)
         for text, path, rec_idx in iter_texts(self.files, self.resume_file, self.resume_record):
             ids = self.tokenizer.encode(text)
             ids.append(self.tokenizer.eos_token_id)
@@ -185,14 +183,13 @@ class PretrainStream(IterableDataset):
             while len(buf) >= self.ctx_len + 1:
                 chunk = buf[: self.ctx_len + 1]
                 del buf[: self.ctx_len]
+                self.buffer_tokens = list(buf)
                 x = torch.tensor(chunk[:-1], dtype=torch.long)
                 y = torch.tensor(chunk[1:], dtype=torch.long)
                 yield x, y, self.last_pos
 
 
-########################################################################################################
 # SFT: conversation JSON/JSONL with loss masking (mirrors upstream sft/src/dataset.py)
-########################################################################################################
 
 DEFAULT_STOP_TOKEN = "\n\n"
 
@@ -201,10 +198,14 @@ def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
     out = []
     for sentence in conversations:
         frm = sentence["from"]
-        frm_str = "User" if frm.lower() == "user" else "Assistant" if frm.lower() == "assistant" else frm
+        frm_str = "User" if frm.lower() in ("user", "human") else "Assistant" if frm.lower() in ("assistant", "gpt") else frm
         val = sentence.get("value", "")
         new = dict(sentence)
-        new["value"] = (frm_str + ": " + val + DEFAULT_STOP_TOKEN) if val else (frm_str + ":")
+        new["from"] = frm_str
+        # always keep the "From: " prefix (even when val is empty) so it exactly matches the
+        # `frm_str + ": "` prefix_len computed in _preprocess_conversation -- previously an empty
+        # val produced "From:" (no space), which desynced the mask boundary by one token.
+        new["value"] = frm_str + ": " + val + DEFAULT_STOP_TOKEN
         out.append(new)
     return out
 
@@ -215,20 +216,23 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
     input_ids: List[int] = []
     tokenized_lens: List[int] = []
     speakers: List[str] = []
+    prefix_lens: List[int] = []
     for c in conversations:
         ids = tokenizer.encode(c["value"])
         input_ids.extend(ids)
         tokenized_lens.append(len(ids))
         speakers.append(c["from"])
+        prefix_len = len(tokenizer.encode(c["from"] + ": "))
+        prefix_lens.append(prefix_len)
 
     targets = list(input_ids)
     cur = 0
-    for length, speaker in zip(tokenized_lens, speakers):
+    for length, speaker, prefix_len in zip(tokenized_lens, speakers, prefix_lens):
         if speaker.lower() == "user":
             for j in range(cur, cur + length):
                 targets[j] = IGNORE_INDEX
         elif speaker.lower() == "assistant":
-            for j in range(cur, min(cur + 3, cur + length)):
+            for j in range(cur, min(cur + prefix_len, cur + length)):
                 targets[j] = IGNORE_INDEX
         cur += length
 
