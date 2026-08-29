@@ -13,7 +13,7 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.processors import ByteLevel as ByteLevelProcessor
 from tokenizers.trainers import BpeTrainer
 
-from data import discover_files, iter_texts
+from dataset import discover_files, iter_texts
 
 SPECIAL_TOKENS = ["<pad>", "<eos>"]
 
