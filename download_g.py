@@ -1,98 +1,379 @@
-import argparse
-import json
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
 import os
-import sys
-from datasets import load_dataset
+from pathlib import Path
 
-DEFAULT_DATASETS_DIR = "./datasets"
-DEFAULT_TARGET_GB = 20.0
+from huggingface_hub import HfApi, hf_hub_download
 
-DEFAULT_DATASETS = [
-    ("fineweb_edu", "HuggingFaceFW/fineweb-edu", "sample-10BT"),
-    ("enwiki", "HuggingFaceFW/finewiki", "en"),
-    ("hiwiki", "HuggingFaceFW/finewiki", "hi"),
-    ("finepdfs_hi", "HuggingFaceFW/finepdfs-edu", "hin_Deva")
-]
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Download pre-training datasets with streaming limits.")
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=DEFAULT_DATASETS_DIR,
-        help="Directory to save output jsonl files."
+# ============================================================
+# Configuration
+# ============================================================
+
+OUTPUT_ROOT = Path("./datasets/raw")
+
+# Maximum download size PER LANGUAGE.
+# 40 GiB = 40 * 1024^3 bytes.
+MAX_GIB_PER_LANGUAGE = 40
+
+HINDI_REPO = "HuggingFaceFW/fineweb-2"
+HINDI_PATH = "data/hin_Deva/train"
+
+ENGLISH_REPO = "HuggingFaceFW/fineweb"
+
+# Original FineWeb English 100BT sample.
+ENGLISH_PATH = "data/100BT"
+
+
+# ============================================================
+# Hugging Face
+# ============================================================
+
+api = HfApi()
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def gib_to_bytes(gib: float) -> int:
+    return int(gib * 1024 ** 3)
+
+
+def get_repo_files(
+    repo_id: str,
+    path: str,
+) -> list[dict]:
+
+    print(f"\nInspecting {repo_id}/{path}")
+
+    info = api.list_repo_tree(
+        repo_id=repo_id,
+        repo_type="dataset",
+        path=path,
+        recursive=True,
     )
-    parser.add_argument(
-        "--target-gb",
-        type=float,
-        default=DEFAULT_TARGET_GB,
-        help="Target size cap in GB per dataset."
+
+    files = []
+
+    for item in info:
+        if not hasattr(item, "path"):
+            continue
+
+        if not item.path.endswith(".parquet"):
+            continue
+
+        size = getattr(item, "size", None)
+
+        if size is None:
+            continue
+
+        files.append(
+            {
+                "path": item.path,
+                "size": int(size),
+            }
+        )
+
+    files.sort(
+        key=lambda x: x["path"]
     )
-    return parser.parse_args()
 
-def main():
-    args = parse_args()
-    datasets_dir = args.output_dir
-    target_bytes = int(args.target_gb * 1024 * 1024 * 1024)
+    if not files:
+        raise RuntimeError(
+            f"No Parquet files found in:\n"
+            f"{repo_id}/{path}"
+        )
 
-    os.makedirs(datasets_dir, exist_ok=True)
-    print(f"Starting / Resuming dataset streaming into '{datasets_dir}' (Limit: {args.target_gb:.2f} GB per dataset)...")
+    return files
 
-    for name, path, config in DEFAULT_DATASETS:
-        out_path = os.path.join(datasets_dir, f"{name}.jsonl")
-        bytes_written = 0
-        existing_lines = 0
 
-        # Resume check: Verify file size and existing line count if resuming
-        if os.path.exists(out_path):
-            bytes_written = os.path.getsize(out_path)
-            if bytes_written >= target_bytes:
-                print(f"[{name}] Already reached target limit ({bytes_written / (1024**3):.2f} GB). Skipping.")
+def get_existing_size(
+    directory: Path,
+) -> int:
+
+    total = 0
+
+    if not directory.exists():
+        return 0
+
+    for path in directory.rglob("*"):
+
+        if path.is_file():
+            total += path.stat().st_size
+
+    return total
+
+
+# ============================================================
+# Downloader
+# ============================================================
+
+def download_dataset(
+    repo_id: str,
+    dataset_path: str,
+    output_name: str,
+) -> None:
+
+    output_dir = (
+        OUTPUT_ROOT / output_name
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    max_bytes = gib_to_bytes(
+        MAX_GIB_PER_LANGUAGE
+    )
+
+    files = get_repo_files(
+        repo_id,
+        dataset_path,
+    )
+
+    existing_bytes = get_existing_size(
+        output_dir
+    )
+
+    print()
+    print("=" * 70)
+    print(f"DATASET: {output_name}")
+    print("=" * 70)
+
+    print(
+        f"Files available: "
+        f"{len(files):,}"
+    )
+
+    print(
+        f"Existing data: "
+        f"{existing_bytes / 1024**3:.2f} GiB"
+    )
+
+    print(
+        f"Maximum: "
+        f"{MAX_GIB_PER_LANGUAGE:.2f} GiB"
+    )
+
+    if existing_bytes >= max_bytes:
+
+        print(
+            "\nMaximum size already reached."
+        )
+
+        return
+
+    downloaded_bytes = existing_bytes
+    downloaded_files = 0
+    skipped_files = 0
+
+    for index, file_info in enumerate(
+        files,
+        start=1,
+    ):
+
+        filename = file_info["path"]
+        file_size = file_info["size"]
+
+        destination = (
+            output_dir / filename
+        )
+
+        # ----------------------------------------------------
+        # Already downloaded.
+        # ----------------------------------------------------
+
+        if destination.exists():
+
+            actual_size = (
+                destination.stat().st_size
+            )
+
+            if actual_size == file_size:
+
+                downloaded_files += 1
+
+                print(
+                    f"[{index:,}/{len(files):,}] "
+                    f"already exists: "
+                    f"{filename}"
+                )
+
                 continue
 
-            print(f"[{name}] Found existing file ({bytes_written / (1024**3):.2f} GB). Counting records to skip...")
-            with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
-                existing_lines = sum(1 for _ in f)
-            print(f"[{name}] Resuming download from record #{existing_lines:,}...")
+            print(
+                f"[{index:,}/{len(files):,}] "
+                f"partial/corrupt file detected: "
+                f"{filename}"
+            )
 
-        print(f"\n---> Fetching {name} ({path} | config: {config}). Target: {args.target_gb:.2f} GB")
+            destination.unlink()
 
-        try:
-            ds = load_dataset(path, name=config, split="train", streaming=True)
+        # ----------------------------------------------------
+        # Check size limit BEFORE downloading.
+        # ----------------------------------------------------
 
-            # Fast-forward through existing lines if resuming
-            if existing_lines > 0:
-                ds = ds.skip(existing_lines)
+        remaining = (
+            max_bytes - downloaded_bytes
+        )
 
-            # Append mode prevents overwriting downloaded data
-            with open(out_path, "a", encoding="utf-8") as f_out:
-                for item in ds:
-                    text = item.get("text", "") or item.get("content", "")
-                    if not text:
-                        continue
+        if file_size > remaining:
 
-                    line = json.dumps({"text": text}, ensure_ascii=False) + "\n"
-                    line_bytes = len(line.encode("utf-8"))
+            skipped_files += 1
 
-                    f_out.write(line)
-                    bytes_written += line_bytes
+            print(
+                f"\nSIZE LIMIT REACHED"
+            )
 
-                    # Progress update every 500 MB
-                    if bytes_written % (500 * 1024 * 1024) < line_bytes:
-                        f_out.flush()
-                        gb_written = bytes_written / (1024 ** 3)
-                        print(f"[{name}] Total written: {gb_written:.2f} GB / {args.target_gb:.2f} GB")
+            print(
+                f"Current:   "
+                f"{downloaded_bytes / 1024**3:.2f} GiB"
+            )
 
-                    if bytes_written >= target_bytes:
-                        f_out.flush()
-                        print(f"[{name}] Successfully reached target limit.")
-                        break
+            print(
+                f"Next file: "
+                f"{file_size / 1024**3:.2f} GiB"
+            )
 
-        except Exception as e:
-            print(f"Skipped or hit stream boundary for {name}: {e}")
+            print(
+                f"Remaining: "
+                f"{remaining / 1024**3:.2f} GiB"
+            )
 
-    print("\nAll dataset downloads finished or reached target limits!")
+            print(
+                "\nStopping instead of exceeding "
+                "the configured limit."
+            )
+
+            break
+
+        # ----------------------------------------------------
+        # Download.
+        # ----------------------------------------------------
+
+        print(
+            f"\n[{index:,}/{len(files):,}] "
+            f"Downloading:"
+        )
+
+        print(
+            f"  {filename}"
+        )
+
+        print(
+            f"  Size: "
+            f"{file_size / 1024**3:.2f} GiB"
+        )
+
+        print(
+            f"  Total after: "
+            f"{(downloaded_bytes + file_size) / 1024**3:.2f} GiB"
+        )
+
+        hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename=filename,
+            local_dir=str(output_dir),
+            resume_download=True,
+        )
+
+        # ----------------------------------------------------
+        # Verify the resulting file.
+        # ----------------------------------------------------
+
+        if not destination.exists():
+
+            raise RuntimeError(
+                f"Download returned but file "
+                f"was not found:\n{destination}"
+            )
+
+        actual_size = (
+            destination.stat().st_size
+        )
+
+        if actual_size != file_size:
+
+            raise RuntimeError(
+                f"Size verification failed:\n"
+                f"File: {filename}\n"
+                f"Expected: {file_size}\n"
+                f"Actual: {actual_size}"
+            )
+
+        downloaded_bytes += actual_size
+        downloaded_files += 1
+
+        print(
+            f"  OK — "
+            f"{downloaded_bytes / 1024**3:.2f} GiB total"
+        )
+
+    print()
+    print("=" * 70)
+    print(f"{output_name.upper()} COMPLETE")
+    print("=" * 70)
+
+    print(
+        f"Downloaded: "
+        f"{downloaded_bytes / 1024**3:.2f} GiB"
+    )
+
+    print(
+        f"Files: "
+        f"{downloaded_files:,}"
+    )
+
+    print(
+        f"Location: "
+        f"{output_dir.resolve()}"
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+
+    OUTPUT_ROOT.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print("=" * 70)
+    print("FineWeb English + Hindi Limited Downloader")
+    print("=" * 70)
+
+    print(
+        f"\nMaximum per language: "
+        f"{MAX_GIB_PER_LANGUAGE} GiB"
+    )
+
+    # Hindi: FineWeb2
+    download_dataset(
+        repo_id=HINDI_REPO,
+        dataset_path=HINDI_PATH,
+        output_name="hindi",
+    )
+
+    # English: original FineWeb
+    download_dataset(
+        repo_id=ENGLISH_REPO,
+        dataset_path=ENGLISH_PATH,
+        output_name="english",
+    )
+
+    print()
+    print("=" * 70)
+    print("ALL DOWNLOADS COMPLETE")
+    print("=" * 70)
+
 
 if __name__ == "__main__":
     main()
-
