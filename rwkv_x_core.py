@@ -156,7 +156,14 @@ class RWKV_Tmix_x070(nn.Module):
         B, T, C = x.shape
         H, N = self.n_head, self.head_size
 
-        x_prev = torch.cat([torch.zeros(B, 1, C, dtype=x.dtype, device=x.device), x[:, :-1, :]], dim=1)
+        if state is not None and isinstance(state, tuple):
+            s_tensor, x_prev_last = state
+            prev0 = x_prev_last.unsqueeze(1)
+            state = s_tensor
+        else:
+            prev0 = torch.zeros(B, 1, C, dtype=x.dtype, device=x.device)
+
+        x_prev = torch.cat([prev0, x[:, :-1, :]], dim=1)
         xx = x_prev - x
 
         xr = x + xx * self.x_r
@@ -217,7 +224,7 @@ class RWKV_Tmix_x070(nn.Module):
         xx_out = self.ln_x(xx_out.reshape(B * T, C)).reshape(B, T, C)
         xx_out = xx_out + ((r_ * k_ * self.r_k).sum(dim=-1, keepdim=True) * v_).reshape(B, T, C)
         y = self.output(xx_out * g)
-        return y, v_first, state
+        return y, v_first, (state, x[:, -1, :])
 
 
 # RWKV ChannelMix (dense) + MoE variant (used by merge_moe.py output)
@@ -263,16 +270,14 @@ class RWKV_CMix_MoE(nn.Module):
         top_w = torch.softmax(top_val, dim=-1)
 
         out = torch.zeros_like(x)
-        new_prev = []
         for e_id, expert in enumerate(self.experts):
-            e_out, e_prev = expert(x, x_prev_last)
-            new_prev.append(e_prev)
             mask = (top_idx == e_id)
             if not torch.any(mask):
                 continue
+            e_out, _ = expert(x, x_prev_last)
             weight = torch.where(mask, top_w, torch.zeros_like(top_w)).sum(dim=-1, keepdim=True)
             out = out + e_out * weight
-        return out, new_prev  # new_prev: list of per-expert last-token states
+        return out, x[:, -1, :]
 
 
 # MOBA block: CPU always uses full causal SDPA (upstream's long_forward needs a GPU-only flash-attn
