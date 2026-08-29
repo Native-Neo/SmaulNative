@@ -1,30 +1,5 @@
-########################################################################################################
-# rwkv_x_core.py
-#
-# Pure-PyTorch (CPU-safe) reimplementation of howard-hou/RWKV-X's training model
-# (pretrain/src/model.py + sft/src/model.py), with the CUDA-kernel WKV-7 op
-# ("wind_backstepping", pretrain/src/model.py cuda/wkv7_cuda.cu) replaced by a
-# plain-Python differentiable recurrence.
-#
-# The recurrence formula used here is NOT guessed. It is the exact reference
-# loop already shipped by the RWKV-X authors for CUDA-free inference
-# (package/src/rwkv_x/model.py, `RWKV_x070_TMix_seq`, the `else` branch used
-# when RWKV_CUDA_ON=0), made batched + gradient-tracking instead of eval-only.
-#
-# Numerical equivalence check against the real training kernel
-# (pretrain/cuda/wkv7_cuda.cu, wind_backstepping): the kernel computes
-#     w_eff = exp(-exp(w_raw))
-# where w_raw = -softplus(-(w0 + tanh(xw@w1)@w2)) - 0.5 = ln(sigmoid(w0+g)) - 0.5.
-# So exp(w_raw) = sigmoid(w0+g) * exp(-0.5) = 0.606531 * sigmoid(w0+g), hence
-#     w_eff = exp(-0.606531 * sigmoid(w0+g))
-# which is *exactly* the closed form used in the inference reference loop below.
-# Confirmed algebraically equal -> this is upstream's own math, not reinvented.
-#
-# Consequence of going pure-Python: training is O(T) sequential per layer
-# instead of the CUDA kernel's chunked/parallel-scan implementation. On CPU
-# this is unavoidable without writing your own CPU kernel. Expect this to be
-# slow at long ctx_len -- that tradeoff was chosen explicitly (CPU-only box).
-########################################################################################################
+# rwkv_x_core.py -- CPU-pure-PyTorch RWKV-7 + MOBA hybrid (howard-hou/RWKV-X math, no CUDA kernel).
+# Decay: w_eff = exp(-exp(w_raw)) (real kernel) == exp(-0.606531*sigmoid(w0+g)) (used below). Verified equal.
 
 import math
 import json
@@ -37,9 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-########################################################################################################
 # Config
-########################################################################################################
 
 @dataclass
 class RWKVXConfig:
@@ -54,7 +27,7 @@ class RWKVXConfig:
     head_size_divisor: int = 8
     ctx_len_hint: int = 1024       # training BPTT window; does NOT cap inference (state is O(1)/token)
     # MoE (only used by merge_moe.py output / MoE-upcycled checkpoints)
-    is_moe: bool = True
+    is_moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
 
@@ -98,9 +71,7 @@ def config_for_target_params(target_params: int, vocab_size: int = 65530,
     return best[1]
 
 
-########################################################################################################
 # RWKV-7 TimeMix (pure PyTorch, CPU-safe, differentiable)
-########################################################################################################
 
 class RWKV_Tmix_x070(nn.Module):
     def __init__(self, cfg: RWKVXConfig, layer_id: int):
@@ -249,9 +220,7 @@ class RWKV_Tmix_x070(nn.Module):
         return y, v_first, state
 
 
-########################################################################################################
 # RWKV ChannelMix (dense) + MoE variant (used by merge_moe.py output)
-########################################################################################################
 
 class RWKV_CMix_x070(nn.Module):
     def __init__(self, cfg: RWKVXConfig, layer_id: int):
@@ -306,15 +275,8 @@ class RWKV_CMix_MoE(nn.Module):
         return out, new_prev  # new_prev: list of per-expert last-token states
 
 
-########################################################################################################
-# MOBA-lite sparse attention block (CPU: always uses full causal SDPA, math-fallback capable)
-#
-# Upstream's long_forward() calls a custom moba_attn_varlen kernel (flash-attn-family, GPU-only).
-# On a CPU box that path is unusable, so this always takes the short_forward path (plain causal
-# self-attention via F.scaled_dot_product_attention, which has a CPU math fallback). This is
-# functionally a full-attention transformer block instead of block-sparse MOBA when T is large --
-# correct but O(T^2) and CPU-slow for very long sequences. Train ctx_len accordingly.
-########################################################################################################
+# MOBA block: CPU always uses full causal SDPA (upstream's long_forward needs a GPU-only flash-attn
+# varlen kernel). Correct, just O(T^2) instead of block-sparse for long sequences.
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: RWKVXConfig):
@@ -378,9 +340,7 @@ class RWKVBlock(nn.Module):
         return x, v_first, new_tmix_state, new_cmix_state
 
 
-########################################################################################################
 # Top-level model
-########################################################################################################
 
 class RWKVXModel(nn.Module):
     def __init__(self, cfg: RWKVXConfig):
