@@ -240,8 +240,8 @@ Contributions, experiments, architecture improvements, training optimizations, d
 Because the project contains separate architecture paths, changes should clearly indicate whether they target:
 
 - The root RWKV-X implementation.
-- The `transformer` implementation. (No longer maintained)
-- The `transformers-based-RWKV` implementation. (No longer maintained)
+- The `transformer` implementation. (No longer Updated)
+- The `transformers-based-RWKV` implementation. (No longer Updated)
 - Shared data or tokenizer tooling.
 - Model merging infrastructure.
 - Quantization-aware training tooling.
