@@ -63,7 +63,7 @@ python syntheticdata.py --count 250000 --format both --output-dir ./datasets
 
 - `RWKV_Tmix_x070`: Exact RWKV-7 TimeMix with value-residual, gated decay (`w_eff = exp(-0.606531 * sigmoid(w0 + g))`), and O(1)-per-token recurrent state (streaming/unlimited-context generation at inference; training uses a finite BPTT window).
 - `MOBABlock`: Sparse-attention blocks interleaved among RWKV blocks (CPU falls back to full causal SDPA).
-- `config_for_target_params()`: Solves layer count to hit a parameter target (default ~256M).
+- `config_for_target_params()`: Solves layer count to hit a parameter target (train.py hardcodes this to 256M params using the binary/Mebi convention, i.e. `256*1024*1024` = 268,435,456; call the function directly with your own target for other sizes).
 - HF-style `save_pretrained()` / `from_pretrained()` (`config.json` + `model.safetensors`) plus an upstream-shaped `.pth` (`rwkvx_upstream_compatible.pth`) loadable by the `rwkv-x` pip package on CUDA boxes.
 
 ### `tokenizer.py`
