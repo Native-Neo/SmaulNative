@@ -211,6 +211,7 @@ def download_dataset(
                 f"{filename}"
             )
 
+            downloaded_bytes -= actual_size
             destination.unlink()
 
         # ----------------------------------------------------

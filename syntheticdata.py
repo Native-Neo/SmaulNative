@@ -43,11 +43,6 @@ except ImportError:
 # Dynamic Combinatorial Generators (Zero Collisions)
 # ============================================================================
 
-VAR_NAMES_PY = ["data", "nums", "values", "arr", "items", "records", "tokens", "elements", "input_list", "sequence"]
-FUNC_PREFIXES = ["process", "compute", "filter", "calculate", "analyze", "find", "extract", "transform", "evaluate"]
-TOPICS_HI = ["गणित", "भौतिकी", "रसायन विज्ञान", "कंप्यूटर विज्ञान", "एल्गोरिदम", "साइबर सुरक्षा", "कृत्रिम बुद्धिमत्ता"]
-
-
 def gen_linear_equation() -> Dict[str, str]:
     """Generates unique linear algebraic equations in English and Hindi."""
     is_hindi = random.random() > 0.5
@@ -145,45 +140,81 @@ def gen_system_linear_equations() -> Dict[str, str]:
     return {"instruction": prompt, "response": response, "think": think, "domain": "math_system_linear"}
 
 
+# One quicksort snippet per language -- previously the prompt named a random language (incl.
+# C++/Rust) but the code block always emitted Python or JS regardless, so ~half the samples had
+# a prompt/response mismatch. Fenced language tag now always matches the emitted code.
+_QUICKSORT_BY_LANG = {
+    "Python": (
+        "def quick_sort(arr: list[int]) -> list[int]:\n"
+        "    if len(arr) <= 1:\n"
+        "        return arr\n"
+        "    pivot = arr[len(arr) // 2]\n"
+        "    left = [x for x in arr if x < pivot]\n"
+        "    middle = [x for x in arr if x == pivot]\n"
+        "    right = [x for x in arr if x > pivot]\n"
+        "    return quick_sort(left) + middle + quick_sort(right)\n\n"
+        "print(quick_sort([64, 34, 25, 12, 22, 11, 90]))\n"
+    ),
+    "JavaScript": (
+        "function quickSort(arr) {\n"
+        "    if (arr.length <= 1) return arr;\n"
+        "    const pivot = arr[Math.floor(arr.length / 2)];\n"
+        "    const left = arr.filter(x => x < pivot);\n"
+        "    const middle = arr.filter(x => x === pivot);\n"
+        "    const right = arr.filter(x => x > pivot);\n"
+        "    return [...quickSort(left), ...middle, ...quickSort(right)];\n"
+        "}\n\n"
+        "console.log(quickSort([64, 34, 25, 12, 22, 11, 90]));\n"
+    ),
+    "C++": (
+        "#include <vector>\n"
+        "void quickSort(std::vector<int>& a, int lo, int hi) {\n"
+        "    if (lo >= hi) return;\n"
+        "    int pivot = a[(lo + hi) / 2], i = lo, j = hi;\n"
+        "    while (i <= j) {\n"
+        "        while (a[i] < pivot) i++;\n"
+        "        while (a[j] > pivot) j--;\n"
+        "        if (i <= j) std::swap(a[i++], a[j--]);\n"
+        "    }\n"
+        "    quickSort(a, lo, j);\n"
+        "    quickSort(a, i, hi);\n"
+        "}\n"
+    ),
+    "Rust": (
+        "fn quick_sort(arr: &mut [i32]) {\n"
+        "    let len = arr.len();\n"
+        "    if len <= 1 { return; }\n"
+        "    let pivot = arr[len / 2];\n"
+        "    let (mut i, mut j) = (0, len - 1);\n"
+        "    loop {\n"
+        "        while arr[i] < pivot { i += 1; }\n"
+        "        while arr[j] > pivot { j -= 1; }\n"
+        "        if i >= j { break; }\n"
+        "        arr.swap(i, j);\n"
+        "        i += 1;\n"
+        "        if j == 0 { break; } else { j -= 1; }\n"
+        "    }\n"
+        "    let (left, right) = arr.split_at_mut(j + 1);\n"
+        "    quick_sort(left);\n"
+        "    quick_sort(right);\n"
+        "}\n"
+    ),
+}
+_LANG_FENCE = {"Python": "python", "JavaScript": "javascript", "C++": "cpp", "Rust": "rust"}
+
+
 def gen_sorting_algorithm_code() -> Dict[str, str]:
-    """Generates unique sorting algorithm questions in Python/JS/C++."""
+    """Generates unique sorting algorithm questions in Python/JS/C++/Rust."""
     algo = random.choice(["Quick Sort", "Merge Sort", "Bubble Sort", "Insertion Sort", "Selection Sort"])
-    lang = random.choice(["Python", "JavaScript", "C++", "Rust"])
-    var_name = random.choice(VAR_NAMES_PY)
-    
+    lang = random.choice(list(_QUICKSORT_BY_LANG))
+
     prompt = f"Write a clean, optimized implementation of {algo} in {lang}."
     think = f"Demonstrate standard {algo} logic in {lang} with complexity analysis."
-    
-    if lang == "Python":
-        code = (
-            f"def quick_sort(arr: list[int]) -> list[int]:\n"
-            f"    if len(arr) <= 1:\n"
-            f"        return arr\n"
-            f"    pivot = arr[len(arr) // 2]\n"
-            f"    left = [x for x in arr if x < pivot]\n"
-            f"    middle = [x for x in arr if x == pivot]\n"
-            f"    right = [x for x in arr if x > pivot]\n"
-            f"    return quick_sort(left) + middle + quick_sort(right)\n\n"
-            f"# Example Usage:\n"
-            f"{var_name} = [64, 34, 25, 12, 22, 11, 90]\n"
-            f"print(quick_sort({var_name}))\n"
-        )
-    else:
-        code = (
-            f"function quickSort(arr) {{\n"
-            f"    if (arr.length <= 1) return arr;\n"
-            f"    const pivot = arr[Math.floor(arr.length / 2)];\n"
-            f"    const left = arr.filter(x => x < pivot);\n"
-            f"    const middle = arr.filter(x => x === pivot);\n"
-            f"    const right = arr.filter(x => x > pivot);\n"
-            f"    return [...quickSort(left), ...middle, ...quickSort(right)];\n"
-            f"}}\n\n"
-            f"console.log(quickSort([64, 34, 25, 12, 22, 11, 90]));\n"
-        )
+    code = _QUICKSORT_BY_LANG[lang]
 
     response = (
         f"Here is the implementation of **{algo}** in **{lang}**:\n\n"
-        f"```{lang.lower()}\n{code}```\n\n"
+        f"```{_LANG_FENCE[lang]}\n{code}```\n\n"
         f"### Complexity Analysis:\n"
         f"- **Time Complexity:** Average $\\mathcal{{O}}(N \\log N)$, Worst-case $\\mathcal{{O}}(N^2)$\n"
         f"- **Space Complexity:** $\\mathcal{{O}}(\\log N)$ recursion stack space."
@@ -191,32 +222,109 @@ def gen_sorting_algorithm_code() -> Dict[str, str]:
     return {"instruction": prompt, "response": response, "think": think, "domain": "code_algorithms"}
 
 
+# Previously this always emitted the same Python stack body no matter which of six data
+# structures or three languages the prompt named -- a Java/BST prompt would get Python stack
+# code. Restricted to {Stack, Queue} x {Python, C++, Java}, each with a real, matching body.
+_DS_TEMPLATES = {
+    ("Stack", "Python"): (
+        "class Stack:\n"
+        "    def __init__(self):\n"
+        "        self._items = []\n\n"
+        "    def push(self, item):\n"
+        "        self._items.append(item)\n\n"
+        "    def pop(self):\n"
+        "        if self.is_empty():\n"
+        "            raise IndexError('pop from empty stack')\n"
+        "        return self._items.pop()\n\n"
+        "    def is_empty(self):\n"
+        "        return len(self._items) == 0\n"
+    ),
+    ("Queue", "Python"): (
+        "from collections import deque\n\n"
+        "class Queue:\n"
+        "    def __init__(self):\n"
+        "        self._items = deque()\n\n"
+        "    def enqueue(self, item):\n"
+        "        self._items.append(item)\n\n"
+        "    def dequeue(self):\n"
+        "        if self.is_empty():\n"
+        "            raise IndexError('dequeue from empty queue')\n"
+        "        return self._items.popleft()\n\n"
+        "    def is_empty(self):\n"
+        "        return len(self._items) == 0\n"
+    ),
+    ("Stack", "C++"): (
+        "#include <vector>\n"
+        "#include <stdexcept>\n"
+        "template <typename T>\n"
+        "class Stack {\n"
+        "    std::vector<T> items;\n"
+        "public:\n"
+        "    void push(const T& item) { items.push_back(item); }\n"
+        "    T pop() {\n"
+        "        if (items.empty()) throw std::out_of_range(\"pop from empty stack\");\n"
+        "        T v = items.back(); items.pop_back(); return v;\n"
+        "    }\n"
+        "    bool isEmpty() const { return items.empty(); }\n"
+        "};\n"
+    ),
+    ("Queue", "C++"): (
+        "#include <deque>\n"
+        "#include <stdexcept>\n"
+        "template <typename T>\n"
+        "class Queue {\n"
+        "    std::deque<T> items;\n"
+        "public:\n"
+        "    void enqueue(const T& item) { items.push_back(item); }\n"
+        "    T dequeue() {\n"
+        "        if (items.empty()) throw std::out_of_range(\"dequeue from empty queue\");\n"
+        "        T v = items.front(); items.pop_front(); return v;\n"
+        "    }\n"
+        "    bool isEmpty() const { return items.empty(); }\n"
+        "};\n"
+    ),
+    ("Stack", "Java"): (
+        "import java.util.ArrayDeque;\n\n"
+        "public class Stack<T> {\n"
+        "    private final ArrayDeque<T> items = new ArrayDeque<>();\n"
+        "    public void push(T item) { items.push(item); }\n"
+        "    public T pop() {\n"
+        "        if (items.isEmpty()) throw new java.util.NoSuchElementException(\"pop from empty stack\");\n"
+        "        return items.pop();\n"
+        "    }\n"
+        "    public boolean isEmpty() { return items.isEmpty(); }\n"
+        "}\n"
+    ),
+    ("Queue", "Java"): (
+        "import java.util.ArrayDeque;\n\n"
+        "public class Queue<T> {\n"
+        "    private final ArrayDeque<T> items = new ArrayDeque<>();\n"
+        "    public void enqueue(T item) { items.addLast(item); }\n"
+        "    public T dequeue() {\n"
+        "        if (items.isEmpty()) throw new java.util.NoSuchElementException(\"dequeue from empty queue\");\n"
+        "        return items.removeFirst();\n"
+        "    }\n"
+        "    public boolean isEmpty() { return items.isEmpty(); }\n"
+        "}\n"
+    ),
+}
+_DS_FENCE = {"Python": "python", "C++": "cpp", "Java": "java"}
+
+
 def gen_data_structure_code() -> Dict[str, str]:
-    """Generates unique data structure implementations."""
-    ds = random.choice(["Stack", "Queue", "Min Heap", "Binary Search Tree", "LRU Cache", "Singly Linked List"])
-    lang = random.choice(["Python", "C++", "Java"])
-    
-    prompt = f"Implement a {ds} data structure in {lang} with methods for insertion, deletion, and searching."
-    think = f"Provide standard class-based {ds} implementation in {lang} with type hints."
-    
+    """Generates unique Stack/Queue implementations across Python/C++/Java."""
+    ds, lang = random.choice(list(_DS_TEMPLATES))
+    op_a, op_b = ("push", "pop") if ds == "Stack" else ("enqueue", "dequeue")
+
+    prompt = f"Implement a {ds} data structure in {lang} with {op_a}/{op_b} and an emptiness check."
+    think = f"Provide a standard class-based {ds} implementation in {lang}."
+
     response = (
         f"Here is a complete implementation of a **{ds}** in **{lang}**:\n\n"
-        f"```{lang.lower()}\n"
-        f"class {ds.replace(' ', '')}:\n"
-        f"    def __init__(self):\n"
-        f"        self.items = []\n\n"
-        f"    def push(self, item):\n"
-        f"        self.items.append(item)\n\n"
-        f"    def pop(self):\n"
-        f"        if not self.is_empty():\n"
-        f"            return self.items.pop()\n"
-        f"        raise IndexError('Pop from empty stack')\n\n"
-        f"    def is_empty(self):\n"
-        f"        return len(self.items) == 0\n"
-        f"```\n\n"
+        f"```{_DS_FENCE[lang]}\n{_DS_TEMPLATES[(ds, lang)]}```\n\n"
         f"### Complexity:\n"
-        f"- Push: $\\mathcal{{O}}(1)$\n"
-        f"- Pop: $\\mathcal{{O}}(1)$"
+        f"- {op_a.capitalize()}: $\\mathcal{{O}}(1)$\n"
+        f"- {op_b.capitalize()}: $\\mathcal{{O}}(1)$"
     )
     return {"instruction": prompt, "response": response, "think": think, "domain": "code_datastructures"}
 
