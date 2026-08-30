@@ -22,6 +22,13 @@ from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDat
 from tokenizer import train_tokenizer
 import qat
 
+# Fixed model-size target: "256M params" using the binary (Mebi) convention -- 256*1024*1024 =
+# 268,435,456, the closest achievable parameter count at the chosen --n_embd/--head_size/
+# --n_moba_layer. No longer a CLI flag -- config_for_target_params() still accepts an arbitrary
+# target if you're calling it directly from your own script (see rwkv_x_core.py / USEME.MD), but
+# train.py always builds toward this fixed value.
+TARGET_PARAMS = 268_435_456  # 256M params (binary/Mebi convention: 256 * 1024 * 1024)
+
 STOP_REQUESTED = False
 
 
@@ -229,7 +236,6 @@ def parse_args():
     p.add_argument("--tokenizer_vocab_size", type=int, default=32768,
                     help="only used when auto-training a tokenizer.json that doesn't exist yet")
 
-    p.add_argument("--target_params", type=int, default=256_000_000)
     p.add_argument("--n_embd", type=int, default=768)
     p.add_argument("--head_size", type=int, default=64, help="n_embd must be divisible by this")
     p.add_argument("--n_moba_layer", type=int, default=3, help="MOBA sparse-attn blocks; 0 = pure RWKV-7")
@@ -265,7 +271,7 @@ def build_model(args, tokenizer) -> RWKVXModel:
 
     print("[INIT] creating new model")
     vocab_size = tokenizer_vocab_size(tokenizer)
-    cfg = config_for_target_params(args.target_params, vocab_size=vocab_size,
+    cfg = config_for_target_params(TARGET_PARAMS, vocab_size=vocab_size,
                                     n_embd=args.n_embd, n_moba_layer=args.n_moba_layer,
                                     head_size=args.head_size)
     cfg.ctx_len_hint = args.ctx_len
