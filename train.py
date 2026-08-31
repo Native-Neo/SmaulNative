@@ -225,15 +225,15 @@ def train_sft(args, model, optimizer, resume, device, tokenizer):
 # CLI
 
 def parse_args():
-    p = argparse.ArgumentParser(description="RWKV-X godfather trainer (pretrain + sft, CPU-safe)")
+    p = argparse.ArgumentParser(description="RWKV-X trainer (pretrain + sft, CPU-safe)")
     p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
     p.add_argument("--dataset_dir", type=str, default="./datasets")
-    p.add_argument("--output_dir", type=str, default="./RWKV-X-256M")
+    p.add_argument("--output_dir", type=str, default="./SmaulNative")
     p.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
-    p.add_argument("--tokenizer_path", type=str, default="./tokenizer.json",
+    p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json",
                     help="merged BPE tokenizer.json (see tokenizer.py); auto-trained on "
                          "--dataset_dir if missing")
-    p.add_argument("--tokenizer_vocab_size", type=int, default=32768,
+    p.add_argument("--tokenizer_vocab_size", type=int, default=131072,
                     help="only used when auto-training a tokenizer.json that doesn't exist yet")
 
     p.add_argument("--n_embd", type=int, default=768)
@@ -245,8 +245,8 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=3, help="sft only")
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--optimizer", choices=["lion", "adamw"], default="lion")
-    p.add_argument("--log_every", type=int, default=10)
-    p.add_argument("--save_every", type=int, default=200)
+    p.add_argument("--log_every", type=int, default=1)
+    p.add_argument("--save_every", type=int, default=5000)
     p.add_argument("--new_data", action="store_true",
                     help="reset dataset position, keep model/optimizer weights")
 
