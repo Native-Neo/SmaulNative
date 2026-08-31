@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
-
 import os
 from pathlib import Path
-
 from huggingface_hub import HfApi, hf_hub_download
-
 
 # ============================================================
 # Configuration
@@ -26,13 +23,11 @@ ENGLISH_REPO = "HuggingFaceFW/fineweb"
 # Original FineWeb English 100BT sample.
 ENGLISH_PATH = "data/100BT"
 
-
 # ============================================================
 # Hugging Face
 # ============================================================
 
 api = HfApi()
-
 
 # ============================================================
 # Helpers
@@ -40,7 +35,6 @@ api = HfApi()
 
 def gib_to_bytes(gib: float) -> int:
     return int(gib * 1024 ** 3)
-
 
 def get_repo_files(
     repo_id: str,
@@ -52,7 +46,7 @@ def get_repo_files(
     info = api.list_repo_tree(
         repo_id=repo_id,
         repo_type="dataset",
-        path=path,
+        path_in_repo=path,
         recursive=True,
     )
 
@@ -105,7 +99,6 @@ def get_existing_size(
             total += path.stat().st_size
 
     return total
-
 
 # ============================================================
 # Downloader
@@ -275,12 +268,13 @@ def download_dataset(
             f"{(downloaded_bytes + file_size) / 1024**3:.2f} GiB"
         )
 
+        # resume_download was removed in newer huggingface_hub -- downloads
+        # resume automatically now, so the kwarg is just dropped.
         hf_hub_download(
             repo_id=repo_id,
             repo_type="dataset",
             filename=filename,
             local_dir=str(output_dir),
-            resume_download=True,
         )
 
         # ----------------------------------------------------
