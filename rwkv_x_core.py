@@ -10,26 +10,35 @@ from typing import Optional, List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 # Config
 
 @dataclass
 class RWKVXConfig:
-    vocab_size: int = 65530
-    n_embd: int = 768
-    n_layer: int = 21              # total RWKV-7 blocks
+    vocab_size: int = 65536
+    n_embd: int = 1024
+    n_layer: int = 15              # total RWKV-7 blocks
     head_size: int = 64
-    n_moba_layer: int = 3          # how many of the n_layer positions become MOBA (sparse-attn) blocks instead
+    n_moba_layer: int = 5          # how many of the n_layer positions become MOBA (sparse-attn) blocks instead
     moba_chunk_size: int = 512
     moba_topk: int = 4
     dropout: float = 0.0
     head_size_divisor: int = 8
     ctx_len_hint: int = 1024       # training BPTT window; does NOT cap inference (state is O(1)/token)
+    # Gradient checkpointing for the RWKV-7 WKV recurrence: the per-timestep loop retains a
+    # (B,H,N,N) state tensor for every timestep for backprop, which dominates training memory
+    # (roughly linear in ctx_len * n_rwkv_layers). Chunking + checkpointing bounds that to
+    # O(wkv_chunk_size) per layer at the cost of recomputing each chunk's forward once more
+    # during backward. Only applies during training with grad enabled -- eval/inference (or
+    # calibration under no_grad) always runs the plain, un-checkpointed loop. Set to >= ctx_len
+    # to effectively disable chunking (one chunk == the old behavior, still checkpointed).
+    wkv_chunk_size: int = 64
     # MoE (only used by merge_moe.py output / MoE-upcycled checkpoints)
     is_moe: bool = False
     num_experts: int = 1
-    num_experts_per_tok: int = 1
+    num_experts_per_tok: int = 2
 
     def save(self, path: Path):
         Path(path).write_text(json.dumps(asdict(self), indent=2))
@@ -72,6 +81,36 @@ def config_for_target_params(target_params: int, vocab_size: int = 65530,
 
 
 # RWKV-7 TimeMix (pure PyTorch, CPU-safe, differentiable)
+
+def _wkv_run_chunk(state: torch.Tensor, w_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor,
+                    kk_c: torch.Tensor, a_c: torch.Tensor, r_c: torch.Tensor
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Runs the WKV recurrence over one chunk of timesteps. Pulled out of the per-timestep
+    Python loop so it can be wrapped in torch.utils.checkpoint.checkpoint -- during backward,
+    autograd recomputes this function's forward instead of having kept every intermediate
+    (B,H,N,N) state tensor around, which is what was driving training memory through the roof
+    at longer ctx_len / more RWKV layers.
+    state: (B,H,N,N) fp32. w_c/k_c/v_c/kk_c/a_c/r_c: (B, Tc, H, N).
+    Returns (final_state, y_chunk) where y_chunk is (B, Tc, H, N).
+    """
+    Tc = w_c.shape[1]
+    ys = []
+    for t in range(Tc):
+        w_t = w_c[:, t]
+        k_t = k_c[:, t]
+        v_t = v_c[:, t]
+        kk_t = kk_c[:, t]
+        a_t = a_c[:, t]
+        r_t = r_c[:, t]
+
+        vk = v_t.unsqueeze(-1) @ k_t.unsqueeze(-2)                       # (B,H,N,N)
+        ab = (-kk_t).unsqueeze(-1) @ (kk_t * a_t).unsqueeze(-2)          # (B,H,N,N)
+        state = state * w_t.unsqueeze(-2) + state @ ab.float() + vk.float()
+        y_t = (state.to(dtype=r_t.dtype) @ r_t.unsqueeze(-1)).squeeze(-1)  # (B,H,N)
+        ys.append(y_t)
+    y_chunk = torch.stack(ys, dim=1)
+    return state, y_chunk
+
 
 class RWKV_Tmix_x070(nn.Module):
     def __init__(self, cfg: RWKVXConfig, layer_id: int):
@@ -205,22 +244,28 @@ class RWKV_Tmix_x070(nn.Module):
         else:
             state = state.to(dtype=torch.float32)
 
-        ys = []
-        for t in range(T):
-            w_t = w_[:, t]                    # (B,H,N)
-            k_t = k_[:, t]
-            v_t = v_[:, t]
-            kk_t = kk_[:, t]
-            a_t = a_[:, t]
-            r_t = r_[:, t]
+        # Gradient checkpointing: only worth it (and only correct to enable) while training with
+        # grad enabled. Under eval/no_grad (e.g. QAT calibration, plain inference) there's no
+        # backward pass to save memory for, and checkpoint() would just add pointless recompute.
+        use_checkpoint = self.training and torch.is_grad_enabled()
+        chunk_size = max(1, self.cfg.wkv_chunk_size) if use_checkpoint else T
 
-            vk = v_t.unsqueeze(-1) @ k_t.unsqueeze(-2)                       # (B,H,N,N)
-            ab = (-kk_t).unsqueeze(-1) @ (kk_t * a_t).unsqueeze(-2)          # (B,H,N,N)
-            state = state * w_t.unsqueeze(-2) + state @ ab.float() + vk.float()
-            y_t = (state.to(dtype=x.dtype) @ r_t.unsqueeze(-1)).squeeze(-1)  # (B,H,N)
-            ys.append(y_t)
+        ys_chunks = []
+        t0 = 0
+        while t0 < T:
+            t1 = min(t0 + chunk_size, T)
+            w_c, k_c, v_c = w_[:, t0:t1], k_[:, t0:t1], v_[:, t0:t1]
+            kk_c, a_c, r_c = kk_[:, t0:t1], a_[:, t0:t1], r_[:, t0:t1]
+            if use_checkpoint:
+                state, y_c = torch.utils.checkpoint.checkpoint(
+                    _wkv_run_chunk, state, w_c, k_c, v_c, kk_c, a_c, r_c, use_reentrant=False
+                )
+            else:
+                state, y_c = _wkv_run_chunk(state, w_c, k_c, v_c, kk_c, a_c, r_c)
+            ys_chunks.append(y_c)
+            t0 = t1
 
-        xx_out = torch.stack(ys, dim=1).reshape(B, T, C)                    # (B,T,C)
+        xx_out = torch.cat(ys_chunks, dim=1).reshape(B, T, C)                # (B,T,C)
         xx_out = self.ln_x(xx_out.reshape(B * T, C)).reshape(B, T, C)
         xx_out = xx_out + ((r_ * k_ * self.r_k).sum(dim=-1, keepdim=True) * v_).reshape(B, T, C)
         y = self.output(xx_out * g)
