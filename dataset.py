@@ -73,18 +73,44 @@ def discover_files(dataset_dir: Path) -> List[Path]:
     return files
 
 
-def extract_text(obj: Any) -> str:
+def _looks_numeric(s: str) -> bool:
+    """True for ids/scores/dates-as-strings ('42', '3.14', '2024-01-01', '-7') that shouldn't
+    be mistaken for prose when no recognized text column is present."""
+    s = s.strip()
+    if not s:
+        return True
+    core = s.replace(".", "", 1).replace("-", "", 1).replace(":", "", 1).replace("/", "", 1)
+    return core.isdigit()
+
+
+_WARNED_FILES: set = set()
+
+
+def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
     if isinstance(obj, str):
         return obj
     if isinstance(obj, dict):
+        # case-insensitive match against known text-bearing keys first
+        lower_map = {str(k).lower(): v for k, v in obj.items()}
         for key in TEXT_KEYS:
-            v = obj.get(key)
-            if isinstance(v, str):
+            v = lower_map.get(key)
+            if isinstance(v, str) and v.strip():
                 return v
-        return "\n".join(v for v in obj.values() if isinstance(v, str))
+        # no recognized column: pick the longest plausible prose string field instead of
+        # blindly joining every string value (which silently turns id/label/score columns
+        # into "text" and floods training with digit strings)
+        candidates = [v for v in obj.values() if isinstance(v, str) and not _looks_numeric(v)]
+        if candidates:
+            if source_path and source_path not in _WARNED_FILES:
+                _WARNED_FILES.add(source_path)
+                print(f"[WARN] {source_path}: no column named {TEXT_KEYS} found; "
+                      f"guessing text column from available keys {list(obj.keys())}. "
+                      f"Rename your text column to one of {TEXT_KEYS} to silence this.")
+            return max(candidates, key=len)
+        return ""
     if isinstance(obj, list):
-        return "\n".join(extract_text(x) for x in obj)
-    return str(obj)
+        return "\n".join(extract_text(x, source_path) for x in obj)
+    return ""
 
 
 def iter_texts(files: List[Path], resume_file: Optional[str] = None,
@@ -122,7 +148,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                             obj = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        text = extract_text(obj).strip()
+                        text = extract_text(obj, str(path)).strip()
                         if text:
                             yield text, str(path), i + 1
             elif suffix == ".json":
@@ -131,7 +157,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                 if not isinstance(records, list):
                     records = [records]
                 for i in range(start_idx, len(records)):
-                    text = extract_text(records[i]).strip()
+                    text = extract_text(records[i], str(path)).strip()
                     if text:
                         yield text, str(path), i + 1
             elif suffix == ".csv":
@@ -140,17 +166,21 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                     for i, row in enumerate(reader):
                         if i < start_idx:
                             continue
-                        text = extract_text(row).strip()
+                        text = extract_text(row, str(path)).strip()
                         if text:
                             yield text, str(path), i + 1
             elif suffix == ".parquet":
                 import pyarrow.parquet as pq
-                table = pq.read_table(path)
-                rows = table.to_pylist()
-                for i in range(start_idx, len(rows)):
-                    text = extract_text(rows[i]).strip()
-                    if text:
-                        yield text, str(path), i + 1
+                pf = pq.ParquetFile(path)
+                i = -1
+                for batch in pf.iter_batches(batch_size=1024):
+                    for row in batch.to_pylist():
+                        i += 1
+                        if i < start_idx:
+                            continue
+                        text = extract_text(row, str(path)).strip()
+                        if text:
+                            yield text, str(path), i + 1
         except Exception as e:
             print(f"[WARN] skipping {path}: {e}")
 
