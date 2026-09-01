@@ -236,14 +236,14 @@ def parse_args():
     p.add_argument("--tokenizer_vocab_size", type=int, default=65536,
                     help="only used when auto-training a tokenizer.json that doesn't exist yet")
 
-    p.add_argument("--target_params", type=int, default=273_588_224,
+    p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS,
                     help="approx total param count to size the model for (config_for_target_params "
                          "searches n_layer at your --n_embd/--head_size/--n_moba_layer to hit this). "
-                         "Default is 256M, which is too large for most CPU boxes -- on an 8GB machine "
-                         "try 20000000-40000000 instead, and pair it with a smaller "
-                         "--tokenizer_vocab_size (emb+head scale with vocab_size) and a smaller "
-                         "--ctx_len (the WKV recurrence retains a state tensor per timestep for "
-                         "backprop, so this is usually the bigger memory lever of the two).")
+                         "Default is 256M (268435456 params, binary/MiB convention), which is too large "
+                         "for most CPU boxes -- on an 8GB machine try 20000000-40000000 instead, and "
+                         "pair it with a smaller --tokenizer_vocab_size (emb+head scale with vocab_size) "
+                         "and a smaller --ctx_len (the WKV recurrence retains a state tensor per timestep "
+                         "for backprop, so this is usually the bigger memory lever of the two).")
 
     p.add_argument("--n_embd", type=int, default=832)
     p.add_argument("--head_size", type=int, default=64, help="n_embd must be divisible by this")
@@ -276,7 +276,14 @@ def parse_args():
                     help="after training finishes, convert a --qat model's FFN linears to real packed "
                          "int3 weights and save that (separate) checkpoint here; the training "
                          "checkpoint in --output_dir stays fake-quantized/fine-tunable")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.target_params <= 0:
+        p.error("--target_params must be > 0")
+    if args.n_embd <= 0 or args.head_size <= 0:
+        p.error("--n_embd and --head_size must be > 0")
+    if args.n_embd % args.head_size:
+        p.error(f"--n_embd ({args.n_embd}) must be divisible by --head_size ({args.head_size})")
+    return args
 
 
 def build_model(args, tokenizer) -> RWKVXModel:
@@ -290,6 +297,10 @@ def build_model(args, tokenizer) -> RWKVXModel:
     cfg = config_for_target_params(args.target_params, vocab_size=vocab_size,
                                     n_embd=args.n_embd, n_moba_layer=args.n_moba_layer,
                                     head_size=args.head_size)
+    actual_params = cfg.approx_param_count()
+    if abs(actual_params - args.target_params) / args.target_params > 0.10:
+        raise ValueError(f"requested {args.target_params:,} params, closest supported architecture is "
+                         f"{actual_params:,} ({abs(actual_params - args.target_params) / args.target_params:.1%} away)")
     cfg.ctx_len_hint = args.ctx_len
     model = RWKVXModel(cfg)
     print(f"[MODEL] n_layer={cfg.n_layer} n_embd={cfg.n_embd} n_moba_layer={cfg.n_moba_layer} "
