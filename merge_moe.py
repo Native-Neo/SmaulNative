@@ -2,7 +2,6 @@
 # merge_moe.py -- merges N RWKV-X checkpoints into one Channel-Mix MoE model (each branch's FFN
 # becomes an expert; everything else shared from base) and unions their tokenizers (base ids kept,
 # no duplicate tokens/merges, embeddings resized if vocab grows). Own MoE extension, not upstream RWKV-X.
-
 import argparse
 import json
 from pathlib import Path
@@ -24,6 +23,8 @@ def load_checkpoint(d: Path):
 
 def assert_compatible(base_cfg: RWKVXConfig, branch_cfg: RWKVXConfig, branch_path: Path):
     # vocab_size is intentionally excluded here: tokenizer merging below may legitimately grow it.
+    # is_moe/num_experts are intentionally excluded too -- both dense and MoE branches are
+    # supported (see branch_expert_state_dicts below); they just contribute different expert counts.
     for field in ("n_embd", "n_layer", "n_moba_layer", "head_size"):
         bv, ov = getattr(base_cfg, field), getattr(branch_cfg, field)
         if bv != ov:
@@ -34,10 +35,43 @@ def assert_compatible(base_cfg: RWKVXConfig, branch_cfg: RWKVXConfig, branch_pat
 
 
 def cmix_prefixes(cfg: RWKVXConfig) -> List[str]:
-    """Every ffn.* prefix across both rwkv_blocks and moba_blocks -- both use RWKV_CMix_x070."""
+    """Every ffn.* prefix across both rwkv_blocks and moba_blocks -- both use RWKV_CMix_x070
+    (dense) or RWKV_CMix_MoE (already-merged), depending on cfg.is_moe."""
     prefixes = [f"rwkv_blocks.{i}.ffn" for i in range(cfg.n_layer - cfg.n_moba_layer)]
     prefixes += [f"moba_blocks.{i}.ffn" for i in range(cfg.n_moba_layer)]
     return prefixes
+
+
+def branch_expert_state_dicts(cfg: RWKVXConfig, sd: Dict[str, torch.Tensor], prefix: str
+                               ) -> List[Dict[str, torch.Tensor]]:
+    """Returns this branch's contribution at `prefix` as a list of one-expert-worth state dicts
+    (relative to a single RWKV_CMix_x070, i.e. keys like 'key.weight'/'value.weight').
+    - Dense branch (cfg.is_moe == False): one expert -- the branch's own ffn.{key,value}.weight.
+    - MoE branch (cfg.is_moe == True): cfg.num_experts experts -- each of its existing
+      ffn.experts.{i}.{key,value}.weight, gate dropped (a fresh router is always used for
+      the new merge; averaging/reusing old gates across a different expert count isn't
+      well-defined)."""
+    src_prefix = f"{prefix}."
+    if not cfg.is_moe:
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in sd.items():
+            if k.startswith(src_prefix):
+                out[k[len(src_prefix):]] = v
+        return [out] if out else []
+
+    experts: List[Dict[str, torch.Tensor]] = [dict() for _ in range(cfg.num_experts)]
+    experts_prefix = src_prefix + "experts."
+    for k, v in sd.items():
+        if not k.startswith(experts_prefix):
+            continue  # skips ffn.gate.weight too -- old router intentionally not carried over
+        rest = k[len(experts_prefix):]
+        e_id_str, _, suffix = rest.partition(".")
+        if not e_id_str.isdigit():
+            continue
+        e_id = int(e_id_str)
+        if 0 <= e_id < cfg.num_experts:
+            experts[e_id][suffix] = v
+    return [e for e in experts if e]
 
 
 # Tokenizer merge -- union vocab/merges, base ids preserved, no duplicates
@@ -139,10 +173,15 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     for bd in branch_dirs:
         cfg, sd = load_checkpoint(bd)
         assert_compatible(base_cfg, cfg, bd)
-        branches.append((bd, sd))
+        branches.append((bd, cfg, sd))
 
-    num_experts = len(branches)
-    print(f"[MERGE] base={base_dir}, {num_experts} expert branches, top_k={top_k}")
+    # Each branch contributes one expert per FFN if dense, or cfg.num_experts if it's itself
+    # an already-merged MoE checkpoint -- so the new expert count is a sum, not just len(branches).
+    per_branch_expert_counts = [cfg.num_experts if cfg.is_moe else 1 for (_, cfg, _) in branches]
+    num_experts = sum(per_branch_expert_counts)
+    branch_summary = ", ".join(f"{bd.name}:{n}" for (bd, _, _), n in zip(branches, per_branch_expert_counts))
+    print(f"[MERGE] base={base_dir} (is_moe={base_cfg.is_moe}), {len(branches)} branch(es) "
+          f"contributing {num_experts} total expert(s) ({branch_summary}), top_k={top_k}")
 
     print("[MERGE] merging tokenizers...")
     merged_tok_json, merged_vocab_size, tok_stats = merge_tokenizers(base_dir, branch_dirs)
@@ -169,22 +208,31 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
         else:
             print(f"[WARN] shape/key mismatch for shared tensor {k}, keeping fresh init")
 
-    # 2) fill each expert's ffn from the corresponding branch
+    # 2) fill experts from each branch, in order -- a dense branch supplies 1 expert, an MoE
+    # branch supplies all of its existing experts (its own router is dropped; a fresh router
+    # is always used post-merge since the expert count/identity has changed)
     for prefix in prefixes:
-        for e_id, (bd, sd) in enumerate(branches):
-            src_prefix = f"{prefix}."
-            dst_prefix = f"{prefix}.experts.{e_id}."
-            found_any = False
-            for k, v in sd.items():
-                if k.startswith(src_prefix):
-                    suffix = k[len(src_prefix):]
+        e_id = 0
+        for bd, cfg, sd in branches:
+            branch_experts = branch_expert_state_dicts(cfg, sd, prefix)
+            expected = cfg.num_experts if cfg.is_moe else 1
+            if not branch_experts:
+                print(f"[WARN] branch {bd} has no {prefix}.* tensors; {expected} expert slot(s) "
+                      f"at {prefix} keep random init")
+                e_id += expected
+                continue
+            for expert_sd in branch_experts:
+                dst_prefix = f"{prefix}.experts.{e_id}."
+                found_any = False
+                for suffix, v in expert_sd.items():
                     dst_key = dst_prefix + suffix
                     if dst_key in out_sd and out_sd[dst_key].shape == v.shape:
                         out_sd[dst_key] = v
                         found_any = True
-            if not found_any:
-                print(f"[WARN] branch {bd} has no {src_prefix}* tensors; expert {e_id} at {prefix} "
-                      f"keeps random init")
+                if not found_any:
+                    print(f"[WARN] branch {bd} expert at {prefix} had no matching tensors; "
+                          f"expert {e_id} keeps random init")
+                e_id += 1
         # router: leave at RWKVXModel's own random init (already in out_sd from moe_model construction)
 
     moe_model.load_state_dict(out_sd, strict=True)
@@ -196,23 +244,28 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     meta = {
         "engine": "rwkv-x godfather merge_moe.py",
         "base_model": str(base_dir),
+        "base_was_moe": base_cfg.is_moe,
         "branches": [str(b) for b in branch_dirs],
+        "branch_expert_counts": {str(bd): n for (bd, _, _), n in zip(branches, per_branch_expert_counts)},
         "num_experts": num_experts,
         "top_k": moe_cfg.num_experts_per_tok,
         "tokenizer_merge": tok_stats,
         "note": "Custom MoE-upcycled Channel-Mix, requires rwkv_x_core.RWKVXModel to load "
-                "(not compatible with upstream rwkv-x pip package).",
+                "(not compatible with upstream rwkv-x pip package). Routers from any MoE "
+                "branch/base are not carried over -- this merge always initializes a fresh "
+                "router over the new expert set and expects further training/fine-tuning.",
     }
     (out_dir / "merge_config.json").write_text(json.dumps(meta, indent=2))
     print(f"[DONE] merged model -> {out_dir} ({moe_model.num_parameters()/1e6:.1f}M params, "
-          f"vocab_size={merged_vocab_size})")
+          f"vocab_size={merged_vocab_size}, num_experts={num_experts})")
 
 
 def main():
     p = argparse.ArgumentParser(description="Merge N RWKV-X checkpoints (+ their tokenizers) into a Channel-Mix MoE model")
     p.add_argument("--base", required=True, type=str, help="base checkpoint dir (provides everything except FFN experts)")
     p.add_argument("--branches", required=True, nargs="+", type=str,
-                    help="one or more checkpoint dirs, each becomes one expert")
+                    help="one or more checkpoint dirs, each becomes one expert (or, if a branch "
+                         "is itself an MoE checkpoint, all of its existing experts)")
     p.add_argument("--out", required=True, type=str)
     p.add_argument("--top_k", type=int, default=1, help="experts activated per token")
     args = p.parse_args()
