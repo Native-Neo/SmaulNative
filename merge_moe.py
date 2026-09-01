@@ -22,9 +22,6 @@ def load_checkpoint(d: Path):
 
 
 def assert_compatible(base_cfg: RWKVXConfig, branch_cfg: RWKVXConfig, branch_path: Path):
-    # vocab_size is intentionally excluded here: tokenizer merging below may legitimately grow it.
-    # is_moe/num_experts are intentionally excluded too -- both dense and MoE branches are
-    # supported (see branch_expert_state_dicts below); they just contribute different expert counts.
     for field in ("n_embd", "n_layer", "n_moba_layer", "head_size"):
         bv, ov = getattr(base_cfg, field), getattr(branch_cfg, field)
         if bv != ov:
@@ -35,8 +32,6 @@ def assert_compatible(base_cfg: RWKVXConfig, branch_cfg: RWKVXConfig, branch_pat
 
 
 def cmix_prefixes(cfg: RWKVXConfig) -> List[str]:
-    """Every ffn.* prefix across both rwkv_blocks and moba_blocks -- both use RWKV_CMix_x070
-    (dense) or RWKV_CMix_MoE (already-merged), depending on cfg.is_moe."""
     prefixes = [f"rwkv_blocks.{i}.ffn" for i in range(cfg.n_layer - cfg.n_moba_layer)]
     prefixes += [f"moba_blocks.{i}.ffn" for i in range(cfg.n_moba_layer)]
     return prefixes
@@ -44,13 +39,6 @@ def cmix_prefixes(cfg: RWKVXConfig) -> List[str]:
 
 def branch_expert_state_dicts(cfg: RWKVXConfig, sd: Dict[str, torch.Tensor], prefix: str
                                ) -> List[Dict[str, torch.Tensor]]:
-    """Returns this branch's contribution at `prefix` as a list of one-expert-worth state dicts
-    (relative to a single RWKV_CMix_x070, i.e. keys like 'key.weight'/'value.weight').
-    - Dense branch (cfg.is_moe == False): one expert -- the branch's own ffn.{key,value}.weight.
-    - MoE branch (cfg.is_moe == True): cfg.num_experts experts -- each of its existing
-      ffn.experts.{i}.{key,value}.weight, gate dropped (a fresh router is always used for
-      the new merge; averaging/reusing old gates across a different expert count isn't
-      well-defined)."""
     src_prefix = f"{prefix}."
     if not cfg.is_moe:
         out: Dict[str, torch.Tensor] = {}
@@ -63,7 +51,7 @@ def branch_expert_state_dicts(cfg: RWKVXConfig, sd: Dict[str, torch.Tensor], pre
     experts_prefix = src_prefix + "experts."
     for k, v in sd.items():
         if not k.startswith(experts_prefix):
-            continue  # skips ffn.gate.weight too -- old router intentionally not carried over
+            continue
         rest = k[len(experts_prefix):]
         e_id_str, _, suffix = rest.partition(".")
         if not e_id_str.isdigit():
@@ -71,7 +59,7 @@ def branch_expert_state_dicts(cfg: RWKVXConfig, sd: Dict[str, torch.Tensor], pre
         e_id = int(e_id_str)
         if 0 <= e_id < cfg.num_experts:
             experts[e_id][suffix] = v
-    return [e for e in experts if e]
+    return experts
 
 
 # Tokenizer merge -- union vocab/merges, base ids preserved, no duplicates
@@ -88,7 +76,6 @@ def _load_tokenizer_json(d: Path) -> dict:
 
 
 def merge_tokenizers(base_dir: Path, branch_dirs: List[Path]) -> Tuple[dict, int, dict]:
-    """Returns (merged_tokenizer_json_dict, merged_vocab_size, stats)."""
     base_tok = _load_tokenizer_json(base_dir)
     base_vocab: Dict[str, int] = base_tok["model"]["vocab"]
     base_merges: List = base_tok["model"]["merges"]
@@ -104,19 +91,16 @@ def merge_tokenizers(base_dir: Path, branch_dirs: List[Path]) -> Tuple[dict, int
 
     for bd in branch_dirs:
         if bd.resolve() == base_dir.resolve():
-            continue  # base merged with itself is trivially a no-op, skip explicitly
+            continue
         branch_tok = _load_tokenizer_json(bd)
         branch_vocab: Dict[str, int] = branch_tok["model"]["vocab"]
         branch_merges: List = branch_tok["model"]["merges"]
 
-        # conflict check: same token string mapped to a different id than base already has --
-        # cannot safely union without breaking one side's ids, so we keep base's id and just warn
-        # (matches the conservative "base wins" policy from the original tokenizer-merge design).
         for token, tid in branch_vocab.items():
             if token in merged_vocab:
                 if merged_vocab[token] != tid:
                     conflicting_branches.append((str(bd), token, merged_vocab[token], tid))
-                continue  # already present (from base or an earlier branch) -- no duplicate added
+                continue
             merged_vocab[token] = next_id
             next_id += 1
             added_tokens_total += 1
@@ -139,7 +123,7 @@ def merge_tokenizers(base_dir: Path, branch_dirs: List[Path]) -> Tuple[dict, int
         "merged_vocab_size": len(merged_vocab),
         "added_tokens": added_tokens_total,
         "added_merges": added_merges_total,
-        "id_conflicts": conflicting_branches,  # token strings where branch id != base id (base id kept)
+        "id_conflicts": conflicting_branches,
     }
     if conflicting_branches:
         print(f"[WARN] {len(conflicting_branches)} token(s) had conflicting ids across branches; "
@@ -177,10 +161,10 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
         assert_compatible(base_cfg, cfg, bd)
         branches.append((bd, cfg, sd))
 
-    # Each branch contributes one expert per FFN if dense, or cfg.num_experts if it's itself
-    # an already-merged MoE checkpoint -- so the new expert count is a sum, not just len(branches).
     per_branch_expert_counts = [cfg.num_experts if cfg.is_moe else 1 for (_, cfg, _) in branches]
     num_experts = sum(per_branch_expert_counts)
+    if num_experts < 1:
+        raise ValueError("merge requires at least one expert")
     if top_k > num_experts:
         raise ValueError(f"top_k ({top_k}) cannot exceed the merged expert count ({num_experts})")
     branch_summary = ", ".join(f"{bd.name}:{n}" for (bd, _, _), n in zip(branches, per_branch_expert_counts))
@@ -196,9 +180,10 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     moe_cfg = RWKVXConfig(**{**base_cfg.__dict__, "is_moe": True, "vocab_size": merged_vocab_size,
                               "num_experts": num_experts, "num_experts_per_tok": top_k})
     moe_model = RWKVXModel(moe_cfg)
-    out_sd = moe_model.state_dict()  # start from a fresh init, then overwrite with real weights
+    out_sd = moe_model.state_dict()
 
     prefixes = cmix_prefixes(base_cfg)
+    expected_expert_keys = {"key.weight", "value.weight"}
 
     # 1) copy every non-ffn tensor straight from base, resizing emb/head if vocab grew
     ffn_marker = ".ffn."
@@ -207,37 +192,39 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
             continue
         if k in ("emb.weight", "head.weight") and v.shape[0] != merged_vocab_size:
             v = resize_vocab_matrix(v, merged_vocab_size)
-        if k in out_sd and out_sd[k].shape == v.shape:
-            out_sd[k] = v
-        else:
-            print(f"[WARN] shape/key mismatch for shared tensor {k}, keeping fresh init")
+        if k not in out_sd:
+            raise ValueError(f"shared tensor {k} is missing from merged model")
+        if out_sd[k].shape != v.shape:
+            raise ValueError(f"shared tensor {k} shape mismatch: branch={tuple(v.shape)}, model={tuple(out_sd[k].shape)}")
+        out_sd[k] = v
 
-    # 2) fill experts from each branch, in order -- a dense branch supplies 1 expert, an MoE
-    # branch supplies all of its existing experts (its own router is dropped; a fresh router
-    # is always used post-merge since the expert count/identity has changed)
+    # 2) fill experts from each branch. Every expected expert must provide the complete FFN.
     for prefix in prefixes:
         e_id = 0
         for bd, cfg, sd in branches:
             branch_experts = branch_expert_state_dicts(cfg, sd, prefix)
             expected = cfg.num_experts if cfg.is_moe else 1
-            if not branch_experts:
-                print(f"[WARN] branch {bd} has no {prefix}.* tensors; {expected} expert slot(s) "
-                      f"at {prefix} keep random init")
-                e_id += expected
-                continue
+            if len(branch_experts) != expected:
+                raise ValueError(f"{bd}: {prefix} contains {len(branch_experts)} experts, expected {expected}")
             for expert_sd in branch_experts:
-                dst_prefix = f"{prefix}.experts.{e_id}."
-                found_any = False
-                for suffix, v in expert_sd.items():
-                    dst_key = dst_prefix + suffix
-                    if dst_key in out_sd and out_sd[dst_key].shape == v.shape:
-                        out_sd[dst_key] = v
-                        found_any = True
-                if not found_any:
-                    print(f"[WARN] branch {bd} expert at {prefix} had no matching tensors; "
-                          f"expert {e_id} keeps random init")
+                missing = expected_expert_keys - set(expert_sd)
+                extra = set(expert_sd) - expected_expert_keys
+                if missing:
+                    raise ValueError(f"{bd}: {prefix} expert {e_id} missing tensors: {sorted(missing)}")
+                if extra:
+                    raise ValueError(f"{bd}: {prefix} expert {e_id} has unexpected tensors: {sorted(extra)}")
+                for suffix in expected_expert_keys:
+                    dst_key = f"{prefix}.experts.{e_id}.{suffix}"
+                    v = expert_sd[suffix]
+                    if dst_key not in out_sd:
+                        raise ValueError(f"merged model is missing expert tensor {dst_key}")
+                    if out_sd[dst_key].shape != v.shape:
+                        raise ValueError(f"{bd}: {prefix} expert {e_id} {suffix} shape mismatch: "
+                                         f"branch={tuple(v.shape)}, model={tuple(out_sd[dst_key].shape)}")
+                    out_sd[dst_key] = v
                 e_id += 1
-        # router: leave at RWKVXModel's own random init (already in out_sd from moe_model construction)
+        if e_id != num_experts:
+            raise ValueError(f"{prefix}: filled {e_id} experts, expected {num_experts}")
 
     moe_model.load_state_dict(out_sd, strict=True)
 
