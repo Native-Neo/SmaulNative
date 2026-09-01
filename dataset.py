@@ -79,7 +79,7 @@ def _looks_numeric(s: str) -> bool:
     s = s.strip()
     if not s:
         return True
-    core = s.replace(".", "", 1).replace("-", "", 1).replace(":", "", 1).replace("/", "", 1)
+    core = s.replace(".", "", 1).replace("-", "").replace(":", "", 1).replace("/", "", 1)
     return core.isdigit()
 
 
@@ -311,16 +311,16 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
 
 class SFTDataset(Dataset):
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int):
-        records = discover_sft_records(dataset_dir)
-        self.examples = [
-            _preprocess_conversation(r["conversations"], tokenizer, ctx_len, tokenizer.pad_token_id)
-            for r in records
-        ]
-        del records
+        self.records = discover_sft_records(dataset_dir)
+        self.tokenizer = tokenizer
+        self.ctx_len = ctx_len
+        self.pad_token_id = tokenizer.pad_token_id
 
     def __len__(self):
-        return len(self.examples)
+        return len(self.records)
 
     def __getitem__(self, idx):
-        d = self.examples[idx]
+        d = _preprocess_conversation(
+            self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id
+        )
         return d["input_ids"], d["labels"]

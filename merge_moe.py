@@ -204,6 +204,11 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     if top_k < 1:
         raise ValueError(f"top_k must be >= 1, got {top_k}")
     base_cfg, base_sd = load_checkpoint(base_dir)
+    if base_cfg.is_moe:
+        raise ValueError(
+            "MoE base checkpoints are not supported because their experts would be omitted; "
+            "use a dense base checkpoint and pass MoE checkpoints via --branches"
+        )
     branches = []
     for bd in branch_dirs:
         cfg, sd = load_checkpoint(bd)

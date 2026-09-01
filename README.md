@@ -73,12 +73,12 @@ python syntheticdata.py --count 250000 --format both --output-dir ./datasets
 
 ### `tokenizer.py`
 
-Trains a byte-level BPE tokenizer directly on the dataset directory using Hugging Face `tokenizers`. Outputs a single merged `tokenizer.json` (vocab + merges + special tokens `<pad>`/`<eos>`), replacing upstream's fixed-vocab TRIE setup.
+Trains a byte-level BPE tokenizer directly on the dataset directory using Hugging Face `tokenizers`. Outputs a single merged `tokenizer.json` (vocab + merges + four special tokens): `<pad>` is used for padding and `<eos>` marks the end of a sequence; `<bos>` is reserved for optionally prepending a beginning-of-sequence marker, and `<unk>` is reserved for pre-tokenizers that cannot represent every byte (the byte-level BPE does not need it). This replaces upstream's fixed-vocab TRIE setup.
 
 Usage:
 
 ```bash
-python tokenizer.py --dataset_dir ./datasets --output ./tokenizer.json --vocab_size 32768
+python tokenizer.py --dataset_dir ./datasets --output ./SmaulNative/tokenizer.json --vocab_size 131072
 ```
 
 ### `train.py`
@@ -218,7 +218,7 @@ Root pipeline execution commands:
 ```bash
 python download.py                                                    # fetch FineWeb English + Hindi datasets
 python syntheticdata.py --count 250000 --format both                  # generate synthetic instruction dataset
-python tokenizer.py --dataset_dir ./datasets --output ./tokenizer.json# train BPE tokenizer
+python tokenizer.py --dataset_dir ./datasets --output ./SmaulNative/tokenizer.json --vocab_size 131072 # train BPE tokenizer
 python train.py --mode pretrain --dataset_dir ./datasets              # run pretraining (RWKV-X)
 python train.py --mode sft --dataset_dir ./sft_data                   # run SFT (Supervised Fine-Tuning)
 python train.py --mode sft --dataset_dir ./sft_data --qat \

@@ -114,7 +114,7 @@ def _load_rng_state(path: Path):
     if not path.exists():
         return
     try:
-        state = torch.load(path, map_location="cpu")
+        state = torch.load(path, map_location="cpu", weights_only=True)
         torch.set_rng_state(state["torch"])
         if torch.cuda.is_available() and "cuda" in state:
             torch.cuda.set_rng_state_all(state["cuda"])
@@ -226,7 +226,7 @@ def parse_args():
     p.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
     p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json",
                     help="merged BPE tokenizer.json (see tokenizer.py); auto-trained on --dataset_dir if missing")
-    p.add_argument("--tokenizer_vocab_size", type=int, default=65536,
+    p.add_argument("--tokenizer_vocab_size", type=int, default=131072,
                     help="only used when auto-training a tokenizer.json that doesn't exist yet")
     p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS,
                     help="approx total param count to size the model for")

@@ -33,7 +33,7 @@ The pieces chain together, but most are optional depending on what you want:
 
 ```bash
 python download.py
-python tokenizer.py --dataset_dir ./datasets --output ./tokenizer.json --vocab_size 32768
+python tokenizer.py --dataset_dir ./datasets --output ./SmaulNative/tokenizer.json --vocab_size 131072
 python train.py --mode pretrain --dataset_dir ./datasets --output_dir ./RWKV-X-256M --ctx_len 256
 python train.py --mode sft --dataset_dir ./sft_data --output_dir ./RWKV-X-SFT \
     --tokenizer_path ./RWKV-X-256M/tokenizer.json --qat --qat_export_dir ./RWKV-X-SFT-int3
