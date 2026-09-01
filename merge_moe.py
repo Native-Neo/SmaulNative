@@ -75,26 +75,74 @@ def _load_tokenizer_json(d: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def _merge_key(m) -> Tuple[str, str]:
+    if isinstance(m, list) and len(m) == 2:
+        return str(m[0]), str(m[1])
+    if isinstance(m, str):
+        parts = m.split(" ", 1)
+        if len(parts) == 2:
+            return parts[0], parts[1]
+    raise ValueError(f"invalid BPE merge rule: {m!r}")
+
+
+def _union_merges(tokenizers: List[dict]) -> List:
+    """Build one BPE merge order that preserves every input tokenizer's ordering.
+
+    Simply appending each branch's merge list changes BPE ranks and therefore changes
+    tokenization. A topological merge preserves every tokenizer's pair ordering and fails
+    if the input rankings contain an actual ordering conflict.
+    """
+    nodes: Dict[Tuple[str, str], object] = {}
+    edges: Dict[Tuple[str, str], set] = {}
+    indegree: Dict[Tuple[str, str], int] = {}
+    order_hint: Dict[Tuple[str, str], int] = {}
+
+    for tok_idx, tok in enumerate(tokenizers):
+        prev = None
+        for pos, raw in enumerate(tok["model"]["merges"]):
+            key = _merge_key(raw)
+            nodes.setdefault(key, raw)
+            edges.setdefault(key, set())
+            indegree.setdefault(key, 0)
+            order_hint.setdefault(key, tok_idx * 10**9 + pos)
+            if prev is not None and key not in edges[prev]:
+                edges[prev].add(key)
+                indegree[key] += 1
+            prev = key
+
+    ready = sorted((k for k, degree in indegree.items() if degree == 0), key=order_hint.get)
+    result = []
+    while ready:
+        key = ready.pop(0)
+        result.append(nodes[key])
+        for nxt in sorted(edges[key], key=order_hint.get):
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                ready.append(nxt)
+        ready.sort(key=order_hint.get)
+
+    if len(result) != len(nodes):
+        raise ValueError("tokenizer BPE merge orders conflict; no valid union preserves all tokenizer rankings")
+    return result
+
+
 def merge_tokenizers(base_dir: Path, branch_dirs: List[Path]) -> Tuple[dict, int, dict]:
     base_tok = _load_tokenizer_json(base_dir)
     base_vocab: Dict[str, int] = base_tok["model"]["vocab"]
-    base_merges: List = base_tok["model"]["merges"]
 
     merged_vocab: Dict[str, int] = dict(base_vocab)
-    merged_merges: List = list(base_merges)
-    merges_seen = {tuple(m) if isinstance(m, list) else m for m in merged_merges}
     next_id = max(merged_vocab.values(), default=-1) + 1
 
     added_tokens_total = 0
-    added_merges_total = 0
     conflicting_branches = []
+    tokenizers = [base_tok]
 
     for bd in branch_dirs:
         if bd.resolve() == base_dir.resolve():
             continue
         branch_tok = _load_tokenizer_json(bd)
+        tokenizers.append(branch_tok)
         branch_vocab: Dict[str, int] = branch_tok["model"]["vocab"]
-        branch_merges: List = branch_tok["model"]["merges"]
 
         for token, tid in branch_vocab.items():
             if token in merged_vocab:
@@ -105,13 +153,14 @@ def merge_tokenizers(base_dir: Path, branch_dirs: List[Path]) -> Tuple[dict, int
             next_id += 1
             added_tokens_total += 1
 
-        for m in branch_merges:
-            key = tuple(m) if isinstance(m, list) else m
-            if key in merges_seen:
-                continue
-            merges_seen.add(key)
-            merged_merges.append(m)
-            added_merges_total += 1
+    merged_merges = _union_merges(tokenizers)
+
+    # Every merge operand must exist in the merged vocabulary. Otherwise the tokenizer
+    # contains a rule that can never be applied correctly.
+    for m in merged_merges:
+        left, right = _merge_key(m)
+        if left not in merged_vocab or right not in merged_vocab:
+            raise ValueError(f"BPE merge references missing token(s): {left!r}, {right!r}")
 
     merged_tok = dict(base_tok)
     merged_tok["model"] = dict(base_tok["model"])
@@ -122,7 +171,7 @@ def merge_tokenizers(base_dir: Path, branch_dirs: List[Path]) -> Tuple[dict, int
         "base_vocab_size": len(base_vocab),
         "merged_vocab_size": len(merged_vocab),
         "added_tokens": added_tokens_total,
-        "added_merges": added_merges_total,
+        "added_merges": len(merged_merges) - len(base_tok["model"]["merges"]),
         "id_conflicts": conflicting_branches,
     }
     if conflicting_branches:
