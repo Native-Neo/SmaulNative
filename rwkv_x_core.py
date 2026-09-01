@@ -3,7 +3,7 @@
 
 import math
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -12,8 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-
-# Config
 
 @dataclass
 class RWKVXConfig:
@@ -73,7 +71,7 @@ def _wkv_run_chunk(state: torch.Tensor, w_c: torch.Tensor, k_c: torch.Tensor, v_
                     kk_c: torch.Tensor, a_c: torch.Tensor, r_c: torch.Tensor
                     ) -> Tuple[torch.Tensor, torch.Tensor]:
     Tc = w_c.shape[1]
-    ys = []
+    ys = torch.empty_like(r_c)
     for t in range(Tc):
         w_t = w_c[:, t]
         k_t = k_c[:, t]
@@ -85,8 +83,8 @@ def _wkv_run_chunk(state: torch.Tensor, w_c: torch.Tensor, k_c: torch.Tensor, v_
         ab = (-kk_t).unsqueeze(-1) @ (kk_t * a_t).unsqueeze(-2)
         state = state * w_t.unsqueeze(-2) + state @ ab.float() + vk.float()
         y_t = (state.to(dtype=r_t.dtype) @ r_t.unsqueeze(-1)).squeeze(-1)
-        ys.append(y_t)
-    return state, torch.stack(ys, dim=1)
+        ys[:, t] = y_t
+    return state, ys
 
 
 class RWKV_Tmix_x070(nn.Module):
@@ -419,8 +417,6 @@ class RWKVXModel(nn.Module):
         if packed:
             from qat import QuantizedLinear
             for key in packed:
-                if not key.endswith(".packed"):
-                    continue
                 base = key[:-len(".packed")]
                 scale_key = base + ".scale"
                 if scale_key not in sd:
