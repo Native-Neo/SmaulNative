@@ -168,6 +168,8 @@ def resize_vocab_matrix(tensor: torch.Tensor, target_size: int) -> torch.Tensor:
 # Model merge
 
 def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1):
+    if top_k < 1:
+        raise ValueError(f"top_k must be >= 1, got {top_k}")
     base_cfg, base_sd = load_checkpoint(base_dir)
     branches = []
     for bd in branch_dirs:
@@ -179,6 +181,8 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     # an already-merged MoE checkpoint -- so the new expert count is a sum, not just len(branches).
     per_branch_expert_counts = [cfg.num_experts if cfg.is_moe else 1 for (_, cfg, _) in branches]
     num_experts = sum(per_branch_expert_counts)
+    if top_k > num_experts:
+        raise ValueError(f"top_k ({top_k}) cannot exceed the merged expert count ({num_experts})")
     branch_summary = ", ".join(f"{bd.name}:{n}" for (bd, _, _), n in zip(branches, per_branch_expert_counts))
     print(f"[MERGE] base={base_dir} (is_moe={base_cfg.is_moe}), {len(branches)} branch(es) "
           f"contributing {num_experts} total expert(s) ({branch_summary}), top_k={top_k}")
@@ -190,7 +194,7 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
           f"(+{tok_stats['added_tokens']} tokens, +{tok_stats['added_merges']} merge rules)")
 
     moe_cfg = RWKVXConfig(**{**base_cfg.__dict__, "is_moe": True, "vocab_size": merged_vocab_size,
-                              "num_experts": num_experts, "num_experts_per_tok": min(top_k, num_experts)})
+                              "num_experts": num_experts, "num_experts_per_tok": top_k})
     moe_model = RWKVXModel(moe_cfg)
     out_sd = moe_model.state_dict()  # start from a fresh init, then overwrite with real weights
 
