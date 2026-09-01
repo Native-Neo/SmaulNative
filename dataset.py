@@ -90,15 +90,11 @@ def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
     if isinstance(obj, str):
         return obj
     if isinstance(obj, dict):
-        # case-insensitive match against known text-bearing keys first
         lower_map = {str(k).lower(): v for k, v in obj.items()}
         for key in TEXT_KEYS:
             v = lower_map.get(key)
             if isinstance(v, str) and v.strip():
                 return v
-        # no recognized column: pick the longest plausible prose string field instead of
-        # blindly joining every string value (which silently turns id/label/score columns
-        # into "text" and floods training with digit strings)
         candidates = [v for v in obj.values() if isinstance(v, str) and not _looks_numeric(v)]
         if candidates:
             if source_path and source_path not in _WARNED_FILES:
@@ -201,7 +197,7 @@ class PretrainStream(IterableDataset):
         self.resume_file = resume_file
         self.resume_record = resume_record
         self.buffer_tokens = list(buffer_tokens) if buffer_tokens is not None else []
-        self.last_pos: Tuple[Optional[str], int] = (None, 0)  # updated as we go, read by trainer for checkpointing
+        self.last_pos: Tuple[Optional[str], int] = (None, 0)
 
     def __iter__(self):
         buf: List[int] = list(self.buffer_tokens)
@@ -219,8 +215,6 @@ class PretrainStream(IterableDataset):
                 yield x, y, self.last_pos
 
 
-# SFT: conversation JSON/JSONL with loss masking (mirrors upstream sft/src/dataset.py)
-
 DEFAULT_STOP_TOKEN = "\n\n"
 
 
@@ -232,9 +226,6 @@ def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
         val = sentence.get("value", "")
         new = dict(sentence)
         new["from"] = frm_str
-        # always keep the "From: " prefix (even when val is empty) so it exactly matches the
-        # `frm_str + ": "` prefix_len computed in _preprocess_conversation -- previously an empty
-        # val produced "From:" (no space), which desynced the mask boundary by one token.
         new["value"] = frm_str + ": " + val + DEFAULT_STOP_TOKEN
         out.append(new)
     return out
@@ -252,8 +243,7 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
         input_ids.extend(ids)
         tokenized_lens.append(len(ids))
         speakers.append(c["from"])
-        prefix_len = len(tokenizer.encode(c["from"] + ": "))
-        prefix_lens.append(prefix_len)
+        prefix_lens.append(len(tokenizer.encode(c["from"] + ": ")))
 
     targets = list(input_ids)
     cur = 0
@@ -270,28 +260,25 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
     targets = targets[:ctx_len]
     pad_len = ctx_len - len(input_ids)
     if pad_len > 0:
-        input_ids = input_ids + [pad_token_id] * pad_len
-        targets = targets + [IGNORE_INDEX] * pad_len
+        input_ids += [pad_token_id] * pad_len
+        targets += [IGNORE_INDEX] * pad_len
 
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "labels": torch.tensor(targets, dtype=torch.long),
-    }
+    return {"input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(targets, dtype=torch.long)}
 
 
 def discover_sft_records(dataset_dir: Path) -> List[Dict]:
-    """SFT data must be conversation-style JSON/JSONL: [{"conversations":[{"from":"user","value":..},
-    {"from":"assistant","value":..}, ...]}], possibly nested in subfolders, any number of files."""
     records = []
     for path in discover_files(dataset_dir):
         if path.suffix.lower() not in (".json", ".jsonl"):
             continue
         try:
             if path.suffix.lower() == ".jsonl":
-                for line in open(path, "r", encoding="utf-8", errors="replace"):
-                    line = line.strip()
-                    if line:
-                        records.append(json.loads(line))
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            records.append(json.loads(line))
             else:
                 data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
                 records.extend(data if isinstance(data, list) else [data])
@@ -309,15 +296,16 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
 
 class SFTDataset(Dataset):
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int):
-        self.records = discover_sft_records(dataset_dir)
-        self.tokenizer = tokenizer
-        self.ctx_len = ctx_len
+        records = discover_sft_records(dataset_dir)
+        self.examples = [
+            _preprocess_conversation(r["conversations"], tokenizer, ctx_len, tokenizer.pad_token_id)
+            for r in records
+        ]
+        del records
 
     def __len__(self):
-        return len(self.records)
+        return len(self.examples)
 
     def __getitem__(self, idx):
-        rec = self.records[idx]
-        d = _preprocess_conversation(rec["conversations"], self.tokenizer, self.ctx_len,
-                                      pad_token_id=self.tokenizer.pad_token_id)
+        d = self.examples[idx]
         return d["input_ids"], d["labels"]
