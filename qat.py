@@ -162,5 +162,6 @@ def calibrate(model: RWKVXModel, tokenizer, calib_texts, ctx_len: int, device, m
             x = torch.tensor(chunk[:-1], dtype=torch.long, device=device).unsqueeze(0)
             model(x)
             n_batches += 1
+            print(f"[QAT] calib batch {n_batches}/{max_batches}")
     model.train(was_training)
     return n_batches

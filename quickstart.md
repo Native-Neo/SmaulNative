@@ -6,7 +6,11 @@ export from the repo root.
 ## Setup
 
 ```bash
-pip install torch transformers tokenizers safetensors datasets pyarrow tqdm pyyaml psutil pandas huggingface_hub
+# All the dependencies for every branch
+pip install torch transformers tokenizers safetensors datasets pyarrow tqdm pyyaml psutil pandas huggingface_hub 
+
+# All dependencies for Main
+pip install torch tokenizers safetensors huggingface_hub pyarrow
 ```
 
 A Hugging Face token is only required for the gated/rate-limited downloads in

@@ -9,6 +9,11 @@ SmaulNative is intended as a practical experimentation environment for training 
 ## Repository
 The project is hosted at:
 https://github.com/Native-Neo/SmaulNative
+The project is based on:
+https://github.com/howard-hou/RWKV-X
+
+## See the quickstart guide
+[USEME](USEME.md)
 
 ## Current Repository Layout
 ```text

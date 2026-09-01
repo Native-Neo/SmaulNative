@@ -73,18 +73,40 @@ def discover_files(dataset_dir: Path) -> List[Path]:
     return files
 
 
-def extract_text(obj: Any) -> str:
+def _looks_numeric(s: str) -> bool:
+    """True for ids/scores/dates-as-strings ('42', '3.14', '2024-01-01', '-7') that shouldn't
+    be mistaken for prose when no recognized text column is present."""
+    s = s.strip()
+    if not s:
+        return True
+    core = s.replace(".", "", 1).replace("-", "", 1).replace(":", "", 1).replace("/", "", 1)
+    return core.isdigit()
+
+
+_WARNED_FILES: set = set()
+
+
+def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
     if isinstance(obj, str):
         return obj
     if isinstance(obj, dict):
+        lower_map = {str(k).lower(): v for k, v in obj.items()}
         for key in TEXT_KEYS:
-            v = obj.get(key)
-            if isinstance(v, str):
+            v = lower_map.get(key)
+            if isinstance(v, str) and v.strip():
                 return v
-        return "\n".join(v for v in obj.values() if isinstance(v, str))
+        candidates = [v for v in obj.values() if isinstance(v, str) and not _looks_numeric(v)]
+        if candidates:
+            if source_path and source_path not in _WARNED_FILES:
+                _WARNED_FILES.add(source_path)
+                print(f"[WARN] {source_path}: no column named {TEXT_KEYS} found; "
+                      f"guessing text column from available keys {list(obj.keys())}. "
+                      f"Rename your text column to one of {TEXT_KEYS} to silence this.")
+            return max(candidates, key=len)
+        return ""
     if isinstance(obj, list):
-        return "\n".join(extract_text(x) for x in obj)
-    return str(obj)
+        return "\n".join(extract_text(x, source_path) for x in obj)
+    return ""
 
 
 def iter_texts(files: List[Path], resume_file: Optional[str] = None,
@@ -102,7 +124,26 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
         start_idx = resume_record if str(path) == resume_file else 0
         suffix = path.suffix.lower()
         try:
-            if suffix in PLAIN_TEXT_SUFFIXES:
+            if suffix in (".txt", ".text"):
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    doc: List[str] = []
+                    record = -1
+                    for line in f:
+                        line = line.rstrip()
+                        if line.strip():
+                            doc.append(line)
+                            continue
+                        if not doc:
+                            continue
+                        record += 1
+                        if record >= start_idx:
+                            yield "\n".join(doc), str(path), record + 1
+                        doc = []
+                    if doc:
+                        record += 1
+                        if record >= start_idx:
+                            yield "\n".join(doc), str(path), record + 1
+            elif suffix in PLAIN_TEXT_SUFFIXES:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f):
                         if i < start_idx:
@@ -122,7 +163,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                             obj = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        text = extract_text(obj).strip()
+                        text = extract_text(obj, str(path)).strip()
                         if text:
                             yield text, str(path), i + 1
             elif suffix == ".json":
@@ -131,7 +172,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                 if not isinstance(records, list):
                     records = [records]
                 for i in range(start_idx, len(records)):
-                    text = extract_text(records[i]).strip()
+                    text = extract_text(records[i], str(path)).strip()
                     if text:
                         yield text, str(path), i + 1
             elif suffix == ".csv":
@@ -140,26 +181,26 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                     for i, row in enumerate(reader):
                         if i < start_idx:
                             continue
-                        text = extract_text(row).strip()
+                        text = extract_text(row, str(path)).strip()
                         if text:
                             yield text, str(path), i + 1
             elif suffix == ".parquet":
                 import pyarrow.parquet as pq
-                table = pq.read_table(path)
-                rows = table.to_pylist()
-                for i in range(start_idx, len(rows)):
-                    text = extract_text(rows[i]).strip()
-                    if text:
-                        yield text, str(path), i + 1
+                pf = pq.ParquetFile(path)
+                i = -1
+                for batch in pf.iter_batches(batch_size=1024):
+                    for row in batch.to_pylist():
+                        i += 1
+                        if i < start_idx:
+                            continue
+                        text = extract_text(row, str(path)).strip()
+                        if text:
+                            yield text, str(path), i + 1
         except Exception as e:
             print(f"[WARN] skipping {path}: {e}")
 
 
-# Pretraining: token-chunk stream
-
 class PretrainStream(IterableDataset):
-    """Streams (input_ids, labels) fixed-length chunks of size ctx_len for causal LM training."""
-
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int,
                  resume_file: Optional[str] = None, resume_record: int = 0,
                  buffer_tokens: Optional[List[int]] = None):
@@ -171,7 +212,7 @@ class PretrainStream(IterableDataset):
         self.resume_file = resume_file
         self.resume_record = resume_record
         self.buffer_tokens = list(buffer_tokens) if buffer_tokens is not None else []
-        self.last_pos: Tuple[Optional[str], int] = (None, 0)  # updated as we go, read by trainer for checkpointing
+        self.last_pos: Tuple[Optional[str], int] = (None, 0)
 
     def __iter__(self):
         buf: List[int] = list(self.buffer_tokens)
@@ -189,8 +230,6 @@ class PretrainStream(IterableDataset):
                 yield x, y, self.last_pos
 
 
-# SFT: conversation JSON/JSONL with loss masking (mirrors upstream sft/src/dataset.py)
-
 DEFAULT_STOP_TOKEN = "\n\n"
 
 
@@ -202,9 +241,6 @@ def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
         val = sentence.get("value", "")
         new = dict(sentence)
         new["from"] = frm_str
-        # always keep the "From: " prefix (even when val is empty) so it exactly matches the
-        # `frm_str + ": "` prefix_len computed in _preprocess_conversation -- previously an empty
-        # val produced "From:" (no space), which desynced the mask boundary by one token.
         new["value"] = frm_str + ": " + val + DEFAULT_STOP_TOKEN
         out.append(new)
     return out
@@ -222,8 +258,7 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
         input_ids.extend(ids)
         tokenized_lens.append(len(ids))
         speakers.append(c["from"])
-        prefix_len = len(tokenizer.encode(c["from"] + ": "))
-        prefix_lens.append(prefix_len)
+        prefix_lens.append(len(tokenizer.encode(c["from"] + ": ")))
 
     targets = list(input_ids)
     cur = 0
@@ -240,28 +275,25 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
     targets = targets[:ctx_len]
     pad_len = ctx_len - len(input_ids)
     if pad_len > 0:
-        input_ids = input_ids + [pad_token_id] * pad_len
-        targets = targets + [IGNORE_INDEX] * pad_len
+        input_ids += [pad_token_id] * pad_len
+        targets += [IGNORE_INDEX] * pad_len
 
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "labels": torch.tensor(targets, dtype=torch.long),
-    }
+    return {"input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(targets, dtype=torch.long)}
 
 
 def discover_sft_records(dataset_dir: Path) -> List[Dict]:
-    """SFT data must be conversation-style JSON/JSONL: [{"conversations":[{"from":"user","value":..},
-    {"from":"assistant","value":..}, ...]}], possibly nested in subfolders, any number of files."""
     records = []
     for path in discover_files(dataset_dir):
         if path.suffix.lower() not in (".json", ".jsonl"):
             continue
         try:
             if path.suffix.lower() == ".jsonl":
-                for line in open(path, "r", encoding="utf-8", errors="replace"):
-                    line = line.strip()
-                    if line:
-                        records.append(json.loads(line))
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            records.append(json.loads(line))
             else:
                 data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
                 records.extend(data if isinstance(data, list) else [data])
@@ -279,15 +311,16 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
 
 class SFTDataset(Dataset):
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int):
-        self.records = discover_sft_records(dataset_dir)
-        self.tokenizer = tokenizer
-        self.ctx_len = ctx_len
+        records = discover_sft_records(dataset_dir)
+        self.examples = [
+            _preprocess_conversation(r["conversations"], tokenizer, ctx_len, tokenizer.pad_token_id)
+            for r in records
+        ]
+        del records
 
     def __len__(self):
-        return len(self.records)
+        return len(self.examples)
 
     def __getitem__(self, idx):
-        rec = self.records[idx]
-        d = _preprocess_conversation(rec["conversations"], self.tokenizer, self.ctx_len,
-                                      pad_token_id=self.tokenizer.pad_token_id)
+        d = self.examples[idx]
         return d["input_ids"], d["labels"]
