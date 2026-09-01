@@ -18,16 +18,16 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 from rwkv_x_core import RWKVXConfig, RWKVXModel, config_for_target_params
+from router_utils import set_router_only_training
 from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDataset, iter_texts, discover_files
 from tokenizer import train_tokenizer
 import qat
 
-# Fixed model-size target: "256M params" using the binary (Mebi) convention -- 256*1024*1024 =
-# 268,435,456, the closest achievable parameter count at the chosen --n_embd/--head_size/
-# --n_moba_layer. No longer a CLI flag -- config_for_target_params() still accepts an arbitrary
-# target if you're calling it directly from your own script (see rwkv_x_core.py / USEME.MD), but
-# train.py always builds toward this fixed value.
-TARGET_PARAMS = 268_435_456  # 256M params (binary/Mebi convention: 256 * 1024 * 1024)
+# Default model-size target: "256M params" using the binary (Mebi) convention -- 256*1024*1024 =
+# 268,435,456. Overridable via --target_params since a 256M model is not realistic on small-RAM
+# CPU boxes once you account for fp32 weights + grads + Lion momentum + the WKV recurrence's
+# retained per-timestep backward graph -- pass a much smaller value (e.g. 20-40M) there instead.
+DEFAULT_TARGET_PARAMS = 268_435_456  # 256M params (binary/Mebi convention: 256 * 1024 * 1024)
 
 STOP_REQUESTED = False
 
@@ -236,6 +236,15 @@ def parse_args():
     p.add_argument("--tokenizer_vocab_size", type=int, default=131072,
                     help="only used when auto-training a tokenizer.json that doesn't exist yet")
 
+    p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS,
+                    help="approx total param count to size the model for (config_for_target_params "
+                         "searches n_layer at your --n_embd/--head_size/--n_moba_layer to hit this). "
+                         "Default is 256M, which is too large for most CPU boxes -- on an 8GB machine "
+                         "try 20000000-40000000 instead, and pair it with a smaller "
+                         "--tokenizer_vocab_size (emb+head scale with vocab_size) and a smaller "
+                         "--ctx_len (the WKV recurrence retains a state tensor per timestep for "
+                         "backprop, so this is usually the bigger memory lever of the two).")
+
     p.add_argument("--n_embd", type=int, default=768)
     p.add_argument("--head_size", type=int, default=64, help="n_embd must be divisible by this")
     p.add_argument("--n_moba_layer", type=int, default=3, help="MOBA sparse-attn blocks; 0 = pure RWKV-7")
@@ -249,6 +258,13 @@ def parse_args():
     p.add_argument("--save_every", type=int, default=5000)
     p.add_argument("--new_data", action="store_true",
                     help="reset dataset position, keep model/optimizer weights")
+    p.add_argument("--train_router_only", action="store_true",
+                    help="freeze every parameter except each MoE Channel-Mix's router (gate) -- "
+                         "use right after merge_moe.py to let routing settle over the "
+                         "already-merged experts before (optionally) rerunning without this flag "
+                         "for joint fine-tuning. Requires --output_dir to point at an is_moe=True "
+                         "checkpoint (e.g. merge_moe.py's --out); errors otherwise. Also cuts "
+                         "training memory, since frozen params get no gradient buffer.")
 
     p.add_argument("--qat", action="store_true",
                     help="fake-quantize the Channel-Mix (FFN) linears at 3-bit (int3) precision -- weight "
@@ -271,7 +287,7 @@ def build_model(args, tokenizer) -> RWKVXModel:
 
     print("[INIT] creating new model")
     vocab_size = tokenizer_vocab_size(tokenizer)
-    cfg = config_for_target_params(TARGET_PARAMS, vocab_size=vocab_size,
+    cfg = config_for_target_params(args.target_params, vocab_size=vocab_size,
                                     n_embd=args.n_embd, n_moba_layer=args.n_moba_layer,
                                     head_size=args.head_size)
     cfg.ctx_len_hint = args.ctx_len
@@ -301,6 +317,13 @@ def main():
         train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size)
     tokenizer = load_tokenizer(tokenizer_path)
     model = build_model(args, tokenizer).to(device)
+
+    if args.train_router_only:
+        n_trainable = set_router_only_training(model, True)
+        n_total = model.num_parameters()
+        print(f"[ROUTER-ONLY] frozen everything except router gates: "
+              f"{n_trainable:,} / {n_total:,} params trainable "
+              f"({n_trainable / n_total * 100:.2f}%)")
 
     if args.qat:
         n = qat.prepare_qat(model)
