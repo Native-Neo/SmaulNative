@@ -233,10 +233,10 @@ def parse_args():
     p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json",
                     help="merged BPE tokenizer.json (see tokenizer.py); auto-trained on "
                          "--dataset_dir if missing")
-    p.add_argument("--tokenizer_vocab_size", type=int, default=131072,
+    p.add_argument("--tokenizer_vocab_size", type=int, default=65536,
                     help="only used when auto-training a tokenizer.json that doesn't exist yet")
 
-    p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS,
+    p.add_argument("--target_params", type=int, default=273_588_224,
                     help="approx total param count to size the model for (config_for_target_params "
                          "searches n_layer at your --n_embd/--head_size/--n_moba_layer to hit this). "
                          "Default is 256M, which is too large for most CPU boxes -- on an 8GB machine "
@@ -245,9 +245,9 @@ def parse_args():
                          "--ctx_len (the WKV recurrence retains a state tensor per timestep for "
                          "backprop, so this is usually the bigger memory lever of the two).")
 
-    p.add_argument("--n_embd", type=int, default=768)
+    p.add_argument("--n_embd", type=int, default=832)
     p.add_argument("--head_size", type=int, default=64, help="n_embd must be divisible by this")
-    p.add_argument("--n_moba_layer", type=int, default=3, help="MOBA sparse-attn blocks; 0 = pure RWKV-7")
+    p.add_argument("--n_moba_layer", type=int, default=5, help="MOBA sparse-attn blocks; 0 = pure RWKV-7")
     p.add_argument("--ctx_len", type=int, default=512, help="train-time BPTT window (CPU: keep this small)")
 
     p.add_argument("--batch_size", type=int, default=1)
