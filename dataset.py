@@ -124,7 +124,26 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
         start_idx = resume_record if str(path) == resume_file else 0
         suffix = path.suffix.lower()
         try:
-            if suffix in PLAIN_TEXT_SUFFIXES:
+            if suffix in (".txt", ".text"):
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    doc: List[str] = []
+                    record = -1
+                    for line in f:
+                        line = line.rstrip()
+                        if line.strip():
+                            doc.append(line)
+                            continue
+                        if not doc:
+                            continue
+                        record += 1
+                        if record >= start_idx:
+                            yield "\n".join(doc), str(path), record + 1
+                        doc = []
+                    if doc:
+                        record += 1
+                        if record >= start_idx:
+                            yield "\n".join(doc), str(path), record + 1
+            elif suffix in PLAIN_TEXT_SUFFIXES:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f):
                         if i < start_idx:
