@@ -219,7 +219,7 @@ def parse_args():
     p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
     p.add_argument("--dataset_dir", type=str, default="./datasets")
     p.add_argument("--output_dir", type=str, default="./SmaulNative")
-    p.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
+    p.add_argument("--checkpoint_dir", type=str, default="./SmaulNative")
     p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json")
     p.add_argument("--tokenizer_vocab_size", type=int, default=65536)
     p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS)
