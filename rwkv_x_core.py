@@ -15,7 +15,7 @@ import torch.utils.checkpoint
 
 @dataclass
 class RWKVXConfig:
-    vocab_size: int = 65530
+    vocab_size: int = 65536
     n_embd: int = 832
     n_layer: int = 20
     head_size: int = 64
