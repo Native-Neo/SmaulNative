@@ -205,7 +205,7 @@ _LANG_FENCE = {"Python": "python", "JavaScript": "javascript", "C++": "cpp", "Ru
 
 def gen_sorting_algorithm_code() -> Dict[str, str]:
     """Generates unique sorting algorithm questions in Python/JS/C++/Rust."""
-    algo = random.choice(["Quick Sort", "Merge Sort", "Bubble Sort", "Insertion Sort", "Selection Sort"])
+    algo = "Quick Sort"
     lang = random.choice(list(_QUICKSORT_BY_LANG))
 
     prompt = f"Write a clean, optimized implementation of {algo} in {lang}."
