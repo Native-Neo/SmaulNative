@@ -273,10 +273,13 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.ctx_len = ctx_len
         self.pad_token_id = tokenizer.pad_token_id
+        self._processed_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
-        d = _preprocess_conversation(self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id)
-        return d["input_ids"], d["labels"]
+        if idx not in self._processed_cache:
+            d = _preprocess_conversation(self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id)
+            self._processed_cache[idx] = (d["input_ids"], d["labels"])
+        return self._processed_cache[idx]

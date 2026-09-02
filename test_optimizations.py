@@ -1,5 +1,10 @@
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import torch
 
+from dataset import SFTDataset
 from qat import QuantizedLinear, _pack_3bit, _unpack_3bit
 from rwkv_x_core import RWKVXConfig, RWKV_CMix_MoE
 
@@ -20,6 +25,62 @@ def test_quantized_linear_code_cache():
     y2 = layer(x)
     assert torch.equal(y1, y2)
     assert len(layer._code_cache) == 1
+
+
+def test_quantized_linear_load_state_dict_clears_code_cache():
+    shape = torch.Size((2, 3))
+    layer = QuantizedLinear(
+        _pack_3bit(torch.tensor([4, 5, 6, 7, 3, 2], dtype=torch.uint8)),
+        torch.tensor([0.1, 0.2]),
+        shape,
+    )
+    replacement = QuantizedLinear(
+        _pack_3bit(torch.tensor([7, 6, 5, 4, 1, 0], dtype=torch.uint8)),
+        torch.tensor([0.3, 0.4]),
+        shape,
+    )
+    x = torch.tensor([[1.0, -2.0, 0.5]])
+
+    old_output = layer(x)
+    assert len(layer._code_cache) == 1
+
+    layer.load_state_dict(replacement.state_dict())
+
+    assert not layer._code_cache
+    new_output = layer(x)
+    assert torch.equal(new_output, replacement(x))
+    assert not torch.equal(new_output, old_output)
+
+
+def test_sft_dataset_caches_processed_records():
+    class CountingTokenizer:
+        pad_token_id = 0
+
+        def __init__(self):
+            self.encode_calls = 0
+
+        def encode(self, text):
+            self.encode_calls += 1
+            return list(text.encode())
+
+    with TemporaryDirectory() as dataset_dir:
+        record = {
+            "conversations": [
+                {"from": "user", "value": "Hello"},
+                {"from": "assistant", "value": "Hi"},
+            ]
+        }
+        Path(dataset_dir, "sample.json").write_text(json.dumps([record]), encoding="utf-8")
+        tokenizer = CountingTokenizer()
+        dataset = SFTDataset(Path(dataset_dir), tokenizer, ctx_len=64)
+
+        first = dataset[0]
+        encode_calls = tokenizer.encode_calls
+        second = dataset[0]
+
+        assert encode_calls > 0
+        assert tokenizer.encode_calls == encode_calls
+        assert second is first
 
 
 def test_moe_matches_dense_reference():
@@ -48,5 +109,7 @@ def test_moe_matches_dense_reference():
 if __name__ == "__main__":
     test_int3_roundtrip()
     test_quantized_linear_code_cache()
+    test_quantized_linear_load_state_dict_clears_code_cache()
+    test_sft_dataset_caches_processed_records()
     test_moe_matches_dense_reference()
     print("optimization tests passed")

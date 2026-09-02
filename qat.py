@@ -71,6 +71,14 @@ class QuantizedLinear(nn.Module):
         self.out_features, self.in_features = int(shape[0]), int(shape[1])
         self._code_cache = {}
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+        self._code_cache.clear()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         key = (x.device.type, x.device.index)
         codes = self._code_cache.get(key)
