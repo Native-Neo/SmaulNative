@@ -246,15 +246,25 @@ class RWKV_CMix_MoE(nn.Module):
         logits = self.gate(x)
         top_val, top_idx = torch.topk(logits, k=self.top_k, dim=-1)
         top_w = torch.softmax(top_val, dim=-1)
-        out = torch.zeros_like(x)
+        x_prev = torch.cat([
+            x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros(B, 1, C, dtype=x.dtype, device=x.device),
+            x[:, :-1, :],
+        ], dim=1)
+        flat_x = x.reshape(-1, C)
+        flat_prev = x_prev.reshape(-1, C)
+        flat_out = torch.zeros_like(flat_x)
+        flat_idx = top_idx.reshape(-1, self.top_k)
+        flat_w = top_w.reshape(-1, self.top_k)
         for e_id, expert in enumerate(self.experts):
-            mask = (top_idx == e_id)
-            if not torch.any(mask):
+            mask = flat_idx == e_id
+            token_mask = mask.any(dim=-1)
+            positions = token_mask.nonzero(as_tuple=False).squeeze(1)
+            if positions.numel() == 0:
                 continue
-            e_out, _ = expert(x, x_prev_last)
-            weight = torch.where(mask, top_w, torch.zeros_like(top_w)).sum(dim=-1, keepdim=True)
-            out = out + e_out * weight
-        return out, x[:, -1, :]
+            weights = flat_w[mask]
+            e_out = expert.value(torch.relu(expert.key(flat_x[positions] + (flat_prev[positions] - flat_x[positions]) * expert.x_k.squeeze(0))) ** 2)
+            flat_out.index_add_(0, positions, e_out * weights.unsqueeze(-1))
+        return flat_out.view(B, T, C), x[:, -1, :]
 
 
 class CausalSelfAttention(nn.Module):
