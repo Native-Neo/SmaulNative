@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # qat.py -- Quantization-Aware Training for RWKV-X, at 3-bit (int3) precision.
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,15 +23,27 @@ def _activation_fake_quant() -> FakeQuantize:
 
 
 def _pack_3bit(codes: torch.Tensor) -> torch.Tensor:
-    flat = codes.reshape(-1).to(torch.uint8).cpu().numpy()
-    bits = np.unpackbits(flat[:, None], axis=1, bitorder="big")[:, 5:8]
-    return torch.from_numpy(np.packbits(bits.reshape(-1)).copy())
+    """Pack uint8 codes (values 0-7) into 3-bit packed bytes, entirely device-agnostic."""
+    device = codes.device
+    shifts = torch.tensor([2, 1, 0], dtype=torch.uint8, device=device)
+    bits = (codes.reshape(-1).to(torch.uint8).unsqueeze(-1) >> shifts) & 1
+    flat_bits = bits.reshape(-1)
+    pad_len = (8 - (flat_bits.numel() % 8)) % 8
+    if pad_len > 0:
+        flat_bits = torch.cat([flat_bits, torch.zeros(pad_len, dtype=torch.uint8, device=device)])
+    bit_groups = flat_bits.reshape(-1, 8)
+    powers = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.uint8, device=device)
+    return (bit_groups * powers).sum(dim=-1)
 
 
 def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
-    bits = np.unpackbits(packed.cpu().numpy())[:numel * 3].reshape(numel, 3)
-    codes = bits[:, 0] * 4 + bits[:, 1] * 2 + bits[:, 2]
-    return torch.from_numpy(codes.astype(np.uint8).copy())
+    """Unpack 3-bit packed bytes into uint8 codes, entirely device-agnostic."""
+    device = packed.device
+    shifts = torch.arange(7, -1, -1, dtype=torch.uint8, device=device)
+    bits = (packed.unsqueeze(-1) >> shifts) & 1
+    flat_bits = bits.reshape(-1)[:numel * 3]
+    grouped = flat_bits.reshape(numel, 3)
+    return grouped[:, 0] * 4 + grouped[:, 1] * 2 + grouped[:, 2]
 
 
 class QATLinear(nn.Module):
@@ -60,8 +71,8 @@ class QATLinear(nn.Module):
 class QuantizedLinear(nn.Module):
     """Converted post-QAT op with packed int3 weights.
 
-    The unpacked uint8 codes are cached per device. This avoids repeating the NumPy
-    unpacking work on every inference step without expanding the weights to FP32 memory.
+    The unpacked uint8 codes are cached per device. Unpacking is entirely PyTorch-native
+    (no NumPy), so it runs on whatever device the packed buffer lives on.
     """
 
     def __init__(self, packed: torch.Tensor, scale: torch.Tensor, shape: torch.Size):
