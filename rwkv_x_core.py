@@ -262,7 +262,7 @@ class RWKV_CMix_MoE(nn.Module):
             if positions.numel() == 0:
                 continue
             weights = flat_w[mask]
-            e_out = expert.value(torch.relu(expert.key(flat_x[positions] + (flat_prev[positions] - flat_x[positions]) * expert.x_k)) ** 2)
+            e_out = expert.value(torch.relu(expert.key(flat_x[positions] + (flat_prev[positions] - flat_x[positions]) * expert.x_k.squeeze(0))) ** 2)
             flat_out.index_add_(0, positions, e_out * weights.unsqueeze(-1))
         return flat_out.view(B, T, C), x[:, -1, :]
 
