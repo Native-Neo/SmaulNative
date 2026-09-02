@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-# train.py -- single entrypoint for RWKV-X pretrain + SFT, plain torch loop (no Lightning/DeepSpeed),
-# Ctrl-C checkpointing, full resume, HF export. Training ctx_len is still a finite BPTT window --
-# "unlimited context" is RWKV's inference-time state property, not free at train time.
+# train.py -- single entrypoint for RWKV-X pretrain + SFT.
 
 import argparse
 import json
@@ -15,7 +13,7 @@ from typing import Optional
 import torch
 from torch.optim import Optimizer
 
-from rwkv_x_core import RWKVXConfig, RWKVXModel, config_for_target_params
+from rwkv_x_core import RWKVXModel, config_for_target_params
 from router_utils import set_router_only_training
 from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDataset, iter_texts, discover_files
 from tokenizer import train_tokenizer
@@ -38,27 +36,31 @@ class Lion(Optimizer):
     def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
         if lr <= 0:
             raise ValueError("lr must be > 0")
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
-        super().__init__(params, defaults)
+        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
 
     @torch.no_grad()
     def step(self, closure=None):
         loss = closure() if closure is not None else None
         for group in self.param_groups:
             lr, (beta1, beta2), wd = group["lr"], group["betas"], group["weight_decay"]
+            params, grads, avgs = [], [], []
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad
                 state = self.state[p]
-                if len(state) == 0:
+                if not state:
                     state["exp_avg"] = torch.zeros_like(p)
-                exp_avg = state["exp_avg"]
-                if wd != 0:
-                    p.mul_(1.0 - lr * wd)
-                update = exp_avg.mul(beta1).add(grad, alpha=1.0 - beta1)
-                p.add_(torch.sign(update), alpha=-lr)
-                exp_avg.mul_(beta2).add_(grad, alpha=1.0 - beta2)
+                params.append(p)
+                grads.append(p.grad)
+                avgs.append(state["exp_avg"])
+            if not params:
+                continue
+            if wd:
+                torch._foreach_mul_(params, 1.0 - lr * wd)
+            updates = torch._foreach_mul(avgs, beta1)
+            torch._foreach_add_(updates, grads, alpha=1.0 - beta1)
+            torch._foreach_add_(params, torch._foreach_sign(updates), alpha=-lr)
+            torch._foreach_lerp_(avgs, grads, 1.0 - beta2)
         return loss
 
 
@@ -128,12 +130,10 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
     print("\n[SAVE] Saving checkpoint...")
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     model.save_pretrained(output_dir)
     bundled_tok = output_dir / "tokenizer.json"
     if tokenizer_path.resolve() != bundled_tok.resolve():
         shutil.copy2(tokenizer_path, bundled_tok)
-
     tmp = checkpoint_dir / "optimizer.pt.tmp"
     torch.save(optimizer.state_dict(), tmp)
     os.replace(tmp, checkpoint_dir / "optimizer.pt")
@@ -152,7 +152,6 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
     batch_x, batch_y = [], []
     t0 = time.perf_counter()
     tok_since = 0
-
     for x, y, pos in stream:
         batch_x.append(x)
         batch_y.append(y)
@@ -174,11 +173,9 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
         resume.file_path, resume.record_index = pos
         resume.buffer_tokens = list(stream.buffer_tokens)
         tok_since += xb.numel()
-
         if resume.global_step % args.log_every == 0:
             dt = time.perf_counter() - t0
-            print(f"step {resume.global_step} | loss {loss.item():.4f} | "
-                  f"{tok_since/max(dt,1e-9):.1f} tok/s | tokens {resume.total_tokens:,}")
+            print(f"step {resume.global_step} | loss {loss.item():.4f} | {tok_since/max(dt,1e-9):.1f} tok/s | tokens {resume.total_tokens:,}")
             t0 = time.perf_counter()
             tok_since = 0
         batch_x, batch_y = [], []
@@ -192,9 +189,8 @@ def train_sft(args, model, optimizer, resume, device, tokenizer):
     dataset = SFTDataset(Path(args.dataset_dir), tokenizer, args.ctx_len)
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     model.train()
-    start_epoch = resume.epoch
-    for epoch in range(start_epoch, args.epochs):
-        for step, (xb, yb) in enumerate(loader):
+    for epoch in range(resume.epoch, args.epochs):
+        for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad(set_to_none=True)
             _, loss, _ = model(xb, labels=yb)
@@ -224,24 +220,21 @@ def parse_args():
     p.add_argument("--dataset_dir", type=str, default="./datasets")
     p.add_argument("--output_dir", type=str, default="./SmaulNative")
     p.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
-    p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json",
-                    help="merged BPE tokenizer.json (see tokenizer.py); auto-trained on --dataset_dir if missing")
-    p.add_argument("--tokenizer_vocab_size", type=int, default=65536,
-                    help="only used when auto-training a tokenizer.json that doesn't exist yet")
-    p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS,
-                    help="approx total param count to size the model for")
+    p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json")
+    p.add_argument("--tokenizer_vocab_size", type=int, default=65536)
+    p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS)
     p.add_argument("--n_embd", type=int, default=832)
-    p.add_argument("--head_size", type=int, default=64, help="n_embd must be divisible by this")
-    p.add_argument("--n_moba_layer", type=int, default=5, help="MOBA sparse-attn blocks; 0 = pure RWKV-7")
-    p.add_argument("--ctx_len", type=int, default=512, help="train-time BPTT window (CPU: keep this small)")
+    p.add_argument("--head_size", type=int, default=64)
+    p.add_argument("--n_moba_layer", type=int, default=5)
+    p.add_argument("--ctx_len", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--epochs", type=int, default=3, help="sft only")
+    p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--optimizer", choices=["lion", "adamw"], default="lion")
     p.add_argument("--log_every", type=int, default=1)
     p.add_argument("--save_every", type=int, default=5000)
-    p.add_argument("--new_data", action="store_true", help="reset dataset position, keep model/optimizer weights")
-    p.add_argument("--train_router_only", action="store_true", help="freeze every parameter except each MoE Channel-Mix's router")
+    p.add_argument("--new_data", action="store_true")
+    p.add_argument("--train_router_only", action="store_true")
     p.add_argument("--qat", action="store_true")
     p.add_argument("--qat_calib_batches", type=int, default=64)
     p.add_argument("--qat_export_dir", type=str, default=None)
@@ -261,18 +254,15 @@ def build_model(args, tokenizer) -> RWKVXModel:
         print(f"[RESUME] loading model from {output_dir}")
         return RWKVXModel.from_pretrained(output_dir)
     print("[INIT] creating new model")
-    vocab_size = tokenizer_vocab_size(tokenizer)
-    cfg = config_for_target_params(args.target_params, vocab_size=vocab_size,
+    cfg = config_for_target_params(args.target_params, vocab_size=tokenizer_vocab_size(tokenizer),
                                     n_embd=args.n_embd, n_moba_layer=args.n_moba_layer,
                                     head_size=args.head_size)
     actual_params = cfg.approx_param_count()
     if abs(actual_params - args.target_params) / args.target_params > 0.10:
-        raise ValueError(f"requested {args.target_params:,} params, closest supported architecture is "
-                         f"{actual_params:,} ({abs(actual_params - args.target_params) / args.target_params:.1%} away)")
+        raise ValueError(f"requested {args.target_params:,} params, closest supported architecture is {actual_params:,} ({abs(actual_params - args.target_params) / args.target_params:.1%} away)")
     cfg.ctx_len_hint = args.ctx_len
     model = RWKVXModel(cfg)
-    print(f"[MODEL] n_layer={cfg.n_layer} n_embd={cfg.n_embd} n_moba_layer={cfg.n_moba_layer} "
-          f"vocab_size={cfg.vocab_size} -> {model.num_parameters()/1e6:.1f}M params")
+    print(f"[MODEL] n_layer={cfg.n_layer} n_embd={cfg.n_embd} n_moba_layer={cfg.n_moba_layer} vocab_size={cfg.vocab_size} -> {model.num_parameters()/1e6:.1f}M params")
     return model
 
 
@@ -287,18 +277,14 @@ def main():
         print(f"[RESUME] using tokenizer bundled with existing checkpoint: {bundled_tok}")
         tokenizer_path = bundled_tok
     if not tokenizer_path.exists():
-        print(f"[TOKENIZER] {tokenizer_path} not found -- training one on {args.dataset_dir} "
-              f"(vocab_size={args.tokenizer_vocab_size})")
+        print(f"[TOKENIZER] {tokenizer_path} not found -- training one on {args.dataset_dir} (vocab_size={args.tokenizer_vocab_size})")
         train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size)
     tokenizer = load_tokenizer(tokenizer_path)
     model = build_model(args, tokenizer).to(device)
-
     if args.train_router_only:
         n_trainable = set_router_only_training(model, True)
         n_total = model.num_parameters()
-        print(f"[ROUTER-ONLY] frozen everything except router gates: {n_trainable:,} / {n_total:,} params trainable "
-              f"({n_trainable / n_total * 100:.2f}%)")
-
+        print(f"[ROUTER-ONLY] frozen everything except router gates: {n_trainable:,} / {n_total:,} params trainable ({n_trainable / n_total * 100:.2f}%)")
     if args.qat:
         n = qat.prepare_qat(model)
         print(f"[QAT] fake-quantizing {n} Channel-Mix linear(s); calibrating on {args.qat_calib_batches} batches from {args.dataset_dir} ...")
@@ -306,7 +292,6 @@ def main():
         calib_texts = (text for text, _path, _idx in iter_texts(calib_files))
         done = qat.calibrate(model, tokenizer, calib_texts, args.ctx_len, device, max_batches=args.qat_calib_batches)
         print(f"[QAT] calibrated on {done} batches")
-
     opt_cls = Lion if args.optimizer == "lion" else torch.optim.AdamW
     optimizer = opt_cls(model.parameters(), lr=args.learning_rate)
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -317,15 +302,12 @@ def main():
             print("[RESUME] loaded optimizer state")
         except Exception as e:
             print(f"[WARN] could not restore optimizer: {e}")
-
     resume = ResumeState.load(checkpoint_dir / "resume_state.json")
     if args.new_data:
         resume = ResumeState()
     else:
         _load_rng_state(checkpoint_dir / "rng_state.pt")
-    print(f"[RESUME] step={resume.global_step:,} tokens={resume.total_tokens:,} file={resume.file_path} "
-          f"record={resume.record_index} epoch={resume.epoch}")
-
+    print(f"[RESUME] step={resume.global_step:,} tokens={resume.total_tokens:,} file={resume.file_path} record={resume.record_index} epoch={resume.epoch}")
     try:
         if args.mode == "pretrain":
             train_pretrain(args, model, optimizer, resume, device, tokenizer)
@@ -333,7 +315,6 @@ def main():
             train_sft(args, model, optimizer, resume, device, tokenizer)
     finally:
         save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path)
-
     if args.qat and args.qat_export_dir:
         import copy
         print(f"[QAT] converting to real packed int3 weights -> {args.qat_export_dir}")
