@@ -26,7 +26,7 @@ def text_iterator(dataset_dir: Path) -> Iterator[str]:
         yield text
 
 
-def train_tokenizer(dataset_dir: Path, output_path: Path, vocab_size: int = 32768,
+def train_tokenizer(dataset_dir: Path, output_path: Path, vocab_size: int = 65536,
                      min_frequency: int = 2, special_tokens: List[str] = None) -> Tokenizer:
     special_tokens = special_tokens or SPECIAL_TOKENS
     tok = Tokenizer(BPE(unk_token=None))
@@ -54,7 +54,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train a byte-level BPE tokenizer on --dataset_dir")
     p.add_argument("--dataset_dir", type=str, default="./datasets")
     p.add_argument("--output", type=str, default="./SmaulNative/tokenizer.json")
-    p.add_argument("--vocab_size", type=int, default=131072)
+    p.add_argument("--vocab_size", type=int, default=65536)
     p.add_argument("--min_frequency", type=int, default=2)
     return p.parse_args()
 
