@@ -19,7 +19,7 @@ from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDat
 from tokenizer import train_tokenizer
 import qat
 
-DEFAULT_TARGET_PARAMS = 268_435_456
+DEFAULT_TARGET_PARAMS = 256_000_000
 STOP_REQUESTED = False
 
 
