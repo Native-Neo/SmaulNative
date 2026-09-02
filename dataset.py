@@ -123,12 +123,12 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                             yield "\n".join(doc), str(path), record + 1
             elif suffix in PLAIN_TEXT_SUFFIXES:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    for i, line in enumerate(f):
-                        if i < start_idx:
-                            continue
-                        line = line.strip()
-                        if line:
-                            yield line, str(path), i + 1
+                    content = f.read().strip()
+                if content:
+                    record = 0
+                    if str(path) == resume_file:
+                        record = start_idx
+                    yield content, str(path), record + 1
             elif suffix == ".jsonl":
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f):
