@@ -239,6 +239,8 @@ def parse_args():
     p.add_argument("--qat", action="store_true")
     p.add_argument("--qat_calib_batches", type=int, default=64)
     p.add_argument("--qat_export_dir", type=str, default=None)
+    p.add_argument("--compile", action="store_true",
+                    help="torch.compile(model) for faster training (PyTorch 2.0+, ~2-5x on CPU)")
     args = p.parse_args()
     if args.target_params <= 0:
         p.error("--target_params must be > 0")
@@ -289,10 +291,14 @@ def main():
     if args.qat:
         n = qat.prepare_qat(model)
         print(f"[QAT] fake-quantizing {n} Channel-Mix linear(s); calibrating on {args.qat_calib_batches} batches from {args.dataset_dir} ...")
+        model.to(device)
         calib_files = discover_files(Path(args.dataset_dir))
         calib_texts = (text for text, _path, _idx in iter_texts(calib_files))
         done = qat.calibrate(model, tokenizer, calib_texts, args.ctx_len, device, max_batches=args.qat_calib_batches)
         print(f"[QAT] calibrated on {done} batches")
+    if args.compile:
+        print("[INIT] compiling model via torch.compile ...")
+        model = torch.compile(model)
     opt_cls = Lion if args.optimizer == "lion" else torch.optim.AdamW
     optimizer = opt_cls(model.parameters(), lr=args.learning_rate)
     checkpoint_dir = Path(args.checkpoint_dir)
