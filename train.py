@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX") # Delete this if you have a CPU Newer than or is Haswell Generation of Intel 4th gen an onwards
 import shutil
 import signal
 import time
