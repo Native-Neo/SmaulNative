@@ -164,15 +164,34 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
             elif suffix == ".parquet":
                 import pyarrow.parquet as pq
                 pf = pq.ParquetFile(path)
+                # Find a recognized text column to allow fast direct column access,
+                # avoiding to_pylist() which reconstructs every row as a full Python dict.
+                schema_names = pf.schema_arrow.names
+                schema_lower = [c.lower() for c in schema_names]
+                fast_col = None
+                for cand in TEXT_KEYS:
+                    if cand in schema_lower:
+                        fast_col = schema_names[schema_lower.index(cand)]
+                        break
                 i = -1
                 for batch in pf.iter_batches(batch_size=1024):
-                    for row in batch.to_pylist():
-                        i += 1
-                        if i < start_idx:
-                            continue
-                        text = extract_text(row, str(path)).strip()
-                        if text:
-                            yield text, str(path), i + 1
+                    if fast_col is not None:
+                        col = batch.column(fast_col)
+                        for row_idx in range(batch.num_rows):
+                            i += 1
+                            if i < start_idx:
+                                continue
+                            val = col[row_idx].as_py()
+                            if isinstance(val, str) and val.strip():
+                                yield val.strip(), str(path), i + 1
+                    else:
+                        for row in batch.to_pylist():
+                            i += 1
+                            if i < start_idx:
+                                continue
+                            text = extract_text(row, str(path)).strip()
+                            if text:
+                                yield text, str(path), i + 1
         except Exception as e:
             print(f"[WARN] skipping {path}: {e}")
 

@@ -8,7 +8,23 @@ _EXT = None
 
 
 def configure(threads=None):
-    threads = threads or int(os.environ.get("SMAUL_CPU_THREADS", min(os.cpu_count() or 1, 4)))
+    # i3-3220: 2 physical cores, 4 HW threads. Using all 4 causes severe oversubscription
+    # with PyTorch/MKL's own internal threading (measured 8x SLOWER than 2 threads on this CPU).
+    # Default to physical core count (2). Override with SMAUL_CPU_THREADS.
+    if threads is None:
+        env_val = os.environ.get("SMAUL_CPU_THREADS")
+        if env_val:
+            threads = int(env_val)
+        else:
+            import subprocess
+            try:
+                cores = int(subprocess.check_output(
+                    ["nproc", "--all"], text=True
+                ).strip())
+                # Use physical cores: for HyperThreaded CPUs, logical/2
+                threads = max(1, cores // 2)
+            except Exception:
+                threads = min(os.cpu_count() or 1, 2)
     threads = max(1, threads)
     os.environ.setdefault("OMP_NUM_THREADS", str(threads))
     os.environ.setdefault("MKL_NUM_THREADS", str(threads))
@@ -29,7 +45,7 @@ def _load():
     _EXT = load(
         name="smaulnative_cpu",
         sources=[str(root / "cpu_kernels.cpp")],
-        extra_cflags=["-O3", "-march=native"],
+        extra_cflags=["-O3", "-march=native", "-mavx"],
         verbose=False,
     )
     return _EXT

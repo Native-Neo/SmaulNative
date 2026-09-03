@@ -11,8 +11,9 @@ _cpu_dir = str(Path(__file__).resolve().parent)
 if _cpu_dir not in sys.path:
     sys.path.insert(0, _cpu_dir)
 
-os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("SMAUL_CPU_THREADS", str(min(os.cpu_count() or 1, 4))))
-os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
+_default_threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
+os.environ.setdefault("OMP_NUM_THREADS", _default_threads)
+os.environ.setdefault("MKL_NUM_THREADS", _default_threads)
 
 import torch
 import train
