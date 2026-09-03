@@ -5,7 +5,7 @@ The CPU path adds a fused C++ Lion update and a faster pretraining loop. The ker
 Use the optimized trainer with:
 
 ```bash
-python cpu_train.py --mode pretrain --dataset_dir ./datasets --output_dir ./SmaulNative --checkpoint_dir ./SmaulNative --tokenizer_path ./SmaulNative/tokenizer.json --optimizer lion
+python cpu/cpu_train.py --mode pretrain --dataset_dir ./datasets --output_dir ./SmaulNative --checkpoint_dir ./SmaulNative --tokenizer_path ./SmaulNative/tokenizer.json --optimizer lion
 ```
 
 `SMAUL_CPU_THREADS` controls PyTorch/OpenMP CPU parallelism. On a 2-core/4-thread Ivy Bridge CPU, start with `SMAUL_CPU_THREADS=4`; benchmark 2 vs 4 if needed.
@@ -13,7 +13,7 @@ python cpu_train.py --mode pretrain --dataset_dir ./datasets --output_dir ./Smau
 For a kernel-only test:
 
 ```bash
-python benchmark_cpu.py --threads 4
+python cpu/benchmark_cpu.py --threads 4
 ```
 
 The normal `train.py` remains unchanged. `cpu_train.py` swaps in the native Lion optimizer and removes the unnecessary batch tensor stack for batch size 1. Existing checkpoints and optimizer state remain compatible because the native optimizer uses the same Lion state and update equations.
