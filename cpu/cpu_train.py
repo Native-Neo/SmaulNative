@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 import os
+import sys
+from pathlib import Path
+
+_repo_root = str(Path(__file__).resolve().parent.parent)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+_cpu_dir = str(Path(__file__).resolve().parent)
+if _cpu_dir not in sys.path:
+    sys.path.insert(0, _cpu_dir)
 
 os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("SMAUL_CPU_THREADS", str(min(os.cpu_count() or 1, 4))))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ["OMP_NUM_THREADS"])
 
 import torch
 import train
-from cpu_backend import NativeLion, configure
+try:
+    from cpu_backend import NativeLion, configure
+except ImportError:
+    from cpu.cpu_backend import NativeLion, configure
 
 threads = configure()
 train.Lion = NativeLion
