@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX") # Delete this if you have a CPU Newer than or is Haswell Generation of Intel 4th gen an onwards
 import shutil
 import signal
 import time
@@ -19,7 +20,7 @@ from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDat
 from tokenizer import train_tokenizer
 import qat
 
-DEFAULT_TARGET_PARAMS = 268_435_456
+DEFAULT_TARGET_PARAMS = 256_000_000
 STOP_REQUESTED = False
 
 
@@ -219,7 +220,7 @@ def parse_args():
     p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
     p.add_argument("--dataset_dir", type=str, default="./datasets")
     p.add_argument("--output_dir", type=str, default="./SmaulNative")
-    p.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
+    p.add_argument("--checkpoint_dir", type=str, default="./SmaulNative")
     p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json")
     p.add_argument("--tokenizer_vocab_size", type=int, default=65536)
     p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS)
@@ -238,6 +239,8 @@ def parse_args():
     p.add_argument("--qat", action="store_true")
     p.add_argument("--qat_calib_batches", type=int, default=64)
     p.add_argument("--qat_export_dir", type=str, default=None)
+    p.add_argument("--compile", action="store_true",
+                    help="torch.compile(model) for faster training (PyTorch 2.0+, ~2-5x on CPU)")
     args = p.parse_args()
     if args.target_params <= 0:
         p.error("--target_params must be > 0")
@@ -288,10 +291,14 @@ def main():
     if args.qat:
         n = qat.prepare_qat(model)
         print(f"[QAT] fake-quantizing {n} Channel-Mix linear(s); calibrating on {args.qat_calib_batches} batches from {args.dataset_dir} ...")
+        model.to(device)
         calib_files = discover_files(Path(args.dataset_dir))
         calib_texts = (text for text, _path, _idx in iter_texts(calib_files))
         done = qat.calibrate(model, tokenizer, calib_texts, args.ctx_len, device, max_batches=args.qat_calib_batches)
         print(f"[QAT] calibrated on {done} batches")
+    if args.compile:
+        print("[INIT] compiling model via torch.compile ...")
+        model = torch.compile(model)
     opt_cls = Lion if args.optimizer == "lion" else torch.optim.AdamW
     optimizer = opt_cls(model.parameters(), lr=args.learning_rate)
     checkpoint_dir = Path(args.checkpoint_dir)
