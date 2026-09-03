@@ -53,7 +53,8 @@ python download.py
 python tokenizer.py --dataset_dir ./datasets --output ./SmaulNative/tokenizer.json --vocab_size 32768
 
 # 3. Pretraining
-python train.py --mode pretrain --dataset_dir ./datasets --output_dir ./SmaulNative --ctx_len 256
+python train.py --mode pretrain --dataset_dir ./datasets --output_dir ./SmaulNative --ctx_len 256 \
+    --tokenizer_path ./SmaulNative/tokenizer.json
 
 # 4. Supervised Fine-Tuning (SFT) + 3-bit QAT
 python train.py --mode sft --dataset_dir ./datasets --output_dir ./SmaulNative-SFT \
