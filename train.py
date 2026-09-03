@@ -14,8 +14,7 @@ from typing import Optional
 import torch
 from torch.optim import Optimizer
 
-from rwkv_x_core import RWKVXModel, config_for_target_params
-from router_utils import set_router_only_training
+from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, config_for_target_params
 from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDataset, iter_texts, discover_files
 from tokenizer import train_tokenizer
 import qat
@@ -63,6 +62,25 @@ class Lion(Optimizer):
             torch._foreach_add_(params, torch._foreach_sign(updates), alpha=-lr)
             torch._foreach_lerp_(avgs, grads, 1.0 - beta2)
         return loss
+
+
+def set_router_only_training(model: RWKVXModel, router_only: bool) -> int:
+    """When router_only=True, freezes every parameter except each RWKV_CMix_MoE's router.
+    Since frozen params (requires_grad=False) never get a gradient tensor allocated, this also
+    meaningfully cuts training memory versus fine-tuning the whole model."""
+    if not model.cfg.is_moe:
+        raise ValueError("set_router_only_training requires an MoE model (cfg.is_moe=True); "
+                         "this checkpoint has no router -- did you mean to point --output_dir "
+                         "at a merge_moe.py output instead?")
+
+    router_params = {id(p) for module in model.modules() if isinstance(module, RWKV_CMix_MoE)
+                     for p in module.gate.parameters()}
+    n_trainable = 0
+    for p in model.parameters():
+        p.requires_grad_(id(p) in router_params if router_only else True)
+        if p.requires_grad:
+            n_trainable += p.numel()
+    return n_trainable
 
 
 class ResumeState:
