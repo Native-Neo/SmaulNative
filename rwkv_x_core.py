@@ -27,13 +27,6 @@ class RWKVXConfig:
     dropout: float = 0.0
     head_size_divisor: int = 8
     ctx_len_hint: int = 1024       # training BPTT window; does NOT cap inference (state is O(1)/token)
-    # Gradient checkpointing for the RWKV-7 WKV recurrence: the per-timestep loop retains a
-    # (B,H,N,N) state tensor for every timestep for backprop, which dominates training memory
-    # (roughly linear in ctx_len * n_rwkv_layers). Chunking + checkpointing bounds that to
-    # O(wkv_chunk_size) per layer at the cost of recomputing each chunk's forward once more
-    # during backward. Only applies during training with grad enabled -- eval/inference (or
-    # calibration under no_grad) always runs the plain, un-checkpointed loop. Set to >= ctx_len
-    # to effectively disable chunking (one chunk == the old behavior, still checkpointed).
     wkv_chunk_size: int = 64
     # MoE (only used by merge_moe.py output / MoE-upcycled checkpoints)
     is_moe: bool = False
@@ -63,7 +56,7 @@ class RWKVXConfig:
 
 
 def config_for_target_params(target_params: int, vocab_size: int = 65530,
-                              n_embd: int = 768, n_moba_layer: int = 3,
+                              n_embd: int = 832, n_moba_layer: int = 5,
                               head_size: int = 64) -> RWKVXConfig:
     """Search n_layer to hit ~target_params at a fixed n_embd (matches upstream's own
     L12-D768 / L24-D1024 style sizing convention, just solved for a target instead of
