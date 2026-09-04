@@ -6,6 +6,8 @@ CPU utilization (wall-clock estimate), peak RAM.
 
 Usage:
     python cpu/benchmark_full.py [--ctx_len 512] [--steps 3] [--threads 2]
+
+Compilation is enabled by default. Pass --no-compile to measure eager PyTorch.
 """
 import argparse
 import os
@@ -25,7 +27,8 @@ p = argparse.ArgumentParser()
 p.add_argument("--ctx_len", type=int, default=512)
 p.add_argument("--steps", type=int, default=3)
 p.add_argument("--threads", type=int, default=None)
-p.add_argument("--compile", action="store_true")
+p.add_argument("--compile", dest="compile", action="store_true", default=True)
+p.add_argument("--no-compile", dest="compile", action="store_false")
 args = p.parse_args()
 
 _default_threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
@@ -39,6 +42,8 @@ from rwkv_x_core import RWKVXConfig, RWKVXModel
 
 threads = configure(args.threads)
 torch.manual_seed(42)
+
+torch.set_float32_matmul_precision("high")
 
 cfg = RWKVXConfig(
     vocab_size=65536, n_embd=832, n_layer=17, head_size=64,
@@ -86,7 +91,7 @@ for step in range(args.steps):
 
     total = t_fwd + t_bwd + t_opt
     tps = tok_per_step / total
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # MB
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     results.append((t_fwd, t_bwd, t_opt, total, tps, rss))
     print(f"  step {step+1}/{args.steps}: fwd={t_fwd:.2f}s  bwd={t_bwd:.2f}s  opt={t_opt:.3f}s  total={total:.2f}s  {tps:.1f} tok/s  RAM={rss:.0f}MB")
 
