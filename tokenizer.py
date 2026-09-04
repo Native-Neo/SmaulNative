@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# tokenizer.py -- trains a byte-level BPE tokenizer on --dataset_dir, saves one tokenizer.json
-# (vocab+merges+special tokens in one file). train.py auto-runs this if tokenizer.json is missing.
+# tokenizer.py -- trains byte-level BPE tokenizer, saves tokenizer.json.
+# train.py auto-runs this if tokenizer.json is missing.
 import argparse
 from pathlib import Path
 from typing import Iterator, List
@@ -12,9 +12,7 @@ from tokenizers.processors import ByteLevel as ByteLevelProcessor
 from tokenizers.trainers import BpeTrainer
 from dataset import discover_files, iter_texts
 
-# <pad>/<eos> are required by dataset.py's TokenizerWrapper. <bos>/<unk> are reserved here
-# so they exist in the vocab for future use (e.g. prepending <bos>, or switching pre-tokenizers
-# later); byte-level BPE itself never needs <unk> since every byte is representable.
+# pad/eos required by TokenizerWrapper; bos/unk reserved for future use
 SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
 
 
