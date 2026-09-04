@@ -1,4 +1,4 @@
-# dataset.py -- recursive multi-format (txt/jsonl/json/csv/parquet/source) dataset loader, pretrain + SFT.
+# dataset.py -- multi-format dataset loader, pretrain + SFT.
 
 import csv
 import json
@@ -164,8 +164,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
             elif suffix == ".parquet":
                 import pyarrow.parquet as pq
                 pf = pq.ParquetFile(path)
-                # Find a recognized text column to allow fast direct column access,
-                # avoiding to_pylist() which reconstructs every row as a full Python dict.
+                # direct column access, avoids to_pylist() row overhead
                 schema_names = pf.schema_arrow.names
                 schema_lower = [c.lower() for c in schema_names]
                 fast_col = None
