@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# merge_moe.py -- merges N RWKV-X checkpoints into one Channel-Mix MoE model (each branch's FFN
-# becomes an expert; everything else shared from base) and unions their tokenizers (base ids kept,
-# no duplicate tokens/merges, embeddings resized if vocab grows). Own MoE extension, not upstream RWKV-X.
+# merge_moe.py -- merges N checkpoints into one Channel-Mix MoE model.
+# Each branch's FFN becomes an expert, rest shared from base.
+# Unions tokenizers, resizes embeddings if vocab grows.
 import argparse
 import json
 from pathlib import Path
@@ -155,8 +155,7 @@ def merge_tokenizers(base_dir: Path, branch_dirs: List[Path]) -> Tuple[dict, int
 
     merged_merges = _union_merges(tokenizers)
 
-    # Every merge operand must exist in the merged vocabulary. Otherwise the tokenizer
-    # contains a rule that can never be applied correctly.
+    # every merge operand must exist in merged vocab
     for m in merged_merges:
         left, right = _merge_key(m)
         if left not in merged_vocab or right not in merged_vocab:
@@ -234,7 +233,7 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     prefixes = cmix_prefixes(base_cfg)
     expected_expert_keys = {"key.weight", "value.weight"}
 
-    # 1) copy every non-ffn tensor straight from base, resizing emb/head if vocab grew
+    # 1) copy non-ffn tensors from base, resize emb/head if grown
     ffn_marker = ".ffn."
     for k, v in base_sd.items():
         if ffn_marker in k:
@@ -247,7 +246,7 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
             raise ValueError(f"shared tensor {k} shape mismatch: branch={tuple(v.shape)}, model={tuple(out_sd[k].shape)}")
         out_sd[k] = v
 
-    # 2) fill experts from each branch. Every expected expert must provide the complete FFN.
+    # 2) fill experts, each must supply the complete FFN
     for prefix in prefixes:
         e_id = 0
         for bd, cfg, sd in branches:
