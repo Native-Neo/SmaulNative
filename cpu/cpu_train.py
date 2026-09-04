@@ -11,9 +11,15 @@ _cpu_dir = str(Path(__file__).resolve().parent)
 if _cpu_dir not in sys.path:
     sys.path.insert(0, _cpu_dir)
 
+# This backend targets small CPU-only machines. Keep BLAS/OpenMP from creating a
+# second layer of oversubscription, and let Inductor use its C++ wrapper/autotuning
+# path automatically when torch.compile is available.
 _default_threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
 os.environ.setdefault("OMP_NUM_THREADS", _default_threads)
 os.environ.setdefault("MKL_NUM_THREADS", _default_threads)
+os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
+os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
+os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
 
 if "--no-compile" in sys.argv:
     sys.argv.remove("--no-compile")
@@ -24,6 +30,15 @@ else:
 import torch
 import train
 import rwkv_x_core
+
+# Match the physical-core-oriented BLAS/OpenMP configuration at the PyTorch level too.
+# Inter-op parallelism stays at one so it does not compete with intra-op kernels.
+threads = int(_default_threads)
+torch.set_num_threads(threads)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass
 
 # TorchScript lowers the recurrent timestep loop into a native Torch graph instead of
 # dispatching each timestep through the Python interpreter. torch.compile can then compile
@@ -39,7 +54,7 @@ try:
 except ImportError:
     from cpu.cpu_backend import NativeLion, configure
 
-threads = configure()
+configure()
 train.Lion = NativeLion
 
 _original_save_checkpoint = train.save_checkpoint
