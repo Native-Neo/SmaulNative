@@ -26,7 +26,7 @@ class RWKVXConfig:
     moba_topk: int = 4
     dropout: float = 0.0
     head_size_divisor: int = 8
-    ctx_len_hint: int = 1024       # train BPTT window; doesn't cap inference
+    ctx_len_hint: int = 2048       # train BPTT window; doesn't cap inference
     wkv_chunk_size: int = 64
     # MoE (only used by merge_moe.py output)
     is_moe: bool = False
