@@ -33,7 +33,17 @@ except ImportError:
 threads = configure()
 train.Lion = NativeLion
 
-_old_pretrain = train.train_pretrain
+# torch.compile returns an OptimizedModule wrapper. Save the original RWKV-X module so
+# checkpoints retain the normal save_pretrained format instead of compiled wrapper keys.
+_original_save_checkpoint = train.save_checkpoint
+
+
+def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path):
+    raw_model = getattr(model, "_orig_mod", model)
+    return _original_save_checkpoint(raw_model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path)
+
+
+train.save_checkpoint = save_checkpoint
 
 
 def train_pretrain(args, model, optimizer, resume, device, tokenizer):
