@@ -85,7 +85,7 @@ def gen_quadratic_equation() -> Dict[str, str]:
     root1 = random.randint(-100, 100)
     root2 = random.randint(-100, 100)
     
-    # (x - root1)(x - root2) = x^2 - (root1 + root2)x + (root1 * root2)
+    # b,c derived so roots are exactly root1, root2
     b = -a * (root1 + root2)
     c = a * (root1 * root2)
     
@@ -140,9 +140,7 @@ def gen_system_linear_equations() -> Dict[str, str]:
     return {"instruction": prompt, "response": response, "think": think, "domain": "math_system_linear"}
 
 
-# One quicksort snippet per language -- previously the prompt named a random language (incl.
-# C++/Rust) but the code block always emitted Python or JS regardless, so ~half the samples had
-# a prompt/response mismatch. Fenced language tag now always matches the emitted code.
+# fenced language tag must match the emitted code
 _QUICKSORT_BY_LANG = {
     "Python": (
         "def quick_sort(arr: list[int]) -> list[int]:\n"
@@ -222,9 +220,7 @@ def gen_sorting_algorithm_code() -> Dict[str, str]:
     return {"instruction": prompt, "response": response, "think": think, "domain": "code_algorithms"}
 
 
-# Previously this always emitted the same Python stack body no matter which of six data
-# structures or three languages the prompt named -- a Java/BST prompt would get Python stack
-# code. Restricted to {Stack, Queue} x {Python, C++, Java}, each with a real, matching body.
+# {Stack,Queue} x {Python,C++,Java}, each real matching body
 _DS_TEMPLATES = {
     ("Stack", "Python"): (
         "class Stack:\n"
