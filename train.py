@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# train.py -- single entrypoint for RWKV-X pretrain + SFT.
+# train.py -- single entrypoint, pretrain + SFT.
 
 import argparse
+import contextlib
 import json
 import os
 os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX") # Delete this if you have a CPU Newer than or is Haswell Generation of Intel 4th gen an onwards
@@ -145,11 +146,13 @@ def _load_rng_state(path: Path):
 
 
 def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState,
-                    output_dir: Path, checkpoint_dir: Path, tokenizer_path: Path):
+                    output_dir: Path, checkpoint_dir: Path, tokenizer_path: Path,
+                    save_dtype: str = "fp32"):
     print("\n[SAVE] Saving checkpoint...")
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(output_dir)
+    # optimizer.pt stays fp32, momentum needs full precision
+    model.save_pretrained(output_dir, dtype=save_dtype)
     bundled_tok = output_dir / "tokenizer.json"
     if tokenizer_path.resolve() != bundled_tok.resolve():
         shutil.copy2(tokenizer_path, bundled_tok)
@@ -159,6 +162,27 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
     resume.save(checkpoint_dir / "resume_state.json")
     _save_rng_state(checkpoint_dir / "rng_state.pt")
     print(f"[SAVE COMPLETE] model -> {output_dir}, optimizer/resume -> {checkpoint_dir}\n")
+
+
+def _autocast(args):
+    # bf16 only: CPU autocast has no fp16 kernels
+    if args.precision == "bf16":
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def _optimizer_step(args, model, optimizer, xb, yb):
+    """One fwd/bwd/step. Returns loss tensor, or None if skipped."""
+    optimizer.zero_grad(set_to_none=True)
+    with _autocast(args):
+        _, loss, _ = model(xb, labels=yb)
+    if not torch.isfinite(loss):
+        print(f"[WARN] non-finite loss {loss.item()}, skipping step")
+        return None
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    return loss
 
 
 def train_pretrain(args, model, optimizer, resume, device, tokenizer):
@@ -178,15 +202,10 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
             continue
         xb = torch.stack(batch_x).to(device)
         yb = torch.stack(batch_y).to(device)
-        optimizer.zero_grad(set_to_none=True)
-        _, loss, _ = model(xb, labels=yb)
-        if not torch.isfinite(loss):
-            print(f"[WARN] non-finite loss {loss.item()}, skipping step")
+        loss = _optimizer_step(args, model, optimizer, xb, yb)
+        if loss is None:
             batch_x, batch_y = [], []
             continue
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
         resume.global_step += 1
         resume.total_tokens += xb.numel()
         resume.file_path, resume.record_index = pos
@@ -199,7 +218,7 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
             tok_since = 0
         batch_x, batch_y = [], []
         if resume.global_step % args.save_every == 0:
-            save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path))
+            save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), save_dtype=args.save_dtype)
         if STOP_REQUESTED:
             break
 
@@ -211,21 +230,16 @@ def train_sft(args, model, optimizer, resume, device, tokenizer):
     for epoch in range(resume.epoch, args.epochs):
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            _, loss, _ = model(xb, labels=yb)
-            if not torch.isfinite(loss):
-                print(f"[WARN] non-finite loss {loss.item()}, skipping step")
+            loss = _optimizer_step(args, model, optimizer, xb, yb)
+            if loss is None:
                 continue
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
             resume.global_step += 1
             resume.total_tokens += xb.numel()
             if resume.global_step % args.log_every == 0:
                 print(f"epoch {epoch} step {resume.global_step} | loss {loss.item():.4f}")
             if resume.global_step % args.save_every == 0:
                 resume.epoch = epoch
-                save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path))
+                save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), save_dtype=args.save_dtype)
             if STOP_REQUESTED:
                 break
         if STOP_REQUESTED:
@@ -243,9 +257,17 @@ def parse_args():
     p.add_argument("--tokenizer_vocab_size", type=int, default=65536)
     p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS)
     p.add_argument("--n_embd", type=int, default=832)
+    p.add_argument("--n_layer", type=int, default=None,
+                    help="pin block count directly, skips the --target_params search entirely")
     p.add_argument("--head_size", type=int, default=64)
     p.add_argument("--n_moba_layer", type=int, default=5)
     p.add_argument("--ctx_len", type=int, default=512)
+    p.add_argument("--precision", choices=["fp32", "bf16"], default="fp32",
+                    help="autocast dtype for forward/backward. fp16 not offered -- torch CPU "
+                         "autocast only implements bf16 kernels. Master weights/optimizer stay fp32.")
+    p.add_argument("--save_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
+                    help="cast weights to this dtype in the saved model.safetensors only "
+                         "(optimizer.pt stays fp32 for resume). Halves checkpoint size for fp16/bf16.")
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--learning_rate", type=float, default=1e-4)
@@ -275,12 +297,19 @@ def build_model(args, tokenizer) -> RWKVXModel:
         print(f"[RESUME] loading model from {output_dir}")
         return RWKVXModel.from_pretrained(output_dir)
     print("[INIT] creating new model")
-    cfg = config_for_target_params(args.target_params, vocab_size=tokenizer_vocab_size(tokenizer),
-                                    n_embd=args.n_embd, n_moba_layer=args.n_moba_layer,
-                                    head_size=args.head_size)
-    actual_params = cfg.approx_param_count()
-    if abs(actual_params - args.target_params) / args.target_params > 0.10:
-        raise ValueError(f"requested {args.target_params:,} params, closest supported architecture is {actual_params:,} ({abs(actual_params - args.target_params) / args.target_params:.1%} away)")
+    if args.n_layer is not None:
+        # n_layer pinned directly, skip target_params search
+        from rwkv_x_core import RWKVXConfig
+        cfg = RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd,
+                           n_layer=args.n_layer, n_moba_layer=args.n_moba_layer,
+                           head_size=args.head_size)
+    else:
+        cfg = config_for_target_params(args.target_params, vocab_size=tokenizer_vocab_size(tokenizer),
+                                        n_embd=args.n_embd, n_moba_layer=args.n_moba_layer,
+                                        head_size=args.head_size)
+        actual_params = cfg.approx_param_count()
+        if abs(actual_params - args.target_params) / args.target_params > 0.10:
+            raise ValueError(f"requested {args.target_params:,} params, closest supported architecture is {actual_params:,} ({abs(actual_params - args.target_params) / args.target_params:.1%} away)")
     cfg.ctx_len_hint = args.ctx_len
     model = RWKVXModel(cfg)
     print(f"[MODEL] n_layer={cfg.n_layer} n_embd={cfg.n_embd} n_moba_layer={cfg.n_moba_layer} vocab_size={cfg.vocab_size} -> {model.num_parameters()/1e6:.1f}M params")
@@ -339,7 +368,7 @@ def main():
         else:
             train_sft(args, model, optimizer, resume, device, tokenizer)
     finally:
-        save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path)
+        save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path, save_dtype=args.save_dtype)
     if args.qat and args.qat_export_dir:
         import copy
         print(f"[QAT] converting to real packed int3 weights -> {args.qat_export_dir}")
