@@ -19,16 +19,15 @@ import torch.utils.checkpoint
 class RWKVXConfig:
     vocab_size: int = 65530
     n_embd: int = 832
-    n_layer: int = 20              # total RWKV-7 blocks
+    n_layer: int = 20
     head_size: int = 64
-    n_moba_layer: int = 5          # how many blocks become MOBA instead
+    n_moba_layer: int = 5
     moba_chunk_size: int = 512
     moba_topk: int = 4
     dropout: float = 0.0
     head_size_divisor: int = 8
-    ctx_len_hint: int = 2048       # train BPTT window; doesn't cap inference
+    ctx_len_hint: int = 2048
     wkv_chunk_size: int = 64
-    # MoE (only used by merge_moe.py output)
     is_moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
@@ -42,14 +41,14 @@ class RWKVXConfig:
 
     def approx_param_count(self) -> int:
         C, V, L = self.n_embd, self.vocab_size, self.n_layer
-        emb_head = 2 * V * C  # emb + head, not tied
+        emb_head = 2 * V * C
         d_decay = max(32, round(1.8 * (C ** 0.5) / 32) * 32)
         d_aaa = d_decay
         d_mv = max(32, round(1.3 * (C ** 0.5) / 32) * 32)
         d_gate = max(32, round(0.6 * (C ** 0.8) / 32) * 32)
         tmix = 4 * C * C + C * (2 * d_decay + 2 * d_aaa + 2 * d_mv + 2 * d_gate)
         cmix = 8 * C * C
-        moba_att = 4 * C * C  # same 4 projections as RWKV attn
+        moba_att = 4 * C * C
         rwkv_layers = (L - self.n_moba_layer) * (tmix + cmix)
         moba_layers = self.n_moba_layer * (moba_att + cmix)
         return emb_head + rwkv_layers + moba_layers
@@ -58,7 +57,6 @@ class RWKVXConfig:
 def config_for_target_params(target_params: int, vocab_size: int = 65530,
                               n_embd: int = 832, n_moba_layer: int = 5,
                               head_size: int = 64) -> RWKVXConfig:
-    """Search n_layer to hit target_params at fixed n_embd."""
     if n_embd % head_size != 0:
         raise ValueError(f"n_embd ({n_embd}) must be divisible by head_size ({head_size})")
     best = None
@@ -71,18 +69,17 @@ def config_for_target_params(target_params: int, vocab_size: int = 65530,
     return best[1]
 
 
-# RWKV-7 TimeMix (pure PyTorch, CPU-safe, differentiable)
+# RWKV-7 TimeMix
 
 def _wkv_run_chunk(state: torch.Tensor, w_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor,
                     kk_c: torch.Tensor, a_c: torch.Tensor, r_c: torch.Tensor
                     ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Runs WKV recurrence over one chunk. Checkpointed for backward.
-    state: (B,H,N,N) fp32. w_c/k_c/v_c/kk_c/a_c/r_c: (B, Tc, H, N).
-    Returns (final_state, y_chunk), y_chunk is (B, Tc, H, N).
-
-    state@ab, ab=outer(-kk,kk*a), rewritten as (state@u)@v. ~1.46x faster.
-    """
+    """Runs one WKV chunk."""
     Tc = w_c.shape[1]
+    k_c = k_c.float()
+    v_c = v_c.float()
+    kk_c = kk_c.float()
+    a_c = a_c.float()
     ys = []
     for t in range(Tc):
         w_t = w_c[:, t]
@@ -92,16 +89,23 @@ def _wkv_run_chunk(state: torch.Tensor, w_c: torch.Tensor, k_c: torch.Tensor, v_
         a_t = a_c[:, t]
         r_t = r_c[:, t]
 
-        # ab = outer(-kk, kk*a), state@ab = (state@u)@v
-        # u=(B,H,N,1), v=(B,H,1,N)
-        u = (-kk_t).unsqueeze(-1).float()                            # (B,H,N,1)
-        v = (kk_t * a_t).unsqueeze(-2).float()                       # (B,H,1,N)
-        vk = v_t.unsqueeze(-1).float() @ k_t.unsqueeze(-2).float()   # (B,H,N,N)
-        state = state * w_t.unsqueeze(-2) + (state @ u) @ v + vk
-        y_t = (state.to(dtype=r_t.dtype) @ r_t.unsqueeze(-1)).squeeze(-1)  # (B,H,N)
+        u = (-kk_t).unsqueeze(-1)
+        v = (kk_t * a_t).unsqueeze(-2)
+        state = state * w_t.unsqueeze(-2) + torch.bmm(
+            torch.bmm(state.reshape(-1, state.shape[-2], state.shape[-1]), u.reshape(-1, state.shape[-2], 1)),
+            v.reshape(-1, 1, state.shape[-1])
+        ).reshape_as(state) + torch.bmm(
+            v_t.unsqueeze(-1).reshape(-1, state.shape[-1], 1),
+            k_t.unsqueeze(-2).reshape(-1, 1, state.shape[-1])
+        ).reshape_as(state)
+        y_t = torch.bmm(
+            state.reshape(-1, state.shape[-2], state.shape[-1]),
+            r_t.unsqueeze(-1).reshape(-1, state.shape[-1], 1)
+        ).reshape(r_t.shape)
+        if y_t.dtype != r_t.dtype:
+            y_t = y_t.to(r_t.dtype)
         ys.append(y_t)
-    y_chunk = torch.stack(ys, dim=1)
-    return state, y_chunk
+    return state, torch.stack(ys, dim=1)
 
 
 class RWKV_Tmix_x070(nn.Module):
@@ -177,13 +181,6 @@ class RWKV_Tmix_x070(nn.Module):
             self.output.weight.data.zero_()
 
     def forward(self, x: torch.Tensor, v_first: torch.Tensor, state: Optional[torch.Tensor] = None):
-        """
-        x: (B, T, C)
-        v_first: (B, T, C) -- passthrough of layer-0's v, per upstream's value-residual trick
-        state: optional (B, H, N, N) recurrent state to continue from (for streaming/unlimited-context
-               inference or truncated-BPTT training across chunks). None -> starts at zero.
-        returns: y (B,T,C), v_first (B,T,C), new_state (B,H,N,N)
-        """
         B, T, C = x.shape
         H, N = self.n_head, self.head_size
 
@@ -220,8 +217,6 @@ class RWKV_Tmix_x070(nn.Module):
         kk = k * self.k_k
         kk = F.normalize(kk.view(B, T, H, N), dim=-1, p=2.0).view(B, T, C)
         k = k * (1 + (a - 1) * self.k_a)
-
-        # decay, verified equal to real training-kernel formula
         w = torch.exp(-0.606531 * torch.sigmoid((self.w0 + g_).float()))
 
         r_ = r.view(B, T, H, N)
@@ -236,7 +231,6 @@ class RWKV_Tmix_x070(nn.Module):
         else:
             state = state.to(dtype=torch.float32)
 
-        # checkpoint only helps under training + grad enabled
         use_checkpoint = self.training and torch.is_grad_enabled()
         chunk_size = max(1, self.cfg.wkv_chunk_size) if use_checkpoint else T
 
@@ -255,14 +249,14 @@ class RWKV_Tmix_x070(nn.Module):
             ys_chunks.append(y_c)
             t0 = t1
 
-        xx_out = torch.cat(ys_chunks, dim=1).reshape(B, T, C)                # (B,T,C)
+        xx_out = torch.cat(ys_chunks, dim=1).reshape(B, T, C)
         xx_out = self.ln_x(xx_out.reshape(B * T, C)).reshape(B, T, C)
         xx_out = xx_out + ((r_ * k_ * self.r_k).sum(dim=-1, keepdim=True) * v_).reshape(B, T, C)
         y = self.output(xx_out * g)
         return y, v_first, (state, x[:, -1, :])
 
 
-# RWKV ChannelMix + MoE variant (merge_moe.py output)
+# RWKV ChannelMix + MoE
 
 class RWKV_CMix_x070(nn.Module):
     def __init__(self, cfg: RWKVXConfig, layer_id: int):
@@ -288,8 +282,7 @@ class RWKV_CMix_x070(nn.Module):
 
 
 class RWKV_CMix_MoE(nn.Module):
-    """Top-k routed Channel-Mix, produced by merge_moe.py. Not part of upstream RWKV-X --
-    this is this project's own MoE-upcycling extension, documented as such."""
+    """Top-k routed Channel-Mix."""
     def __init__(self, cfg: RWKVXConfig, layer_id: int):
         super().__init__()
         self.num_experts = cfg.num_experts
@@ -300,20 +293,19 @@ class RWKV_CMix_MoE(nn.Module):
 
     def forward(self, x, x_prev_last: Optional[torch.Tensor] = None):
         B, T, C = x.shape
-        logits = self.gate(x)  # (B,T,E)
+        logits = self.gate(x)
         top_val, top_idx = torch.topk(logits, k=self.top_k, dim=-1)
         top_w = torch.softmax(top_val, dim=-1)
 
-        # speedup: time-shift is expert-independent, computed once
         prev0 = x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros(B, 1, C, dtype=x.dtype, device=x.device)
-        xx = torch.cat([prev0, x[:, :-1, :]], dim=1) - x  # (B,T,C)
+        xx = torch.cat([prev0, x[:, :-1, :]], dim=1) - x
 
         x_flat, xx_flat = x.reshape(B * T, C), xx.reshape(B * T, C)
         idx_flat, w_flat = top_idx.reshape(B * T, self.top_k), top_w.reshape(B * T, self.top_k)
         out_flat = torch.zeros_like(x_flat)
         for e_id, expert in enumerate(self.experts):
-            mask = (idx_flat == e_id)  # (B*T, top_k)
-            sel = mask.any(dim=-1).nonzero(as_tuple=True)[0]  # only routed tokens
+            mask = (idx_flat == e_id)
+            sel = mask.any(dim=-1).nonzero(as_tuple=True)[0]
             if sel.numel() == 0:
                 continue
             k = x_flat.index_select(0, sel) + xx_flat.index_select(0, sel) * expert.x_k.view(-1)
@@ -323,8 +315,7 @@ class RWKV_CMix_MoE(nn.Module):
         return out_flat.view(B, T, C), x[:, -1, :]
 
 
-# MOBA block: CPU uses full causal SDPA, no flash-attn varlen kernel.
-# Correct, just O(T^2) not block-sparse.
+# MOBA block: CPU uses full causal SDPA.
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: RWKVXConfig):
@@ -361,8 +352,6 @@ class MOBABlock(nn.Module):
         self.ffn = RWKV_CMix_x070(cfg, layer_id) if not cfg.is_moe else RWKV_CMix_MoE(cfg, layer_id)
 
     def forward(self, x, cmix_state=None):
-        # checkpoint att+ffn: MOBA's SDPA and FFN kept full
-        # activations for backward. Trades recompute for RAM.
         use_checkpoint = self.training and torch.is_grad_enabled()
         if use_checkpoint:
             att_out = torch.utils.checkpoint.checkpoint(self.att, self.ln1(x), use_reentrant=False)
@@ -393,7 +382,6 @@ class RWKVBlock(nn.Module):
     def forward(self, x, v_first, tmix_state=None, cmix_state=None):
         if self.layer_id == 0:
             x = self.ln0(x)
-        # att already chunk-checkpoints its WKV loop
         xx, v_first, new_tmix_state = self.att(self.ln1(x), v_first, tmix_state)
         x = x + xx
         if self.training and torch.is_grad_enabled():
@@ -415,7 +403,6 @@ class RWKVXModel(nn.Module):
         self.emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout > 0 else None
 
-        # interleave MOBA among RWKV blocks, evenly spaced
         n_moba = cfg.n_moba_layer
         n_rwkv = cfg.n_layer - n_moba
         assert n_rwkv > 0, "n_moba_layer must be < n_layer"
@@ -432,21 +419,14 @@ class RWKVXModel(nn.Module):
             ri += take
             order.append(("moba", m))
         order += [("rwkv", ri + k) for k in range(n_rwkv - ri)]
-        self._order = order  # list of ("rwkv"|"moba", index)
+        self._order = order
 
         self.ln_out = nn.LayerNorm(cfg.n_embd)
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
 
     def forward(self, idx: torch.Tensor, labels: Optional[torch.Tensor] = None,
-                state: Optional[dict] = None, use_cache: bool = False):
-        """
-        idx: (B,T) token ids
-        labels: (B,T) target ids, -100 = ignore (for SFT masking)
-        state: optional dict with 'tmix' (list per rwkv block) and 'cmix' (list per block, any kind)
-               recurrent state to continue from -- this is what gives RWKV its O(1)/token,
-               unlimited-context streaming property. Not used during ordinary truncated-BPTT
-               training unless you explicitly chain chunks.
-        """
+                state: Optional[dict] = None, use_cache: bool = False,
+                return_logits: bool = True):
         B, T = idx.shape
         x = self.emb(idx)
         if self.dropout is not None:
@@ -482,6 +462,8 @@ class RWKVXModel(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
             )
+        if not return_logits:
+            logits = None
 
         new_state = {"tmix": new_tmix_state, "cmix": new_cmix_state} if use_cache else None
         return logits, loss, new_state
@@ -489,10 +471,8 @@ class RWKVXModel(nn.Module):
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    # export state_dict with upstream's key prefixes (rwkv.*/moba.*)
     def upstream_compatible_state_dict(self) -> dict:
         out = {}
-        # rwkv.* blocks only count pure-RWKV blocks, moba is separate
         out["rwkv.emb.weight"] = self.emb.weight
         for i, blk in enumerate(self.rwkv_blocks):
             prefix = f"rwkv.blocks.{i}."
@@ -513,7 +493,6 @@ class RWKVXModel(nn.Module):
         from safetensors.torch import save_file
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        # only downcast floating tensors, leave int/bool buffers alone
         cast = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
         sd = {}
         for k, v in self.state_dict().items():
@@ -523,9 +502,8 @@ class RWKVXModel(nn.Module):
             sd[k] = v
         save_file(sd, str(out_dir / "model.safetensors"))
         self.cfg.save(out_dir / "config.json")
-        # also drop upstream-shaped .pth for the real rwkv-x package
         torch.save({k: v.detach().cpu() for k, v in self.upstream_compatible_state_dict().items()},
-                    out_dir / "rwkvx_upstream_compatible.pth")
+                   out_dir / "rwkvx_upstream_compatible.pth")
 
     @classmethod
     def from_pretrained(cls, in_dir: Path):
