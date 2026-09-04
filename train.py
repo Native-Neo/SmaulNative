@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
-# train.py -- single entrypoint, pretrain + SFT.
+# train.py -- single entrypoint, pretrain + SFT. Pass --cpu for
+# small/old-CPU tuning (thread pinning, native Lion, AVX-only MKL).
 
 import argparse
 import contextlib
 import json
 import os
-os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX") # Delete this if you have a CPU Newer than or is Haswell Generation of Intel 4th gen an onwards
+import sys
+
+# must run before `import torch` -- gated on raw argv since argparse
+# hasn't run yet. Untuned defaults hurt on big/GPU boxes, so --cpu opts in.
+if "--cpu" in sys.argv:
+    _threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
+    os.environ.setdefault("OMP_NUM_THREADS", _threads)
+    os.environ.setdefault("MKL_NUM_THREADS", _threads)
+    os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX")  # pre-Haswell CPUs: delete if AVX2+
+    os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
+    os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
+    os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
+    if "--no-compile" not in sys.argv and "--compile" not in sys.argv:
+        sys.argv.append("--compile")
+
 import shutil
 import signal
 import time
@@ -151,6 +166,7 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
     print("\n[SAVE] Saving checkpoint...")
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    model = getattr(model, "_orig_mod", model)  # unwrap torch.compile wrapper
     # optimizer.pt stays fp32, momentum needs full precision
     model.save_pretrained(output_dir, dtype=save_dtype)
     bundled_tok = output_dir / "tokenizer.json"
@@ -271,7 +287,7 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--learning_rate", type=float, default=1e-4)
-    p.add_argument("--optimizer", choices=["lion", "adamw"], default="lion")
+    p.add_argument("--optimizer", choices=["adafactor", "lion", "adamw"], default="adafactor")
     p.add_argument("--log_every", type=int, default=1)
     p.add_argument("--save_every", type=int, default=5000)
     p.add_argument("--new_data", action="store_true")
@@ -281,6 +297,9 @@ def parse_args():
     p.add_argument("--qat_export_dir", type=str, default=None)
     p.add_argument("--compile", action="store_true",
                     help="torch.compile(model) for faster training (PyTorch 2.0+, ~2-5x on CPU)")
+    p.add_argument("--cpu", action="store_true",
+                    help="small/old-CPU tuning: thread pinning, native C++ Lion, WKV "
+                         "TorchScript, AVX-only MKL, auto --compile. See cpu/README or docs/cpu.md.")
     args = p.parse_args()
     if args.target_params <= 0:
         p.error("--target_params must be > 0")
@@ -320,6 +339,15 @@ def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[DEVICE] {device}")
+    if args.cpu:
+        from cpu import configure as cpu_configure
+        import rwkv_x_core
+        threads = cpu_configure()
+        try:
+            rwkv_x_core._wkv_run_chunk = torch.jit.script(rwkv_x_core._wkv_run_chunk)
+        except Exception as exc:
+            print(f"[WARN] WKV TorchScript optimization unavailable: {exc}")
+        print(f"[CPU] {threads} threads, WKV scripted, compile={args.compile}")
     tokenizer_path = Path(args.tokenizer_path)
     output_dir = Path(args.output_dir)
     bundled_tok = output_dir / "tokenizer.json"
@@ -346,8 +374,15 @@ def main():
     if args.compile:
         print("[INIT] compiling model via torch.compile ...")
         model = torch.compile(model)
-    opt_cls = Lion if args.optimizer == "lion" else torch.optim.AdamW
-    optimizer = opt_cls(model.parameters(), lr=args.learning_rate)
+    opt_map = {"lion": Lion, "adamw": torch.optim.AdamW}
+    if args.optimizer == "adafactor":
+        if not hasattr(torch.optim, "Adafactor"):
+            raise RuntimeError("torch.optim.Adafactor needs torch>=2.5, pip install -U torch")
+        opt_map["adafactor"] = torch.optim.Adafactor
+    if args.cpu and args.optimizer == "lion":
+        from cpu import NativeLion
+        opt_map["lion"] = NativeLion
+    optimizer = opt_map[args.optimizer](model.parameters(), lr=args.learning_rate)
     checkpoint_dir = Path(args.checkpoint_dir)
     opt_path = checkpoint_dir / "optimizer.pt"
     if opt_path.exists() and not args.new_data:
