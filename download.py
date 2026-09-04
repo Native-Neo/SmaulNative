@@ -50,8 +50,7 @@ api = HfApi()
 
 
 def get_repo_files(repo_id: str, path: str) -> list[dict]:
-    print(f"
-[HF] Inspecting {repo_id}/{path}...")
+    print(f"[HF] Inspecting {repo_id}/{path}...")
     info = api.list_repo_tree(
         repo_id=repo_id,
         repo_type="dataset",
@@ -115,8 +114,7 @@ class ShardWriter:
         )
         self.current_shard_tokens = 0
         self.current_shard_rows = 0
-        print(f"
-[SHARD] Opened new shard: {self.current_shard_path.name} (target: {self.shard_tokens:,} tokens)")
+        print(f"[SHARD] Opened new shard: {self.current_shard_path.name} (target: {self.shard_tokens:,} tokens)")
 
     def _flush_buffer(self):
         if not self._buf_texts:
@@ -273,8 +271,7 @@ def process_dataset(
 
     for file_info in repo_files:
         if total_tokens >= max_tokens:
-            print(f"
-[LIMIT REACHED] Reached maximum token budget: {total_tokens:,} >= {max_tokens:,}")
+            print(f"[LIMIT REACHED] Reached maximum token budget: {total_tokens:,} >= {max_tokens:,}")
             break
 
         rel_path = file_info["path"]
@@ -285,8 +282,7 @@ def process_dataset(
         if last_raw_file == rel_path:
             start_row = last_row_index
 
-        print(f"
-[DOWNLOAD] Downloading {rel_path} ({file_info['size'] / 1024**2:.1f} MB)...")
+        print(f"[DOWNLOAD] Downloading {rel_path} ({file_info['size'] / 1024**2:.1f} MB)...")
         downloaded_path = Path(
             hf_hub_download(
                 repo_id=config["repo_id"],
@@ -302,8 +298,7 @@ def process_dataset(
             tok_count = len(tok_ids) + 1  # include EOS token
 
             if total_tokens + tok_count > max_tokens:
-                print(f"
-[BUDGET] Next document ({tok_count:,} tokens) reaches hard limit {max_tokens:,}.")
+                print(f"[BUDGET] Next document ({tok_count:,} tokens) reaches hard limit {max_tokens:,}.")
                 file_completed = False
                 break
 
@@ -342,8 +337,7 @@ def process_dataset(
         manifest["total_tokens"] = total_tokens
         save_manifest(output_dir, manifest)
 
-    print(f"
-[DONE] {language.upper()} finished: {total_tokens:,} tokens written into {output_dir}.")
+    print(f"[DONE] {language.upper()} finished: {total_tokens:,} tokens written into {output_dir}.")
 
 
 def parse_args():
