@@ -282,7 +282,7 @@ def merge(base_dir: Path, branch_dirs: List[Path], out_dir: Path, top_k: int = 1
     (out_dir / "tokenizer.json").write_text(json.dumps(merged_tok_json))
 
     meta = {
-        "engine": "rwkv-x godfather merge_moe.py",
+        "engine": "rwkv-x merge_moe.py",
         "base_model": str(base_dir),
         "base_was_moe": base_cfg.is_moe,
         "branches": [str(b) for b in branch_dirs],
