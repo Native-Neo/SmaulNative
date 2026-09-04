@@ -15,8 +15,6 @@ _default_threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_cou
 os.environ.setdefault("OMP_NUM_THREADS", _default_threads)
 os.environ.setdefault("MKL_NUM_THREADS", _default_threads)
 
-# The optimized CPU entrypoint enables torch.compile by default. Use --no-compile
-# when debugging or when the compile startup cost is undesirable for a short run.
 if "--no-compile" in sys.argv:
     sys.argv.remove("--no-compile")
 else:
@@ -25,6 +23,17 @@ else:
 
 import torch
 import train
+import rwkv_x_core
+
+# TorchScript lowers the recurrent timestep loop into a native Torch graph instead of
+# dispatching each timestep through the Python interpreter. torch.compile can then compile
+# the surrounding model normally. Keep the original function as a fallback for unsupported
+# Torch/Python combinations.
+try:
+    rwkv_x_core._wkv_run_chunk = torch.jit.script(rwkv_x_core._wkv_run_chunk)
+except Exception as exc:
+    print(f"[WARN] WKV TorchScript optimization unavailable: {exc}")
+
 try:
     from cpu_backend import NativeLion, configure
 except ImportError:
@@ -33,8 +42,6 @@ except ImportError:
 threads = configure()
 train.Lion = NativeLion
 
-# torch.compile returns an OptimizedModule wrapper. Save the original RWKV-X module so
-# checkpoints retain the normal save_pretrained format instead of compiled wrapper keys.
 _original_save_checkpoint = train.save_checkpoint
 
 
