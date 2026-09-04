@@ -23,31 +23,36 @@ def _load_wkv():
     return _WKV_EXT
 
 
-def _native_wkv(state, w, k, v, kk, a, r):
-    class WKV(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, state, w, k, v, kk, a, r):
-            ctx.save_for_backward(state, w, k, v, kk, a, r)
-            ext = _load_wkv()
-            out_state, y = ext.wkv_forward(
-                state.contiguous(), w.float().contiguous(), k.float().contiguous(),
-                v.float().contiguous(), kk.float().contiguous(), a.float().contiguous(),
-                r.float().contiguous()
+class _NativeWKV(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state, w, k, v, kk, a, r):
+        ctx.save_for_backward(state, w, k, v, kk, a, r)
+        ext = _load_wkv()
+        out_state, y = ext.wkv_forward(
+            state.contiguous(), w.float().contiguous(), k.float().contiguous(),
+            v.float().contiguous(), kk.float().contiguous(), a.float().contiguous(),
+            r.float().contiguous()
+        )
+        return out_state, y.to(dtype=r.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_state, grad_y):
+        saved = ctx.saved_tensors
+        with torch.enable_grad():
+            inputs = [x.detach().requires_grad_(True) for x in saved]
+            out_state, y = _WKV_ORIG(*inputs)
+            if grad_state is None:
+                grad_state = torch.zeros_like(out_state)
+            if grad_y is None:
+                grad_y = torch.zeros_like(y)
+            grads = torch.autograd.grad(
+                (out_state, y), inputs, (grad_state, grad_y), allow_unused=True
             )
-            return out_state, y.to(dtype=r.dtype)
+        return grads
 
-        @staticmethod
-        def backward(ctx, grad_state, grad_y):
-            saved = ctx.saved_tensors
-            with torch.enable_grad():
-                inputs = [x.detach().requires_grad_(True) for x in saved]
-                out_state, y = _WKV_ORIG(*inputs)
-                grads = torch.autograd.grad(
-                    (out_state, y), inputs, (grad_state, grad_y), allow_unused=True
-                )
-            return grads
 
-    return WKV.apply(state, w, k, v, kk, a, r)
+def _native_wkv(state, w, k, v, kk, a, r):
+    return _NativeWKV.apply(state, w, k, v, kk, a, r)
 
 
 def configure(threads=None):
