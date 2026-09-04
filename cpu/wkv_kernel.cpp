@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <ATen/Parallel.h>
 #include <immintrin.h>
+#include <vector>
 
 std::vector<torch::Tensor> wkv_forward(
     torch::Tensor state, torch::Tensor w, torch::Tensor k, torch::Tensor v,
@@ -14,6 +15,7 @@ std::vector<torch::Tensor> wkv_forward(
                 kk.dim() == 4 && a.dim() == 4 && r.dim() == 4);
     const int64_t B = state.size(0), H = state.size(1), N = state.size(2), T = w.size(1);
     TORCH_CHECK(state.size(2) == state.size(3));
+    TORCH_CHECK(N <= 128, "native WKV head size must be <= 128");
     TORCH_CHECK(w.sizes() == k.sizes() && w.sizes() == v.sizes() && w.sizes() == kk.sizes() &&
                 w.sizes() == a.sizes() && w.sizes() == r.sizes());
     TORCH_CHECK(w.size(2) == H && w.size(3) == N);
