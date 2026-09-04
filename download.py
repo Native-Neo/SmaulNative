@@ -109,21 +109,15 @@ class ShardWriter:
         self._buf_tokens = 0
 
     def add_document(self, text: str, token_count: int) -> bool:
-        if token_count > self.shard_tokens and self.current_shard_tokens == 0 and not self._buf_texts:
-            self._buf_texts.append(text)
-            self._buf_tokens += token_count
-            self._flush_buffer()
-            self.close_shard()
-            return True
-
+        """Add one document and report whether the current shard reached its target."""
         self._buf_texts.append(text)
         self._buf_tokens += token_count
+
         if len(self._buf_texts) >= self._batch_size:
             self._flush_buffer()
 
         if self.current_shard_tokens + self._buf_tokens >= self.shard_tokens:
             self._flush_buffer()
-            self.close_shard()
             return True
         return False
 
@@ -281,8 +275,14 @@ def process_dataset(language: str, config: dict, tokenizer: TokenizerWrapper,
 
     repo_files = get_repo_files(config["repo_id"], config["path"])
     completed_raw = set(manifest["completed_raw_files"])
-    start_shard_idx = len(manifest["shards"])
-    writer = ShardWriter(output_dir, shard_tokens, compression, language, config["repo_id"], start_shard_idx)
+    writer = ShardWriter(
+        output_dir,
+        shard_tokens,
+        compression,
+        language,
+        config["repo_id"],
+        len(manifest["shards"]),
+    )
 
     last_raw_file = manifest.get("last_raw_file")
     last_row_index = int(manifest.get("last_row_index", 0))
