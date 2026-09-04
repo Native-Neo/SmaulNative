@@ -15,6 +15,14 @@ _default_threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_cou
 os.environ.setdefault("OMP_NUM_THREADS", _default_threads)
 os.environ.setdefault("MKL_NUM_THREADS", _default_threads)
 
+# The optimized CPU entrypoint enables torch.compile by default. Use --no-compile
+# when debugging or when the compile startup cost is undesirable for a short run.
+if "--no-compile" in sys.argv:
+    sys.argv.remove("--no-compile")
+else:
+    if "--compile" not in sys.argv:
+        sys.argv.append("--compile")
+
 import torch
 import train
 try:
