@@ -18,7 +18,7 @@ import torch.utils.checkpoint
 @dataclass
 class RWKVXConfig:
     vocab_size: int = 65530
-    n_embd: int = 768
+    n_embd: int = 832
     n_layer: int = 20           # total RWKV-7 blocks
     head_size: int = 64
     n_moba_layer: int = 5          # how many of the n_layer positions become MOBA (sparse-attn) blocks instead
