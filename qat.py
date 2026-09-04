@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# qat.py -- Quantization-Aware Training for RWKV-X, at 3-bit (int3) precision.
+# qat.py -- Quantization-Aware Training for RWKV-X, int3.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
