@@ -18,15 +18,15 @@ import torch.utils.checkpoint
 @dataclass
 class RWKVXConfig:
     vocab_size: int = 65530
-    n_embd: int = 832
-    n_layer: int = 20              # total RWKV-7 blocks
+    n_embd: int = 768
+    n_layer: int = 20           # total RWKV-7 blocks
     head_size: int = 64
     n_moba_layer: int = 5          # how many of the n_layer positions become MOBA (sparse-attn) blocks instead
     moba_chunk_size: int = 512
     moba_topk: int = 4
     dropout: float = 0.0
     head_size_divisor: int = 8
-    ctx_len_hint: int = 1024       # training BPTT window; does NOT cap inference (state is O(1)/token)
+    ctx_len_hint: int = 2048      # training BPTT window; does NOT cap inference (state is O(1)/token)
     wkv_chunk_size: int = 64
     # MoE (only used by merge_moe.py output / MoE-upcycled checkpoints)
     is_moe: bool = False
