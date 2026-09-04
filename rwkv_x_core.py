@@ -64,7 +64,7 @@ def config_for_target_params(target_params: int, vocab_size: int = 65530,
     if n_embd % head_size != 0:
         raise ValueError(f"n_embd ({n_embd}) must be divisible by head_size ({head_size})")
     best = None
-    for n_layer in range(4, 80):
+    for n_layer in range(1, 256):
         cfg = RWKVXConfig(vocab_size=vocab_size, n_embd=n_embd, n_layer=n_layer,
                            n_moba_layer=min(n_moba_layer, n_layer), head_size=head_size)
         diff = abs(cfg.approx_param_count() - target_params)
