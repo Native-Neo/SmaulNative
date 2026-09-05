@@ -11,12 +11,13 @@ if "--cpu" in sys.argv:
     _threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
     os.environ.setdefault("OMP_NUM_THREADS", _threads)
     os.environ.setdefault("MKL_NUM_THREADS", _threads)
-    os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX")
+    os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "SSE4.2")
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
-    if "--no-compile" not in sys.argv and "--compile" not in sys.argv:
-        sys.argv.append("--compile")
+    # --compile is NOT auto-added: Inductor codegen quality on old/non-AVX2
+    # CPUs is unproven, compile time itself is real cost. Benchmark it:
+    # `python train.py --cpu --compile` vs without, on your own box.
 
 import shutil
 import signal
@@ -154,20 +155,23 @@ def _load_rng_state(path: Path):
 
 def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState,
                     output_dir: Path, checkpoint_dir: Path, tokenizer_path: Path,
-                    save_dtype: str = "fp32"):
+                    save_dtype: str = "fp32", save_optimizer: bool = True):
     print("\n[SAVE] Saving checkpoint...")
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     model = getattr(model, "_orig_mod", model)
-    model.save_pretrained(output_dir, dtype=save_dtype)
+    model.save_pretrained(output_dir, dtype=save_dtype, include_upstream=False)
     bundled_tok = output_dir / "tokenizer.json"
     if tokenizer_path.resolve() != bundled_tok.resolve():
         shutil.copy2(tokenizer_path, bundled_tok)
-    tmp = checkpoint_dir / "optimizer.pt.tmp"
-    torch.save(optimizer.state_dict(), tmp)
-    os.replace(tmp, checkpoint_dir / "optimizer.pt")
+    if save_optimizer:
+        # full optimizer.pt write is the expensive part -- --optimizer_save_every
+        # lets model checkpoints stay frequent without paying this every time
+        tmp = checkpoint_dir / "optimizer.pt.tmp"
+        torch.save(optimizer.state_dict(), tmp)
+        os.replace(tmp, checkpoint_dir / "optimizer.pt")
+        _save_rng_state(checkpoint_dir / "rng_state.pt")
     resume.save(checkpoint_dir / "resume_state.json")
-    _save_rng_state(checkpoint_dir / "rng_state.pt")
     print(f"[SAVE COMPLETE] model -> {output_dir}, optimizer/resume -> {checkpoint_dir}\n")
 
 
@@ -185,7 +189,7 @@ def _optimizer_step(args, model, optimizer, xb, yb):
         print(f"[WARN] non-finite loss {loss.item()}, skipping step")
         return None
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
     optimizer.step()
     return loss
 
@@ -223,33 +227,40 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
             tok_since = 0
         batch_x, batch_y = [], []
         if resume.global_step % args.save_every == 0:
-            save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), save_dtype=args.save_dtype)
+            save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), save_dtype=args.save_dtype, save_optimizer=(resume.global_step % args.optimizer_save_every == 0))
         if STOP_REQUESTED:
             break
 
 
 def train_sft(args, model, optimizer, resume, device, tokenizer):
     dataset = SFTDataset(Path(args.dataset_dir), tokenizer, args.ctx_len)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     model.train()
     for epoch in range(resume.epoch, args.epochs):
+        # deterministic per-epoch shuffle so a resume mid-epoch can skip
+        # ahead instead of restarting the epoch (record_index doubles as
+        # pretrain's file-position field and SFT's shuffled-index cursor)
+        perm = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(epoch)).tolist()
+        start = resume.record_index if epoch == resume.epoch else 0
+        loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, sampler=perm[start:])
+        consumed = start
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
             loss = _optimizer_step(args, model, optimizer, xb, yb)
+            consumed += len(xb)
             if loss is None:
                 continue
             resume.global_step += 1
             resume.total_tokens += xb.numel()
+            resume.epoch, resume.record_index = epoch, consumed
             if resume.global_step % args.log_every == 0:
                 print(f"epoch {epoch} step {resume.global_step} | loss {loss.item():.4f}")
             if resume.global_step % args.save_every == 0:
-                resume.epoch = epoch
-                save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), save_dtype=args.save_dtype)
+                save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), save_dtype=args.save_dtype, save_optimizer=(resume.global_step % args.optimizer_save_every == 0))
             if STOP_REQUESTED:
                 break
         if STOP_REQUESTED:
             break
-        resume.epoch = epoch + 1
+        resume.epoch, resume.record_index = epoch + 1, 0
 
 
 def parse_args():
@@ -262,21 +273,26 @@ def parse_args():
     p.add_argument("--tokenizer_vocab_size", type=int, default=65536)
     p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS)
     p.add_argument("--n_embd", type=int, default=832)
-    p.add_argument("--n_layer", type=int, default=None,
+    p.add_argument("--n_layer", type=int, default=17,
                     help="pin block count directly, skips the --target_params search entirely")
     p.add_argument("--head_size", type=int, default=64)
-    p.add_argument("--n_moba_layer", type=int, default=5)
-    p.add_argument("--ctx_len", type=int, default=512)
+    p.add_argument("--n_moba_layer", type=int, default=3)
+    p.add_argument("--ctx_len", type=int, default=1024)
     p.add_argument("--precision", choices=["fp32", "bf16"], default="fp32",
                     help="autocast dtype for forward/backward. fp16 not offered -- torch CPU autocast only implements bf16 kernels. Master weights/optimizer stay fp32.")
     p.add_argument("--save_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
                     help="cast weights to this dtype in the saved model.safetensors only (optimizer.pt stays fp32 for resume). Halves checkpoint size for fp16/bf16.")
-    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--optimizer", choices=["adafactor", "lion", "adamw"], default="adafactor")
     p.add_argument("--log_every", type=int, default=1)
     p.add_argument("--save_every", type=int, default=5000)
+    p.add_argument("--optimizer_save_every", type=int, default=None,
+                    help="save optimizer.pt/rng_state.pt only every N steps (default: same "
+                         "as --save_every). Set higher to cut the periodic I/O spike -- "
+                         "resume just replays slightly stale optimizer momentum, model "
+                         "weights and resume position stay exactly in sync either way.")
     p.add_argument("--new_data", action="store_true")
     p.add_argument("--train_router_only", action="store_true")
     p.add_argument("--qat", action="store_true")
@@ -285,10 +301,13 @@ def parse_args():
     p.add_argument("--compile", action="store_true",
                     help="torch.compile(model) for faster training (PyTorch 2.0+, ~2-5x on CPU)")
     p.add_argument("--cpu", action="store_true",
-                    help="small/old-CPU tuning: thread pinning, native C++ Lion, native WKV, AVX-only MKL, auto --compile. See docs/cpu.md.")
+                    help="small/old-CPU tuning: thread pinning, native C++ Lion, native WKV, "
+                         "AVX-only MKL. Add --compile separately, benchmark it first. See docs/cpu.md.")
     args = p.parse_args()
     if args.target_params <= 0:
         p.error("--target_params must be > 0")
+    if args.optimizer_save_every is None:
+        args.optimizer_save_every = args.save_every
     if args.n_embd <= 0 or args.head_size <= 0:
         p.error("--n_embd and --head_size must be > 0")
     if args.n_embd % args.head_size:
