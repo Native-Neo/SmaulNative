@@ -75,25 +75,22 @@ def configure(threads=None):
     global _WKV_ORIG
     threads = _configure(threads)
     torch.set_float32_matmul_precision("high")
-    try:
-        import rwkv_x_core
-        if _WKV_ORIG is None:
-            _WKV_ORIG = rwkv_x_core._wkv_run_chunk
-            rwkv_x_core._wkv_run_chunk = _native_wkv
-        old_init = rwkv_x_core.RWKVXConfig.__init__
-        if not getattr(old_init, "_smaul_cpu", False):
-            chunk = int(os.environ.get("SMAUL_WKV_CHUNK", "128"))
-            checkpoint_ffn = os.environ.get("SMAUL_CHECKPOINT_FFN", "0") not in {"0", "false", "False"}
+    import rwkv_x_core
+    if _WKV_ORIG is None:
+        _WKV_ORIG = rwkv_x_core._wkv_run_chunk
+        rwkv_x_core._wkv_run_chunk = _native_wkv
+    old_init = rwkv_x_core.RWKVXConfig.__init__
+    if not getattr(old_init, "_smaul_cpu", False):
+        chunk = int(os.environ.get("SMAUL_WKV_CHUNK", "128"))
+        checkpoint_ffn = os.environ.get("SMAUL_CHECKPOINT_FFN", "0") not in {"0", "false", "False"}
 
-            def init(self, *args, **kwargs):
-                old_init(self, *args, **kwargs)
-                self.wkv_chunk_size = chunk
-                self.checkpoint_ffn = checkpoint_ffn
+        def init(self, *args, **kwargs):
+            old_init(self, *args, **kwargs)
+            self.wkv_chunk_size = chunk
+            self.checkpoint_ffn = checkpoint_ffn
 
-            init._smaul_cpu = True
-            rwkv_x_core.RWKVXConfig.__init__ = init
-    except Exception:
-        pass
+        init._smaul_cpu = True
+        rwkv_x_core.RWKVXConfig.__init__ = init
     return threads
 
 
