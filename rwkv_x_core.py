@@ -299,7 +299,7 @@ class RWKV_CMix_MoE(nn.Module):
         top_w = torch.softmax(top_val, dim=-1)
 
         prev0 = x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros(B, 1, C, dtype=x.dtype, device=x.device)
-        xx = torch.cat([prev0, x[:, :-1, :],], dim=1) - x
+        xx = torch.cat([prev0, x[:, :-1, :]], dim=1) - x
 
         x_flat, xx_flat = x.reshape(B * T, C), xx.reshape(B * T, C)
         idx_flat, w_flat = top_idx.reshape(B * T, self.top_k), top_w.reshape(B * T, self.top_k)
@@ -492,7 +492,7 @@ class RWKVXModel(nn.Module):
                 out[prefix + k] = v
         return out
 
-    def save_pretrained(self, out_dir: Path, dtype: str = "fp32"):
+    def save_pretrained(self, out_dir: Path, dtype: str = "fp32", include_upstream: bool = True):
         from safetensors.torch import save_file
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -505,8 +505,9 @@ class RWKVXModel(nn.Module):
             sd[k] = v
         save_file(sd, str(out_dir / "model.safetensors"))
         self.cfg.save(out_dir / "config.json")
-        torch.save({k: v.detach().cpu() for k, v in self.upstream_compatible_state_dict().items()},
-                   out_dir / "rwkvx_upstream_compatible.pth")
+        if include_upstream:
+            torch.save({k: v.detach().cpu() for k, v in self.upstream_compatible_state_dict().items()},
+                       out_dir / "rwkvx_upstream_compatible.pth")
 
     @classmethod
     def from_pretrained(cls, in_dir: Path):
