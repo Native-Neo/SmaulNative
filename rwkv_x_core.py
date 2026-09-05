@@ -19,9 +19,9 @@ import torch.utils.checkpoint
 class RWKVXConfig:
     vocab_size: int = 65530
     n_embd: int = 832
-    n_layer: int = 20
+    n_layer: int = 17
     head_size: int = 64
-    n_moba_layer: int = 5
+    n_moba_layer: int = 3
     moba_chunk_size: int = 512
     moba_topk: int = 4
     dropout: float = 0.0
@@ -181,7 +181,7 @@ class RWKV_Tmix_x070(nn.Module):
             self.value.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
             self.output.weight.data.zero_()
 
-    def forward(self, x: torch.Tensor, v_first: torch.Tensor, state: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, v_first: Optional[torch.Tensor], state: Optional[torch.Tensor] = None):
         B, T, C = x.shape
         H, N = self.n_head, self.head_size
 
@@ -294,6 +294,7 @@ class RWKV_CMix_MoE(nn.Module):
 
     def forward(self, x, x_prev_last: Optional[torch.Tensor] = None):
         B, T, C = x.shape
+        N = B * T
         logits = self.gate(x)
         top_val, top_idx = torch.topk(logits, k=self.top_k, dim=-1)
         top_w = torch.softmax(top_val, dim=-1)
@@ -301,17 +302,27 @@ class RWKV_CMix_MoE(nn.Module):
         prev0 = x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros(B, 1, C, dtype=x.dtype, device=x.device)
         xx = torch.cat([prev0, x[:, :-1, :]], dim=1) - x
 
-        x_flat, xx_flat = x.reshape(B * T, C), xx.reshape(B * T, C)
-        idx_flat, w_flat = top_idx.reshape(B * T, self.top_k), top_w.reshape(B * T, self.top_k)
+        x_flat, xx_flat = x.reshape(N, C), xx.reshape(N, C)
+        # one sort groups all (token, expert) pairs contiguously by expert,
+        # instead of each expert rescanning the full (N, top_k) mask
+        assign_expert = top_idx.reshape(-1)
+        assign_weight = top_w.reshape(-1)
+        assign_token = torch.arange(N, device=x.device).repeat_interleave(self.top_k)
+        order = torch.argsort(assign_expert)
+        sorted_expert, sorted_token, sorted_w = assign_expert[order], assign_token[order], assign_weight[order]
+        counts = torch.bincount(sorted_expert, minlength=self.num_experts)
+
         out_flat = torch.zeros_like(x_flat)
+        offset = 0
         for e_id, expert in enumerate(self.experts):
-            mask = (idx_flat == e_id)
-            sel = mask.any(dim=-1).nonzero(as_tuple=True)[0]
-            if sel.numel() == 0:
+            n = counts[e_id].item()
+            if n == 0:
                 continue
+            sel = sorted_token[offset:offset + n]
+            w = sorted_w[offset:offset + n].unsqueeze(-1)
+            offset += n
             k = x_flat.index_select(0, sel) + xx_flat.index_select(0, sel) * expert.x_k.view(-1)
             e_out = expert.value(torch.relu(expert.key(k)) ** 2)
-            w = torch.where(mask[sel], w_flat[sel], torch.zeros_like(w_flat[sel])).sum(dim=-1, keepdim=True)
             out_flat.index_add_(0, sel, e_out * w)
         return out_flat.view(B, T, C), x[:, -1, :]
 
@@ -319,10 +330,14 @@ class RWKV_CMix_MoE(nn.Module):
 # MOBA block: CPU uses full causal SDPA.
 
 class CausalSelfAttention(nn.Module):
+    """MOBA block-sparse causal attention: each chunk attends to itself
+    (causal) plus its top-k highest-affinity earlier chunks, not all of T."""
     def __init__(self, cfg: RWKVXConfig):
         super().__init__()
         C = cfg.n_embd
         self.n_head = C // cfg.head_size
+        self.chunk_size = max(1, cfg.moba_chunk_size)
+        self.top_k = max(0, cfg.moba_topk)
         self.receptance = nn.Linear(C, C, bias=False)
         self.key = nn.Linear(C, C, bias=False)
         self.value = nn.Linear(C, C, bias=False)
@@ -334,14 +349,46 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        H = self.n_head
+        H, N, cs, k_top = self.n_head, C // self.n_head, self.chunk_size, self.top_k
         q, k, v = self.receptance(x), self.key(x), self.value(x)
-        q = q.view(B, T, H, C // H).transpose(1, 2)
-        k = k.view(B, T, H, C // H).transpose(1, 2)
-        v = v.view(B, T, H, C // H).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.output(y)
+        q = q.view(B, T, H, N).transpose(1, 2)
+        k = k.view(B, T, H, N).transpose(1, 2)
+        v = v.view(B, T, H, N).transpose(1, 2)
+
+        n_chunks = (T + cs - 1) // cs
+        if k_top <= 0 or n_chunks <= k_top + 1:
+            # too short for chunking to pay off -- plain causal attention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            return self.output(y.transpose(1, 2).contiguous().view(B, T, C))
+
+        pad = n_chunks * cs - T
+        k_c = (F.pad(k, (0, 0, 0, pad)) if pad else k).view(B, H, n_chunks, cs, N)
+        v_c = (F.pad(v, (0, 0, 0, pad)) if pad else v).view(B, H, n_chunks, cs, N)
+        # chunk-mean affinity score; padded rows in the last chunk are never
+        # read since top_c indices only ever cover chunks strictly before i
+        k_mean = k_c.mean(dim=3)
+
+        out = torch.zeros(B, H, T, N, dtype=q.dtype, device=q.device)
+        for i in range(n_chunks):
+            lo, hi = i * cs, min((i + 1) * cs, T)
+            q_i = q[:, :, lo:hi]
+            own_k, own_v = k_c[:, :, i, :hi - lo], v_c[:, :, i, :hi - lo]
+            if i == 0:
+                y_i = F.scaled_dot_product_attention(q_i, own_k, own_v, is_causal=True)
+            else:
+                n_pick = min(k_top, i)
+                scores = torch.einsum("bhn,bhcn->bhc", q_i.mean(dim=2), k_mean[:, :, :i])
+                top_c = scores.topk(n_pick, dim=-1).indices  # (B,H,n_pick), all < i
+                idx = top_c.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, cs, N)
+                k_sel = torch.gather(k_c[:, :, :i], 2, idx).reshape(B, H, n_pick * cs, N)
+                v_sel = torch.gather(v_c[:, :, :i], 2, idx).reshape(B, H, n_pick * cs, N)
+                k_cat, v_cat = torch.cat([k_sel, own_k], dim=2), torch.cat([v_sel, own_v], dim=2)
+                mask = torch.zeros(hi - lo, n_pick * cs + (hi - lo), dtype=torch.bool, device=x.device)
+                mask[:, :n_pick * cs] = True  # selected earlier chunks: fully visible
+                mask[:, n_pick * cs:] = torch.tril(torch.ones(hi - lo, hi - lo, dtype=torch.bool, device=x.device))
+                y_i = F.scaled_dot_product_attention(q_i, k_cat, v_cat, attn_mask=mask)
+            out[:, :, lo:hi] = y_i
+        return self.output(out.transpose(1, 2).contiguous().view(B, T, C))
 
 
 class MOBABlock(nn.Module):
@@ -435,7 +482,7 @@ class RWKVXModel(nn.Module):
         if self.dropout is not None:
             x = self.dropout(x)
 
-        v_first = torch.empty_like(x)
+        v_first = None
         if state is None:
             tmix_state = [None] * len(self.rwkv_blocks)
             cmix_state = [None] * len(self._order)
@@ -492,7 +539,7 @@ class RWKVXModel(nn.Module):
                 out[prefix + k] = v
         return out
 
-    def save_pretrained(self, out_dir: Path, dtype: str = "fp32"):
+    def save_pretrained(self, out_dir: Path, dtype: str = "fp32", include_upstream: bool = True):
         from safetensors.torch import save_file
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -505,8 +552,9 @@ class RWKVXModel(nn.Module):
             sd[k] = v
         save_file(sd, str(out_dir / "model.safetensors"))
         self.cfg.save(out_dir / "config.json")
-        torch.save({k: v.detach().cpu() for k, v in self.upstream_compatible_state_dict().items()},
-                   out_dir / "rwkvx_upstream_compatible.pth")
+        if include_upstream:
+            torch.save({k: v.detach().cpu() for k, v in self.upstream_compatible_state_dict().items()},
+                       out_dir / "rwkvx_upstream_compatible.pth")
 
     @classmethod
     def from_pretrained(cls, in_dir: Path):
