@@ -21,7 +21,7 @@ class RWKVXConfig:
     n_embd: int = 832
     n_layer: int = 17
     head_size: int = 64
-    n_moba_layer: int = 3
+    n_moba_layer: int = 5
     moba_chunk_size: int = 512
     moba_topk: int = 4
     dropout: float = 0.0
@@ -70,12 +70,9 @@ def config_for_target_params(target_params: int, vocab_size: int = 65530,
     return best[1]
 
 
-# RWKV-7 TimeMix
-
 def _wkv_run_chunk(state: torch.Tensor, w_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor,
                     kk_c: torch.Tensor, a_c: torch.Tensor, r_c: torch.Tensor
                     ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Runs one WKV chunk."""
     Tc = w_c.shape[1]
     k_c = k_c.float()
     v_c = v_c.float()
@@ -232,7 +229,8 @@ class RWKV_Tmix_x070(nn.Module):
         else:
             state = state.to(dtype=torch.float32)
 
-        use_checkpoint = self.training and torch.is_grad_enabled()
+        # Native CPU WKV has its own backward; checkpointing it only adds recompute.
+        use_checkpoint = self.training and torch.is_grad_enabled() and not x.device.type == "cpu"
         chunk_size = max(1, self.cfg.wkv_chunk_size) if use_checkpoint else T
 
         ys_chunks = []
@@ -290,53 +288,28 @@ class RWKV_CMix_MoE(nn.Module):
         self.top_k = min(cfg.num_experts, cfg.num_experts_per_tok)
         self.experts = nn.ModuleList([RWKV_CMix_x070(cfg, layer_id) for _ in range(self.num_experts)])
         self.gate = nn.Linear(cfg.n_embd, self.num_experts, bias=False)
-        nn.init.normal_(self.gate.weight, mean=0.0, std=0.02)
 
-    def forward(self, x, x_prev_last: Optional[torch.Tensor] = None):
-        B, T, C = x.shape
-        N = B * T
+    def forward(self, x, x_prev_last=None):
         logits = self.gate(x)
-        top_val, top_idx = torch.topk(logits, k=self.top_k, dim=-1)
-        top_w = torch.softmax(top_val, dim=-1)
-
-        prev0 = x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros(B, 1, C, dtype=x.dtype, device=x.device)
-        xx = torch.cat([prev0, x[:, :-1, :]], dim=1) - x
-
-        x_flat, xx_flat = x.reshape(N, C), xx.reshape(N, C)
-        # one sort groups all (token, expert) pairs contiguously by expert,
-        # instead of each expert rescanning the full (N, top_k) mask
-        assign_expert = top_idx.reshape(-1)
-        assign_weight = top_w.reshape(-1)
-        assign_token = torch.arange(N, device=x.device).repeat_interleave(self.top_k)
-        order = torch.argsort(assign_expert)
-        sorted_expert, sorted_token, sorted_w = assign_expert[order], assign_token[order], assign_weight[order]
-        counts = torch.bincount(sorted_expert, minlength=self.num_experts)
-
-        out_flat = torch.zeros_like(x_flat)
-        offset = 0
-        for e_id, expert in enumerate(self.experts):
-            n = counts[e_id].item()
-            if n == 0:
+        probs = torch.softmax(logits, dim=-1)
+        topv, topi = torch.topk(probs, self.top_k, dim=-1)
+        topv = topv / topv.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        out = torch.zeros_like(x)
+        for e, expert in enumerate(self.experts):
+            mask = (topi == e).any(dim=-1)
+            if not mask.any():
                 continue
-            sel = sorted_token[offset:offset + n]
-            w = sorted_w[offset:offset + n].unsqueeze(-1)
-            offset += n
-            k = x_flat.index_select(0, sel) + xx_flat.index_select(0, sel) * expert.x_k.view(-1)
-            e_out = expert.value(torch.relu(expert.key(k)) ** 2)
-            out_flat.index_add_(0, sel, e_out * w)
-        return out_flat.view(B, T, C), x[:, -1, :]
+            y, _ = expert(x[mask].view(-1, 1, x.shape[-1]), None)
+            out[mask] += y.view(-1, x.shape[-1]) * probs[mask, e].unsqueeze(-1)
+        return out, x[:, -1, :]
 
-
-# MOBA block: CPU uses full causal SDPA.
 
 class CausalSelfAttention(nn.Module):
-    """MOBA block-sparse causal attention: each chunk attends to itself
-    (causal) plus its top-k highest-affinity earlier chunks, not all of T."""
     def __init__(self, cfg: RWKVXConfig):
         super().__init__()
         C = cfg.n_embd
         self.n_head = C // cfg.head_size
-        self.chunk_size = max(1, cfg.moba_chunk_size)
+        self.chunk_size = cfg.moba_chunk_size
         self.top_k = max(0, cfg.moba_topk)
         self.receptance = nn.Linear(C, C, bias=False)
         self.key = nn.Linear(C, C, bias=False)
@@ -357,15 +330,12 @@ class CausalSelfAttention(nn.Module):
 
         n_chunks = (T + cs - 1) // cs
         if k_top <= 0 or n_chunks <= k_top + 1:
-            # too short for chunking to pay off -- plain causal attention
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             return self.output(y.transpose(1, 2).contiguous().view(B, T, C))
 
         pad = n_chunks * cs - T
         k_c = (F.pad(k, (0, 0, 0, pad)) if pad else k).view(B, H, n_chunks, cs, N)
         v_c = (F.pad(v, (0, 0, 0, pad)) if pad else v).view(B, H, n_chunks, cs, N)
-        # chunk-mean affinity score; padded rows in the last chunk are never
-        # read since top_c indices only ever cover chunks strictly before i
         k_mean = k_c.mean(dim=3)
 
         out = torch.zeros(B, H, T, N, dtype=q.dtype, device=q.device)
@@ -378,13 +348,13 @@ class CausalSelfAttention(nn.Module):
             else:
                 n_pick = min(k_top, i)
                 scores = torch.einsum("bhn,bhcn->bhc", q_i.mean(dim=2), k_mean[:, :, :i])
-                top_c = scores.topk(n_pick, dim=-1).indices  # (B,H,n_pick), all < i
+                top_c = scores.topk(n_pick, dim=-1).indices
                 idx = top_c.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, cs, N)
                 k_sel = torch.gather(k_c[:, :, :i], 2, idx).reshape(B, H, n_pick * cs, N)
                 v_sel = torch.gather(v_c[:, :, :i], 2, idx).reshape(B, H, n_pick * cs, N)
                 k_cat, v_cat = torch.cat([k_sel, own_k], dim=2), torch.cat([v_sel, own_v], dim=2)
                 mask = torch.zeros(hi - lo, n_pick * cs + (hi - lo), dtype=torch.bool, device=x.device)
-                mask[:, :n_pick * cs] = True  # selected earlier chunks: fully visible
+                mask[:, :n_pick * cs] = True
                 mask[:, n_pick * cs:] = torch.tril(torch.ones(hi - lo, hi - lo, dtype=torch.bool, device=x.device))
                 y_i = F.scaled_dot_product_attention(q_i, k_cat, v_cat, attn_mask=mask)
             out[:, :, lo:hi] = y_i
@@ -443,8 +413,6 @@ class RWKVBlock(nn.Module):
         x = x + ffn_out
         return x, v_first, new_tmix_state, new_cmix_state
 
-
-# Top-level model
 
 class RWKVXModel(nn.Module):
     def __init__(self, cfg: RWKVXConfig):
