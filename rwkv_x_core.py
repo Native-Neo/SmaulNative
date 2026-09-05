@@ -63,7 +63,7 @@ def config_for_target_params(target_params: int, vocab_size: int = 65530,
     best = None
     for n_layer in range(4, 80):
         cfg = RWKVXConfig(vocab_size=vocab_size, n_embd=n_embd, n_layer=n_layer,
-                           n_moba_layer=min(n_moba_layer, n_layer), head_size=head_size)
+                           n_moba_layer=min(n_moba_layer, n_layer - 1), head_size=head_size)
         diff = abs(cfg.approx_param_count() - target_params)
         if best is None or diff < best[0]:
             best = (diff, cfg)
