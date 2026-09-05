@@ -15,9 +15,6 @@ if "--cpu" in sys.argv:
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
-    # --compile is NOT auto-added: Inductor codegen quality on old/non-AVX2
-    # CPUs is unproven, compile time itself is real cost. Benchmark it:
-    # `python train.py --cpu --compile` vs without, on your own box.
 
 import shutil
 import signal
@@ -81,7 +78,6 @@ class Lion(Optimizer):
 def set_router_only_training(model: RWKVXModel, router_only: bool) -> int:
     if not model.cfg.is_moe:
         raise ValueError("set_router_only_training requires an MoE model (cfg.is_moe=True); this checkpoint has no router -- did you mean to point --output_dir at a merge_moe.py output instead?")
-
     router_params = {id(p) for module in model.modules() if isinstance(module, RWKV_CMix_MoE)
                      for p in module.gate.parameters()}
     n_trainable = 0
@@ -165,8 +161,6 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
     if tokenizer_path.resolve() != bundled_tok.resolve():
         shutil.copy2(tokenizer_path, bundled_tok)
     if save_optimizer:
-        # full optimizer.pt write is the expensive part -- --optimizer_save_every
-        # lets model checkpoints stay frequent without paying this every time
         tmp = checkpoint_dir / "optimizer.pt.tmp"
         torch.save(optimizer.state_dict(), tmp)
         os.replace(tmp, checkpoint_dir / "optimizer.pt")
@@ -175,26 +169,39 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
     print(f"[SAVE COMPLETE] model -> {output_dir}, optimizer/resume -> {checkpoint_dir}\n")
 
 
-def _autocast(args):
+def _autocast(args, device):
+    if device.type == "cuda":
+        dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
+        return torch.autocast(device_type="cuda", dtype=dtype)
     if args.precision == "bf16":
         return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
     return contextlib.nullcontext()
 
 
-def _optimizer_step(args, model, optimizer, xb, yb):
+def _optimizer_step(args, model, optimizer, xb, yb, device, scaler):
     optimizer.zero_grad(set_to_none=True)
-    with _autocast(args):
+    with _autocast(args, device):
         _, loss, _ = model(xb, labels=yb)
     if not torch.isfinite(loss):
         print(f"[WARN] non-finite loss {loss.item()}, skipping step")
+        if scaler is not None:
+            scaler.update()
         return None
-    loss.backward()
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+    else:
+        loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
-    optimizer.step()
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
     return loss
 
 
-def train_pretrain(args, model, optimizer, resume, device, tokenizer):
+def train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler):
     if resume.file_path is not None and not Path(resume.file_path).is_file():
         raise FileNotFoundError(f"resume dataset file no longer exists: {resume.file_path}")
     stream = PretrainStream(Path(args.dataset_dir), tokenizer, args.ctx_len,
@@ -211,7 +218,7 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
             continue
         xb = torch.stack(batch_x).to(device)
         yb = torch.stack(batch_y).to(device)
-        loss = _optimizer_step(args, model, optimizer, xb, yb)
+        loss = _optimizer_step(args, model, optimizer, xb, yb, device, scaler)
         if loss is None:
             batch_x, batch_y = [], []
             continue
@@ -232,20 +239,17 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
             break
 
 
-def train_sft(args, model, optimizer, resume, device, tokenizer):
+def train_sft(args, model, optimizer, resume, device, tokenizer, scaler):
     dataset = SFTDataset(Path(args.dataset_dir), tokenizer, args.ctx_len)
     model.train()
     for epoch in range(resume.epoch, args.epochs):
-        # deterministic per-epoch shuffle so a resume mid-epoch can skip
-        # ahead instead of restarting the epoch (record_index doubles as
-        # pretrain's file-position field and SFT's shuffled-index cursor)
         perm = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(epoch)).tolist()
         start = resume.record_index if epoch == resume.epoch else 0
         loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, sampler=perm[start:])
         consumed = start
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
-            loss = _optimizer_step(args, model, optimizer, xb, yb)
+            loss = _optimizer_step(args, model, optimizer, xb, yb, device, scaler)
             consumed += len(xb)
             if loss is None:
                 continue
@@ -264,7 +268,7 @@ def train_sft(args, model, optimizer, resume, device, tokenizer):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="RWKV-X trainer (pretrain + sft, CPU-safe)")
+    p = argparse.ArgumentParser(description="RWKV-X trainer (pretrain + sft, CPU/CUDA)")
     p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
     p.add_argument("--dataset_dir", type=str, default="./datasets")
     p.add_argument("--output_dir", type=str, default="./SmaulNative")
@@ -273,37 +277,30 @@ def parse_args():
     p.add_argument("--tokenizer_vocab_size", type=int, default=65536)
     p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS)
     p.add_argument("--n_embd", type=int, default=832)
-    p.add_argument("--n_layer", type=int, default=17,
-                    help="pin block count directly, skips the --target_params search entirely")
+    p.add_argument("--n_layer", type=int, default=17)
     p.add_argument("--head_size", type=int, default=64)
     p.add_argument("--n_moba_layer", type=int, default=3)
     p.add_argument("--ctx_len", type=int, default=1024)
-    p.add_argument("--precision", choices=["fp32", "bf16"], default="fp32",
-                    help="autocast dtype for forward/backward. fp16 not offered -- torch CPU autocast only implements bf16 kernels. Master weights/optimizer stay fp32.")
-    p.add_argument("--save_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
-                    help="cast weights to this dtype in the saved model.safetensors only (optimizer.pt stays fp32 for resume). Halves checkpoint size for fp16/bf16.")
+    p.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=None,
+                    help="CUDA: fp16/bf16 autocast. CPU: bf16 or fp32. Default is fp16 on CUDA, fp32 on CPU.")
+    p.add_argument("--save_dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--optimizer", choices=["adafactor", "lion", "adamw"], default="adafactor")
     p.add_argument("--log_every", type=int, default=1)
     p.add_argument("--save_every", type=int, default=5000)
-    p.add_argument("--optimizer_save_every", type=int, default=None,
-                    help="save optimizer.pt/rng_state.pt only every N steps (default: same "
-                         "as --save_every). Set higher to cut the periodic I/O spike -- "
-                         "resume just replays slightly stale optimizer momentum, model "
-                         "weights and resume position stay exactly in sync either way.")
+    p.add_argument("--optimizer_save_every", type=int, default=None)
     p.add_argument("--new_data", action="store_true")
     p.add_argument("--train_router_only", action="store_true")
     p.add_argument("--qat", action="store_true")
     p.add_argument("--qat_calib_batches", type=int, default=64)
     p.add_argument("--qat_export_dir", type=str, default=None)
-    p.add_argument("--compile", action="store_true",
-                    help="torch.compile(model) for faster training (PyTorch 2.0+, ~2-5x on CPU)")
-    p.add_argument("--cpu", action="store_true",
-                    help="small/old-CPU tuning: thread pinning, native C++ Lion, native WKV, "
-                         "AVX-only MKL. Add --compile separately, benchmark it first. See docs/cpu.md.")
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--cpu", action="store_true")
     args = p.parse_args()
+    if args.precision is None:
+        args.precision = "fp16" if torch.cuda.is_available() and not args.cpu else "fp32"
     if args.target_params <= 0:
         p.error("--target_params must be > 0")
     if args.optimizer_save_every is None:
@@ -312,12 +309,10 @@ def parse_args():
         p.error("--n_embd and --head_size must be > 0")
     if args.n_embd % args.head_size:
         p.error(f"--n_embd ({args.n_embd}) must be divisible by --head_size ({args.head_size})")
-    if args.n_layer is not None and args.n_layer <= 0:
-        p.error("--n_layer must be > 0")
-    if args.n_moba_layer < 0:
-        p.error("--n_moba_layer must be >= 0")
-    if args.n_layer is not None and args.n_moba_layer >= args.n_layer:
-        p.error("--n_moba_layer must leave at least one RWKV layer")
+    if args.n_layer <= 0 or args.n_moba_layer < 0 or args.n_moba_layer >= args.n_layer:
+        p.error("invalid layer counts")
+    if args.cpu and args.precision == "fp16":
+        p.error("--precision fp16 requires CUDA")
     return args
 
 
@@ -327,18 +322,10 @@ def build_model(args, tokenizer) -> RWKVXModel:
         print(f"[RESUME] loading model from {output_dir}")
         return RWKVXModel.from_pretrained(output_dir)
     print("[INIT] creating new model")
-    if args.n_layer is not None:
-        from rwkv_x_core import RWKVXConfig
-        cfg = RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd,
-                           n_layer=args.n_layer, n_moba_layer=args.n_moba_layer,
-                           head_size=args.head_size)
-    else:
-        cfg = config_for_target_params(args.target_params, vocab_size=tokenizer_vocab_size(tokenizer),
-                                        n_embd=args.n_embd, n_moba_layer=args.n_moba_layer,
-                                        head_size=args.head_size)
-        actual_params = cfg.approx_param_count()
-        if abs(actual_params - args.target_params) / args.target_params > 0.10:
-            raise ValueError(f"requested {args.target_params:,} params, closest supported architecture is {actual_params:,} ({abs(actual_params - args.target_params) / args.target_params:.1%} away)")
+    from rwkv_x_core import RWKVXConfig
+    cfg = RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd,
+                      n_layer=args.n_layer, n_moba_layer=args.n_moba_layer,
+                      head_size=args.head_size)
     cfg.ctx_len_hint = args.ctx_len
     model = RWKVXModel(cfg)
     print(f"[MODEL] n_layer={cfg.n_layer} n_embd={cfg.n_embd} n_moba_layer={cfg.n_moba_layer} vocab_size={cfg.vocab_size} -> {model.num_parameters()/1e6:.1f}M params")
@@ -347,12 +334,16 @@ def build_model(args, tokenizer) -> RWKVXModel:
 
 def main():
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[DEVICE] {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(f"[DEVICE] {device} | precision={args.precision}")
     if args.cpu:
         from cpu import configure as cpu_configure
         threads = cpu_configure()
         print(f"[CPU] {threads} threads, WKV native, compile={args.compile}")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        print(f"[CUDA] {torch.cuda.get_device_name(0)} | AMP={args.precision}")
     tokenizer_path = Path(args.tokenizer_path)
     output_dir = Path(args.output_dir)
     bundled_tok = output_dir / "tokenizer.json"
@@ -402,11 +393,12 @@ def main():
     else:
         _load_rng_state(checkpoint_dir / "rng_state.pt")
     print(f"[RESUME] step={resume.global_step:,} tokens={resume.total_tokens:,} file={resume.file_path} record={resume.record_index} epoch={resume.epoch}")
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and args.precision == "fp16" else None
     try:
         if args.mode == "pretrain":
-            train_pretrain(args, model, optimizer, resume, device, tokenizer)
+            train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler)
         else:
-            train_sft(args, model, optimizer, resume, device, tokenizer)
+            train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
     finally:
         save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path, save_dtype=args.save_dtype)
     if args.qat and args.qat_export_dir:
