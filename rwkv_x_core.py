@@ -174,8 +174,8 @@ class RWKV_Tmix_x070(nn.Module):
             self.key = nn.Linear(C, C, bias=False)
             self.value = nn.Linear(C, C, bias=False)
             self.output = nn.Linear(C, C, bias=False)
-
             self.ln_x = nn.GroupNorm(H, C, eps=(1e-5) * (cfg.head_size_divisor ** 2))
+
             self.receptance.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
             self.key.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
             self.value.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
@@ -347,6 +347,7 @@ class CausalSelfAttention(nn.Module):
 class MOBABlock(nn.Module):
     def __init__(self, cfg: RWKVXConfig, layer_id: int):
         super().__init__()
+        self.cfg_checkpoint_ffn = cfg.checkpoint_ffn
         self.ln1 = nn.LayerNorm(cfg.n_embd)
         self.ln2 = nn.LayerNorm(cfg.n_embd)
         self.att = CausalSelfAttention(cfg)
@@ -359,7 +360,7 @@ class MOBABlock(nn.Module):
         else:
             att_out = self.att(self.ln1(x))
         x = x + att_out
-        if self.cfg_checkpoint_ffn:
+        if self.cfg_checkpoint_ffn and self.training and torch.is_grad_enabled():
             ffn_out, new_cmix_state = torch.utils.checkpoint.checkpoint(
                 self.ffn, self.ln2(x), cmix_state, use_reentrant=False
             )
