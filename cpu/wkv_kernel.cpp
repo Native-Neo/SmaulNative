@@ -182,6 +182,19 @@ std::vector<torch::Tensor> wkv_backward(
                 const float* prev = hist.data() + t * state_stride;
                 const float* next = hist.data() + (t + 1) * state_stride;
 
+                // su/c depend on (prev, kkt, at) at this timestep; they were only
+                // ever populated for t=T-1 during the forward-recompute pass above,
+                // so they must be recomputed here for every t, not reused stale.
+                for (int64_t i = 0; i < N; ++i) {
+                    float s = 0.0f;
+                    const float* prow = prev + i * N;
+                    #pragma GCC ivdep
+                    for (int64_t j = 0; j < N; ++j) s -= prow[j] * kkt[j];
+                    su[i] = s;
+                }
+                #pragma GCC ivdep
+                for (int64_t j = 0; j < N; ++j) c[j] = kkt[j] * at[j];
+
                 std::copy(gnext.begin(), gnext.end(), gcur.begin());
                 #pragma GCC ivdep
                 for (int64_t i = 0; i < N; ++i)
