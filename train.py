@@ -159,7 +159,7 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     model = getattr(model, "_orig_mod", model)
-    model.save_pretrained(output_dir, dtype=save_dtype)
+    model.save_pretrained(output_dir, dtype=save_dtype, include_upstream=False)
     bundled_tok = output_dir / "tokenizer.json"
     if tokenizer_path.resolve() != bundled_tok.resolve():
         shutil.copy2(tokenizer_path, bundled_tok)
