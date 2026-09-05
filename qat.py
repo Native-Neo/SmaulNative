@@ -15,6 +15,29 @@ ACT_QMIN, ACT_QMAX = 0, NUM_LEVELS - 1
 SIGNED_ACT_QMIN, SIGNED_ACT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
 
 
+def _install_cuda_wkv_compile():
+    if not torch.cuda.is_available() or not hasattr(torch, "compile"):
+        return
+    try:
+        import rwkv_x_core
+        fn = rwkv_x_core._wkv_run_chunk
+        if not getattr(fn, "_smaul_cuda_compiled", False):
+            compiled = torch.compile(
+                fn,
+                mode="max-autotune-no-cudagraphs",
+                dynamic=False,
+                fullgraph=False,
+            )
+            compiled._smaul_cuda_compiled = True
+            rwkv_x_core._wkv_run_chunk = compiled
+        print("[CUDA] WKV TorchInductor enabled")
+    except Exception as e:
+        print(f"[CUDA] WKV compile unavailable, using eager path: {e}")
+
+
+_install_cuda_wkv_compile()
+
+
 def _weight_fake_quant() -> FakeQuantize:
     return FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, quant_min=WEIGHT_QMIN, quant_max=WEIGHT_QMAX, dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0)()
 
