@@ -28,6 +28,7 @@ class RWKVXConfig:
     head_size_divisor: int = 8
     ctx_len_hint: int = 2048
     wkv_chunk_size: int = 64
+    checkpoint_ffn: bool = True
     is_moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
@@ -173,8 +174,8 @@ class RWKV_Tmix_x070(nn.Module):
             self.key = nn.Linear(C, C, bias=False)
             self.value = nn.Linear(C, C, bias=False)
             self.output = nn.Linear(C, C, bias=False)
-            self.ln_x = nn.GroupNorm(H, C, eps=(1e-5) * (cfg.head_size_divisor ** 2))
 
+            self.ln_x = nn.GroupNorm(H, C, eps=(1e-5) * (cfg.head_size_divisor ** 2))
             self.receptance.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
             self.key.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5))
             self.value.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
@@ -358,7 +359,7 @@ class MOBABlock(nn.Module):
         else:
             att_out = self.att(self.ln1(x))
         x = x + att_out
-        if use_checkpoint:
+        if self.cfg_checkpoint_ffn:
             ffn_out, new_cmix_state = torch.utils.checkpoint.checkpoint(
                 self.ffn, self.ln2(x), cmix_state, use_reentrant=False
             )
@@ -372,6 +373,7 @@ class RWKVBlock(nn.Module):
     def __init__(self, cfg: RWKVXConfig, layer_id: int):
         super().__init__()
         self.layer_id = layer_id
+        self.cfg_checkpoint_ffn = cfg.checkpoint_ffn
         if layer_id == 0:
             self.ln0 = nn.LayerNorm(cfg.n_embd)
         self.ln1 = nn.LayerNorm(cfg.n_embd)
@@ -384,7 +386,7 @@ class RWKVBlock(nn.Module):
             x = self.ln0(x)
         xx, v_first, new_tmix_state = self.att(self.ln1(x), v_first, tmix_state)
         x = x + xx
-        if self.training and torch.is_grad_enabled():
+        if self.cfg_checkpoint_ffn and self.training and torch.is_grad_enabled():
             ffn_out, new_cmix_state = torch.utils.checkpoint.checkpoint(
                 self.ffn, self.ln2(x), cmix_state, use_reentrant=False
             )
