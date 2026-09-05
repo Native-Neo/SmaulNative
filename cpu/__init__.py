@@ -87,8 +87,7 @@ def _linear_memory_attention(self, x):
         v_i = v[:, :, lo:hi]
         local_y = F.scaled_dot_product_attention(q_i, k_i, v_i, is_causal=True)
         pk = phi_k[:, :, lo:hi]
-        pv = v_i
-        kv = torch.einsum("bhtn,bhtm->bhtnm", pk, pv).cumsum(dim=2)
+        kv = torch.einsum("bhtn,bhtm->bhtnm", pk, v_i).cumsum(dim=2)
         z = pk.cumsum(dim=2)
         state_i = state.unsqueeze(2) + kv
         norm_i = norm.unsqueeze(2) + z
