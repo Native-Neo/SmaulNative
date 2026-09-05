@@ -26,6 +26,11 @@ DATASET_CONFIGS = {
         "path": "data/100BT",
         "desc": "FineWeb English (100BT sample)",
     },
+    "openthoughts": {
+        "repo_id": "open-thoughts/OpenThoughts3-1.2M",
+        "path": "data",
+        "desc": "OpenThoughts3-1.2M reasoning (math, code, science)",
+    },
 }
 
 DEFAULT_MAX_TOKENS = 10_000_000_000
@@ -58,6 +63,21 @@ def get_repo_files(repo_id: str, path: str) -> list[dict]:
         raise RuntimeError(f"No Parquet files found in {repo_id}/{path}")
     print(f"[HF] Found {len(files):,} remote parquet files.")
     return files
+
+
+def format_conversation(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    parts = []
+    for turn in value:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("from", "")).strip()
+        text = turn.get("value")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        parts.append(f"{role}: {text.strip()}" if role else text.strip())
+    return "\n".join(parts)
 
 
 class ShardWriter:
@@ -223,12 +243,15 @@ def stream_raw_parquet(parquet_path: Path, start_row: int = 0) -> Iterator[tuple
     names = pf.schema_arrow.names
     lower_names = [name.lower() for name in names]
     text_col = None
+    conversation_col = None
     for candidate in ("text", "content", "document", "body"):
         if candidate in lower_names:
             text_col = names[lower_names.index(candidate)]
             break
+    if "conversations" in lower_names:
+        conversation_col = names[lower_names.index("conversations")]
 
-    columns = [text_col] if text_col else None
+    columns = [text_col or conversation_col] if text_col or conversation_col else None
     for batch in pf.iter_batches(batch_size=2048, columns=columns):
         if current_row + batch.num_rows <= start_row:
             current_row += batch.num_rows
@@ -242,6 +265,15 @@ def stream_raw_parquet(parquet_path: Path, start_row: int = 0) -> Iterator[tuple
                 value = col[idx].as_py()
                 if isinstance(value, str) and value.strip():
                     yield global_idx, value.strip()
+        elif conversation_col:
+            col = batch.column(0)
+            for idx in range(batch.num_rows):
+                global_idx = current_row + idx
+                if global_idx < start_row:
+                    continue
+                text = format_conversation(col[idx].as_py()).strip()
+                if text:
+                    yield global_idx, text
         else:
             for idx, row in enumerate(batch.to_pylist()):
                 global_idx = current_row + idx
@@ -359,13 +391,13 @@ def process_dataset(language: str, config: dict, tokenizer: TokenizerWrapper,
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Token-limited FineWeb downloader and Parquet sharder")
+    p = argparse.ArgumentParser(description="Token-limited dataset downloader and Parquet sharder")
     p.add_argument("--max_tokens", type=int, default=DEFAULT_MAX_TOKENS)
     p.add_argument("--shard_tokens", type=int, default=DEFAULT_SHARD_TOKENS)
     p.add_argument("--compression", choices=["zstd", "snappy", "gzip", "none"], default=DEFAULT_COMPRESSION)
     p.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT))
     p.add_argument("--tokenizer_path", default=str(DEFAULT_TOKENIZER_PATH))
-    p.add_argument("--languages", nargs="+", choices=["hindi", "english", "all"], default=["all"])
+    p.add_argument("--languages", nargs="+", choices=["hindi", "english", "openthoughts", "all"], default=["all"])
     p.add_argument("--temp_dir", default="./datasets/.temp_raw")
     p.add_argument("--no_clean_temp", action="store_true")
     return p.parse_args()
