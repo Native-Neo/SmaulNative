@@ -86,16 +86,17 @@ def _linear_memory_attention(self, x):
         k_i = k[:, :, lo:hi]
         v_i = v[:, :, lo:hi]
         local_y = F.scaled_dot_product_attention(q_i, k_i, v_i, is_causal=True)
-        global_y = []
-        for t in range(hi - lo):
-            kt = phi_k[:, :, lo + t]
-            vt = v_i[:, :, t]
-            state = state + kt.unsqueeze(-1) * vt.unsqueeze(-2)
-            norm = norm + kt
-            qt = phi_q[:, :, lo + t]
-            denom = (qt * norm).sum(dim=-1, keepdim=True).clamp_min(1e-6)
-            global_y.append((torch.matmul(qt.unsqueeze(-2), state).squeeze(-2) / denom).unsqueeze(2))
-        global_y = torch.cat(global_y, dim=2)
+        pk = phi_k[:, :, lo:hi]
+        pv = v_i
+        kv = torch.einsum("bhtn,bhtm->bhtnm", pk, pv).cumsum(dim=2)
+        z = pk.cumsum(dim=2)
+        state_i = state.unsqueeze(2) + kv
+        norm_i = norm.unsqueeze(2) + z
+        global_y = torch.einsum("bhtn,bhtnm->bhtm", phi_q[:, :, lo:hi], state_i)
+        denom = (phi_q[:, :, lo:hi] * norm_i).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        global_y = global_y / denom
+        state = state_i[:, :, -1]
+        norm = norm_i[:, :, -1]
         ys.append((local_y + global_y) * 0.5)
     y = torch.cat(ys, dim=2)
     return self.output(y.transpose(1, 2).contiguous().view(B, T, C))
