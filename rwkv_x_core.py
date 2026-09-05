@@ -181,7 +181,7 @@ class RWKV_Tmix_x070(nn.Module):
             self.value.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5))
             self.output.weight.data.zero_()
 
-    def forward(self, x: torch.Tensor, v_first: torch.Tensor, state: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, v_first: Optional[torch.Tensor], state: Optional[torch.Tensor] = None):
         B, T, C = x.shape
         H, N = self.n_head, self.head_size
 
@@ -299,7 +299,7 @@ class RWKV_CMix_MoE(nn.Module):
         top_w = torch.softmax(top_val, dim=-1)
 
         prev0 = x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros(B, 1, C, dtype=x.dtype, device=x.device)
-        xx = torch.cat([prev0, x[:, :-1, :]], dim=1) - x
+        xx = torch.cat([prev0, x[:, :-1, :],], dim=1) - x
 
         x_flat, xx_flat = x.reshape(B * T, C), xx.reshape(B * T, C)
         idx_flat, w_flat = top_idx.reshape(B * T, self.top_k), top_w.reshape(B * T, self.top_k)
@@ -435,7 +435,7 @@ class RWKVXModel(nn.Module):
         if self.dropout is not None:
             x = self.dropout(x)
 
-        v_first = torch.empty_like(x)
+        v_first = None
         if state is None:
             tmix_state = [None] * len(self.rwkv_blocks)
             cmix_state = [None] * len(self._order)
