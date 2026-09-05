@@ -8,9 +8,6 @@ _EXT = None
 
 
 def configure(threads=None):
-    # i3-3220: 2 physical cores, 4 HW threads. Using all 4 causes severe oversubscription
-    # with PyTorch/MKL's own internal threading (measured 8x SLOWER than 2 threads on this CPU).
-    # Default to physical core count (2). Override with SMAUL_CPU_THREADS.
     if threads is None:
         env_val = os.environ.get("SMAUL_CPU_THREADS")
         if env_val:
@@ -21,7 +18,6 @@ def configure(threads=None):
                 cores = int(subprocess.check_output(
                     ["nproc", "--all"], text=True
                 ).strip())
-                # Use physical cores: for HyperThreaded CPUs, logical/2
                 threads = max(1, cores // 2)
             except Exception:
                 threads = min(os.cpu_count() or 1, 2)
@@ -75,14 +71,13 @@ class NativeLion(Optimizer):
                 self._ext.lion_step(p, p.grad, state["exp_avg"], lr, b1, b2, wd)
         return loss
 
-    @staticmethod
-    def _fallback(p, g, lr, b1, b2, wd):
-        state = getattr(p, "_smaul_lion_state", None)
-        if state is None:
-            state = torch.zeros_like(p)
-            p._smaul_lion_state = state
-        state.mul_(b1).add_(g, alpha=1 - b1)
+    def _fallback(self, p, g, lr, b1, b2, wd):
+        state = self.state[p]
+        if not state:
+            state["exp_avg"] = torch.zeros_like(p)
+        avg = state["exp_avg"]
+        avg.mul_(b1).add_(g, alpha=1 - b1)
         if wd:
             p.mul_(1 - lr * wd)
-        p.add_(state.sign(), alpha=-lr)
-        state.lerp_(g, 1 - b2)
+        p.add_(avg.sign(), alpha=-lr)
+        avg.lerp_(g, 1 - b2)

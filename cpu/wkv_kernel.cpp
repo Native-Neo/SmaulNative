@@ -53,16 +53,20 @@ std::vector<torch::Tensor> wkv_forward(
                 for (int64_t i = 0; i < N; ++i) {
                     float sum = 0.0f;
                     const float* row = st + i * N;
+                    #pragma GCC ivdep
                     for (int64_t j = 0; j < N; ++j) sum += row[j] * (-kkt[j]);
                     su[i] = sum;
                 }
+                #pragma GCC ivdep
                 for (int64_t i = 0; i < N; ++i) {
                     float* row = st + i * N;
                     const float vi = vt[i];
+                    #pragma GCC ivdep
                     for (int64_t j = 0; j < N; ++j) {
                         row[j] = row[j] * wt[j] + su[i] * (kkt[j] * at[j]) + vi * kt[j];
                     }
                     float out = 0.0f;
+                    #pragma GCC ivdep
                     for (int64_t j = 0; j < N; ++j) out += row[j] * rt[j];
                     yt[i] = out;
                 }
@@ -147,13 +151,17 @@ std::vector<torch::Tensor> wkv_backward(
                 for (int64_t i = 0; i < N; ++i) {
                     float s = 0.0f;
                     const float* row = prev + i * N;
+                    #pragma GCC ivdep
                     for (int64_t j = 0; j < N; ++j) s -= row[j] * kkt[j];
                     su[i] = s;
                 }
+                #pragma GCC ivdep
                 for (int64_t j = 0; j < N; ++j) c[j] = kkt[j] * at[j];
+                #pragma GCC ivdep
                 for (int64_t i = 0; i < N; ++i) {
                     const float* prow = prev + i * N;
                     float* nrow = next + i * N;
+                    #pragma GCC ivdep
                     for (int64_t j = 0; j < N; ++j)
                         nrow[j] = prow[j] * wt[j] + su[i] * c[j] + vt[i] * kt[j];
                 }
@@ -174,26 +182,46 @@ std::vector<torch::Tensor> wkv_backward(
                 const float* prev = hist.data() + t * state_stride;
                 const float* next = hist.data() + (t + 1) * state_stride;
 
+                // su/c depend on (prev, kkt, at) at this timestep; they were only
+                // ever populated for t=T-1 during the forward-recompute pass above,
+                // so they must be recomputed here for every t, not reused stale.
+                for (int64_t i = 0; i < N; ++i) {
+                    float s = 0.0f;
+                    const float* prow = prev + i * N;
+                    #pragma GCC ivdep
+                    for (int64_t j = 0; j < N; ++j) s -= prow[j] * kkt[j];
+                    su[i] = s;
+                }
+                #pragma GCC ivdep
+                for (int64_t j = 0; j < N; ++j) c[j] = kkt[j] * at[j];
+
                 std::copy(gnext.begin(), gnext.end(), gcur.begin());
+                #pragma GCC ivdep
                 for (int64_t i = 0; i < N; ++i)
                     for (int64_t j = 0; j < N; ++j)
                         gcur[i * N + j] += gy[i] * rt[j];
 
                 float* grt = grp + off;
+                #pragma GCC ivdep
                 for (int64_t j = 0; j < N; ++j) {
                     float sum = 0.0f;
+                    #pragma GCC ivdep
                     for (int64_t i = 0; i < N; ++i) sum += gy[i] * next[i * N + j];
                     grt[j] += sum;
                 }
 
+                #pragma GCC ivdep
                 for (int64_t i = 0; i < N; ++i) {
                     float z = 0.0f;
+                    #pragma GCC ivdep
                     for (int64_t j = 0; j < N; ++j) z += gcur[i * N + j] * c[j];
                     gsu[i] = z;
                 }
                 std::fill(gc.begin(), gc.end(), 0.0f);
+                #pragma GCC ivdep
                 for (int64_t j = 0; j < N; ++j) {
                     float z = 0.0f;
+                    #pragma GCC ivdep
                     for (int64_t i = 0; i < N; ++i) z += gcur[i * N + j] * su[i];
                     gc[j] = z;
                 }
@@ -203,8 +231,10 @@ std::vector<torch::Tensor> wkv_backward(
                 float* gvt = gvp + off;
                 float* gkkt = gkkp + off;
                 float* gat = gap + off;
+                #pragma GCC ivdep
                 for (int64_t j = 0; j < N; ++j) {
                     float sw = 0.0f, sk = 0.0f;
+                    #pragma GCC ivdep
                     for (int64_t i = 0; i < N; ++i) {
                         const float gij = gcur[i * N + j];
                         sw += gij * prev[i * N + j];
@@ -218,14 +248,18 @@ std::vector<torch::Tensor> wkv_backward(
                 }
 
                 float* gs = (t == 0) ? gs0p + sbase : gnext.data();
+                #pragma GCC ivdep
                 for (int64_t i = 0; i < N; ++i) {
                     float gsu_i = gsu[i];
+                    #pragma GCC ivdep
                     for (int64_t j = 0; j < N; ++j)
                         gs[i * N + j] = gcur[i * N + j] * wt[j] - gsu_i * kkt[j];
                 }
 
+                #pragma GCC ivdep
                 for (int64_t j = 0; j < N; ++j) {
                     float z = 0.0f;
+                    #pragma GCC ivdep
                     for (int64_t i = 0; i < N; ++i) z -= gsu[i] * prev[i * N + j];
                     gkkt[j] += z;
                 }

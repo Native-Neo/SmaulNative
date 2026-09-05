@@ -12,18 +12,43 @@ WBITS = 3
 NUM_LEVELS = 2 ** WBITS
 WEIGHT_QMIN, WEIGHT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
 ACT_QMIN, ACT_QMAX = 0, NUM_LEVELS - 1
+SIGNED_ACT_QMIN, SIGNED_ACT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
+
+
+def _install_cuda_wkv_compile():
+    if not torch.cuda.is_available() or not hasattr(torch, "compile"):
+        return
+    try:
+        import rwkv_x_core
+        fn = rwkv_x_core._wkv_run_chunk
+        if not getattr(fn, "_smaul_cuda_compiled", False):
+            compiled = torch.compile(
+                fn,
+                mode="max-autotune-no-cudagraphs",
+                dynamic=False,
+                fullgraph=False,
+            )
+            compiled._smaul_cuda_compiled = True
+            rwkv_x_core._wkv_run_chunk = compiled
+        print("[CUDA] WKV TorchInductor enabled")
+    except Exception as e:
+        print(f"[CUDA] WKV compile unavailable, using eager path: {e}")
+
+
+_install_cuda_wkv_compile()
 
 
 def _weight_fake_quant() -> FakeQuantize:
     return FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, quant_min=WEIGHT_QMIN, quant_max=WEIGHT_QMAX, dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0)()
 
 
-def _activation_fake_quant() -> FakeQuantize:
+def _activation_fake_quant(signed: bool = False) -> FakeQuantize:
+    if signed:
+        return FakeQuantize.with_args(observer=MovingAverageMinMaxObserver, quant_min=SIGNED_ACT_QMIN, quant_max=SIGNED_ACT_QMAX, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric)()
     return FakeQuantize.with_args(observer=MovingAverageMinMaxObserver, quant_min=ACT_QMIN, quant_max=ACT_QMAX, dtype=torch.quint8, qscheme=torch.per_tensor_affine)()
 
 
 def _pack_3bit(codes: torch.Tensor) -> torch.Tensor:
-    """Pack uint8 codes (values 0-7) into 3-bit packed bytes, entirely device-agnostic."""
     device = codes.device
     shifts = torch.tensor([2, 1, 0], dtype=torch.uint8, device=device)
     bits = (codes.reshape(-1).to(torch.uint8).unsqueeze(-1) >> shifts) & 1
@@ -37,7 +62,6 @@ def _pack_3bit(codes: torch.Tensor) -> torch.Tensor:
 
 
 def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
-    """Unpack 3-bit packed bytes into uint8 codes, entirely device-agnostic."""
     device = packed.device
     shifts = torch.arange(7, -1, -1, dtype=torch.uint8, device=device)
     bits = (packed.unsqueeze(-1) >> shifts) & 1
@@ -47,12 +71,12 @@ def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
 
 
 class QATLinear(nn.Module):
-    def __init__(self, linear: nn.Linear):
+    def __init__(self, linear: nn.Linear, signed_activation: bool = False):
         super().__init__()
         assert linear.bias is None, "RWKV-X Channel-Mix linears are all bias=False"
         self.weight = linear.weight
         self.weight_fq = _weight_fake_quant()
-        self.act_fq = _activation_fake_quant()
+        self.act_fq = _activation_fake_quant(signed_activation)
         self.fake_quant_enabled = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -69,12 +93,6 @@ class QATLinear(nn.Module):
 
 
 class QuantizedLinear(nn.Module):
-    """Converted post-QAT op with packed int3 weights.
-
-    The unpacked uint8 codes are cached per device. Unpacking is entirely PyTorch-native
-    (no NumPy), so it runs on whatever device the packed buffer lives on.
-    """
-
     def __init__(self, packed: torch.Tensor, scale: torch.Tensor, shape: torch.Size):
         super().__init__()
         self.register_buffer("packed", packed)
@@ -116,7 +134,7 @@ def prepare_qat(model: RWKVXModel) -> int:
         for name in _CMIX_LINEAR_NAMES:
             mod = getattr(cmix, name)
             if isinstance(mod, nn.Linear):
-                setattr(cmix, name, QATLinear(mod))
+                setattr(cmix, name, QATLinear(mod, signed_activation=name == "key"))
                 n += 1
     return n
 

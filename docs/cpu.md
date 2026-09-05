@@ -1,27 +1,32 @@
 # Native CPU backend
 
-The CPU path adds a fused C++ Lion update and a faster pretraining loop. The kernel is compiled
-locally with `-O3 -march=native -mavx`, using explicit AVX (256-bit) intrinsics for the Lion hot
-loop (~5x faster than the old scalar loop on Ivy Bridge CPUs such as the i3-3220).
+The CPU path provides a native C++ WKV forward/backward kernel and a fused C++ Lion update. The WKV
+kernel uses `at::parallel_for`; Lion uses AVX when supported by the host CPU. Both are compiled locally.
 
-Use the optimized trainer with:
+## Enable native WKV
 
-```bash
-python cpu/cpu_train.py --mode pretrain --dataset_dir ./datasets --output_dir ./SmaulNative \
-  --checkpoint_dir ./SmaulNative --tokenizer_path ./SmaulNative/tokenizer.json --optimizer lion
-```
-
-**Thread configuration for the i3-3220:**
-
-`SMAUL_CPU_THREADS` controls PyTorch/OpenMP CPU parallelism. The default is now **physical core
-count ÷ 2** (= 2 on a 4-thread i3-3220). Using all 4 HW threads (old default) caused an 8x
-*slowdown* due to HyperThreading oversubscription with MKL. Use `SMAUL_CPU_THREADS=2`:
+The normal trainer uses the native backend with `--cpu`:
 
 ```bash
-SMAUL_CPU_THREADS=2 python cpu/cpu_train.py --mode pretrain ...
+python train.py --cpu --mode pretrain --dataset_dir ./datasets --output_dir ./RWKV-X-256M
 ```
 
-Do **not** set `SMAUL_CPU_THREADS=4` on an i3-3220 — it is measured to be 8x slower.
+`--cpu` configures PyTorch CPU threading and replaces the Python/TorchScript WKV path with the native
+C++ implementation. The native kernel supports head sizes up to 128.
+
+## Thread configuration
+
+`SMAUL_CPU_THREADS` controls the configured CPU thread count. For CPUs with HyperThreading, fewer
+threads can be faster than using every logical CPU. Benchmark the value on your machine rather than
+assuming that the logical-core count is optimal.
+
+Example:
+
+```bash
+SMAUL_CPU_THREADS=2 python train.py --cpu --mode pretrain --dataset_dir ./datasets --output_dir ./RWKV-X-256M
+```
+
+## Benchmarks
 
 For a kernel-only test:
 
@@ -29,15 +34,15 @@ For a kernel-only test:
 python cpu/benchmark_cpu.py --threads 2 --size 10000000
 ```
 
-For a full end-to-end training step benchmark:
+For an end-to-end training-step benchmark:
 
 ```bash
 python cpu/benchmark_full.py --ctx_len 512 --steps 3
 ```
 
-The normal `train.py` remains unchanged. `cpu_train.py` swaps in the native AVX Lion optimizer
-and removes the unnecessary batch tensor stack for batch size 1. Existing checkpoints and optimizer
-state remain compatible because the native optimizer uses the same Lion state and update equations.
+The native WKV path parallelizes independent batch/head work while each recurrence remains sequential
+across time. MOBA attention on CPU still uses causal scaled-dot-product attention and is O(T²), so a
+smaller `--ctx_len` can have a large effect on training speed.
 
-The kernel is intentionally host-compiled with `-march=native -mavx`; do not copy a built
-extension between different CPU architectures.
+The kernel is intentionally compiled for the host CPU. Do not copy a built extension between different
+CPU architectures.

@@ -3,6 +3,7 @@
 import csv
 import json
 from pathlib import Path
+from collections import OrderedDict
 from typing import Iterator, List, Tuple, Optional, Dict, Any
 
 import torch
@@ -211,14 +212,17 @@ class PretrainStream(IterableDataset):
 
     def __iter__(self):
         buf = list(self.buffer_tokens)
+        SUBCHUNK = 4096  # bound peak buf size for huge single records
         for text, path, rec_idx in iter_texts(self.files, self.resume_file, self.resume_record):
-            buf.extend(self.tokenizer.encode(text) + [self.tokenizer.eos_token_id])
+            ids = self.tokenizer.encode(text) + [self.tokenizer.eos_token_id]
             self.last_pos = (path, rec_idx)
-            while len(buf) >= self.ctx_len + 1:
-                chunk = buf[:self.ctx_len + 1]
-                del buf[:self.ctx_len]
-                self.buffer_tokens = list(buf)
-                yield torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long), self.last_pos
+            for i in range(0, len(ids), SUBCHUNK):
+                buf.extend(ids[i:i + SUBCHUNK])
+                while len(buf) >= self.ctx_len + 1:
+                    chunk = buf[:self.ctx_len + 1]
+                    del buf[:self.ctx_len]
+                    self.buffer_tokens = buf  # alias: generator is suspended at yield, safe
+                    yield torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long), self.last_pos
 
 
 DEFAULT_STOP_TOKEN = "\n\n"
@@ -286,18 +290,25 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
 
 
 class SFTDataset(Dataset):
+    _CACHE_MAX = 2048  # bounded LRU, not unbounded growth
+
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int):
         self.records = discover_sft_records(dataset_dir)
         self.tokenizer = tokenizer
         self.ctx_len = ctx_len
         self.pad_token_id = tokenizer.pad_token_id
-        self._processed_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._processed_cache: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
-        if idx not in self._processed_cache:
-            d = _preprocess_conversation(self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id)
-            self._processed_cache[idx] = (d["input_ids"], d["labels"])
-        return self._processed_cache[idx]
+        if idx in self._processed_cache:
+            self._processed_cache.move_to_end(idx)
+            return self._processed_cache[idx]
+        d = _preprocess_conversation(self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id)
+        item = (d["input_ids"], d["labels"])
+        self._processed_cache[idx] = item
+        if len(self._processed_cache) > self._CACHE_MAX:
+            self._processed_cache.popitem(last=False)
+        return item
