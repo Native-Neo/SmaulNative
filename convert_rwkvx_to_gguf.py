@@ -5,7 +5,6 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 import torch
 from safetensors.torch import load_file
 
@@ -52,14 +51,6 @@ def _write_metadata(writer, cfg, tokens, merges):
     writer.add_token_merges([" ".join(m) if isinstance(m, list) else str(m) for m in merges])
 
 
-def _tensor_type(gguf, dtype):
-    if dtype == torch.float32:
-        return gguf.GGMLQuantizationType.F32
-    if dtype == torch.float16:
-        return gguf.GGMLQuantizationType.F16
-    raise ValueError(f"unsupported checkpoint dtype: {dtype}")
-
-
 def convert(input_dir: Path, output: Path, dtype: str):
     try:
         import gguf
@@ -81,19 +72,17 @@ def convert(input_dir: Path, output: Path, dtype: str):
     if len(tokens) != expected_vocab:
         raise ValueError(f"tokenizer vocab is {len(tokens)}, checkpoint expects {expected_vocab}")
 
+    output.parent.mkdir(parents=True, exist_ok=True)
     requested_dtype = torch.float16 if dtype == "f16" else torch.float32
     writer = gguf.GGUFWriter(str(output), "rwkv_x")
     _write_metadata(writer, cfg, tokens, merges)
 
     for name, tensor in state.items():
         if not torch.is_floating_point(tensor):
-            arr = tensor.numpy()
-            writer.add_tensor(name, arr)
+            writer.add_tensor(name, tensor.numpy())
             continue
-        tensor = tensor.to(requested_dtype).contiguous()
-        writer.add_tensor(name, tensor.numpy())
+        writer.add_tensor(name, tensor.to(requested_dtype).contiguous().numpy())
 
-    output.parent.mkdir(parents=True, exist_ok=True)
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
