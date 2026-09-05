@@ -27,7 +27,7 @@ def text_iterator(dataset_dir: Path) -> Iterator[str]:
 def train_tokenizer(dataset_dir: Path, output_path: Path, vocab_size: int = 65536,
                      min_frequency: int = 2, special_tokens: List[str] = None) -> Tokenizer:
     special_tokens = special_tokens or SPECIAL_TOKENS
-    tok = Tokenizer(BPE(unk_token=None))
+    tok = Tokenizer(BPE(unk_token="<unk>"))  # reserved even though byte-level never needs it
     pre_tok = ByteLevelPreTokenizer(add_prefix_space=False)
     tok.pre_tokenizer = pre_tok
     tok.decoder = ByteLevelDecoder()
