@@ -86,6 +86,8 @@ def configure(threads=None):
 
         def init(self, *args, **kwargs):
             old_init(self, *args, **kwargs)
+            if self.head_size > 128:
+                raise ValueError(f"--cpu native WKV needs head_size <= 128, got {self.head_size}")
             self.wkv_chunk_size = chunk
             self.checkpoint_ffn = checkpoint_ffn
 
