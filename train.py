@@ -293,6 +293,12 @@ def parse_args():
         p.error("--n_embd and --head_size must be > 0")
     if args.n_embd % args.head_size:
         p.error(f"--n_embd ({args.n_embd}) must be divisible by --head_size ({args.head_size})")
+    if args.n_layer is not None and args.n_layer <= 0:
+        p.error("--n_layer must be > 0")
+    if args.n_moba_layer < 0:
+        p.error("--n_moba_layer must be >= 0")
+    if args.n_layer is not None and args.n_moba_layer >= args.n_layer:
+        p.error("--n_moba_layer must leave at least one RWKV layer")
     return args
 
 
