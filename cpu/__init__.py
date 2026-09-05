@@ -37,18 +37,34 @@ class _NativeWKV(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_state, grad_y):
-        saved = ctx.saved_tensors
-        with torch.enable_grad():
-            inputs = [x.detach().requires_grad_(True) for x in saved]
-            out_state, y = _WKV_ORIG(*inputs)
-            if grad_state is None:
-                grad_state = torch.zeros_like(out_state)
-            if grad_y is None:
-                grad_y = torch.zeros_like(y)
-            grads = torch.autograd.grad(
-                (out_state, y), inputs, (grad_state, grad_y), allow_unused=True
-            )
-        return grads
+        state, w, k, v, kk, a, r = ctx.saved_tensors
+        ext = _load_wkv()
+
+        state_f = state.float().contiguous()
+        w_f = w.float().contiguous()
+        k_f = k.float().contiguous()
+        v_f = v.float().contiguous()
+        kk_f = kk.float().contiguous()
+        a_f = a.float().contiguous()
+        r_f = r.float().contiguous()
+
+        if grad_state is None:
+            grad_state = torch.zeros_like(state_f)
+        else:
+            grad_state = grad_state.float().contiguous()
+        if grad_y is None:
+            grad_y = torch.zeros_like(r_f)
+        else:
+            grad_y = grad_y.float().contiguous()
+
+        grads = ext.wkv_backward(
+            state_f, w_f, k_f, v_f, kk_f, a_f, r_f, grad_state, grad_y
+        )
+
+        return tuple(
+            None if g is None else g.to(dtype=src.dtype)
+            for g, src in zip(grads, (state, w, k, v, kk, a, r))
+        )
 
 
 def _native_wkv(state, w, k, v, kk, a, r):
