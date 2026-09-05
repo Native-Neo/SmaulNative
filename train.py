@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# train.py -- single entrypoint, pretrain + SFT. Pass --cpu for
-# small/old-CPU tuning (thread pinning, native Lion, AVX-only MKL).
+# train.py -- single entrypoint, pretrain + SFT. Pass --cpu for small/old-CPU tuning.
 
 import argparse
 import contextlib
@@ -8,13 +7,11 @@ import json
 import os
 import sys
 
-# must run before `import torch` -- gated on raw argv since argparse
-# hasn't run yet. Untuned defaults hurt on big/GPU boxes, so --cpu opts in.
 if "--cpu" in sys.argv:
     _threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
     os.environ.setdefault("OMP_NUM_THREADS", _threads)
     os.environ.setdefault("MKL_NUM_THREADS", _threads)
-    os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX")  # pre-Haswell CPUs: delete if AVX2+
+    os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX")
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
@@ -81,13 +78,8 @@ class Lion(Optimizer):
 
 
 def set_router_only_training(model: RWKVXModel, router_only: bool) -> int:
-    """When router_only=True, freezes every parameter except each RWKV_CMix_MoE's router.
-    Since frozen params (requires_grad=False) never get a gradient tensor allocated, this also
-    meaningfully cuts training memory versus fine-tuning the whole model."""
     if not model.cfg.is_moe:
-        raise ValueError("set_router_only_training requires an MoE model (cfg.is_moe=True); "
-                         "this checkpoint has no router -- did you mean to point --output_dir "
-                         "at a merge_moe.py output instead?")
+        raise ValueError("set_router_only_training requires an MoE model (cfg.is_moe=True); this checkpoint has no router -- did you mean to point --output_dir at a merge_moe.py output instead?")
 
     router_params = {id(p) for module in model.modules() if isinstance(module, RWKV_CMix_MoE)
                      for p in module.gate.parameters()}
@@ -166,8 +158,7 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
     print("\n[SAVE] Saving checkpoint...")
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    model = getattr(model, "_orig_mod", model)  # unwrap torch.compile wrapper
-    # optimizer.pt stays fp32, momentum needs full precision
+    model = getattr(model, "_orig_mod", model)
     model.save_pretrained(output_dir, dtype=save_dtype)
     bundled_tok = output_dir / "tokenizer.json"
     if tokenizer_path.resolve() != bundled_tok.resolve():
@@ -181,14 +172,12 @@ def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState
 
 
 def _autocast(args):
-    # bf16 only: CPU autocast has no fp16 kernels
     if args.precision == "bf16":
         return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
     return contextlib.nullcontext()
 
 
 def _optimizer_step(args, model, optimizer, xb, yb):
-    """One fwd/bwd/step. Returns loss tensor, or None if skipped."""
     optimizer.zero_grad(set_to_none=True)
     with _autocast(args):
         _, loss, _ = model(xb, labels=yb)
@@ -279,11 +268,9 @@ def parse_args():
     p.add_argument("--n_moba_layer", type=int, default=5)
     p.add_argument("--ctx_len", type=int, default=512)
     p.add_argument("--precision", choices=["fp32", "bf16"], default="fp32",
-                    help="autocast dtype for forward/backward. fp16 not offered -- torch CPU "
-                         "autocast only implements bf16 kernels. Master weights/optimizer stay fp32.")
+                    help="autocast dtype for forward/backward. fp16 not offered -- torch CPU autocast only implements bf16 kernels. Master weights/optimizer stay fp32.")
     p.add_argument("--save_dtype", choices=["fp32", "fp16", "bf16"], default="fp32",
-                    help="cast weights to this dtype in the saved model.safetensors only "
-                         "(optimizer.pt stays fp32 for resume). Halves checkpoint size for fp16/bf16.")
+                    help="cast weights to this dtype in the saved model.safetensors only (optimizer.pt stays fp32 for resume). Halves checkpoint size for fp16/bf16.")
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--learning_rate", type=float, default=1e-4)
@@ -298,8 +285,7 @@ def parse_args():
     p.add_argument("--compile", action="store_true",
                     help="torch.compile(model) for faster training (PyTorch 2.0+, ~2-5x on CPU)")
     p.add_argument("--cpu", action="store_true",
-                    help="small/old-CPU tuning: thread pinning, native C++ Lion, WKV "
-                         "TorchScript, AVX-only MKL, auto --compile. See cpu/README or docs/cpu.md.")
+                    help="small/old-CPU tuning: thread pinning, native C++ Lion, native WKV, AVX-only MKL, auto --compile. See docs/cpu.md.")
     args = p.parse_args()
     if args.target_params <= 0:
         p.error("--target_params must be > 0")
@@ -317,7 +303,6 @@ def build_model(args, tokenizer) -> RWKVXModel:
         return RWKVXModel.from_pretrained(output_dir)
     print("[INIT] creating new model")
     if args.n_layer is not None:
-        # n_layer pinned directly, skip target_params search
         from rwkv_x_core import RWKVXConfig
         cfg = RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd,
                            n_layer=args.n_layer, n_moba_layer=args.n_moba_layer,
@@ -341,13 +326,8 @@ def main():
     print(f"[DEVICE] {device}")
     if args.cpu:
         from cpu import configure as cpu_configure
-        import rwkv_x_core
         threads = cpu_configure()
-        try:
-            rwkv_x_core._wkv_run_chunk = torch.jit.script(rwkv_x_core._wkv_run_chunk)
-        except Exception as exc:
-            print(f"[WARN] WKV TorchScript optimization unavailable: {exc}")
-        print(f"[CPU] {threads} threads, WKV scripted, compile={args.compile}")
+        print(f"[CPU] {threads} threads, WKV native, compile={args.compile}")
     tokenizer_path = Path(args.tokenizer_path)
     output_dir = Path(args.output_dir)
     bundled_tok = output_dir / "tokenizer.json"
