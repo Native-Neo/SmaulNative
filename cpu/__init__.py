@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from cpu_backend import NativeLion, configure as _configure
 
@@ -67,6 +68,39 @@ def _native_wkv(state, w, k, v, kk, a, r):
     return _NativeWKV.apply(state, w, k, v, kk, a, r)
 
 
+def _linear_memory_attention(self, x):
+    B, T, C = x.shape
+    H, N = self.n_head, C // self.n_head
+    q = self.receptance(x).view(B, T, H, N).transpose(1, 2)
+    k = self.key(x).view(B, T, H, N).transpose(1, 2)
+    v = self.value(x).view(B, T, H, N).transpose(1, 2)
+    phi_q = F.elu(q) + 1.0
+    phi_k = F.elu(k) + 1.0
+    state = torch.zeros(B, H, N, N, dtype=q.dtype, device=x.device)
+    norm = torch.zeros(B, H, N, dtype=q.dtype, device=x.device)
+    ys = []
+    local = max(1, self.chunk_size)
+    for lo in range(0, T, local):
+        hi = min(lo + local, T)
+        q_i = q[:, :, lo:hi]
+        k_i = k[:, :, lo:hi]
+        v_i = v[:, :, lo:hi]
+        local_y = F.scaled_dot_product_attention(q_i, k_i, v_i, is_causal=True)
+        global_y = []
+        for t in range(hi - lo):
+            kt = phi_k[:, :, lo + t]
+            vt = v_i[:, :, t]
+            state = state + kt.unsqueeze(-1) * vt.unsqueeze(-2)
+            norm = norm + kt
+            qt = phi_q[:, :, lo + t]
+            denom = (qt * norm).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            global_y.append((torch.matmul(qt.unsqueeze(-2), state).squeeze(-2) / denom).unsqueeze(2))
+        global_y = torch.cat(global_y, dim=2)
+        ys.append((local_y + global_y) * 0.5)
+    y = torch.cat(ys, dim=2)
+    return self.output(y.transpose(1, 2).contiguous().view(B, T, C))
+
+
 def configure(threads=None):
     global _WKV_ORIG
     threads = _configure(threads)
@@ -75,6 +109,17 @@ def configure(threads=None):
     if _WKV_ORIG is None:
         _WKV_ORIG = rwkv_x_core._wkv_run_chunk
         rwkv_x_core._wkv_run_chunk = _native_wkv
+    old_att_forward = rwkv_x_core.CausalSelfAttention.forward
+    if not getattr(old_att_forward, "_smaul_linear", False):
+        use_linear = os.environ.get("SMAUL_LINEAR_MEMORY", "1") not in {"0", "false", "False"}
+
+        def att_forward(self, x):
+            if use_linear:
+                return _linear_memory_attention(self, x)
+            return old_att_forward(self, x)
+
+        att_forward._smaul_linear = True
+        rwkv_x_core.CausalSelfAttention.forward = att_forward
     old_init = rwkv_x_core.RWKVXConfig.__init__
     if not getattr(old_init, "_smaul_cpu", False):
         chunk = int(os.environ.get("SMAUL_WKV_CHUNK", "256"))
