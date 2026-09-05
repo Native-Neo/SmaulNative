@@ -17,7 +17,7 @@ def _load_wkv():
         _WKV_EXT = load(
             name="smaulnative_wkv",
             sources=[str(root / "wkv_kernel.cpp")],
-            extra_cflags=["-O3", "-march=native", "-mavx"],
+            extra_cflags=["-O3", "-mavx", "-mtune=native", "-fno-tree-vectorize"],
             verbose=False,
         )
     return _WKV_EXT
