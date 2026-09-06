@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # tokenizer.py -- trains byte-level BPE tokenizer.
 import argparse
+from itertools import islice
 from pathlib import Path
 from typing import Iterator, List
 from tokenizers import Tokenizer

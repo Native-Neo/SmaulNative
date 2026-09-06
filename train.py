@@ -117,14 +117,7 @@ class ResumeState:
     def save(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({
-            "global_step": self.global_step,
-            "total_tokens": self.total_tokens,
-            "file_path": self.file_path,
-            "record_index": self.record_index,
-            "epoch": self.epoch,
-            "buffer_tokens": self.buffer_tokens,
-        }, indent=2))
+        tmp.write_text(json.dumps({"global_step": self.global_step, "total_tokens": self.total_tokens, "file_path": self.file_path, "record_index": self.record_index, "epoch": self.epoch, "buffer_tokens": self.buffer_tokens}, indent=2))
         os.replace(tmp, path)
 
 
@@ -150,9 +143,7 @@ def _load_rng_state(path: Path):
         print(f"[WARN] could not restore RNG state: {e}")
 
 
-def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState,
-                    output_dir: Path, checkpoint_dir: Path, tokenizer_path: Path,
-                    save_dtype: str = "fp32", save_optimizer: bool = True):
+def save_checkpoint(model: RWKVXModel, optimizer: Optimizer, resume: ResumeState, output_dir: Path, checkpoint_dir: Path, tokenizer_path: Path, save_dtype: str = "fp32", save_optimizer: bool = True):
     print("\n[SAVE] Saving checkpoint...")
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -308,8 +299,7 @@ def parse_args():
     p.add_argument("--head_size", type=int, default=64)
     p.add_argument("--n_moba_layer", type=int, default=3)
     p.add_argument("--ctx_len", type=int, default=1024)
-    p.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=None,
-                    help="CUDA: fp16/bf16 autocast. CPU: bf16 or fp32. Default is fp16 on CUDA, fp32 on CPU.")
+    p.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=None, help="CUDA: fp16/bf16 autocast. CPU: bf16 or fp32. Default is fp16 on CUDA, fp32 on CPU.")
     p.add_argument("--save_dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--epochs", type=int, default=3)
@@ -354,9 +344,7 @@ def build_model(args, tokenizer) -> RWKVXModel:
         return RWKVXModel.from_pretrained(output_dir)
     print("[INIT] creating new model")
     from rwkv_x_core import RWKVXConfig
-    cfg = RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd,
-                      n_layer=args.n_layer, n_moba_layer=args.n_moba_layer,
-                      head_size=args.head_size)
+    cfg = RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd, n_layer=args.n_layer, n_moba_layer=args.n_moba_layer, head_size=args.head_size)
     cfg.ctx_len_hint = args.ctx_len
     model = RWKVXModel(cfg)
     print(f"[MODEL] n_layer={cfg.n_layer} n_embd={cfg.n_embd} n_moba_layer={cfg.n_moba_layer} vocab_size={cfg.vocab_size} -> {model.num_parameters()/1e6:.1f}M params")

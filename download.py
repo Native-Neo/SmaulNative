@@ -195,8 +195,8 @@ def process_dataset(name: str, config: dict, output_dir: Path, temp_dir: Path, m
 def parse_args():
     p = argparse.ArgumentParser(description="Download and shard Parquet datasets without tokenization")
     p.add_argument("--max_rows", type=int, default=0, help="Maximum rows per dataset; 0 means unlimited")
-    p.add_argument("--shard_rows", type=int, default=DEFAULT_SHARD_ROWS)
-    p.add_argument("--compression", choices=["zstd", "snappy", "gzip", "none"], default=DEFAULT_COMPRESSION)
+    p.add_argument("--shard_rows", type=int, default=100_000)
+    p.add_argument("--compression", choices=["zstd", "snappy", "gzip", "none"], default="zstd")
     p.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT))
     p.add_argument("--languages", nargs="+", choices=["hindi", "english", "openthoughts", "all"], default=["all"])
     p.add_argument("--temp_dir", default="./datasets/.temp_raw")
