@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator
 
@@ -57,11 +58,18 @@ def _text_column(pf: pq.ParquetFile) -> tuple[str | None, bool]:
 
 
 def _read_row_group(remote: str, row_group: int, columns: list[str] | None, token: str | None) -> list[Any]:
-    with HfFileSystem(token=token).open(remote, "rb") as handle:
-def _read_row_group(remote: str, row_group: int, columns: list[str] | None) -> list[Any]:
-    with fs.open(remote, "rb") as handle:
-        pf = pq.ParquetFile(handle)
-        return pf.read_row_group(row_group, columns=columns).to_pylist()
+    retries = max(1, int(os.environ.get("SMAUL_STREAM_RETRIES", "6")))
+    for attempt in range(retries):
+        try:
+            with HfFileSystem(token=token).open(remote, "rb") as handle:
+                pf = pq.ParquetFile(handle)
+                return pf.read_row_group(row_group, columns=columns).to_pylist()
+        except Exception as exc:
+            if attempt + 1 >= retries:
+                raise
+            delay = min(30.0, 2.0 ** attempt)
+            print(f"[STREAM] row group {row_group} read failed: {type(exc).__name__}; retrying in {delay:.0f}s", file=sys.stderr)
+            time.sleep(delay)
 
 
 def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str,
