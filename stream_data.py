@@ -54,49 +54,56 @@ def _text_column(pf: pq.ParquetFile) -> tuple[str | None, bool]:
 
 
 def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
-                   start_file: str | None = None, start_record: int = 0,
-                   with_position: bool = False) -> Iterator[Any]:
-    if name not in DATASETS:
+                   start_dataset: str | None = None, start_file: str | None = None,
+                   start_record: int = 0, with_position: bool = False) -> Iterator[Any]:
+    names = list(DATASETS) if name == "all" else [name]
+    if name != "all" and name not in DATASETS:
         raise ValueError(f"unknown dataset: {name}")
-    config = DATASETS[name]
-    paths = _files(config["repo_id"], config["path"])
-    if not paths:
-        raise RuntimeError(f"No Parquet files found for {name}")
-    active = start_file is None
-    for rel_path in paths:
-        if not active:
-            if rel_path != start_file:
+    active_dataset = start_dataset is None
+    for dataset_name in names:
+        if not active_dataset:
+            if dataset_name != start_dataset:
                 continue
-            active = True
-        skip = start_record if rel_path == start_file else 0
-        remote = f"datasets/{config['repo_id']}/{rel_path}"
-        print(f"[STREAM] {rel_path}" + (f" from row {skip:,}" if skip else ""), file=sys.stderr)
-        with fs.open(remote, "rb") as handle:
-            pf = pq.ParquetFile(handle)
-            column, conversation = _text_column(pf)
-            columns = [column] if column else None
-            record = 0
-            for batch in pf.iter_batches(batch_size=4096, columns=columns):
-                values = batch.column(0).to_pylist() if column else [row for row in batch.to_pylist()]
-                for value in values:
-                    if record < skip:
-                        record += 1
-                        continue
-                    if column:
-                        text = _conversation(value) if conversation else value
-                    else:
-                        if not isinstance(value, dict):
+            active_dataset = True
+        config = DATASETS[dataset_name]
+        paths = _files(config["repo_id"], config["path"])
+        if not paths:
+            raise RuntimeError(f"No Parquet files found for {dataset_name}")
+        active_file = start_file is None or dataset_name != start_dataset
+        for rel_path in paths:
+            if not active_file:
+                if rel_path != start_file:
+                    continue
+                active_file = True
+            skip = start_record if dataset_name == start_dataset and rel_path == start_file else 0
+            remote = f"datasets/{config['repo_id']}/{rel_path}"
+            print(f"[STREAM] {dataset_name}/{rel_path}" + (f" from row {skip:,}" if skip else ""), file=sys.stderr)
+            with fs.open(remote, "rb") as handle:
+                pf = pq.ParquetFile(handle)
+                column, conversation = _text_column(pf)
+                columns = [column] if column else None
+                record = 0
+                for batch in pf.iter_batches(batch_size=4096, columns=columns):
+                    values = batch.column(0).to_pylist() if column else [row for row in batch.to_pylist()]
+                    for value in values:
+                        if record < skip:
                             record += 1
                             continue
-                        text = ""
-                        for item in value.values():
-                            if isinstance(item, str) and len(item) > len(text):
-                                text = item
-                    text = filter_text(text, name, min_chars, max_chars)
-                    position = (rel_path, record + 1)
-                    record += 1
-                    if text is not None:
-                        yield (text, position) if with_position else text
+                        if column:
+                            text = _conversation(value) if conversation else value
+                        else:
+                            if not isinstance(value, dict):
+                                record += 1
+                                continue
+                            text = ""
+                            for item in value.values():
+                                if isinstance(item, str) and len(item) > len(text):
+                                    text = item
+                        text = filter_text(text, dataset_name, min_chars, max_chars)
+                        position = (dataset_name, rel_path, record + 1)
+                        record += 1
+                        if text is not None:
+                            yield (text, position) if with_position else text
 
 
 def main() -> None:
@@ -106,15 +113,13 @@ def main() -> None:
     p.add_argument("--max_chars", type=int, default=1_000_000)
     p.add_argument("--max_records", type=int, default=0, help="0 means unlimited")
     args = p.parse_args()
-    names = list(DATASETS) if args.dataset == "all" else [args.dataset]
     count = 0
-    for name in names:
-        for text in stream_dataset(name, args.min_chars, args.max_chars):
-            print(json.dumps({"text": text}, ensure_ascii=False), flush=True)
-            count += 1
-            if args.max_records and count >= args.max_records:
-                print(f"[DONE] streamed {count:,} records", file=sys.stderr)
-                return
+    for text in stream_dataset(args.dataset, args.min_chars, args.max_chars):
+        print(json.dumps({"text": text}, ensure_ascii=False), flush=True)
+        count += 1
+        if args.max_records and count >= args.max_records:
+            print(f"[DONE] streamed {count:,} records", file=sys.stderr)
+            return
     print(f"[DONE] streamed {count:,} records", file=sys.stderr)
 
 
