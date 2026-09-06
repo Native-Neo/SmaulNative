@@ -28,6 +28,7 @@ from torch.optim import Optimizer
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, config_for_target_params
 from dataset import load_tokenizer, tokenizer_vocab_size, PretrainStream, SFTDataset, iter_texts, discover_files
 from tokenizer import train_tokenizer
+from stream_data import stream_dataset
 import qat
 
 DEFAULT_TARGET_PARAMS = 256_000_000
@@ -201,17 +202,40 @@ def _optimizer_step(args, model, optimizer, xb, yb, device, scaler):
     return loss
 
 
+def _remote_token_stream(dataset_name, tokenizer, ctx_len):
+    buf = []
+    for text in stream_dataset(dataset_name):
+        ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
+        buf.extend(ids)
+        while len(buf) >= ctx_len + 1:
+            chunk = buf[:ctx_len + 1]
+            del buf[:ctx_len]
+            yield torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long)
+
+
 def train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler):
-    if resume.file_path is not None and not Path(resume.file_path).is_file():
-        raise FileNotFoundError(f"resume dataset file no longer exists: {resume.file_path}")
-    stream = PretrainStream(Path(args.dataset_dir), tokenizer, args.ctx_len,
-                             resume_file=resume.file_path, resume_record=resume.record_index,
-                             buffer_tokens=resume.buffer_tokens)
+    if args.stream_dataset != "none":
+        if resume.global_step and not args.new_data:
+            print("[STREAM] remote datasets do not support exact file-position resume; continuing from the beginning")
+        stream = _remote_token_stream(args.stream_dataset, tokenizer, args.ctx_len)
+        positions = None
+    else:
+        if resume.file_path is not None and not Path(resume.file_path).is_file():
+            raise FileNotFoundError(f"resume dataset file no longer exists: {resume.file_path}")
+        stream = PretrainStream(Path(args.dataset_dir), tokenizer, args.ctx_len,
+                                resume_file=resume.file_path, resume_record=resume.record_index,
+                                buffer_tokens=resume.buffer_tokens)
+        positions = True
     model.train()
     batch_x, batch_y = [], []
     t0 = time.perf_counter()
     tok_since = 0
-    for x, y, pos in stream:
+    for item in stream:
+        if positions:
+            x, y, pos = item
+        else:
+            x, y = item
+            pos = (f"remote:{args.stream_dataset}", 0)
         batch_x.append(x)
         batch_y.append(y)
         if len(batch_x) < args.batch_size:
@@ -225,7 +249,6 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler):
         resume.global_step += 1
         resume.total_tokens += xb.numel()
         resume.file_path, resume.record_index = pos
-        resume.buffer_tokens = list(stream.buffer_tokens)
         tok_since += xb.numel()
         if resume.global_step % args.log_every == 0:
             dt = time.perf_counter() - t0
@@ -271,6 +294,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="RWKV-X trainer (pretrain + sft, CPU/CUDA)")
     p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
     p.add_argument("--dataset_dir", type=str, default="./datasets")
+    p.add_argument("--stream_dataset", choices=["none", "hindi", "english", "openthoughts", "all"], default="none",
+                    help="Stream directly from Hugging Face without storing dataset files")
     p.add_argument("--output_dir", type=str, default="./SmaulNative")
     p.add_argument("--checkpoint_dir", type=str, default="./SmaulNative")
     p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json")
@@ -313,6 +338,8 @@ def parse_args():
         p.error("invalid layer counts")
     if args.cpu and args.precision == "fp16":
         p.error("--precision fp16 requires CUDA")
+    if args.mode == "sft" and args.stream_dataset != "none":
+        p.error("--stream_dataset is supported for pretraining only")
     return args
 
 
@@ -351,6 +378,8 @@ def main():
         print(f"[RESUME] using tokenizer bundled with existing checkpoint: {bundled_tok}")
         tokenizer_path = bundled_tok
     if not tokenizer_path.exists():
+        if args.stream_dataset != "none":
+            raise FileNotFoundError(f"{tokenizer_path} is required for remote streaming; train tokenizer separately first")
         print(f"[TOKENIZER] {tokenizer_path} not found -- training one on {args.dataset_dir} (vocab_size={args.tokenizer_vocab_size})")
         train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size)
     tokenizer = load_tokenizer(tokenizer_path)
