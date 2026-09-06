@@ -20,8 +20,9 @@ DATASETS: Dict[str, Dict[str, str]] = {
     "openthoughts": {"repo_id": "open-thoughts/OpenThoughts3-1.2M", "path": "data"},
 }
 
-api = HfApi()
-fs = HfFileSystem()
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+api = HfApi(token=HF_TOKEN)
+fs = HfFileSystem(token=HF_TOKEN)
 
 
 def _conversation(value: Any) -> str:
@@ -55,8 +56,8 @@ def _text_column(pf: pq.ParquetFile) -> tuple[str | None, bool]:
     return None, False
 
 
-def _read_row_group(remote: str, row_group: int, columns: list[str] | None) -> list[Any]:
-    with fs.open(remote, "rb") as handle:
+def _read_row_group(remote: str, row_group: int, columns: list[str] | None, token: str | None) -> list[Any]:
+    with HfFileSystem(token=token).open(remote, "rb") as handle:
         pf = pq.ParquetFile(handle)
         return pf.read_row_group(row_group, columns=columns).to_pylist()
 
@@ -71,8 +72,9 @@ def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str,
         columns = [column] if column else None
         row_groups = pf.num_row_groups
 
+    token = HF_TOKEN
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_read_row_group, remote, i, columns) for i in range(row_groups)]
+        futures = [pool.submit(_read_row_group, remote, i, columns, token) for i in range(row_groups)]
         record = 0
         for future in futures:
             values = future.result()
@@ -106,7 +108,7 @@ def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
         raise ValueError(f"unknown dataset: {name}")
     workers = workers or int(os.environ.get("SMAUL_STREAM_WORKERS", "0"))
     if workers <= 0:
-        workers = min(8, max(2, os.cpu_count() or 2))
+        workers = min(4, max(1, os.cpu_count() or 1))
     active_dataset = start_dataset is None
     for dataset_name in names:
         if not active_dataset:
