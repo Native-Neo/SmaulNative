@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# tokenizer.py -- trains byte-level BPE tokenizer, saves tokenizer.json.
-# train.py auto-runs this if tokenizer.json is missing.
+# tokenizer.py -- trains byte-level BPE tokenizer.
 import argparse
 from pathlib import Path
 from typing import Iterator, List
@@ -11,8 +10,8 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.processors import ByteLevel as ByteLevelProcessor
 from tokenizers.trainers import BpeTrainer
 from dataset import discover_files, iter_texts
+from stream_data import stream_dataset
 
-# pad/eos required by TokenizerWrapper; bos/unk reserved for future use
 SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
 
 
@@ -24,10 +23,15 @@ def text_iterator(dataset_dir: Path) -> Iterator[str]:
         yield text
 
 
+def remote_text_iterator(dataset_name: str) -> Iterator[str]:
+    yield from stream_dataset(dataset_name)
+
+
 def train_tokenizer(dataset_dir: Path, output_path: Path, vocab_size: int = 65536,
-                     min_frequency: int = 2, special_tokens: List[str] = None) -> Tokenizer:
+                     min_frequency: int = 2, special_tokens: List[str] = None,
+                     stream_name: str = "none") -> Tokenizer:
     special_tokens = special_tokens or SPECIAL_TOKENS
-    tok = Tokenizer(BPE(unk_token="<unk>"))  # reserved even though byte-level never needs it
+    tok = Tokenizer(BPE(unk_token="<unk>"))
     pre_tok = ByteLevelPreTokenizer(add_prefix_space=False)
     tok.pre_tokenizer = pre_tok
     tok.decoder = ByteLevelDecoder()
@@ -37,20 +41,26 @@ def train_tokenizer(dataset_dir: Path, output_path: Path, vocab_size: int = 6553
         min_frequency=min_frequency,
         special_tokens=special_tokens,
         show_progress=True,
-        initial_alphabet=pre_tok.alphabet(),  # seed all 256 byte tokens so none are ever missing
+        initial_alphabet=pre_tok.alphabet(),
     )
-    print(f"[TOKENIZER] training BPE (target vocab_size={vocab_size}) on {dataset_dir} ...")
-    tok.train_from_iterator(text_iterator(dataset_dir), trainer=trainer)
+    if stream_name != "none":
+        print(f"[TOKENIZER] streaming {stream_name} from Hugging Face ...")
+        iterator = remote_text_iterator(stream_name)
+    else:
+        print(f"[TOKENIZER] training BPE on {dataset_dir} ...")
+        iterator = text_iterator(dataset_dir)
+    tok.train_from_iterator(iterator, trainer=trainer)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tok.save(str(output_path))
-    print(f"[TOKENIZER] saved merged tokenizer -> {output_path} "
-          f"(actual vocab_size={tok.get_vocab_size()})")
+    print(f"[TOKENIZER] saved -> {output_path} (actual vocab_size={tok.get_vocab_size()})")
     return tok
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train a byte-level BPE tokenizer on --dataset_dir")
+    p = argparse.ArgumentParser(description="Train a byte-level BPE tokenizer")
     p.add_argument("--dataset_dir", type=str, default="./datasets")
+    p.add_argument("--stream_dataset", choices=["none", "hindi", "english", "openthoughts", "all"], default="none",
+                    help="Stream training text directly from Hugging Face")
     p.add_argument("--output", type=str, default="./SmaulNative/tokenizer.json")
     p.add_argument("--vocab_size", type=int, default=65536)
     p.add_argument("--min_frequency", type=int, default=2)
@@ -59,7 +69,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    train_tokenizer(Path(args.dataset_dir), Path(args.output), args.vocab_size, args.min_frequency)
+    train_tokenizer(Path(args.dataset_dir), Path(args.output), args.vocab_size, args.min_frequency, stream_name=args.stream_dataset)
 
 
 if __name__ == "__main__":
