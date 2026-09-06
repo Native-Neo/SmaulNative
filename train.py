@@ -300,6 +300,8 @@ def parse_args():
     p.add_argument("--checkpoint_dir", type=str, default="./SmaulNative")
     p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json")
     p.add_argument("--tokenizer_vocab_size", type=int, default=65536)
+    p.add_argument("--tokenizer_max_records", type=int, default=5_000_000,
+                    help="Maximum streamed records used to train a missing tokenizer; 0 means unlimited")
     p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS)
     p.add_argument("--n_embd", type=int, default=832)
     p.add_argument("--n_layer", type=int, default=17)
@@ -328,6 +330,8 @@ def parse_args():
         args.precision = "fp16" if torch.cuda.is_available() and not args.cpu else "fp32"
     if args.target_params <= 0:
         p.error("--target_params must be > 0")
+    if args.tokenizer_max_records < 0:
+        p.error("--tokenizer_max_records must be >= 0")
     if args.optimizer_save_every is None:
         args.optimizer_save_every = args.save_every
     if args.n_embd <= 0 or args.head_size <= 0:
@@ -378,10 +382,9 @@ def main():
         print(f"[RESUME] using tokenizer bundled with existing checkpoint: {bundled_tok}")
         tokenizer_path = bundled_tok
     if not tokenizer_path.exists():
-        if args.stream_dataset != "none":
-            raise FileNotFoundError(f"{tokenizer_path} is required for remote streaming; train tokenizer separately first")
-        print(f"[TOKENIZER] {tokenizer_path} not found -- training one on {args.dataset_dir} (vocab_size={args.tokenizer_vocab_size})")
-        train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size)
+        print(f"[TOKENIZER] {tokenizer_path} not found -- training one (vocab_size={args.tokenizer_vocab_size})")
+        train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size,
+                        stream_name=args.stream_dataset, max_records=args.tokenizer_max_records)
     tokenizer = load_tokenizer(tokenizer_path)
     model = build_model(args, tokenizer).to(device)
     if args.train_router_only:
@@ -398,46 +401,24 @@ def main():
         print(f"[QAT] calibrated on {done} batches")
     if args.compile:
         print("[INIT] compiling model via torch.compile ...")
-        model = torch.compile(model)
-    opt_map = {"lion": Lion, "adamw": torch.optim.AdamW}
-    if args.optimizer == "adafactor":
-        if not hasattr(torch.optim, "Adafactor"):
-            raise RuntimeError("torch.optim.Adafactor needs torch>=2.5, pip install -U torch")
-        opt_map["adafactor"] = torch.optim.Adafactor
-    if args.cpu and args.optimizer == "lion":
-        from cpu import NativeLion
-        opt_map["lion"] = NativeLion
-    optimizer = opt_map[args.optimizer](model.parameters(), lr=args.learning_rate)
-    checkpoint_dir = Path(args.checkpoint_dir)
-    opt_path = checkpoint_dir / "optimizer.pt"
-    if opt_path.exists() and not args.new_data:
+        model = torch.compile(model, mode="max-autotune")
+    resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json")
+    optimizer = {"adafactor": torch.optim.Adafactor, "adamw": torch.optim.AdamW, "lion": Lion}[args.optimizer](model.parameters(), lr=args.learning_rate)
+    optimizer_state = Path(args.checkpoint_dir) / "optimizer.pt"
+    if optimizer_state.exists() and not args.new_data:
         try:
-            optimizer.load_state_dict(torch.load(opt_path, map_location=device))
-            print("[RESUME] loaded optimizer state")
+            optimizer.load_state_dict(torch.load(optimizer_state, map_location="cpu"))
+            print("[RESUME] optimizer restored")
         except Exception as e:
             print(f"[WARN] could not restore optimizer: {e}")
-    resume = ResumeState.load(checkpoint_dir / "resume_state.json")
-    if args.new_data:
-        resume = ResumeState()
+    _load_rng_state(Path(args.checkpoint_dir) / "rng_state.pt")
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda" and args.precision == "fp16")
+    if args.mode == "pretrain":
+        train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler)
     else:
-        _load_rng_state(checkpoint_dir / "rng_state.pt")
-    print(f"[RESUME] step={resume.global_step:,} tokens={resume.total_tokens:,} file={resume.file_path} record={resume.record_index} epoch={resume.epoch}")
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and args.precision == "fp16" else None
-    try:
-        if args.mode == "pretrain":
-            train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler)
-        else:
-            train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
-    finally:
-        save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path, save_dtype=args.save_dtype)
-    if args.qat and args.qat_export_dir:
-        import copy
-        print(f"[QAT] converting to real packed int3 weights -> {args.qat_export_dir}")
-        exported = copy.deepcopy(model).cpu()
-        n = qat.convert_qat(exported)
-        exported.save_pretrained(Path(args.qat_export_dir))
-        shutil.copy2(tokenizer_path, Path(args.qat_export_dir) / "tokenizer.json")
-        print(f"[QAT] converted {n} linear(s), exported to {args.qat_export_dir}")
+        train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
+    save_checkpoint(model, optimizer, resume, output_dir, Path(args.checkpoint_dir), tokenizer_path,
+                    save_dtype=args.save_dtype, save_optimizer=True)
 
 
 if __name__ == "__main__":
