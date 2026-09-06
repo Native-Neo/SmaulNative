@@ -25,8 +25,17 @@ def text_iterator(dataset_dir: Path) -> Iterator[str]:
 
 
 def remote_text_iterator(dataset_name: str, max_records: int = 0) -> Iterator[str]:
+    if dataset_name == "all":
+        for name in ("hindi", "english", "openthoughts"):
+            iterator = stream_dataset(name)
+            if max_records:
+                from itertools import islice
+                iterator = islice(iterator, max_records)
+            yield from iterator
+        return
     iterator = stream_dataset(dataset_name)
     if max_records:
+        from itertools import islice
         iterator = islice(iterator, max_records)
     yield from iterator
 
@@ -48,7 +57,10 @@ def train_tokenizer(dataset_dir: Path, output_path: Path, vocab_size: int = 6553
         initial_alphabet=pre_tok.alphabet(),
     )
     if stream_name != "none":
-        limit = f", max {max_records:,} records" if max_records else ""
+        if max_records:
+            limit = f", {max_records:,} records per dataset" if stream_name == "all" else f", max {max_records:,} records"
+        else:
+            limit = ""
         print(f"[TOKENIZER] streaming {stream_name} from Hugging Face{limit} ...")
         iterator = remote_text_iterator(stream_name, max_records)
     else:
@@ -67,7 +79,7 @@ def parse_args():
     p.add_argument("--stream_dataset", choices=["none", "hindi", "english", "openthoughts", "all"], default="none",
                     help="Stream training text directly from Hugging Face")
     p.add_argument("--max_records", type=int, default=5_000_000,
-                    help="Maximum streamed records; 0 means unlimited")
+                    help="Maximum streamed records per dataset when using all; 0 means unlimited")
     p.add_argument("--output", type=str, default="./SmaulNative/tokenizer.json")
     p.add_argument("--vocab_size", type=int, default=65536)
     p.add_argument("--min_frequency", type=int, default=2)

@@ -213,7 +213,9 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler):
     else:
         if resume.file_path is not None and not Path(resume.file_path).is_file():
             raise FileNotFoundError(f"resume dataset file no longer exists: {resume.file_path}")
-        stream = PretrainStream(Path(args.dataset_dir), tokenizer, args.ctx_len, resume_file=resume.file_path, resume_record=resume.record_index, buffer_tokens=resume.buffer_tokens)
+        stream = PretrainStream(Path(args.dataset_dir), tokenizer, args.ctx_len,
+                                resume_file=resume.file_path, resume_record=resume.record_index,
+                                buffer_tokens=resume.buffer_tokens)
         positions = True
     model.train()
     batch_x, batch_y = [], []
@@ -283,12 +285,14 @@ def parse_args():
     p = argparse.ArgumentParser(description="RWKV-X trainer (pretrain + sft, CPU/CUDA)")
     p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
     p.add_argument("--dataset_dir", type=str, default="./datasets")
-    p.add_argument("--stream_dataset", choices=["none", "hindi", "english", "openthoughts", "all"], default="none", help="Stream directly from Hugging Face without storing dataset files")
+    p.add_argument("--stream_dataset", choices=["none", "hindi", "english", "openthoughts", "all"], default="none",
+                    help="Stream directly from Hugging Face without storing dataset files")
     p.add_argument("--output_dir", type=str, default="./SmaulNative")
     p.add_argument("--checkpoint_dir", type=str, default="./SmaulNative")
     p.add_argument("--tokenizer_path", type=str, default="./SmaulNative/tokenizer.json")
     p.add_argument("--tokenizer_vocab_size", type=int, default=65536)
-    p.add_argument("--tokenizer_max_records", type=int, default=5_000_000, help="Maximum streamed records used to train a missing tokenizer; 0 means unlimited")
+    p.add_argument("--tokenizer_max_records", type=int, default=5_000_000,
+                    help="Maximum streamed records used to train a missing tokenizer; 0 means unlimited")
     p.add_argument("--target_params", type=int, default=DEFAULT_TARGET_PARAMS)
     p.add_argument("--n_embd", type=int, default=832)
     p.add_argument("--n_layer", type=int, default=17)
@@ -367,7 +371,8 @@ def main():
         tokenizer_path = bundled_tok
     if not tokenizer_path.exists():
         print(f"[TOKENIZER] {tokenizer_path} not found -- training one (vocab_size={args.tokenizer_vocab_size})")
-        train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size, stream_name=args.stream_dataset, max_records=args.tokenizer_max_records)
+        train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size,
+                        stream_name=args.stream_dataset, max_records=args.tokenizer_max_records)
     tokenizer = load_tokenizer(tokenizer_path)
     model = build_model(args, tokenizer).to(device)
     if args.train_router_only:
@@ -414,7 +419,8 @@ def main():
         else:
             train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
     finally:
-        save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path, save_dtype=args.save_dtype, save_optimizer=True)
+        save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path,
+                        save_dtype=args.save_dtype, save_optimizer=True)
     if args.qat and args.qat_export_dir:
         import copy
         print(f"[QAT] converting to real packed int3 weights -> {args.qat_export_dir}")
