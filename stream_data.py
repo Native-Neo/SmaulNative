@@ -53,39 +53,50 @@ def _text_column(pf: pq.ParquetFile) -> tuple[str | None, bool]:
     return None, False
 
 
-def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000) -> Iterator[str]:
+def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
+                   start_file: str | None = None, start_record: int = 0,
+                   with_position: bool = False) -> Iterator[Any]:
     if name not in DATASETS:
         raise ValueError(f"unknown dataset: {name}")
     config = DATASETS[name]
     paths = _files(config["repo_id"], config["path"])
     if not paths:
         raise RuntimeError(f"No Parquet files found for {name}")
+    active = start_file is None
     for rel_path in paths:
+        if not active:
+            if rel_path != start_file:
+                continue
+            active = True
+        skip = start_record if rel_path == start_file else 0
         remote = f"datasets/{config['repo_id']}/{rel_path}"
-        print(f"[STREAM] {rel_path}", file=sys.stderr)
+        print(f"[STREAM] {rel_path}" + (f" from row {skip:,}" if skip else ""), file=sys.stderr)
         with fs.open(remote, "rb") as handle:
             pf = pq.ParquetFile(handle)
             column, conversation = _text_column(pf)
             columns = [column] if column else None
+            record = 0
             for batch in pf.iter_batches(batch_size=4096, columns=columns):
-                if column:
-                    values = batch.column(0).to_pylist()
-                    for value in values:
+                values = batch.column(0).to_pylist() if column else [row for row in batch.to_pylist()]
+                for value in values:
+                    if record < skip:
+                        record += 1
+                        continue
+                    if column:
                         text = _conversation(value) if conversation else value
-                        text = filter_text(text, name, min_chars, max_chars)
-                        if text is not None:
-                            yield text
-                else:
-                    for row in batch.to_pylist():
-                        if not isinstance(row, dict):
+                    else:
+                        if not isinstance(value, dict):
+                            record += 1
                             continue
                         text = ""
-                        for value in row.values():
-                            if isinstance(value, str) and len(value) > len(text):
-                                text = value
-                        text = filter_text(text, name, min_chars, max_chars)
-                        if text is not None:
-                            yield text
+                        for item in value.values():
+                            if isinstance(item, str) and len(item) > len(text):
+                                text = item
+                    text = filter_text(text, name, min_chars, max_chars)
+                    position = (rel_path, record + 1)
+                    record += 1
+                    if text is not None:
+                        yield (text, position) if with_position else text
 
 
 def main() -> None:
