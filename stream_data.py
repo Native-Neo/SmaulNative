@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator
 
 import pyarrow.parquet as pq
@@ -53,12 +55,58 @@ def _text_column(pf: pq.ParquetFile) -> tuple[str | None, bool]:
     return None, False
 
 
+def _read_row_group(remote: str, row_group: int, columns: list[str] | None) -> list[Any]:
+    with fs.open(remote, "rb") as handle:
+        pf = pq.ParquetFile(handle)
+        return pf.read_row_group(row_group, columns=columns).to_pylist()
+
+
+def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str,
+                 min_chars: int, max_chars: int, skip: int, with_position: bool,
+                 workers: int) -> Iterator[Any]:
+    remote = f"datasets/{config['repo_id']}/{rel_path}"
+    with fs.open(remote, "rb") as handle:
+        pf = pq.ParquetFile(handle)
+        column, conversation = _text_column(pf)
+        columns = [column] if column else None
+        row_groups = pf.num_row_groups
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_read_row_group, remote, i, columns) for i in range(row_groups)]
+        record = 0
+        for future in futures:
+            values = future.result()
+            for value in values:
+                if record < skip:
+                    record += 1
+                    continue
+                if column:
+                    text = _conversation(value) if conversation else value
+                else:
+                    if not isinstance(value, dict):
+                        record += 1
+                        continue
+                    text = ""
+                    for item in value.values():
+                        if isinstance(item, str) and len(item) > len(text):
+                            text = item
+                position = (dataset_name, rel_path, record + 1)
+                record += 1
+                text = filter_text(text, dataset_name, min_chars, max_chars)
+                if text is not None:
+                    yield (text, position) if with_position else text
+
+
 def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
                    start_dataset: str | None = None, start_file: str | None = None,
-                   start_record: int = 0, with_position: bool = False) -> Iterator[Any]:
+                   start_record: int = 0, with_position: bool = False,
+                   workers: int | None = None) -> Iterator[Any]:
     names = list(DATASETS) if name == "all" else [name]
     if name != "all" and name not in DATASETS:
         raise ValueError(f"unknown dataset: {name}")
+    workers = workers or int(os.environ.get("SMAUL_STREAM_WORKERS", "0"))
+    if workers <= 0:
+        workers = min(8, max(2, os.cpu_count() or 2))
     active_dataset = start_dataset is None
     for dataset_name in names:
         if not active_dataset:
@@ -76,34 +124,8 @@ def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
                     continue
                 active_file = True
             skip = start_record if dataset_name == start_dataset and rel_path == start_file else 0
-            remote = f"datasets/{config['repo_id']}/{rel_path}"
             print(f"[STREAM] {dataset_name}/{rel_path}" + (f" from row {skip:,}" if skip else ""), file=sys.stderr)
-            with fs.open(remote, "rb") as handle:
-                pf = pq.ParquetFile(handle)
-                column, conversation = _text_column(pf)
-                columns = [column] if column else None
-                record = 0
-                for batch in pf.iter_batches(batch_size=4096, columns=columns):
-                    values = batch.column(0).to_pylist() if column else [row for row in batch.to_pylist()]
-                    for value in values:
-                        if record < skip:
-                            record += 1
-                            continue
-                        if column:
-                            text = _conversation(value) if conversation else value
-                        else:
-                            if not isinstance(value, dict):
-                                record += 1
-                                continue
-                            text = ""
-                            for item in value.values():
-                                if isinstance(item, str) and len(item) > len(text):
-                                    text = item
-                        text = filter_text(text, dataset_name, min_chars, max_chars)
-                        position = (dataset_name, rel_path, record + 1)
-                        record += 1
-                        if text is not None:
-                            yield (text, position) if with_position else text
+            yield from _stream_file(config, dataset_name, rel_path, min_chars, max_chars, skip, with_position, workers)
 
 
 def main() -> None:
@@ -112,9 +134,10 @@ def main() -> None:
     p.add_argument("--min_chars", type=int, default=20)
     p.add_argument("--max_chars", type=int, default=1_000_000)
     p.add_argument("--max_records", type=int, default=0, help="0 means unlimited")
+    p.add_argument("--workers", type=int, default=None)
     args = p.parse_args()
     count = 0
-    for text in stream_dataset(args.dataset, args.min_chars, args.max_chars):
+    for text in stream_dataset(args.dataset, args.min_chars, args.max_chars, workers=args.workers):
         print(json.dumps({"text": text}, ensure_ascii=False), flush=True)
         count += 1
         if args.max_records and count >= args.max_records:
