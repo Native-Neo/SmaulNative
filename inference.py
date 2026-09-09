@@ -12,7 +12,6 @@ from tokenizer import SmaulTokenizer
 
 
 class RWKVXInference:
-
     def __init__(self, model_dir: str = "./SmaulNative", device: str = "auto", dtype: str = "auto"):
         self.model_dir = Path(model_dir)
         if device == "auto":
@@ -24,11 +23,11 @@ class RWKVXInference:
         self.bos_id = self.tokenizer.bos_token_id
         self.last_prompt_tokens = 0
         if dtype != "auto":
-            self.model = self.model.to({
-                "fp32": torch.float32,
-                "fp16": torch.float16,
-                "bf16": torch.bfloat16,
-            }[dtype])
+            if dtype not in {"fp32", "fp16", "bf16"}:
+                raise ValueError(f"unsupported dtype: {dtype}")
+            if self.device.type == "cpu" and dtype == "fp16":
+                dtype = "fp32"
+            self.model = self.model.to({"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype])
         self.model.eval()
 
     @property
@@ -41,15 +40,8 @@ class RWKVXInference:
     def decode(self, ids: List[int]) -> str:
         return self.tokenizer.decode(ids)
 
-    def _sample(
-        self,
-        logits: torch.Tensor,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        repetition_penalty: float,
-        recent: List[int],
-    ) -> int:
+    def _sample(self, logits: torch.Tensor, temperature: float, top_k: int, top_p: float,
+                repetition_penalty: float, recent: List[int]) -> int:
         logits = logits.float().clone()
         if repetition_penalty != 1.0 and recent:
             ids = torch.tensor(list(dict.fromkeys(recent)), device=logits.device)
@@ -81,61 +73,27 @@ class RWKVXInference:
         self.last_prompt_tokens = len(tokens)
         return tokens
 
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: int = 256,
-        temperature: float = 0.7,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        repetition_penalty: float = 1.05,
-        stop: Optional[List[str]] = None,
-        seed: Optional[int] = None,
-    ) -> str:
-        return "".join(self.stream(
-            prompt,
-            max_new_tokens,
-            temperature,
-            top_k,
-            top_p,
-            repetition_penalty,
-            stop,
-            seed,
-        ))
+    def generate(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7,
+                 top_k: int = 50, top_p: float = 0.95, repetition_penalty: float = 1.05,
+                 stop: Optional[List[str]] = None, seed: Optional[int] = None) -> str:
+        return "".join(self.stream(prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty, stop, seed))
 
-    def stream(
-        self,
-        prompt: str,
-        max_new_tokens: int = 256,
-        temperature: float = 0.7,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        repetition_penalty: float = 1.05,
-        stop: Optional[List[str]] = None,
-        seed: Optional[int] = None,
-    ) -> Iterable[str]:
+    def stream(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7,
+               top_k: int = 50, top_p: float = 0.95, repetition_penalty: float = 1.05,
+               stop: Optional[List[str]] = None, seed: Optional[int] = None) -> Iterable[str]:
         if seed is not None:
             random.seed(seed)
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
-
         prompt_tokens = self._prepare(prompt)
         logits, _, state = self._forward(prompt_tokens)
         recent = prompt_tokens[-128:]
         generated: List[int] = []
         emitted = ""
         stops = stop or []
-
         for _ in range(max_new_tokens):
-            token = self._sample(
-                logits[0, -1],
-                temperature,
-                top_k,
-                top_p,
-                repetition_penalty,
-                recent,
-            )
+            token = self._sample(logits[0, -1], temperature, top_k, top_p, repetition_penalty, recent)
             if token == self.eos_id:
                 break
             generated.append(token)
