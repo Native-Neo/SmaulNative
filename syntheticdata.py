@@ -38,9 +38,6 @@ try:
 except ImportError:
     HAVE_PYARROW = False
 
-# ============================================================================
-# Dynamic Combinatorial Generators (Zero Collisions)
-# ============================================================================
 
 
 def gen_linear_equation() -> Dict[str, str]:
@@ -50,7 +47,6 @@ def gen_linear_equation() -> Dict[str, str]:
     b = random.randint(10, 5000)
     c = random.randint(5000, 500000)
     x = (c - b) / a
-
     if is_hindi:
         prompt = f"समीकरण {a}x + {b} = {c} के लिए x का मान ज्ञात कीजिए।"
         think = f"दोनों पक्षों से {b} घटाएं, फिर {a} से विभाजित करें।"
@@ -71,7 +67,6 @@ def gen_linear_equation() -> Dict[str, str]:
                     f"   $$x = \\frac{{{c - b}}}{{{a}}} = {x:.4f}$$\n\n"
                     f"**Final Answer:** $x = {x:.4f}$")
         domain = "math_algebra_en"
-
     return {"instruction": prompt, "response": response, "think": think, "domain": domain}
 
 
@@ -80,20 +75,14 @@ def gen_quadratic_equation() -> Dict[str, str]:
     a = random.randint(1, 50)
     root1 = random.randint(-100, 100)
     root2 = random.randint(-100, 100)
-
-    # b,c derived so roots are exactly root1, root2
     b = -a * (root1 + root2)
     c = a * (root1 * root2)
-
     sign_b = f"+ {b}" if b >= 0 else f"- {abs(b)}"
     sign_c = f"+ {c}" if c >= 0 else f"- {abs(c)}"
-
     prompt = f"Solve the quadratic equation: {a}x^2 {sign_b}x {sign_c} = 0"
     think = f"Identify coefficients a={a}, b={b}, c={c}. Calculate discriminant Delta = b^2 - 4ac and roots using quadratic formula."
-
     delta = (b**2) - (4 * a * c)
     sqrt_delta = math.isqrt(delta) if delta >= 0 else 0
-
     response = (
         f"To solve ${a}x^2 {sign_b}x {sign_c} = 0$ using the quadratic formula:\n\n"
         f"### 1. Identify Coefficients:\n"
@@ -109,19 +98,18 @@ def gen_quadratic_equation() -> Dict[str, str]:
 
 
 def gen_system_linear_equations() -> Dict[str, str]:
-    """Generates 2x2 systems of linear equations."""
+    """Generates 2x2 systems with a unique solution."""
     x_ans = random.randint(-50, 50)
     y_ans = random.randint(-50, 50)
-
-    a1, b1 = random.randint(1, 20), random.randint(1, 20)
-    a2, b2 = random.randint(1, 20), random.randint(1, 20)
-
+    while True:
+        a1, b1 = random.randint(1, 20), random.randint(1, 20)
+        a2, b2 = random.randint(1, 20), random.randint(1, 20)
+        if a1 * b2 - a2 * b1 != 0:
+            break
     c1 = (a1 * x_ans) + (b1 * y_ans)
     c2 = (a2 * x_ans) + (b2 * y_ans)
-
     prompt = f"Solve the system of linear equations:\n1) {a1}x + {b1}y = {c1}\n2) {a2}x + {b2}y = {c2}"
     think = f"Use elimination or substitution method to solve for x={x_ans} and y={y_ans}."
-
     response = (f"To solve the system of equations:\n"
                 f"$$\\begin{{cases}} {a1}x + {b1}y = {c1} \\\\ {a2}x + {b2}y = {c2} \\end{{cases}}$$\n\n"
                 f"Using substitution or matrix elimination yields:\n"
@@ -133,7 +121,6 @@ def gen_system_linear_equations() -> Dict[str, str]:
     return {"instruction": prompt, "response": response, "think": think, "domain": "math_system_linear"}
 
 
-# fenced language tag must match the emitted code
 _QUICKSORT_BY_LANG = {
     "Python": ("def quick_sort(arr: list[int]) -> list[int]:\n"
                "    if len(arr) <= 1:\n"
@@ -187,14 +174,11 @@ _LANG_FENCE = {"Python": "python", "JavaScript": "javascript", "C++": "cpp", "Ru
 
 
 def gen_sorting_algorithm_code() -> Dict[str, str]:
-    """Generates unique sorting algorithm questions in Python/JS/C++/Rust."""
     algo = "Quick Sort"
     lang = random.choice(list(_QUICKSORT_BY_LANG))
-
     prompt = f"Write a clean, optimized implementation of {algo} in {lang}."
     think = f"Demonstrate standard {algo} logic in {lang} with complexity analysis."
     code = _QUICKSORT_BY_LANG[lang]
-
     response = (f"Here is the implementation of **{algo}** in **{lang}**:\n\n"
                 f"```{_LANG_FENCE[lang]}\n{code}```\n\n"
                 f"### Complexity Analysis:\n"
@@ -203,7 +187,6 @@ def gen_sorting_algorithm_code() -> Dict[str, str]:
     return {"instruction": prompt, "response": response, "think": think, "domain": "code_algorithms"}
 
 
-# {Stack,Queue} x {Python,C++,Java}, each real matching body
 _DS_TEMPLATES = {
     ("Stack", "Python"): ("class Stack:\n"
                           "    def __init__(self):\n"
@@ -254,8 +237,7 @@ _DS_TEMPLATES = {
                        "    }\n"
                        "    bool isEmpty() const { return items.empty(); }\n"
                        "};\n"),
-    ("Stack", "Java"):
-    ("import java.util.ArrayDeque;\n\n"
+    ("Stack", "Java"): ("import java.util.ArrayDeque;\n\n"
      "public class Stack<T> {\n"
      "    private final ArrayDeque<T> items = new ArrayDeque<>();\n"
      "    public void push(T item) { items.push(item); }\n"
@@ -265,8 +247,7 @@ _DS_TEMPLATES = {
      "    }\n"
      "    public boolean isEmpty() { return items.isEmpty(); }\n"
      "}\n"),
-    ("Queue", "Java"):
-    ("import java.util.ArrayDeque;\n\n"
+    ("Queue", "Java"): ("import java.util.ArrayDeque;\n\n"
      "public class Queue<T> {\n"
      "    private final ArrayDeque<T> items = new ArrayDeque<>();\n"
      "    public void enqueue(T item) { items.addLast(item); }\n"
@@ -281,13 +262,10 @@ _DS_FENCE = {"Python": "python", "C++": "cpp", "Java": "java"}
 
 
 def gen_data_structure_code() -> Dict[str, str]:
-    """Generates unique Stack/Queue implementations across Python/C++/Java."""
     ds, lang = random.choice(list(_DS_TEMPLATES))
     op_a, op_b = ("push", "pop") if ds == "Stack" else ("enqueue", "dequeue")
-
     prompt = f"Implement a {ds} data structure in {lang} with {op_a}/{op_b} and an emptiness check."
     think = f"Provide a standard class-based {ds} implementation in {lang}."
-
     response = (f"Here is a complete implementation of a **{ds}** in **{lang}**:\n\n"
                 f"```{_DS_FENCE[lang]}\n{_DS_TEMPLATES[(ds, lang)]}```\n\n"
                 f"### Complexity:\n"
@@ -297,30 +275,21 @@ def gen_data_structure_code() -> Dict[str, str]:
 
 
 def gen_cyber_security_qa() -> Dict[str, str]:
-    """Generates cyber security concepts and vulnerability mitigations."""
     topics = [("Cross-Site Scripting (XSS)", "Sanitize user input and enforce Content Security Policy (CSP) headers."),
               ("CSRF (Cross-Site Request Forgery)", "Use anti-CSRF tokens and SameSite cookie attributes."),
               ("Man-in-the-Middle (MitM) Attack", "Enforce HTTPS with TLS 1.3 and HSTS headers."),
               ("Buffer Overflow", "Use memory-safe languages or bound-checked buffers (fgets vs gets)."),
               ("Password Hashing", "Use Argon2id or bcrypt with strong salt parameters.")]
     vuln, fix = random.choice(topics)
-
     prompt = f"Explain what a {vuln} is and how software engineers can prevent it."
     think = f"Detail threat vector for {vuln} and mitigation strategies."
-
-    response = (
-        f"### What is {vuln}?\n"
-        f"{vuln} is a security vulnerability where an attacker exploits system flaws to compromise confidentiality, integrity, or availability.\n\n"
-        f"### Prevention & Mitigation:\n"
-        f"1. **Primary Defense:** {fix}\n"
-        f"2. **Code Audit:** Conduct regular static analysis (SAST) and dynamic testing (DAST).\n"
-        f"3. **Least Privilege:** Enforce strict access control roles.")
+    response = (f"### What is {vuln}?\n"
+                f"{vuln} is a security vulnerability where an attacker exploits system flaws to compromise confidentiality, integrity, or availability.\n\n"
+                f"### Prevention & Mitigation:\n"
+                f"1. **Primary Defense:** {fix}\n"
+                f"2. **Code Audit:** Conduct regular static analysis (SAST) and dynamic testing (DAST).\n"
+                f"3. **Least Privilege:** Enforce strict access control roles.")
     return {"instruction": prompt, "response": response, "think": think, "domain": "cyber_security"}
-
-
-# ============================================================================
-# Main Generator Engine with Zero-Collision Guarantees
-# ============================================================================
 
 
 def format_chatml(instruction: str, response: str, think: str = "") -> str:
@@ -332,44 +301,25 @@ def format_chatml(instruction: str, response: str, think: str = "") -> str:
 
 
 def build_unique_dataset(target_count: int) -> List[Dict[str, str]]:
-    """Synthesizes target_count 100% unique prompt-response records."""
     samples: List[Dict[str, str]] = []
     seen_prompts: Set[str] = set()
-
-    generators = [
-        gen_linear_equation, gen_quadratic_equation, gen_system_linear_equations, gen_sorting_algorithm_code,
-        gen_data_structure_code, gen_cyber_security_qa
-    ]
-
+    generators = [gen_linear_equation, gen_quadratic_equation, gen_system_linear_equations,
+                  gen_sorting_algorithm_code, gen_data_structure_code, gen_cyber_security_qa]
     print(f"[Generator] Synthesizing {target_count:,} 100% unique bilingual records...")
     start_t = time.time()
-
     attempts = 0
     max_attempts = target_count * 10
-
     while len(samples) < target_count and attempts < max_attempts:
         attempts += 1
-        gen_func = random.choice(generators)
-        item = gen_func()
-
+        item = random.choice(generators)()
         prompt_key = item["instruction"].strip().lower()
-
         if prompt_key not in seen_prompts:
             seen_prompts.add(prompt_key)
-            formatted_text = format_chatml(item["instruction"], item["response"], item.get("think", ""))
-
-            samples.append({
-                "instruction": item["instruction"],
-                "response": item["response"],
-                "think": item.get("think", ""),
-                "domain": item.get("domain", "general"),
-                "text": formatted_text
-            })
-
+            samples.append({"instruction": item["instruction"], "response": item["response"], "think": item.get("think", ""),
+                            "domain": item.get("domain", "general"),
+                            "text": format_chatml(item["instruction"], item["response"], item.get("think", ""))})
             if len(samples) % 50000 == 0 or len(samples) == target_count:
-                elapsed = time.time() - start_t
-                print(f"  └─ Generated {len(samples):,} / {target_count:,} unique records ({elapsed:.2f}s)")
-
+                print(f"  └─ Generated {len(samples):,} / {target_count:,} unique records ({time.time() - start_t:.2f}s)")
     print(f"[Generator] Uniqueness check: {len(seen_prompts):,} unique prompts out of {len(samples):,} generated.")
     return samples
 
@@ -378,37 +328,34 @@ def export_dataset(samples: List[Dict[str, str]], output_dir: Path, fmt: str = "
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "synthetic_bilingual.jsonl"
     parquet_path = output_dir / "synthetic_bilingual.parquet"
-
     print(f"\n[Export] Saving dataset files to '{output_dir}'...")
-
     if fmt in ["jsonl", "both"]:
         with open(jsonl_path, "w", encoding="utf-8") as f:
             for item in samples:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"  └─ JSONL exported: {jsonl_path} ({os.path.getsize(jsonl_path) / (1024*1024):.2f} MB)")
-
     if fmt in ["parquet", "both"]:
-        if HAVE_PYARROW:
-            table = pa.Table.from_pylist(samples)
-            pq.write_table(table, parquet_path, compression="ZSTD")
-            print(f"  └─ Parquet exported: {parquet_path} ({os.path.getsize(parquet_path) / (1024*1024):.2f} MB)")
+        if not HAVE_PYARROW:
+            raise RuntimeError("Parquet export requires pyarrow; install it with 'pip install pyarrow'")
+        table = pa.Table.from_pylist(samples)
+        pq.write_table(table, parquet_path, compression="ZSTD")
+        print(f"  └─ Parquet exported: {parquet_path} ({os.path.getsize(parquet_path) / (1024*1024):.2f} MB)")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Massive Synthetic Data Generator for SmaulNative LLM")
     parser.add_argument("--output-dir", type=str, default="./datasets", help="Output directory.")
     parser.add_argument("--count", type=int, default=250000, help="Number of unique synthetic samples.")
-    parser.add_argument("--format", type=str, choices=["jsonl", "parquet", "both"], default="both",
-                        help="Export format.")
-
+    parser.add_argument("--format", type=str, choices=["jsonl", "parquet", "both"], default="both", help="Export format.")
     args = parser.parse_args()
-
+    if args.count < 0:
+        parser.error("--count must be non-negative")
+    if args.format in ("parquet", "both") and not HAVE_PYARROW:
+        parser.error("--format parquet/both requires pyarrow; install it with 'pip install pyarrow'")
     start_time = time.time()
     samples = build_unique_dataset(args.count)
     export_dataset(samples, Path(args.output_dir), fmt=args.format)
-
-    duration = time.time() - start_time
-    print(f"\n=== Dataset Generation Complete ({len(samples):,} Unique Records) in {duration:.2f}s! ===")
+    print(f"\n=== Dataset Generation Complete ({len(samples):,} Unique Records) in {time.time() - start_time:.2f}s! ===")
 
 
 if __name__ == "__main__":
