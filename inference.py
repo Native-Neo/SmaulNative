@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import torch
-from tokenizers import Tokenizer
 
 from rwkv_x_core import RWKVXModel
+from tokenizer import SmaulTokenizer
 
 
 class RWKVXInference:
@@ -18,15 +18,13 @@ class RWKVXInference:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.model = RWKVXModel.from_pretrained(self.model_dir).to(self.device)
-        self.tokenizer = Tokenizer.from_file(str(self.model_dir / "tokenizer.json"))
-        self.eos_id = self.tokenizer.token_to_id("<eos>")
-        self.bos_id = self.tokenizer.token_to_id("<bos>")
-        if self.eos_id is None:
-            raise ValueError("tokenizer.json is missing <eos>")
+        self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
+        self.eos_id = self.tokenizer.eos_token_id
+        self.bos_id = self.tokenizer.bos_token_id
+        self.last_prompt_tokens = 0
         if dtype != "auto":
             self.model = self.model.to({"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype])
         self.model.eval()
-        self.last_prompt_tokens = 0
 
     @property
     def vocab_size(self):
