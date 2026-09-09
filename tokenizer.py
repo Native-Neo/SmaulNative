@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse,json,re,unicodedata
-from collections import Counter
+from collections import Counter,defaultdict
 from pathlib import Path
 
 SPECIAL=["<pad>","<unk>","<bos>","<eos>"]
@@ -8,22 +8,18 @@ CASE=["<cap>","<upper>"]
 TOKEN_RE=re.compile(r"\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F]+|\d+(?:\.\d+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]",re.UNICODE)
 DEV_BASE=re.compile(r"[\u0900-\u097F]")
 
-
 class TokenIds(list):
     @property
     def ids(self):return self
 
-
 def _json_texts(data):
-    if isinstance(data,str):
-        yield data
+    if isinstance(data,str):yield data
     elif isinstance(data,dict):
         text=next((data[k] for k in ('text','content','document','body','code','prompt','completion') if isinstance(data.get(k),str)),None)
         if text is not None:yield text
         elif 'data' in data:yield from _json_texts(data['data'])
     elif isinstance(data,list):
         for x in data:yield from _json_texts(x)
-
 
 def read_texts(path,max_records=0):
     files=[path] if path.is_file() else [p for p in path.rglob('*') if p.is_file()];seen=0
@@ -50,8 +46,7 @@ def read_texts(path,max_records=0):
         elif ext=='.parquet':
             try:import pyarrow.parquet as pq
             except ImportError:raise SystemExit('Parquet support: pip install pyarrow')
-            pf=pq.ParquetFile(f);names=pf.schema_arrow.names
-            col=next((c for c in names if c.lower() in {'text','content','document','body','code','prompt','completion'}),None)
+            pf=pq.ParquetFile(f);names=pf.schema_arrow.names;col=next((c for c in names if c.lower() in {'text','content','document','body','code','prompt','completion'}),None)
             if col:
                 for batch in pf.iter_batches(batch_size=1024,columns=[col]):
                     for x in batch.column(0).to_pylist():
@@ -60,9 +55,7 @@ def read_texts(path,max_records=0):
                             if max_records and seen>=max_records:return
         if max_records and seen>=max_records:return
 
-
 def tokenize_text(text):return TOKEN_RE.findall(text)
-
 
 def devanagari_units(text):
     out=[];i=0
@@ -81,9 +74,7 @@ def devanagari_units(text):
         out.append(u)
     return out
 
-
 def canonical(x):return x.lower()
-
 
 def case_type(x):
     letters=''.join(c for c in x if c.isalpha())
@@ -92,40 +83,41 @@ def case_type(x):
     if x[:1].isupper() and x[1:].lower()==x[1:]:return 'cap'
     return None
 
-
-def train(dataset,vocab_size=64000,word_budget=40000,max_records=0):
-    words=Counter();graphemes=Counter();chars=Counter();symbols=Counter();cases=Counter();total_words=total_tokens=0
-    for text in read_texts(Path(dataset),max_records):
+def _build(texts,vocab_size,word_budget,max_records=0):
+    words=Counter();graphemes=Counter();chars=Counter();symbols=Counter();cases=defaultdict(Counter);total_words=total_tokens=seen=0
+    for text in texts:
+        seen+=1
         for token in tokenize_text(text):
             total_tokens+=1
             if token.isspace():chars.update(token);continue
             if token.isalpha() or token.isdigit():
                 base=canonical(token);words[base]+=1;total_words+=1;case=case_type(token)
-                if case:cases[(base,case)]+=1
+                if case:cases[base][case]+=1
                 if DEV_BASE.search(token):graphemes.update(devanagari_units(token))
                 chars.update(token)
             else:symbols[token]+=1;chars.update(token)
-    tokens=SPECIAL+CASE;seen=set(tokens)
+        if max_records and seen>=max_records:break
+    tokens=SPECIAL+CASE;seen_tokens=set(tokens)
     for x,_ in words.most_common(word_budget):
-        if x not in seen:tokens.append(x);seen.add(x)
+        if x not in seen_tokens:tokens.append(x);seen_tokens.add(x)
         if len(tokens)>=vocab_size:break
     for x,_ in graphemes.most_common():
-        if x not in seen:tokens.append(x);seen.add(x)
+        if x not in seen_tokens:tokens.append(x);seen_tokens.add(x)
         if len(tokens)>=vocab_size:break
     for x,_ in symbols.most_common():
-        if x not in seen:tokens.append(x);seen.add(x)
+        if x not in seen_tokens:tokens.append(x);seen_tokens.add(x)
         if len(tokens)>=vocab_size:break
     for x,_ in chars.most_common():
-        if x not in seen:tokens.append(x);seen.add(x)
+        if x not in seen_tokens:tokens.append(x);seen_tokens.add(x)
         if len(tokens)>=vocab_size:break
     vocab={x:i for i,x in enumerate(tokens)}
-    return {'version':5,'vocab':vocab,'special_tokens':SPECIAL,'case_tokens':CASE,'case_stats':{w:{c:n for (ww,c),n in cases.items() if ww==w} for w in words},'unk_id':vocab['<unk>'],'stats':{'vocab_size':len(vocab),'whole_words':min(word_budget,len(words)),'unique_words':len(words),'total_words':total_words,'total_tokens':total_tokens,'devanagari_units':len(graphemes),'characters':len(chars),'symbols':len(symbols)}}
+    return {'version':5,'vocab':vocab,'special_tokens':SPECIAL,'case_tokens':CASE,'case_stats':{w:dict(c) for w,c in cases.items()},'unk_id':vocab['<unk>'],'stats':{'vocab_size':len(vocab),'whole_words':min(word_budget,len(words)),'unique_words':len(words),'total_words':total_words,'total_tokens':total_tokens,'devanagari_units':len(graphemes),'characters':len(chars),'symbols':len(symbols)}}
 
+def train(dataset,vocab_size=64000,word_budget=40000,max_records=0):return _build(read_texts(Path(dataset),max_records),vocab_size,word_budget,max_records)
 
 class SmaulTokenizer:
     def __init__(self,data):
         self.data=data;self.vocab=data['vocab'];self.id_to_token={int(i):x for x,i in self.vocab.items()};self.unk_token_id=data['unk_id'];self.pad_token_id=self.vocab['<pad>'];self.bos_token_id=self.vocab['<bos>'];self.eos_token_id=self.vocab['<eos>']
-
     @classmethod
     def from_file(cls,path):return cls(json.loads(Path(path).read_text(encoding='utf-8')))
     def save(self,path):Path(path).write_text(json.dumps(self.data,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
@@ -134,9 +126,7 @@ class SmaulTokenizer:
     def encode(self,text):return TokenIds(encode(text,self))
     def decode(self,ids):return decode(ids,self)
 
-
 def load(path):return SmaulTokenizer.from_file(path)
-
 
 def encode(text,tok):
     v=tok.vocab;u=tok.unk_token_id;cap=v.get('<cap>');upper=v.get('<upper>');out=[]
@@ -153,7 +143,6 @@ def encode(text,tok):
         else:out.extend(v.get(c,u) for c in t)
     return out
 
-
 def decode(ids,tok):
     tab=tok.id_to_token;out=[];case=None
     for i in ids:
@@ -166,10 +155,13 @@ def decode(ids,tok):
         out.append(t);case=None
     return ''.join(out)
 
-
 def train_tokenizer(dataset_dir,output_path,vocab_size=64000,stream_name='none',max_records=0):
-    data=train(dataset_dir,vocab_size=vocab_size,max_records=max_records);tok=SmaulTokenizer(data);tok.save(output_path);return tok
-
+    if stream_name!='none':
+        from stream_data import stream_dataset
+        texts=stream_dataset(stream_name)
+        data=_build(texts,vocab_size,40000,max_records)
+    else:data=train(dataset_dir,vocab_size=vocab_size,max_records=max_records)
+    tok=SmaulTokenizer(data);tok.save(output_path);return tok
 
 def main():
     p=argparse.ArgumentParser();s=p.add_subparsers(dest='cmd',required=True)
@@ -178,9 +170,7 @@ def main():
     x=s.add_parser('decode');x.add_argument('--tokenizer',required=True);x.add_argument('--ids',required=True);x.set_defaults(f=lambda a:print(load(a.tokenizer).decode(a.ids.split())))
     a=p.parse_args();a.f(a)
 
-
 def train_cmd(a):
-    d=train(a.fromdataset,a.vocab_size,a.word_budget,a.max_records);Path(a.output).write_text(json.dumps(d,ensure_ascii=False,separators=(',',':')),encoding='utf-8');s=d['stats'];print(f"Vocabulary: {s['vocab_size']:,}\nWhole words: {s['whole_words']:,}\nUnique words: {s['unique_words']:,}\nCorpus words: {s['total_words']:,}\nDevanagari units: {s['devanagari_units']:,}\nCharacters: {s['characters']:,}\nSymbols/operators: {s['symbols']:,}\nSaved: {a.output}")
-
+    d=_build(read_texts(Path(a.fromdataset),a.max_records),a.vocab_size,a.word_budget,a.max_records);Path(a.output).write_text(json.dumps(d,ensure_ascii=False,separators=(',',':')),encoding='utf-8');s=d['stats'];print(f"Vocabulary: {s['vocab_size']:,}\nWhole words: {s['whole_words']:,}\nUnique words: {s['unique_words']:,}\nCorpus words: {s['total_words']:,}\nDevanagari units: {s['devanagari_units']:,}\nCharacters: {s['characters']:,}\nSymbols/operators: {s['symbols']:,}\nSaved: {a.output}")
 
 if __name__=='__main__':main()
