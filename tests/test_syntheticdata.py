@@ -17,6 +17,7 @@ def test_generated_systems_are_nonsingular():
         assert a * d - b * c != 0
 
 
-def test_count_rejects_negative():
+def test_count_rejects_negative(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["syntheticdata.py", "--count", "-1"])
     with pytest.raises(SystemExit):
-        syntheticdata.main(["--count", "-1"])
+        syntheticdata.main()
