@@ -1,0 +1,35 @@
+name: Readability
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Format Python
+        run: |
+          python -m pip install yapf
+          find . -type f -name '*.py' -not -path './.git/*' -print0 | xargs -0 -r yapf -i --style='{based_on_style: pep8, column_limit: 120, split_before_named_assigns: false}'
+      - name: Format C++
+        run: |
+          find . -type f \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' -o -name '*.h' -o -name '*.hpp' \) -not -path './.git/*' -print0 | xargs -0 -r clang-format -i --style='{BasedOnStyle: LLVM, ColumnLimit: 120}'
+      - name: Commit each file separately
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          files=$(git diff --name-only)
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            git add -- "$file"
+            git commit -m "style: make $file readable"
+            git push origin HEAD:main
+          done <<< "$files"
