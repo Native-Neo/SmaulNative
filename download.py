@@ -12,14 +12,27 @@ from huggingface_hub import HfApi, hf_hub_download
 from dataset import extract_text
 
 DATASET_CONFIGS = {
-    "hindi": {"repo_id": "HuggingFaceFW/fineweb-2", "path": "data/hin_Deva/train", "desc": "FineWeb-2 Hindi (Devanagari)"},
-    "english": {"repo_id": "HuggingFaceFW/fineweb", "path": "data/100BT", "desc": "FineWeb English (100BT sample)"},
-    "openthoughts": {"repo_id": "open-thoughts/OpenThoughts3-1.2M", "path": "data", "desc": "OpenThoughts3-1.2M reasoning (math, code, science)"},
+    "hindi": {
+        "repo_id": "HuggingFaceFW/fineweb-2",
+        "path": "data/hin_Deva/train",
+        "desc": "FineWeb-2 Hindi (Devanagari)"
+    },
+    "english": {
+        "repo_id": "HuggingFaceFW/fineweb",
+        "path": "data/100BT",
+        "desc": "FineWeb English (100BT sample)"
+    },
+    "openthoughts": {
+        "repo_id": "open-thoughts/OpenThoughts3-1.2M",
+        "path": "data",
+        "desc": "OpenThoughts3-1.2M reasoning (math, code, science)"
+    },
 }
 DEFAULT_OUTPUT_ROOT = Path("./datasets")
 DEFAULT_SHARD_ROWS = 100_000
 DEFAULT_COMPRESSION = "zstd"
 api = HfApi()
+
 
 def get_repo_files(repo_id: str, path: str) -> list[dict]:
     print(f"[HF] Inspecting {repo_id}/{path}...")
@@ -35,6 +48,7 @@ def get_repo_files(repo_id: str, path: str) -> list[dict]:
     print(f"[HF] Found {len(files):,} remote parquet files.")
     return files
 
+
 def format_conversation(value: Any) -> str:
     if not isinstance(value, list):
         return ""
@@ -47,6 +61,7 @@ def format_conversation(value: Any) -> str:
         if isinstance(text, str) and text.strip():
             parts.append(f"{role}: {text.strip()}" if role else text.strip())
     return "\n".join(parts)
+
 
 def stream_raw_parquet(parquet_path: Path, start_row: int = 0) -> Iterator[tuple[int, str]]:
     pf = pq.ParquetFile(parquet_path)
@@ -80,8 +95,11 @@ def stream_raw_parquet(parquet_path: Path, start_row: int = 0) -> Iterator[tuple
                     yield row, text
         current += batch.num_rows
 
+
 class ShardWriter:
-    def __init__(self, output_dir: Path, shard_rows: int, compression: Optional[str], dataset: str, repo_id: str, start_idx: int):
+
+    def __init__(self, output_dir: Path, shard_rows: int, compression: Optional[str], dataset: str, repo_id: str,
+                 start_idx: int):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.shard_rows = shard_rows
@@ -91,23 +109,34 @@ class ShardWriter:
         self.index = start_idx
         self.rows: List[str] = []
         self.schema = pa.schema([("text", pa.string())])
+
     def add(self, text: str) -> bool:
         self.rows.append(text)
         return len(self.rows) >= self.shard_rows
+
     def close(self) -> Optional[Dict[str, Any]]:
         if not self.rows:
             return None
         path = self.output_dir / f"shard_{self.index:04d}.parquet"
         table = pa.Table.from_arrays([pa.array(self.rows, type=pa.string())], schema=self.schema)
         pq.write_table(table, path, compression=self.compression, use_dictionary=True)
-        meta = {"shard_file": path.name, "shard_idx": self.index, "row_count": len(self.rows), "dataset": self.dataset, "source_repo": self.repo_id, "compression": self.compression or "none"}
+        meta = {
+            "shard_file": path.name,
+            "shard_idx": self.index,
+            "row_count": len(self.rows),
+            "dataset": self.dataset,
+            "source_repo": self.repo_id,
+            "compression": self.compression or "none"
+        }
         print(f"[SHARD COMPLETE] {path.name}: {len(self.rows):,} rows")
         self.index += 1
         self.rows.clear()
         return meta
 
+
 def default_manifest() -> Dict[str, Any]:
     return {"total_rows": 0, "shards": [], "completed_raw_files": [], "last_raw_file": None, "last_row_index": 0}
+
 
 def read_manifest(output_dir: Path) -> Dict[str, Any]:
     path = output_dir / "manifest.json"
@@ -120,11 +149,13 @@ def read_manifest(output_dir: Path) -> Dict[str, Any]:
     base["completed_raw_files"] = list(base.get("completed_raw_files") or [])
     return base
 
+
 def save_manifest(output_dir: Path, manifest: Dict[str, Any]) -> None:
     path = output_dir / "manifest.json"
     tmp = output_dir / "manifest.json.tmp"
     tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
 
 def reconcile_output(output_dir: Path, manifest: Dict[str, Any]) -> Dict[str, Any]:
     committed = {str(s.get("shard_file")) for s in manifest["shards"]}
@@ -136,7 +167,9 @@ def reconcile_output(output_dir: Path, manifest: Dict[str, Any]) -> Dict[str, An
         raise RuntimeError("Manifest row count does not match committed shards")
     return manifest
 
-def process_dataset(name: str, config: dict, output_dir: Path, temp_dir: Path, max_rows: int, shard_rows: int, compression: Optional[str], clean_temp: bool) -> None:
+
+def process_dataset(name: str, config: dict, output_dir: Path, temp_dir: Path, max_rows: int, shard_rows: int,
+                    compression: Optional[str], clean_temp: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
     manifest = reconcile_output(output_dir, read_manifest(output_dir))
@@ -158,7 +191,9 @@ def process_dataset(name: str, config: dict, output_dir: Path, temp_dir: Path, m
                 continue
             start_row = last_row if last_file == rel_path else 0
             print(f"[DOWNLOAD] {rel_path} ({file_info['size'] / 1024**2:.1f} MB)...")
-            downloaded = Path(hf_hub_download(repo_id=config["repo_id"], repo_type="dataset", filename=rel_path, local_dir=str(temp_dir)))
+            downloaded = Path(
+                hf_hub_download(repo_id=config["repo_id"], repo_type="dataset", filename=rel_path,
+                                local_dir=str(temp_dir)))
             file_completed = True
             for row_idx, text in stream_raw_parquet(downloaded, start_row):
                 if max_rows and total_rows >= max_rows:
@@ -192,6 +227,7 @@ def process_dataset(name: str, config: dict, output_dir: Path, temp_dir: Path, m
         raise
     print(f"[DONE] {name.upper()}: {total_rows:,} rows in {len(manifest['shards']):,} shards.")
 
+
 def parse_args():
     p = argparse.ArgumentParser(description="Download and shard Parquet datasets without tokenization")
     p.add_argument("--max_rows", type=int, default=0, help="Maximum rows per dataset; 0 means unlimited")
@@ -203,6 +239,7 @@ def parse_args():
     p.add_argument("--no_clean_temp", action="store_true")
     return p.parse_args()
 
+
 def main():
     args = parse_args()
     if args.shard_rows <= 0 or args.max_rows < 0:
@@ -212,7 +249,9 @@ def main():
     root = Path(args.output_dir)
     temp = Path(args.temp_dir)
     for name in langs:
-        process_dataset(name, DATASET_CONFIGS[name], root / name, temp / name, args.max_rows, args.shard_rows, compression, not args.no_clean_temp)
+        process_dataset(name, DATASET_CONFIGS[name], root / name, temp / name, args.max_rows, args.shard_rows,
+                        compression, not args.no_clean_temp)
+
 
 if __name__ == "__main__":
     main()
