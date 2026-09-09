@@ -17,18 +17,9 @@ from huggingface_hub import HfApi, HfFileSystem
 from filter_data import filter_text
 
 DATASETS: Dict[str, Dict[str, str]] = {
-    "hindi": {
-        "repo_id": "HuggingFaceFW/fineweb-2",
-        "path": "data/hin_Deva/train",
-    },
-    "english": {
-        "repo_id": "HuggingFaceFW/fineweb",
-        "path": "data/100BT",
-    },
-    "openthoughts": {
-        "repo_id": "open-thoughts/OpenThoughts3-1.2M",
-        "path": "data",
-    },
+    "hindi": {"repo_id": "HuggingFaceFW/fineweb-2", "path": "data/hin_Deva/train"},
+    "english": {"repo_id": "HuggingFaceFW/fineweb", "path": "data/100BT"},
+    "openthoughts": {"repo_id": "open-thoughts/OpenThoughts3-1.2M", "path": "data"},
 }
 
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
@@ -52,12 +43,7 @@ def _conversation(value: Any) -> str:
 
 
 def _files(repo_id: str, path: str) -> list[str]:
-    items = api.list_repo_tree(
-        repo_id=repo_id,
-        repo_type="dataset",
-        path_in_repo=path,
-        recursive=True,
-    )
+    items = api.list_repo_tree(repo_id=repo_id, repo_type="dataset", path_in_repo=path, recursive=True)
     return sorted(item.path for item in items if getattr(item, "path", "").endswith(".parquet"))
 
 
@@ -72,42 +58,26 @@ def _text_column(pf: pq.ParquetFile) -> tuple[str | None, bool]:
     return None, False
 
 
-def _read_row_group(
-    remote: str,
-    row_group: int,
-    columns: list[str] | None,
-    token: str | None,
-) -> list[Any]:
+def _read_row_group(remote: str, row_group: int, columns: list[str] | None, token: str | None) -> list[Any]:
     retries = max(1, int(os.environ.get("SMAUL_STREAM_RETRIES", "6")))
     for attempt in range(retries):
         try:
             with HfFileSystem(token=token).open(remote, "rb") as handle:
-                return pq.ParquetFile(handle).read_row_group(
-                    row_group,
-                    columns=columns,
-                ).to_pylist()
+                return pq.ParquetFile(handle).read_row_group(row_group, columns=columns).to_pylist()
         except Exception as exc:
             if attempt + 1 >= retries:
                 raise
             delay = min(30.0, 2.0**attempt)
             print(
-                f"[STREAM] row group {row_group} read failed: "
-                f"{type(exc).__name__}; retrying in {delay:.0f}s",
+                f"[STREAM] row group {row_group} read failed: {type(exc).__name__}; retrying in {delay:.0f}s",
                 file=sys.stderr,
             )
             time.sleep(delay)
+    return []
 
 
-def _stream_file(
-    config: Dict[str, str],
-    dataset_name: str,
-    rel_path: str,
-    min_chars: int,
-    max_chars: int,
-    skip: int,
-    with_position: bool,
-    workers: int,
-) -> Iterator[Any]:
+def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str, min_chars: int,
+                 max_chars: int, skip: int, with_position: bool, workers: int) -> Iterator[Any]:
     remote = f"datasets/{config['repo_id']}/{rel_path}"
     with fs.open(remote, "rb") as handle:
         pf = pq.ParquetFile(handle)
@@ -121,16 +91,19 @@ def _stream_file(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for first in range(0, row_groups, batch_size):
             futures = [
-                pool.submit(
-                    _read_row_group,
-                    remote,
-                    i,
-                    columns,
-                    token,
-                ) for i in range(first, min(first + batch_size, row_groups))
+                pool.submit(_read_row_group, remote, i, columns, token)
+                for i in range(first, min(first + batch_size, row_groups))
             ]
-            for future in futures:
-                for value in future.result():
+            for group_index, future in enumerate(futures, first):
+                try:
+                    rows = future.result()
+                except Exception as exc:
+                    print(
+                        f"[WARN] skipping row group {group_index} in {rel_path}: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+                for value in rows:
                     if record < skip:
                         record += 1
                         continue
@@ -144,32 +117,28 @@ def _stream_file(
                         ) if isinstance(value, dict) else "")
                     position = (dataset_name, rel_path, record + 1)
                     record += 1
-                    text = filter_text(
-                        text,
-                        dataset_name,
-                        min_chars,
-                        max_chars,
-                    )
+                    if not isinstance(text, str):
+                        continue
+                    text = filter_text(text, dataset_name, min_chars, max_chars)
                     if text is not None:
                         yield (text, position) if with_position else text
 
 
-def stream_dataset(
-    name: str,
-    min_chars: int = 20,
-    max_chars: int = 1_000_000,
-    start_dataset: str | None = None,
-    start_file: str | None = None,
-    start_record: int = 0,
-    with_position: bool = False,
-    workers: int | None = None,
-) -> Iterator[Any]:
+def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
+                   start_dataset: str | None = None, start_file: str | None = None,
+                   start_record: int = 0, with_position: bool = False,
+                   workers: int | None = None) -> Iterator[Any]:
+    if min_chars < 0 or max_chars < min_chars:
+        raise ValueError("require 0 <= min_chars <= max_chars")
+    if start_record < 0:
+        raise ValueError("start_record must be non-negative")
     names = list(DATASETS) if name == "all" else [name]
     if name != "all" and name not in DATASETS:
         raise ValueError(f"unknown dataset: {name}")
 
-    workers = workers or int(os.environ.get("SMAUL_STREAM_WORKERS", "0"))
-    workers = (min(4, max(1, os.cpu_count() or 1)) if workers <= 0 else workers)
+    workers = workers if workers is not None else int(os.environ.get("SMAUL_STREAM_WORKERS", "0"))
+    if workers <= 0:
+        workers = min(4, max(1, os.cpu_count() or 1))
 
     active_dataset = start_dataset is None
     for dataset_name in names:
@@ -188,21 +157,12 @@ def stream_dataset(
                 if rel_path != start_file:
                     continue
                 active_file = True
-            skip = (start_record if dataset_name == start_dataset and rel_path == start_file else 0)
+            skip = start_record if dataset_name == start_dataset and rel_path == start_file else 0
             print(
                 f"[STREAM] {dataset_name}/{rel_path}" + (f" from row {skip:,}" if skip else ""),
                 file=sys.stderr,
             )
-            yield from _stream_file(
-                config,
-                dataset_name,
-                rel_path,
-                min_chars,
-                max_chars,
-                skip,
-                with_position,
-                workers,
-            )
+            yield from _stream_file(config, dataset_name, rel_path, min_chars, max_chars, skip, with_position, workers)
 
 
 def main() -> None:
@@ -213,24 +173,14 @@ def main() -> None:
     p.add_argument("--max_records", type=int, default=0)
     p.add_argument("--workers", type=int, default=None)
     args = p.parse_args()
+    if args.max_records < 0:
+        p.error("--max_records must be non-negative")
     count = 0
-
-    for text in stream_dataset(
-            args.dataset,
-            args.min_chars,
-            args.max_chars,
-            workers=args.workers,
-    ):
-        print(
-            json.dumps({"text": text}, ensure_ascii=False),
-            flush=True,
-        )
+    for text in stream_dataset(args.dataset, args.min_chars, args.max_chars, workers=args.workers):
+        print(json.dumps({"text": text}, ensure_ascii=False), flush=True)
         count += 1
         if args.max_records and count >= args.max_records:
-            print(
-                f"[DONE] streamed {count:,} records",
-                file=sys.stderr,
-            )
+            print(f"[DONE] streamed {count:,} records", file=sys.stderr)
             return
     print(f"[DONE] streamed {count:,} records", file=sys.stderr)
 
