@@ -3,7 +3,7 @@
 
 import math
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -12,8 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-
-# Config
 
 @dataclass
 class RWKVXConfig:
@@ -86,7 +84,6 @@ def _wkv_run_chunk(state: torch.Tensor, w_c: torch.Tensor, k_c: torch.Tensor, v_
         kk_t = kk_c[:, t]
         a_t = a_c[:, t]
         r_t = r_c[:, t]
-
         u = (-kk_t).unsqueeze(-1)
         v = (kk_t * a_t).unsqueeze(-2)
         state = state * w_t.unsqueeze(-2) + torch.bmm(
@@ -229,8 +226,7 @@ class RWKV_Tmix_x070(nn.Module):
         else:
             state = state.to(dtype=torch.float32)
 
-        # Native CPU WKV has its own backward; checkpointing it only adds recompute.
-        use_checkpoint = self.training and torch.is_grad_enabled() and not x.device.type == "cpu"
+        use_checkpoint = self.training and torch.is_grad_enabled() and x.device.type != "cpu"
         chunk_size = max(1, self.cfg.wkv_chunk_size) if use_checkpoint else T
 
         ys_chunks = []
@@ -254,8 +250,6 @@ class RWKV_Tmix_x070(nn.Module):
         y = self.output(xx_out * g)
         return y, v_first, (state, x[:, -1, :])
 
-
-# RWKV ChannelMix + MoE
 
 class RWKV_CMix_x070(nn.Module):
     def __init__(self, cfg: RWKVXConfig, layer_id: int):
@@ -286,6 +280,8 @@ class RWKV_CMix_MoE(nn.Module):
         super().__init__()
         self.num_experts = cfg.num_experts
         self.top_k = min(cfg.num_experts, cfg.num_experts_per_tok)
+        if self.top_k < 1:
+            raise ValueError("num_experts_per_tok must be >= 1")
         self.experts = nn.ModuleList([RWKV_CMix_x070(cfg, layer_id) for _ in range(self.num_experts)])
         self.gate = nn.Linear(cfg.n_embd, self.num_experts, bias=False)
 
@@ -296,11 +292,12 @@ class RWKV_CMix_MoE(nn.Module):
         topv = topv / topv.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         out = torch.zeros_like(x)
         for e, expert in enumerate(self.experts):
-            mask = (topi == e).any(dim=-1)
+            weight = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(dim=-1)
+            mask = weight > 0
             if not mask.any():
                 continue
-            y, _ = expert(x[mask].view(-1, 1, x.shape[-1]), None)
-            out[mask] += y.view(-1, x.shape[-1]) * probs[mask, e].unsqueeze(-1)
+            y, _ = expert(x, x_prev_last)
+            out[mask] += y[mask] * weight[mask].unsqueeze(-1)
         return out, x[:, -1, :]
 
 
