@@ -39,28 +39,27 @@ class SmaulRL:
 
     @staticmethod
     def _sample(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> Tuple[int, float]:
-        logits = logits.float()
+        raw_log_probs = F.log_softmax(logits.float(), -1)
+        raw_logits = logits.float()
         if temperature <= 0:
-            probs = F.softmax(logits, -1)
-            token = int(probs.argmax())
-            return token, float(torch.log(probs[token].clamp_min(1e-12)))
+            token = int(raw_logits.argmax())
+            return token, float(raw_log_probs[token])
 
-        logits = logits / temperature
-        if top_k > 0 and top_k < logits.numel():
-            cutoff = torch.topk(logits, top_k).values[-1]
-            logits = logits.masked_fill(logits < cutoff, -float("inf"))
+        sample_logits = raw_logits / temperature
+        if top_k > 0 and top_k < sample_logits.numel():
+            cutoff = torch.topk(sample_logits, top_k).values[-1]
+            sample_logits = sample_logits.masked_fill(sample_logits < cutoff, -float("inf"))
         if 0 < top_p < 1:
-            values, indices = torch.sort(logits, descending=True)
+            values, indices = torch.sort(sample_logits, descending=True)
             probs = F.softmax(values, -1)
             remove = torch.cumsum(probs, -1) > top_p
             remove[1:] = remove[:-1].clone()
             remove[0] = False
             mask = torch.zeros_like(remove).scatter(0, indices, remove)
-            logits = logits.masked_fill(mask, -float("inf"))
+            sample_logits = sample_logits.masked_fill(mask, -float("inf"))
 
-        log_probs = F.log_softmax(logits, -1)
-        token = int(torch.multinomial(log_probs.exp(), 1))
-        return token, float(log_probs[token])
+        token = int(torch.multinomial(F.softmax(sample_logits, -1), 1))
+        return token, float(raw_log_probs[token])
 
     @torch.no_grad()
     def generate(
@@ -71,7 +70,7 @@ class SmaulRL:
         top_k: int,
         top_p: float,
         seed: Optional[int] = None,
-    ) -> Tuple[str, List[int], float]:
+    ) -> Tuple[str, List[int], List[float]]:
         if seed is not None:
             torch.manual_seed(seed)
             random.seed(seed)
@@ -81,20 +80,20 @@ class SmaulRL:
         ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
         logits, _, state = self.model(ids, state=None, use_cache=True, return_logits=True)
         response = []
-        old_logprob = 0.0
+        old_logprobs = []
         for _ in range(max_new_tokens):
             token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
             if token == self.eos_id:
                 break
             response.append(token)
-            old_logprob += logprob
+            old_logprobs.append(logprob)
             logits, _, state = self.model(
                 torch.tensor([[token]], device=self.device),
                 state=state,
                 use_cache=True,
                 return_logits=True,
             )
-        return self._decode(response), response, old_logprob
+        return self._decode(response), response, old_logprobs
 
     def candidates(
         self,
@@ -107,10 +106,10 @@ class SmaulRL:
     ) -> List[Dict]:
         result = []
         for i in range(count):
-            text, tokens, old_logprob = self.generate(
+            text, tokens, old_logprobs = self.generate(
                 prompt, max_new_tokens, temperature, top_k, top_p, seed=random.randrange(2**31)
             )
-            result.append({"id": i, "text": text, "tokens": tokens, "old_logprob": old_logprob})
+            result.append({"id": i, "text": text, "tokens": tokens, "old_logprobs": old_logprobs})
         return result
 
     @staticmethod
@@ -176,14 +175,17 @@ class SmaulRL:
         for candidate, advantage in zip(candidates, advantages):
             if not candidate["tokens"]:
                 continue
-            new_logprob = self._logprob(prompt, candidate["tokens"])
-            old_mean = candidate["old_logprob"] / len(candidate["tokens"])
-            new_mean = new_logprob.mean()
-            ratio = torch.exp(new_mean - old_mean)
+            new_logprobs = self._logprob(prompt, candidate["tokens"])
+            old_logprobs = torch.tensor(candidate["old_logprobs"], dtype=new_logprobs.dtype, device=self.device)
+            if old_logprobs.numel() != new_logprobs.numel():
+                raise ValueError("stored and recomputed token log-probabilities have different lengths")
+            log_ratio = new_logprobs - old_logprobs
+            ratio = torch.exp(log_ratio.clamp(-20, 20))
             clipped_ratio = ratio.clamp(1 - clip, 1 + clip)
-            policy_loss = -torch.minimum(ratio * advantage, clipped_ratio * advantage)
-            kl = (new_mean - old_mean).pow(2)
-            losses.append(policy_loss + kl_coef * kl)
+            token_advantage = advantage.detach().expand_as(ratio)
+            policy_loss = -torch.minimum(ratio * token_advantage, clipped_ratio * token_advantage).mean()
+            stability = log_ratio.pow(2).mean()
+            losses.append(policy_loss + kl_coef * stability)
 
         if not losses:
             return 0.0
