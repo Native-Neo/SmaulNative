@@ -45,7 +45,8 @@ def filter_text(text: Any, dataset: str = "auto", min_chars: int = 20, max_chars
     return text
 
 
-def filter_record(record: dict[str, Any], dataset: str = "auto", min_chars: int = 20, max_chars: int = 1_000_000) -> Optional[str]:
+def filter_record(record: dict[str, Any], dataset: str = "auto", min_chars: int = 20,
+                  max_chars: int = 1_000_000) -> Optional[str]:
     value = record.get("text") if isinstance(record, dict) else None
     return filter_text(value, dataset, min_chars, max_chars)
 
