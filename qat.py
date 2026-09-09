@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # qat.py -- Quantization-Aware Training for RWKV-X, int3.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.ao.quantization import FakeQuantize, MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver
+from torch.ao.quantization import (
+    FakeQuantize,
+    MovingAverageMinMaxObserver,
+    MovingAveragePerChannelMinMaxObserver,
+)
 
-from rwkv_x_core import RWKVXModel, RWKV_CMix_x070, RWKV_CMix_MoE
+from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
+
 
 _CMIX_LINEAR_NAMES = ("key", "value")
 WBITS = 3
-NUM_LEVELS = 2 ** WBITS
+NUM_LEVELS = 2**WBITS
 WEIGHT_QMIN, WEIGHT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
 ACT_QMIN, ACT_QMAX = 0, NUM_LEVELS - 1
 SIGNED_ACT_QMIN, SIGNED_ACT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
@@ -20,9 +26,15 @@ def _install_cuda_wkv_compile():
         return
     try:
         import rwkv_x_core
+
         fn = rwkv_x_core._wkv_run_chunk
         if not getattr(fn, "_smaul_cuda_compiled", False):
-            compiled = torch.compile(fn, mode="max-autotune-no-cudagraphs", dynamic=False, fullgraph=False)
+            compiled = torch.compile(
+                fn,
+                mode="max-autotune-no-cudagraphs",
+                dynamic=False,
+                fullgraph=False,
+            )
             compiled._smaul_cuda_compiled = True
             rwkv_x_core._wkv_run_chunk = compiled
         print("[CUDA] WKV TorchInductor enabled")
@@ -34,24 +46,54 @@ _install_cuda_wkv_compile()
 
 
 def _weight_fake_quant() -> FakeQuantize:
-    return FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, quant_min=WEIGHT_QMIN, quant_max=WEIGHT_QMAX, dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0)()
+    return FakeQuantize.with_args(
+        observer=MovingAveragePerChannelMinMaxObserver,
+        quant_min=WEIGHT_QMIN,
+        quant_max=WEIGHT_QMAX,
+        dtype=torch.qint8,
+        qscheme=torch.per_channel_symmetric,
+        ch_axis=0,
+    )()
 
 
 def _activation_fake_quant(signed: bool = False) -> FakeQuantize:
     if signed:
-        return FakeQuantize.with_args(observer=MovingAverageMinMaxObserver, quant_min=SIGNED_ACT_QMIN, quant_max=SIGNED_ACT_QMAX, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric)()
-    return FakeQuantize.with_args(observer=MovingAverageMinMaxObserver, quant_min=ACT_QMIN, quant_max=ACT_QMAX, dtype=torch.quint8, qscheme=torch.per_tensor_affine)()
+        return FakeQuantize.with_args(
+            observer=MovingAverageMinMaxObserver,
+            quant_min=SIGNED_ACT_QMIN,
+            quant_max=SIGNED_ACT_QMAX,
+            dtype=torch.qint8,
+            qscheme=torch.per_tensor_symmetric,
+        )()
+    return FakeQuantize.with_args(
+        observer=MovingAverageMinMaxObserver,
+        quant_min=ACT_QMIN,
+        quant_max=ACT_QMAX,
+        dtype=torch.quint8,
+        qscheme=torch.per_tensor_affine,
+    )()
 
 
 def _pack_3bit(codes: torch.Tensor) -> torch.Tensor:
     device = codes.device
     shifts = torch.tensor([2, 1, 0], dtype=torch.uint8, device=device)
-    bits = (codes.reshape(-1).to(torch.uint8).unsqueeze(-1) >> shifts) & 1
+    bits = (
+        codes.reshape(-1).to(torch.uint8).unsqueeze(-1) >> shifts
+    ) & 1
     flat_bits = bits.reshape(-1)
     pad_len = (8 - (flat_bits.numel() % 8)) % 8
     if pad_len:
-        flat_bits = torch.cat([flat_bits, torch.zeros(pad_len, dtype=torch.uint8, device=device)])
-    powers = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.uint8, device=device)
+        flat_bits = torch.cat(
+            [
+                flat_bits,
+                torch.zeros(pad_len, dtype=torch.uint8, device=device),
+            ]
+        )
+    powers = torch.tensor(
+        [128, 64, 32, 16, 8, 4, 2, 1],
+        dtype=torch.uint8,
+        device=device,
+    )
     return (flat_bits.reshape(-1, 8) * powers).sum(dim=-1)
 
 
@@ -59,7 +101,7 @@ def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
     device = packed.device
     shifts = torch.arange(7, -1, -1, dtype=torch.uint8, device=device)
     bits = (packed.unsqueeze(-1) >> shifts) & 1
-    flat_bits = bits.reshape(-1)[:numel * 3]
+    flat_bits = bits.reshape(-1)[: numel * 3]
     grouped = flat_bits.reshape(numel, 3)
     return grouped[:, 0] * 4 + grouped[:, 1] * 2 + grouped[:, 2]
 
@@ -83,7 +125,11 @@ class QATLinear(nn.Module):
         scale, _ = self.weight_fq.calculate_qparams()
         w = self.weight.detach().float()
         scale = scale.float().clamp_min(torch.finfo(torch.float32).eps)
-        q = torch.clamp(torch.round(w / scale.unsqueeze(1)), WEIGHT_QMIN, WEIGHT_QMAX)
+        q = torch.clamp(
+            torch.round(w / scale.unsqueeze(1)),
+            WEIGHT_QMIN,
+            WEIGHT_QMAX,
+        )
         codes = (q - WEIGHT_QMIN).to(torch.uint8)
         return QuantizedLinear(_pack_3bit(codes), scale, w.shape)
 
@@ -93,24 +139,51 @@ class QuantizedLinear(nn.Module):
         super().__init__()
         self.register_buffer("packed", packed)
         self.register_buffer("scale", scale)
-        self.register_buffer("weight_shape", torch.tensor([int(shape[0]), int(shape[1])], dtype=torch.int64))
+        self.register_buffer(
+            "weight_shape",
+            torch.tensor(
+                [int(shape[0]), int(shape[1])],
+                dtype=torch.int64,
+            ),
+        )
         self.out_features, self.in_features = int(shape[0]), int(shape[1])
         self._code_cache = {}
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
-                                      missing_keys, unexpected_keys, error_msgs)
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
         self._code_cache.clear()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         key = (x.device.type, x.device.index)
         codes = self._code_cache.get(key)
         if codes is None or codes.device != x.device:
-            codes = _unpack_3bit(self.packed, self.out_features * self.in_features).to(x.device)
+            codes = _unpack_3bit(
+                self.packed,
+                self.out_features * self.in_features,
+            ).to(x.device)
             self._code_cache[key] = codes
         q = codes.to(x.dtype).view(self.out_features, self.in_features) + WEIGHT_QMIN
-        w = q * self.scale.to(device=x.device, dtype=x.dtype).unsqueeze(1)
+        w = q * self.scale.to(
+            device=x.device,
+            dtype=x.dtype,
+        ).unsqueeze(1)
         return F.linear(x, w)
 
 
@@ -129,7 +202,11 @@ def prepare_qat(model: RWKVXModel) -> int:
         for name in _CMIX_LINEAR_NAMES:
             mod = getattr(cmix, name)
             if isinstance(mod, nn.Linear):
-                setattr(cmix, name, QATLinear(mod, signed_activation=name == "key"))
+                setattr(
+                    cmix,
+                    name,
+                    QATLinear(mod, signed_activation=name == "key"),
+                )
                 n += 1
     return n
 
@@ -146,7 +223,14 @@ def convert_qat(model: RWKVXModel) -> int:
 
 
 @torch.no_grad()
-def calibrate(model: RWKVXModel, tokenizer, calib_texts, ctx_len: int, device, max_batches: int = 64):
+def calibrate(
+    model: RWKVXModel,
+    tokenizer,
+    calib_texts,
+    ctx_len: int,
+    device,
+    max_batches: int = 64,
+):
     was_training = model.training
     model.eval()
     buf, n_batches = [], 0
@@ -156,9 +240,13 @@ def calibrate(model: RWKVXModel, tokenizer, calib_texts, ctx_len: int, device, m
         buf.extend(tokenizer.encode(text))
         buf.append(tokenizer.eos_token_id)
         while len(buf) >= ctx_len + 1 and n_batches < max_batches:
-            chunk = buf[:ctx_len + 1]
+            chunk = buf[: ctx_len + 1]
             del buf[:ctx_len]
-            x = torch.tensor(chunk[:-1], dtype=torch.long, device=device).unsqueeze(0)
+            x = torch.tensor(
+                chunk[:-1],
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(0)
             model(x)
             n_batches += 1
             print(f"[QAT] calib batch {n_batches}/{max_batches}")
