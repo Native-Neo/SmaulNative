@@ -17,15 +17,10 @@ from tokenizer import SmaulTokenizer
 
 class PreferenceModel(nn.Module):
     """Small CPU-friendly model that learns which responses the user prefers."""
-
     def __init__(self, vocab_size: int, embed_dim: int = 32):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.scorer = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.Tanh(),
-            nn.Linear(embed_dim, 1),
-        )
+        self.scorer = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.Tanh(), nn.Linear(embed_dim, 1))
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         hidden = self.embedding(tokens)
@@ -51,16 +46,25 @@ class AutoRL:
         self.bos_id = self.tokenizer.bos_token_id
         self.preference_path = self.work_dir / "preferences.jsonl"
         self.preference_model_path = self.work_dir / "preference_model.pt"
+        self.preference_meta_path = self.work_dir / "preference_model.meta.json"
         self.preference_model = PreferenceModel(self.tokenizer.get_vocab_size()).to(self.device)
+        self.preference_trained = 0
         self._load_preference_model()
 
     def _load_preference_model(self):
         if self.preference_model_path.exists():
             state = torch.load(self.preference_model_path, map_location=self.device, weights_only=True)
             self.preference_model.load_state_dict(state)
+        if self.preference_meta_path.exists():
+            try:
+                self.preference_trained = max(0, int(json.loads(self.preference_meta_path.read_text()).get("records", 0)))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                self.preference_trained = 0
 
-    def _save_preference_model(self):
+    def _save_preference_model(self, record_count: int):
         torch.save(self.preference_model.state_dict(), self.preference_model_path)
+        self.preference_meta_path.write_text(json.dumps({"records": record_count}))
+        self.preference_trained = record_count
 
     def _encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text).ids
@@ -75,7 +79,6 @@ class AutoRL:
         if temperature <= 0:
             token = int(raw_logits.argmax())
             return token, float(raw_log_probs[token])
-
         sample_logits = raw_logits / temperature
         if top_k > 0 and top_k < sample_logits.numel():
             cutoff = torch.topk(sample_logits, top_k).values[-1]
@@ -88,7 +91,6 @@ class AutoRL:
             remove[0] = False
             mask = torch.zeros_like(remove).scatter(0, indices, remove)
             sample_logits = sample_logits.masked_fill(mask, -float("inf"))
-
         token = int(torch.multinomial(F.softmax(sample_logits, -1), 1))
         return token, float(raw_log_probs[token])
 
@@ -99,20 +101,14 @@ class AutoRL:
             prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
         ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
         logits, _, state = self.model(ids, state=None, use_cache=True, return_logits=True)
-        response = []
-        old_logprobs = []
+        response, old_logprobs = [], []
         for _ in range(max_new_tokens):
             token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
             if token == self.eos_id:
                 break
             response.append(token)
             old_logprobs.append(logprob)
-            logits, _, state = self.model(
-                torch.tensor([[token]], device=self.device),
-                state=state,
-                use_cache=True,
-                return_logits=True,
-            )
+            logits, _, state = self.model(torch.tensor([[token]], device=self.device), state=state, use_cache=True, return_logits=True)
         return self._decode(response), response, old_logprobs
 
     def candidates(self, prompt: str, count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float):
@@ -134,9 +130,16 @@ class AutoRL:
                 mask[row, :len(ids)] = True
         return tokens, mask
 
+    def _batch_pairs(self, prompt: str, responses: List[str]):
+        sep = self.tokenizer.eos_token_id
+        texts = []
+        for response in responses:
+            texts.append(self._decode(self._encode(prompt) + [sep] + self._encode(response)))
+        return self._batch(texts)
+
     @torch.no_grad()
-    def preference_scores(self, candidates: List[Dict]) -> torch.Tensor:
-        tokens, mask = self._batch([candidate["text"] for candidate in candidates])
+    def preference_scores(self, prompt: str, candidates: List[Dict]) -> torch.Tensor:
+        tokens, mask = self._batch_pairs(prompt, [candidate["text"] for candidate in candidates])
         self.preference_model.eval()
         return self.preference_model(tokens, mask)
 
@@ -150,27 +153,28 @@ class AutoRL:
         if not self.preference_path.exists():
             print("[PREF] no preferences.jsonl found")
             return
-        records = [
-            json.loads(line)
-            for line in self.preference_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        records = [json.loads(line) for line in self.preference_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         if not records:
             print("[PREF] no preference records found")
             return
-
+        start = min(self.preference_trained, len(records))
+        if start == len(records):
+            print(f"[PREF] up to date ({len(records)} records)")
+            return
+        new_records = records[start:]
         optimizer = torch.optim.AdamW(self.preference_model.parameters(), lr=lr)
         self.preference_model.train()
         for epoch in range(epochs):
-            random.shuffle(records)
+            random.shuffle(new_records)
             total = 0.0
             valid = 0
-            for record in records:
+            for record in new_records:
                 responses = record.get("responses", [])
                 chosen = int(record.get("chosen", -1))
-                if len(responses) < 2 or not 0 <= chosen < len(responses):
+                prompt = record.get("prompt")
+                if not isinstance(prompt, str) or len(responses) < 2 or not 0 <= chosen < len(responses):
                     continue
-                tokens, mask = self._batch(responses)
+                tokens, mask = self._batch_pairs(prompt, responses)
                 scores = self.preference_model(tokens, mask)
                 rejected = torch.cat((scores[:chosen], scores[chosen + 1:]))
                 loss = -F.logsigmoid(scores[chosen] - rejected).mean()
@@ -180,7 +184,7 @@ class AutoRL:
                 total += float(loss.detach())
                 valid += 1
             print(f"[PREF] epoch={epoch + 1}/{epochs} loss={total / max(1, valid):.5f}")
-        self._save_preference_model()
+        self._save_preference_model(len(records))
 
     def _show(self, candidates: List[Dict]):
         print("\n" + "=" * 80)
@@ -208,13 +212,8 @@ class AutoRL:
             print("Please answer yes or no.")
 
     def _save_preference(self, prompt: str, candidates: List[Dict], chosen: int, predicted: int):
-        record = {
-            "prompt": prompt,
-            "responses": [candidate["text"] for candidate in candidates],
-            "chosen": chosen,
-            "source": "auto_confirmed" if chosen == predicted else "human_correction",
-            "predicted": predicted,
-        }
+        record = {"prompt": prompt, "responses": [candidate["text"] for candidate in candidates], "chosen": chosen,
+                  "source": "auto_confirmed" if chosen == predicted else "human_correction", "predicted": predicted}
         with self.preference_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -222,6 +221,8 @@ class AutoRL:
         prompt_ids = self._encode(prompt)
         if not prompt_ids:
             prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
+        if not response_tokens:
+            return torch.empty(0, device=self.device)
         ids = torch.tensor([prompt_ids + response_tokens], dtype=torch.long, device=self.device)
         logits, _, _ = self.model(ids, state=None, use_cache=False, return_logits=True)
         start = len(prompt_ids) - 1
@@ -230,6 +231,8 @@ class AutoRL:
         return F.log_softmax(token_logits.float(), -1).gather(1, targets[:, None]).squeeze(1)
 
     def grpo_step(self, prompt: str, candidates: List[Dict], chosen: int, lr: float, clip: float, kl_coef: float):
+        if not 0 <= chosen < len(candidates):
+            raise ValueError("chosen response is out of range")
         rewards = torch.full((len(candidates),), -1.0, device=self.device)
         rewards[chosen] = 1.0
         advantages = (rewards - rewards.mean()) / rewards.std().clamp_min(1e-6)
@@ -247,8 +250,8 @@ class AutoRL:
             clipped_ratio = ratio.clamp(1 - clip, 1 + clip)
             token_advantage = advantage.detach().expand_as(ratio)
             policy_loss = -torch.minimum(ratio * token_advantage, clipped_ratio * token_advantage).mean()
-            stability = log_ratio.pow(2).mean()
-            losses.append(policy_loss + kl_coef * stability)
+            sampled_kl = (old_logprobs - new_logprobs).mean()
+            losses.append(policy_loss + kl_coef * sampled_kl)
         if not losses:
             return 0.0
         loss = torch.stack(losses).mean()
@@ -270,7 +273,7 @@ class AutoRL:
         self.train_preferences(preference_epochs, preference_lr)
         for prompt in prompts:
             candidates = self.candidates(prompt, count, max_new_tokens, temperature, top_k, top_p)
-            scores = self.preference_scores(candidates)
+            scores = self.preference_scores(prompt, candidates)
             predicted = int(scores.argmax().item())
             chosen = self._verify(candidates, predicted) if verify else predicted
             self._save_preference(prompt, candidates, chosen, predicted)
@@ -297,20 +300,8 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-verify", action="store_true")
     args = parser.parse_args()
-    AutoRL(args.model_dir, args.work_dir, args.device).run(
-        args.prompt,
-        args.responses,
-        args.max_new_tokens,
-        args.temperature,
-        args.top_k,
-        args.top_p,
-        args.preference_epochs,
-        args.preference_lr,
-        args.rl_lr,
-        args.clip,
-        args.kl_coef,
-        not args.no_verify,
-    )
+    AutoRL(args.model_dir, args.work_dir, args.device).run(args.prompt, args.responses, args.max_new_tokens, args.temperature,
+        args.top_k, args.top_p, args.preference_epochs, args.preference_lr, args.rl_lr, args.clip, args.kl_coef, not args.no_verify)
 
 
 if __name__ == "__main__":
