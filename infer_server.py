@@ -14,7 +14,6 @@ import uvicorn
 
 from inference import RWKVXInference
 
-
 HTML = r'''<!doctype html>
 <html lang="en">
 <head>
@@ -73,73 +72,56 @@ def create_app(engine: RWKVXInference):
     async def models():
         return {
             "object": "list",
-            "data": [
-                {
-                    "id": "rwkv-x",
-                    "object": "model",
-                    "owned_by": "SmaulNative",
-                }
-            ],
+            "data": [{
+                "id": "rwkv-x",
+                "object": "model",
+                "owned_by": "SmaulNative",
+            }],
         }
 
     @app.post("/v1/chat/completions")
     async def chat(req: ChatRequest):
         msgs = [m.model_dump() for m in req.messages]
-        system = req.system or (
-            "You are SmaulNative, a helpful local AI assistant. "
-            "Be concise, accurate, and practical."
-        )
+        system = req.system or ("You are SmaulNative, a helpful local AI assistant. "
+                                "Be concise, accurate, and practical.")
         prompt = engine.chat_prompt(msgs, system)
         created = int(time.time())
         request_id = "chatcmpl-" + uuid.uuid4().hex
 
         def chunks():
             for text in engine.stream(
-                prompt,
-                max_new_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                repetition_penalty=req.repetition_penalty,
+                    prompt,
+                    max_new_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    repetition_penalty=req.repetition_penalty,
             ):
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": req.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": text},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                    )
-                    + "\n\n"
-                )
-            yield (
-                "data: "
-                + json.dumps(
-                    {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": req.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-                )
-                + "\n\n"
-            )
+                yield ("data: " +
+                       json.dumps({
+                           "id": request_id,
+                           "object": "chat.completion.chunk",
+                           "created": created,
+                           "model": req.model,
+                           "choices": [{
+                               "index": 0,
+                               "delta": {
+                                   "content": text
+                               },
+                               "finish_reason": None,
+                           }],
+                       }) + "\n\n")
+            yield ("data: " + json.dumps({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": req.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            }) + "\n\n")
             yield "data: [DONE]\n\n"
 
         if req.stream:
@@ -160,24 +142,24 @@ def create_app(engine: RWKVXInference):
             top_p=req.top_p,
             repetition_penalty=req.repetition_penalty,
         )
-        return JSONResponse(
-            {
-                "id": request_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": req.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": text,
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-        )
+        return JSONResponse({
+            "id":
+            request_id,
+            "object":
+            "chat.completion",
+            "created":
+            created,
+            "model":
+            req.model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                },
+                "finish_reason": "stop",
+            }],
+        })
 
     return app
 
