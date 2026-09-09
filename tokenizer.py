@@ -6,7 +6,6 @@ import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
-
 SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>"]
 CASE = ["<cap>", "<upper>"]
 TOKEN_RE = re.compile(
@@ -17,6 +16,7 @@ DEV_BASE = re.compile(r"[\u0900-\u097F]")
 
 
 class TokenIds(list):
+
     @property
     def ids(self):
         return self
@@ -26,9 +26,8 @@ def _json_texts(data):
     if isinstance(data, str):
         yield data
     elif isinstance(data, dict):
-        text = next((data[k] for k in (
-            "text", "content", "document", "body", "code", "prompt", "completion"
-        ) if isinstance(data.get(k), str)), None)
+        text = next((data[k] for k in ("text", "content", "document", "body", "code", "prompt", "completion")
+                     if isinstance(data.get(k), str)), None)
         if text is not None:
             yield text
         elif "data" in data:
@@ -42,11 +41,42 @@ def read_texts(path, max_records=0):
     files = [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file()]
     seen = 0
     plain = {
-        ".txt", ".text", ".py", ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx",
-        ".rs", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".cs", ".php",
-        ".rb", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh",
-        ".html", ".css", ".scss", ".sql", ".md", ".rst", ".yaml", ".yml",
-        ".toml", ".xml",
+        ".txt",
+        ".text",
+        ".py",
+        ".cpp",
+        ".c",
+        ".h",
+        ".hpp",
+        ".cc",
+        ".cxx",
+        ".rs",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".java",
+        ".go",
+        ".cs",
+        ".php",
+        ".rb",
+        ".swift",
+        ".kt",
+        ".kts",
+        ".scala",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".html",
+        ".css",
+        ".scss",
+        ".sql",
+        ".md",
+        ".rst",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".xml",
     }
 
     for f in files:
@@ -84,9 +114,8 @@ def read_texts(path, max_records=0):
                 raise SystemExit("Parquet support: pip install pyarrow")
             pf = pq.ParquetFile(f)
             names = pf.schema_arrow.names
-            col = next((c for c in names if c.lower() in {
-                "text", "content", "document", "body", "code", "prompt", "completion"
-            }), None)
+            col = next((c for c in names
+                        if c.lower() in {"text", "content", "document", "body", "code", "prompt", "completion"}), None)
             if col:
                 for batch in pf.iter_batches(batch_size=1024, columns=[col]):
                     for x in batch.column(0).to_pylist():
@@ -211,7 +240,10 @@ def _build(texts, vocab_size, word_budget, max_records=0):
         "vocab": vocab,
         "special_tokens": SPECIAL,
         "case_tokens": CASE,
-        "case_stats": {w: dict(c) for w, c in cases.items()},
+        "case_stats": {
+            w: dict(c)
+            for w, c in cases.items()
+        },
         "unk_id": vocab["<unk>"],
         "stats": {
             "vocab_size": len(vocab),
@@ -231,6 +263,7 @@ def train(dataset, vocab_size=64000, word_budget=40000, max_records=0):
 
 
 class SmaulTokenizer:
+
     def __init__(self, data):
         self.data = data
         self.vocab = data["vocab"]
@@ -245,9 +278,7 @@ class SmaulTokenizer:
         return cls(json.loads(Path(path).read_text(encoding="utf-8")))
 
     def save(self, path):
-        Path(path).write_text(
-            json.dumps(self.data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
-        )
+        Path(path).write_text(json.dumps(self.data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     def get_vocab_size(self):
         return len(self.vocab)
@@ -357,20 +388,16 @@ def main():
 
 def train_cmd(a):
     d = _build(read_texts(Path(a.fromdataset), a.max_records), a.vocab_size, a.word_budget, a.max_records)
-    Path(a.output).write_text(
-        json.dumps(d, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
-    )
+    Path(a.output).write_text(json.dumps(d, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     s = d["stats"]
-    print(
-        f"Vocabulary: {s['vocab_size']:,}\n"
-        f"Whole words: {s['whole_words']:,}\n"
-        f"Unique words: {s['unique_words']:,}\n"
-        f"Corpus words: {s['total_words']:,}\n"
-        f"Devanagari units: {s['devanagari_units']:,}\n"
-        f"Characters: {s['characters']:,}\n"
-        f"Symbols/operators: {s['symbols']:,}\n"
-        f"Saved: {a.output}"
-    )
+    print(f"Vocabulary: {s['vocab_size']:,}\n"
+          f"Whole words: {s['whole_words']:,}\n"
+          f"Unique words: {s['unique_words']:,}\n"
+          f"Corpus words: {s['total_words']:,}\n"
+          f"Devanagari units: {s['devanagari_units']:,}\n"
+          f"Characters: {s['characters']:,}\n"
+          f"Symbols/operators: {s['symbols']:,}\n"
+          f"Saved: {a.output}")
 
 
 if __name__ == "__main__":
