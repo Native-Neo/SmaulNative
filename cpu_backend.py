@@ -15,9 +15,7 @@ def configure(threads=None):
         else:
             import subprocess
             try:
-                cores = int(subprocess.check_output(
-                    ["nproc", "--all"], text=True
-                ).strip())
+                cores = int(subprocess.check_output(["nproc", "--all"], text=True).strip())
                 threads = max(1, cores // 2)
             except Exception:
                 threads = min(os.cpu_count() or 1, 2)
@@ -48,6 +46,7 @@ def _load():
 
 
 class NativeLion(Optimizer):
+
     def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
         if lr <= 0:
             raise ValueError("lr must be > 0")
