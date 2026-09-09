@@ -121,7 +121,9 @@ class AutoRL:
         return candidates
 
     def _batch(self, texts: List[str]):
-        token_lists = [self._encode(text) for text in texts]
+        return self._batch_ids([self._encode(text) for text in texts])
+
+    def _batch_ids(self, token_lists: List[List[int]]):
         max_len = max(1, max(map(len, token_lists)))
         tokens = torch.zeros(len(token_lists), max_len, dtype=torch.long, device=self.device)
         mask = torch.zeros_like(tokens, dtype=torch.bool)
@@ -132,10 +134,9 @@ class AutoRL:
         return tokens, mask
 
     def _batch_pairs(self, prompt: str, responses: List[str]):
-        sep = self.tokenizer.eos_token_id
         prompt_ids = self._encode(prompt)
-        texts = [self._decode(prompt_ids + [sep] + self._encode(response)) for response in responses]
-        return self._batch(texts)
+        sep = [self.eos_id] if self.eos_id is not None else []
+        return self._batch_ids([prompt_ids + sep + self._encode(response) for response in responses])
 
     @torch.no_grad()
     def preference_scores(self, prompt: str, candidates: List[Dict]) -> torch.Tensor:
