@@ -9,11 +9,11 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
-
 IGNORE_INDEX = -100
 
 
 class TokenizerWrapper:
+
     def __init__(self, tokenizer):
         self._tok = tokenizer
         self.pad_token_id = tokenizer.token_to_id("<pad>")
@@ -33,9 +33,7 @@ class TokenizerWrapper:
 
 def load_tokenizer(path: Path) -> TokenizerWrapper:
     if not Path(path).exists():
-        raise FileNotFoundError(
-            f"No tokenizer found at {path}. Run tokenizer.py first"
-        )
+        raise FileNotFoundError(f"No tokenizer found at {path}. Run tokenizer.py first")
     from tokenizer import SmaulTokenizer
 
     return TokenizerWrapper(SmaulTokenizer.from_file(path))
@@ -107,11 +105,7 @@ PLAIN_TEXT_SUFFIXES = SUPPORTED_SUFFIXES - {
 def discover_files(dataset_dir: Path) -> List[Path]:
     if not dataset_dir.exists():
         raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
-    files = [
-        p.resolve()
-        for p in dataset_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES
-    ]
+    files = [p.resolve() for p in dataset_dir.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES]
     files.sort()
     return files
 
@@ -120,12 +114,7 @@ def _looks_numeric(s: str) -> bool:
     s = s.strip()
     if not s:
         return True
-    core = (
-        s.replace(".", "", 1)
-        .replace("-", "", 1)
-        .replace(":", "", 1)
-        .replace("/", "", 1)
-    )
+    core = (s.replace(".", "", 1).replace("-", "", 1).replace(":", "", 1).replace("/", "", 1))
     return core.isdigit()
 
 
@@ -141,18 +130,12 @@ def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
             v = lower_map.get(key)
             if isinstance(v, str) and v.strip():
                 return v
-        candidates = [
-            v
-            for v in obj.values()
-            if isinstance(v, str) and not _looks_numeric(v)
-        ]
+        candidates = [v for v in obj.values() if isinstance(v, str) and not _looks_numeric(v)]
         if candidates:
             if source_path and source_path not in _WARNED_FILES:
                 _WARNED_FILES.add(source_path)
-                print(
-                    f"[WARN] {source_path}: no recognized text column; "
-                    f"guessing from {list(obj.keys())}"
-                )
+                print(f"[WARN] {source_path}: no recognized text column; "
+                      f"guessing from {list(obj.keys())}")
             return max(candidates, key=len)
         return ""
     if isinstance(obj, list):
@@ -233,11 +216,11 @@ def iter_texts(
 
             elif suffix == ".csv":
                 with open(
-                    path,
-                    "r",
-                    encoding="utf-8",
-                    errors="replace",
-                    newline="",
+                        path,
+                        "r",
+                        encoding="utf-8",
+                        errors="replace",
+                        newline="",
                 ) as f:
                     for i, row in enumerate(csv.DictReader(f)):
                         if i < start_idx:
@@ -282,6 +265,7 @@ def iter_texts(
 
 
 class PretrainStream(IterableDataset):
+
     def __init__(
         self,
         dataset_dir: Path,
@@ -298,26 +282,24 @@ class PretrainStream(IterableDataset):
         self.ctx_len = ctx_len
         self.resume_file = resume_file
         self.resume_record = resume_record
-        self.buffer_tokens = (
-            list(buffer_tokens) if buffer_tokens is not None else []
-        )
+        self.buffer_tokens = (list(buffer_tokens) if buffer_tokens is not None else [])
         self.last_pos: Tuple[Optional[str], int] = (None, 0)
 
     def __iter__(self):
         buf = list(self.buffer_tokens)
         SUBCHUNK = 4096
         for text, path, rec_idx in iter_texts(
-            self.files,
-            self.resume_file,
-            self.resume_record,
+                self.files,
+                self.resume_file,
+                self.resume_record,
         ):
             ids = self.tokenizer.encode(text) + [self.tokenizer.eos_token_id]
             self.last_pos = (path, rec_idx)
             for i in range(0, len(ids), SUBCHUNK):
-                buf.extend(ids[i : i + SUBCHUNK])
+                buf.extend(ids[i:i + SUBCHUNK])
                 while len(buf) >= self.ctx_len + 1:
-                    chunk = buf[: self.ctx_len + 1]
-                    del buf[: self.ctx_len]
+                    chunk = buf[:self.ctx_len + 1]
+                    del buf[:self.ctx_len]
                     self.buffer_tokens = buf
                     yield (
                         torch.tensor(chunk[:-1], dtype=torch.long),
@@ -333,18 +315,11 @@ def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
     out = []
     for sentence in conversations:
         frm = sentence["from"]
-        frm_str = (
-            "User"
-            if frm.lower() in ("user", "human")
-            else "Assistant"
-            if frm.lower() in ("assistant", "gpt")
-            else frm
-        )
+        frm_str = ("User" if frm.lower() in ("user", "human") else "Assistant" if frm.lower() in ("assistant",
+                                                                                                  "gpt") else frm)
         new = dict(sentence)
         new["from"] = frm_str
-        new["value"] = (
-            frm_str + ": " + sentence.get("value", "") + DEFAULT_STOP_TOKEN
-        )
+        new["value"] = (frm_str + ": " + sentence.get("value", "") + DEFAULT_STOP_TOKEN)
         out.append(new)
     return out
 
@@ -366,16 +341,14 @@ def _preprocess_conversation(
     targets = list(input_ids)
     cur = 0
     for length, speaker, prefix_len in zip(
-        tokenized_lens,
-        speakers,
-        prefix_lens,
+            tokenized_lens,
+            speakers,
+            prefix_lens,
     ):
         if speaker.lower() == "user":
-            targets[cur : cur + length] = [IGNORE_INDEX] * length
+            targets[cur:cur + length] = [IGNORE_INDEX] * length
         elif speaker.lower() == "assistant":
-            targets[cur : min(cur + prefix_len, cur + length)] = [
-                IGNORE_INDEX
-            ] * min(prefix_len, length)
+            targets[cur:min(cur + prefix_len, cur + length)] = [IGNORE_INDEX] * min(prefix_len, length)
         cur += length
 
     input_ids = input_ids[:ctx_len]
@@ -403,20 +376,14 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
                         if line:
                             records.append(json.loads(line))
             else:
-                data = json.loads(
-                    path.read_text(encoding="utf-8", errors="replace")
-                )
+                data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
                 records.extend(data if isinstance(data, list) else [data])
         except Exception as e:
             print(f"[WARN] skipping SFT file {path}: {e}")
 
-    records = [
-        r for r in records if isinstance(r, dict) and "conversations" in r
-    ]
+    records = [r for r in records if isinstance(r, dict) and "conversations" in r]
     if not records:
-        raise RuntimeError(
-            f"No SFT conversation records found under {dataset_dir}"
-        )
+        raise RuntimeError(f"No SFT conversation records found under {dataset_dir}")
     return records
 
 
@@ -428,9 +395,7 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.ctx_len = ctx_len
         self.pad_token_id = tokenizer.pad_token_id
-        self._processed_cache: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor]]" = (
-            OrderedDict()
-        )
+        self._processed_cache: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor]]" = (OrderedDict())
 
     def __len__(self):
         return len(self.records)
