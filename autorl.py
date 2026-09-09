@@ -75,10 +75,8 @@ class AutoRL:
     @staticmethod
     def _sample(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> Tuple[int, float]:
         raw_logits = logits.float()
-        raw_log_probs = F.log_softmax(raw_logits, -1)
         if temperature <= 0:
-            token = int(raw_logits.argmax())
-            return token, float(raw_log_probs[token])
+            raise ValueError("temperature must be > 0 for policy sampling")
         sample_logits = raw_logits / temperature
         if top_k > 0 and top_k < sample_logits.numel():
             cutoff = torch.topk(sample_logits, top_k).values[-1]
@@ -91,8 +89,9 @@ class AutoRL:
             remove[0] = False
             mask = torch.zeros_like(remove).scatter(0, indices, remove)
             sample_logits = sample_logits.masked_fill(mask, -float("inf"))
-        token = int(torch.multinomial(F.softmax(sample_logits, -1), 1))
-        return token, float(raw_log_probs[token])
+        log_probs = F.log_softmax(sample_logits, -1)
+        token = int(torch.multinomial(log_probs.exp(), 1))
+        return token, float(log_probs[token])
 
     @torch.no_grad()
     def generate(self, prompt: str, max_new_tokens: int, temperature: float, top_k: int, top_p: float):
@@ -264,9 +263,8 @@ class AutoRL:
         self.model.save_pretrained(policy_dir, dtype="fp32", include_upstream=False)
         return float(loss.detach())
 
-    def run(self, prompts: List[str], count: int, max_new_tokens: int, temperature: float, top_k: int,
-            top_p: float, preference_epochs: int, preference_lr: float, rl_lr: float, clip: float,
-            kl_coef: float, verify: bool):
+    def run(self, prompts: List[str], count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float,
+            preference_epochs: int, preference_lr: float, rl_lr: float, clip: float, kl_coef: float, verify: bool):
         if count < 2:
             raise ValueError("--responses must be at least 2")
         print(f"[PREF] loading {self.preference_count()} preference records")
@@ -300,8 +298,8 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-verify", action="store_true")
     args = parser.parse_args()
-    AutoRL(args.model_dir, args.work_dir, args.device).run(args.prompt, args.responses, args.max_new_tokens, args.temperature,
-        args.top_k, args.top_p, args.preference_epochs, args.preference_lr, args.rl_lr, args.clip, args.kl_coef, not args.no_verify)
+    AutoRL(args.model_dir, args.work_dir, args.device).run(args.prompt, args.responses, args.max_new_tokens, args.temperature, args.top_k,
+        args.top_p, args.preference_epochs, args.preference_lr, args.rl_lr, args.clip, args.kl_coef, not args.no_verify)
 
 
 if __name__ == "__main__":
