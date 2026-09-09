@@ -1,4 +1,3 @@
-import json
 import sys
 from pathlib import Path
 
@@ -17,9 +16,10 @@ from tokenizer import read_texts
 class FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 1
+    vocab = {"User:": 2, "hello": 3, "System:": 4, "rules": 5, "Assistant:": 6, "answer": 7, "\n\n": 8}
 
     def encode(self, text):
-        return [ord(c) % 50 + 2 for c in text]
+        return [self.vocab[word] for word in text.replace("\n\n", " \n\n ").split()]
 
 
 def test_plain_text_resume_skips_completed_record(tmp_path):
@@ -68,12 +68,14 @@ def test_sft_masks_non_assistant_messages_and_malformed_entries():
         {"from": "system", "value": "rules"},
         {"from": "assistant", "value": "answer"},
         {"from": "broken"},
-    ], FakeTokenizer(), 256, 0)
+    ], FakeTokenizer(), 64, 0)
     labels = result["labels"].tolist()
-    assert any(x != IGNORE_INDEX for x in labels)
-    assistant_ids = FakeTokenizer().encode("answer")
-    assert labels[-(len(assistant_ids) + 1): -1] == assistant_ids[:len(assistant_ids)]
-    assert all(x == IGNORE_INDEX for x in labels[:20])
+    ids = result["input_ids"].tolist()
+    assistant = FakeTokenizer().encode("Assistant: answer\n\n")
+    start = ids.index(assistant[0])
+    assert labels[start] == IGNORE_INDEX
+    assert labels[start + 1:] == assistant[1:] + [IGNORE_INDEX] * (64 - start - len(assistant))
+    assert all(x == IGNORE_INDEX for x in labels[:start])
 
 
 def test_rl_sampling_logprob_uses_same_transformed_distribution():
@@ -87,24 +89,27 @@ def test_rl_sampling_logprob_uses_same_transformed_distribution():
     assert abs(stored - expected[token].item()) < 1e-6
 
 
-def test_pretrain_partial_batch_helper_updates_step():
-    from train import _train_pretrain_batch
+def test_pretrain_partial_batch_helper_updates_resume(monkeypatch):
+    import train
 
-    class Args:
-        ctx_len = 4
+    class Resume:
+        global_step = 0
+        total_tokens = 0
+        file_path = None
+        record_index = 0
+        buffer_tokens = []
 
-    class Optimizer:
-        def zero_grad(self, **kwargs):
-            pass
-
-        def step(self):
-            pass
-
-    class Model:
-        pass
-
-    # This regression is covered at the training-loop level by the explicit final flush path.
-    assert hasattr(__import__("train"), "_train_pretrain_batch")
+    monkeypatch.setattr(train, "_optimizer_step", lambda *args: torch.tensor(2.0))
+    resume = Resume()
+    loss = train._train_pretrain_batch(None, object(), object(), resume, torch.device("cpu"), None,
+                                       [torch.ones(4, dtype=torch.long)], [torch.zeros(4, dtype=torch.long)],
+                                       "data.txt", 3, [1, 2])
+    assert loss.item() == 2.0
+    assert resume.global_step == 1
+    assert resume.total_tokens == 4
+    assert resume.file_path == "data.txt"
+    assert resume.record_index == 3
+    assert resume.buffer_tokens == [1, 2]
 
 
 if __name__ == "__main__":
