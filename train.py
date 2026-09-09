@@ -12,18 +12,13 @@ from pathlib import Path
 from typing import Optional
 
 if "--cpu" in sys.argv:
-    threads = str(
-        os.environ.get("SMAUL_CPU_THREADS")
-        or max(1, (os.cpu_count() or 2) // 2)
-    )
+    threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(key, threads)
     os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "SSE4.2")
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
-    os.environ.setdefault(
-        "TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP"
-    )
+    os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
 
 import torch
 from torch.optim import Optimizer
@@ -41,29 +36,27 @@ from stream_data import stream_dataset
 from tokenizer import train_tokenizer
 import qat
 
-
 STOP_REQUESTED = False
 
 
 def _sigint_handler(signum, frame):
     global STOP_REQUESTED
     STOP_REQUESTED = True
-    print(
-        "\n[Ctrl-C] Stop requested. Finishing current step, "
-        "then saving checkpoint."
-    )
+    print("\n[Ctrl-C] Stop requested. Finishing current step, "
+          "then saving checkpoint.")
 
 
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
 class Lion(Optimizer):
+
     def __init__(
-        self,
-        params,
-        lr=1e-4,
-        betas=(0.9, 0.99),
-        weight_decay=0.01,
+            self,
+            params,
+            lr=1e-4,
+            betas=(0.9, 0.99),
+            weight_decay=0.01,
     ):
         if lr <= 0:
             raise ValueError("lr must be > 0")
@@ -95,9 +88,7 @@ class Lion(Optimizer):
                     param.mul_(1 - lr * weight_decay)
 
                 param.add_(
-                    exp_avg.mul(b1)
-                    .add(param.grad, alpha=1 - b1)
-                    .sign(),
+                    exp_avg.mul(b1).add(param.grad, alpha=1 - b1).sign(),
                     alpha=-lr,
                 )
                 exp_avg.lerp_(param.grad, 1 - b2)
@@ -107,22 +98,16 @@ class Lion(Optimizer):
 
 def set_router_only_training(model, router_only):
     if not model.cfg.is_moe:
-        raise ValueError(
-            "set_router_only_training requires cfg.is_moe=True"
-        )
+        raise ValueError("set_router_only_training requires cfg.is_moe=True")
 
     gates = {
         id(param)
-        for module in model.modules()
-        if isinstance(module, RWKV_CMix_MoE)
-        for param in module.gate.parameters()
+        for module in model.modules() if isinstance(module, RWKV_CMix_MoE) for param in module.gate.parameters()
     }
 
     trainable_params = 0
     for param in model.parameters():
-        param.requires_grad_(
-            id(param) in gates if router_only else True
-        )
+        param.requires_grad_(id(param) in gates if router_only else True)
         if param.requires_grad:
             trainable_params += param.numel()
 
@@ -130,6 +115,7 @@ def set_router_only_training(model, router_only):
 
 
 class ResumeState:
+
     def __init__(self):
         self.global_step = 0
         self.total_tokens = 0
@@ -228,11 +214,7 @@ def save_checkpoint(
 
 def _autocast(args, device):
     if device.type == "cuda":
-        dtype = (
-            torch.float16
-            if args.precision == "fp16"
-            else torch.bfloat16
-        )
+        dtype = (torch.float16 if args.precision == "fp16" else torch.bfloat16)
         return torch.autocast(device_type="cuda", dtype=dtype)
 
     if args.precision == "bf16":
@@ -259,9 +241,7 @@ def _optimizer_step(
         _, loss, _ = model(xb, labels=yb)
 
     if not torch.isfinite(loss):
-        print(
-            f"[WARN] non-finite loss {loss.item()}, skipping step"
-        )
+        print(f"[WARN] non-finite loss {loss.item()}, skipping step")
         return None
 
     if scaler:
@@ -296,18 +276,16 @@ def _remote_token_stream(name, tokenizer, ctx_len, resume):
     buffer_tokens = list(resume.buffer_tokens)
 
     for text, position in stream_dataset(
-        name,
-        start_dataset=dataset,
-        start_file=file_path,
-        start_record=record,
-        with_position=True,
+            name,
+            start_dataset=dataset,
+            start_file=file_path,
+            start_record=record,
+            with_position=True,
     ):
-        buffer_tokens.extend(
-            tokenizer.encode(text) + [tokenizer.eos_token_id]
-        )
+        buffer_tokens.extend(tokenizer.encode(text) + [tokenizer.eos_token_id])
 
         while len(buffer_tokens) >= ctx_len + 1:
-            chunk = buffer_tokens[: ctx_len + 1]
+            chunk = buffer_tokens[:ctx_len + 1]
             del buffer_tokens[:ctx_len]
 
             yield (
@@ -337,14 +315,9 @@ def train_pretrain(
         )
         remote = True
     else:
-        if (
-            resume.file_path
-            and not Path(resume.file_path).is_file()
-        ):
-            raise FileNotFoundError(
-                f"resume dataset file no longer exists: "
-                f"{resume.file_path}"
-            )
+        if (resume.file_path and not Path(resume.file_path).is_file()):
+            raise FileNotFoundError(f"resume dataset file no longer exists: "
+                                    f"{resume.file_path}")
 
         stream = PretrainStream(
             Path(args.dataset_dir),
@@ -403,12 +376,10 @@ def train_pretrain(
         if resume.global_step % args.log_every == 0:
             elapsed = time.perf_counter() - t0
             tokens_per_second = tokens_since_log / max(elapsed, 1e-9)
-            print(
-                f"step {resume.global_step} | "
-                f"loss {loss.item():.4f} | "
-                f"{tokens_per_second:.1f} tok/s | "
-                f"tokens {resume.total_tokens:,}"
-            )
+            print(f"step {resume.global_step} | "
+                  f"loss {loss.item():.4f} | "
+                  f"{tokens_per_second:.1f} tok/s | "
+                  f"tokens {resume.total_tokens:,}")
             t0 = time.perf_counter()
             tokens_since_log = 0
 
@@ -453,11 +424,7 @@ def train_sft(
             len(dataset),
             generator=generator,
         ).tolist()
-        start = (
-            resume.record_index
-            if epoch == resume.epoch
-            else 0
-        )
+        start = (resume.record_index if epoch == resume.epoch else 0)
         loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -488,10 +455,8 @@ def train_sft(
             resume.record_index = consumed
 
             if resume.global_step % args.log_every == 0:
-                print(
-                    f"epoch {epoch} step {resume.global_step} | "
-                    f"loss {loss.item():.4f}"
-                )
+                print(f"epoch {epoch} step {resume.global_step} | "
+                      f"loss {loss.item():.4f}")
 
             if resume.global_step % args.save_every == 0:
                 save_checkpoint(
@@ -590,21 +555,11 @@ def parse_args():
     parser.add_argument("--cpu", action="store_true")
 
     args = parser.parse_args()
-    args.precision = args.precision or (
-        "fp16" if torch.cuda.is_available() and not args.cpu else "fp32"
-    )
-    args.optimizer_save_every = (
-        args.optimizer_save_every or args.save_every
-    )
+    args.precision = args.precision or ("fp16" if torch.cuda.is_available() and not args.cpu else "fp32")
+    args.optimizer_save_every = (args.optimizer_save_every or args.save_every)
 
-    if (
-        args.tokenizer_max_records < 0
-        or args.n_embd <= 0
-        or args.head_size <= 0
-        or args.n_layer <= 0
-        or args.n_moba_layer < 0
-        or args.n_moba_layer >= args.n_layer
-    ):
+    if (args.tokenizer_max_records < 0 or args.n_embd <= 0 or args.head_size <= 0 or args.n_layer <= 0
+            or args.n_moba_layer < 0 or args.n_moba_layer >= args.n_layer):
         parser.error("invalid model/training parameters")
 
     if args.n_embd % args.head_size:
@@ -614,9 +569,7 @@ def parse_args():
         parser.error("--precision fp16 requires CUDA")
 
     if args.mode == "sft" and args.stream_dataset != "none":
-        parser.error(
-            "--stream_dataset is supported for pretraining only"
-        )
+        parser.error("--stream_dataset is supported for pretraining only")
 
     return args
 
@@ -624,10 +577,7 @@ def parse_args():
 def build_model(args, tokenizer):
     output_dir = Path(args.output_dir)
 
-    if (
-        (output_dir / "config.json").exists()
-        and (output_dir / "model.safetensors").exists()
-    ):
+    if ((output_dir / "config.json").exists() and (output_dir / "model.safetensors").exists()):
         return RWKVXModel.from_pretrained(output_dir)
 
     from rwkv_x_core import RWKVXConfig
@@ -645,30 +595,21 @@ def build_model(args, tokenizer):
 
 def main():
     args = parse_args()
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available() and not args.cpu
-        else "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"[DEVICE] {device} | precision={args.precision}")
 
     if args.cpu:
         from cpu import configure
 
-        print(
-            f"[CPU] {configure()} threads, "
-            f"native WKV, compile={args.compile}"
-        )
+        print(f"[CPU] {configure()} threads, "
+              f"native WKV, compile={args.compile}")
 
     tokenizer_path = Path(args.tokenizer_path)
     output_dir = Path(args.output_dir)
     bundled_tokenizer = output_dir / "tokenizer.json"
 
-    if (
-        (output_dir / "config.json").exists()
-        and bundled_tokenizer.exists()
-        and bundled_tokenizer.resolve() != tokenizer_path.resolve()
-    ):
+    if ((output_dir / "config.json").exists() and bundled_tokenizer.exists()
+            and bundled_tokenizer.resolve() != tokenizer_path.resolve()):
         tokenizer_path = bundled_tokenizer
 
     if not tokenizer_path.exists():
@@ -694,12 +635,7 @@ def main():
         if args.stream_dataset != "none":
             calib_texts = stream_dataset(args.stream_dataset)
         else:
-            calib_texts = (
-                text
-                for text, _path, _index in iter_texts(
-                    discover_files(Path(args.dataset_dir))
-                )
-            )
+            calib_texts = (text for text, _path, _index in iter_texts(discover_files(Path(args.dataset_dir))))
 
         calibrated = qat.calibrate(
             model,
@@ -715,9 +651,7 @@ def main():
         model = torch.compile(model, mode="max-autotune")
 
     checkpoint_dir = Path(args.checkpoint_dir)
-    resume = ResumeState.load(
-        checkpoint_dir / "resume_state.json"
-    )
+    resume = ResumeState.load(checkpoint_dir / "resume_state.json")
 
     if args.new_data:
         resume = ResumeState()
@@ -743,21 +677,15 @@ def main():
 
     if optimizer_path.exists() and not args.new_data:
         try:
-            optimizer.load_state_dict(
-                torch.load(
-                    optimizer_path,
-                    map_location="cpu",
-                    weights_only=False,
-                )
-            )
+            optimizer.load_state_dict(torch.load(
+                optimizer_path,
+                map_location="cpu",
+                weights_only=False,
+            ))
         except Exception as exc:
             print(f"[WARN] could not restore optimizer: {exc}")
 
-    scaler = (
-        torch.amp.GradScaler("cuda")
-        if device.type == "cuda" and args.precision == "fp16"
-        else None
-    )
+    scaler = (torch.amp.GradScaler("cuda") if device.type == "cuda" and args.precision == "fp16" else None)
 
     try:
         if args.mode == "pretrain":
@@ -795,9 +723,7 @@ def main():
     if args.qat and args.qat_export_dir:
         import copy
 
-        exported = copy.deepcopy(
-            getattr(model, "_orig_mod", model)
-        ).cpu()
+        exported = copy.deepcopy(getattr(model, "_orig_mod", model)).cpu()
         n = qat.convert_qat(exported)
         exported.save_pretrained(Path(args.qat_export_dir))
         shutil.copy2(
