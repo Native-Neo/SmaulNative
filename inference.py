@@ -12,6 +12,7 @@ from tokenizer import SmaulTokenizer
 
 
 class RWKVXInference:
+
     def __init__(self, model_dir: str = "./SmaulNative", device: str = "auto", dtype: str = "auto"):
         self.model_dir = Path(model_dir)
         if device == "auto":
@@ -92,8 +93,14 @@ class RWKVXInference:
         seed: Optional[int] = None,
     ) -> str:
         return "".join(self.stream(
-            prompt, max_new_tokens, temperature, top_k, top_p,
-            repetition_penalty, stop, seed,
+            prompt,
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            stop,
+            seed,
         ))
 
     def stream(
@@ -122,8 +129,12 @@ class RWKVXInference:
 
         for _ in range(max_new_tokens):
             token = self._sample(
-                logits[0, -1], temperature, top_k, top_p,
-                repetition_penalty, recent,
+                logits[0, -1],
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                recent,
             )
             if token == self.eos_id:
                 break
