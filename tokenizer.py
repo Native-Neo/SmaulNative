@@ -8,31 +8,46 @@ CASE=["<cap>","<upper>"]
 TOKEN_RE=re.compile(r"\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F]+|\d+(?:\.\d+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]",re.UNICODE)
 DEV_BASE=re.compile(r"[\u0900-\u097F]")
 
-def read_texts(path):
+
+def read_texts(path,max_records=0):
     files=[path] if path.is_file() else [p for p in path.rglob('*') if p.is_file()]
+    seen=0
     for f in files:
         ext=f.suffix.lower()
-        if ext in {'.txt','.text'}:
-            yield f.read_text(encoding='utf-8',errors='ignore')
+        if ext in {'.txt','.text','.py','.cpp','.c','.h','.hpp','.cc','.cxx','.rs','.js','.ts','.tsx','.jsx','.java','.go','.cs','.php','.rb','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.html','.css','.scss','.sql','.md','.rst','.yaml','.yml','.toml','.xml'}:
+            with f.open('r',encoding='utf-8',errors='ignore') as h:
+                yield h.read()
+                seen+=1
         elif ext in {'.json','.jsonl'}:
-            for line in f.read_text(encoding='utf-8',errors='ignore').splitlines():
-                try:x=json.loads(line)
-                except json.JSONDecodeError:continue
-                if isinstance(x,str):yield x
-                elif isinstance(x,dict):
-                    for k in ('text','content'):
-                        if isinstance(x.get(k),str):yield x[k];break
+            with f.open('r',encoding='utf-8',errors='ignore') as h:
+                for line in h:
+                    try:x=json.loads(line)
+                    except json.JSONDecodeError:continue
+                    if isinstance(x,str):text=x
+                    elif isinstance(x,dict):
+                        text=next((x[k] for k in ('text','content','document','body','code','prompt','completion') if isinstance(x.get(k),str)),None)
+                    else:text=None
+                    if text:
+                        yield text
+                        seen+=1
+                        if max_records and seen>=max_records:return
         elif ext=='.parquet':
             try:import pyarrow.parquet as pq
             except ImportError:raise SystemExit('Parquet support: pip install pyarrow')
-            t=pq.read_table(f)
-            for k in ('text','content'):
-                if k in t.column_names:
-                    for x in t[k].to_pylist():
-                        if isinstance(x,str):yield x
-                    break
+            pf=pq.ParquetFile(f)
+            names=pf.schema_arrow.names
+            col=next((c for c in names if c.lower() in {'text','content','document','body','code','prompt','completion'}),None)
+            if col:
+                for batch in pf.iter_batches(batch_size=1024,columns=[col]):
+                    for x in batch.column(0).to_pylist():
+                        if isinstance(x,str):
+                            yield x
+                            seen+=1
+                            if max_records and seen>=max_records:return
+
 
 def tokenize_text(text):return TOKEN_RE.findall(text)
+
 
 def devanagari_units(text):
     out=[];i=0
@@ -51,7 +66,9 @@ def devanagari_units(text):
         out.append(u)
     return out
 
+
 def canonical(x):return x.lower()
+
 
 def case_type(x):
     letters=''.join(c for c in x if c.isalpha())
@@ -60,10 +77,10 @@ def case_type(x):
     if x[:1].isupper() and x[1:].lower()==x[1:]:return 'cap'
     return None
 
-def train(dataset,vocab_size=64000,word_budget=40000):
-    words=Counter();graphemes=Counter();chars=Counter();symbols=Counter();cases=Counter()
-    total_words=total_tokens=0
-    for text in read_texts(Path(dataset)):
+
+def train(dataset,vocab_size=64000,word_budget=40000,max_records=0):
+    words=Counter();graphemes=Counter();chars=Counter();symbols=Counter();cases=Counter();total_words=total_tokens=0
+    for text in read_texts(Path(dataset),max_records):
         for token in tokenize_text(text):
             total_tokens+=1
             if token.isspace():chars.update(token);continue
@@ -88,16 +105,36 @@ def train(dataset,vocab_size=64000,word_budget=40000):
         if x not in seen:tokens.append(x);seen.add(x)
         if len(tokens)>=vocab_size:break
     vocab={x:i for i,x in enumerate(tokens)}
-    return {'version':4,'vocab':vocab,'special_tokens':SPECIAL,'case_tokens':CASE,'case_stats':{w:{c:n for (ww,c),n in cases.items() if ww==w} for w in vocab if w in words},'unk_id':vocab['<unk>'],'stats':{'vocab_size':len(vocab),'whole_words':min(word_budget,len(words)),'unique_words':len(words),'total_words':total_words,'total_tokens':total_tokens,'devanagari_units':len(graphemes),'characters':len(chars),'symbols':len(symbols)}}
+    return {'version':5,'vocab':vocab,'special_tokens':SPECIAL,'case_tokens':CASE,'case_stats':{w:{c:n for (ww,c),n in cases.items() if ww==w} for w in words},'unk_id':vocab['<unk>'],'stats':{'vocab_size':len(vocab),'whole_words':min(word_budget,len(words)),'unique_words':len(words),'total_words':total_words,'total_tokens':total_tokens,'devanagari_units':len(graphemes),'characters':len(chars),'symbols':len(symbols)}}
 
-def load(path):
-    d=json.loads(Path(path).read_text(encoding='utf-8'));v=d['vocab']
-    return {'vocab':v,'id_to_token':{int(i):x for x,i in v.items()},'unk_id':d['unk_id']}
+
+class SmaulTokenizer:
+    def __init__(self,data):
+        self.data=data;self.vocab=data['vocab'];self.id_to_token={int(i):x for x,i in self.vocab.items()}
+        self.unk_token_id=data['unk_id'];self.pad_token_id=self.vocab['<pad>'];self.bos_token_id=self.vocab['<bos>'];self.eos_token_id=self.vocab['<eos>']
+
+    @classmethod
+    def from_file(cls,path):return cls(json.loads(Path(path).read_text(encoding='utf-8')))
+
+    def save(self,path):Path(path).write_text(json.dumps(self.data,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+
+    def get_vocab_size(self):return len(self.vocab)
+
+    def token_to_id(self,token):return self.vocab.get(token)
+
+    def encode(self,text):return encode(text,self)
+
+    def decode(self,ids):return decode(ids,self)
+
+
+def load(path):return SmaulTokenizer.from_file(path)
+
 
 def encode(text,tok):
-    v=tok['vocab'];u=tok['unk_id'];cap=v.get('<cap>');upper=v.get('<upper>');out=[]
+    v=tok.vocab;u=tok.unk_token_id if hasattr(tok,'unk_token_id') else tok.unk_id;cap=v.get('<cap>');upper=v.get('<upper>');out=[]
     for t in tokenize_text(text):
-        if t.isspace():out.extend(v.get(c,u) for c in t);continue
+        if t.isspace():
+            out.extend(v.get(c,u) for c in t);continue
         b=canonical(t)
         if b in v:
             c=case_type(t)
@@ -109,8 +146,9 @@ def encode(text,tok):
         else:out.extend(v.get(c,u) for c in t)
     return out
 
+
 def decode(ids,tok):
-    tab=tok['id_to_token'];out=[];case=None
+    tab=tok.id_to_token if hasattr(tok,'id_to_token') else tok['id_to_token'];out=[];case=None
     for i in ids:
         t=tab.get(int(i),'<unk>')
         if t=='<cap>':case='cap';continue
@@ -121,14 +159,23 @@ def decode(ids,tok):
         out.append(t);case=None
     return ''.join(out)
 
+
+def train_tokenizer(dataset_dir,output_path,vocab_size=64000,stream_name='none',max_records=0):
+    data=train(dataset_dir,vocab_size=vocab_size,max_records=max_records)
+    SmaulTokenizer(data).save(output_path)
+    return SmaulTokenizer(data)
+
+
 def main():
     p=argparse.ArgumentParser();s=p.add_subparsers(dest='cmd',required=True)
-    x=s.add_parser('train');x.add_argument('--fromdataset',required=True);x.add_argument('--vocab-size',type=int,default=64000);x.add_argument('--word-budget',type=int,default=40000);x.add_argument('--output',default='tokenizer.json');x.set_defaults(f=lambda a:train_cmd(a))
-    x=s.add_parser('encode');x.add_argument('--tokenizer',required=True);x.add_argument('--text',required=True);x.set_defaults(f=lambda a:print(*encode(a.text,load(a.tokenizer))))
-    x=s.add_parser('decode');x.add_argument('--tokenizer',required=True);x.add_argument('--ids',required=True);x.set_defaults(f=lambda a:print(decode(a.ids.split(),load(a.tokenizer))))
+    x=s.add_parser('train');x.add_argument('--fromdataset',required=True);x.add_argument('--vocab-size',type=int,default=64000);x.add_argument('--word-budget',type=int,default=40000);x.add_argument('--max-records',type=int,default=0);x.add_argument('--output',default='tokenizer.json');x.set_defaults(f=lambda a:train_cmd(a))
+    x=s.add_parser('encode');x.add_argument('--tokenizer',required=True);x.add_argument('--text',required=True);x.set_defaults(f=lambda a:print(*load(a.tokenizer).encode(a.text)))
+    x=s.add_parser('decode');x.add_argument('--tokenizer',required=True);x.add_argument('--ids',required=True);x.set_defaults(f=lambda a:print(load(a.tokenizer).decode(a.ids.split())))
     a=p.parse_args();a.f(a)
 
+
 def train_cmd(a):
-    d=train(a.fromdataset,a.vocab_size,a.word_budget);Path(a.output).write_text(json.dumps(d,ensure_ascii=False,separators=(',',':')),encoding='utf-8');s=d['stats'];print(f"Vocabulary: {s['vocab_size']:,}\nWhole words: {s['whole_words']:,}\nUnique words: {s['unique_words']:,}\nCorpus words: {s['total_words']:,}\nDevanagari units: {s['devanagari_units']:,}\nCharacters: {s['characters']:,}\nSymbols/operators: {s['symbols']:,}\nSaved: {a.output}")
+    d=train(a.fromdataset,a.vocab_size,a.word_budget,a.max_records);Path(a.output).write_text(json.dumps(d,ensure_ascii=False,separators=(',',':')),encoding='utf-8');s=d['stats'];print(f"Vocabulary: {s['vocab_size']:,}\nWhole words: {s['whole_words']:,}\nUnique words: {s['unique_words']:,}\nCorpus words: {s['total_words']:,}\nDevanagari units: {s['devanagari_units']:,}\nCharacters: {s['characters']:,}\nSymbols/operators: {s['symbols']:,}\nSaved: {a.output}")
+
 
 if __name__=='__main__':main()
