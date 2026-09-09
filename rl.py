@@ -38,23 +38,25 @@ class SmaulRL:
         return self.tokenizer.decode(ids)
 
     @staticmethod
-    def _sample(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> Tuple[int, float]:
-        raw_logits = logits.float()
+    def _filter_logits(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
         if temperature <= 0:
             raise ValueError("temperature must be > 0 for policy sampling")
-        sample_logits = raw_logits / temperature
-        if top_k > 0 and top_k < sample_logits.numel():
-            cutoff = torch.topk(sample_logits, top_k).values[-1]
-            sample_logits = sample_logits.masked_fill(sample_logits < cutoff, -float("inf"))
+        logits = logits.float() / temperature
+        if top_k > 0 and top_k < logits.numel():
+            cutoff = torch.topk(logits, top_k).values[-1]
+            logits = logits.masked_fill(logits < cutoff, -float("inf"))
         if 0 < top_p < 1:
-            values, indices = torch.sort(sample_logits, descending=True)
+            values, indices = torch.sort(logits, descending=True)
             probs = F.softmax(values, -1)
             remove = torch.cumsum(probs, -1) > top_p
             remove[1:] = remove[:-1].clone()
             remove[0] = False
-            mask = torch.zeros_like(remove).scatter(0, indices, remove)
-            sample_logits = sample_logits.masked_fill(mask, -float("inf"))
-        log_probs = F.log_softmax(sample_logits, -1)
+            logits = logits.masked_fill(torch.zeros_like(remove).scatter(0, indices, remove), -float("inf"))
+        return logits
+
+    @classmethod
+    def _sample(cls, logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> Tuple[int, float]:
+        log_probs = F.log_softmax(cls._filter_logits(logits, temperature, top_k, top_p), -1)
         token = int(torch.multinomial(log_probs.exp(), 1))
         return token, float(log_probs[token])
 
@@ -109,7 +111,7 @@ class SmaulRL:
         with self.preference_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def _logprob(self, prompt: str, response_tokens: List[int]) -> torch.Tensor:
+    def _logprob(self, prompt: str, response_tokens: List[int], temperature: float, top_k: int, top_p: float) -> torch.Tensor:
         prompt_ids = self._encode(prompt)
         if not prompt_ids:
             prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
@@ -119,10 +121,12 @@ class SmaulRL:
         logits, _, _ = self.model(ids, state=None, use_cache=False, return_logits=True)
         start = len(prompt_ids) - 1
         token_logits = logits[0, start:start + len(response_tokens)]
-        targets = torch.tensor(response_tokens, dtype=torch.long, device=self.device)
-        return F.log_softmax(token_logits.float(), -1).gather(1, targets[:, None]).squeeze(1)
+        token_logprobs = [F.log_softmax(self._filter_logits(row, temperature, top_k, top_p), -1)[token]
+                          for row, token in zip(token_logits, response_tokens)]
+        return torch.stack(token_logprobs)
 
-    def grpo_step(self, prompt: str, candidates: List[Dict], chosen: int, lr: float, clip: float, kl_coef: float) -> float:
+    def grpo_step(self, prompt: str, candidates: List[Dict], chosen: int, lr: float, clip: float, kl_coef: float,
+                   temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> float:
         if not 0 <= chosen < len(candidates):
             raise ValueError("chosen response is out of range")
         rewards = torch.full((len(candidates),), -1.0, device=self.device)
@@ -133,7 +137,7 @@ class SmaulRL:
         for candidate, advantage in zip(candidates, advantages):
             if not candidate["tokens"]:
                 continue
-            new_logprobs = self._logprob(prompt, candidate["tokens"])
+            new_logprobs = self._logprob(prompt, candidate["tokens"], temperature, top_k, top_p)
             old_logprobs = torch.tensor(candidate["old_logprobs"], dtype=new_logprobs.dtype, device=self.device)
             if old_logprobs.numel() != new_logprobs.numel():
                 raise ValueError("stored and recomputed token log-probabilities have different lengths")
@@ -164,7 +168,7 @@ class SmaulRL:
             candidates = self.candidates(prompt, count, max_new_tokens, temperature, top_k, top_p)
             chosen = self._pick(candidates)
             self._save(prompt, candidates, chosen)
-            loss = self.grpo_step(prompt, candidates, chosen, lr, clip, kl_coef)
+            loss = self.grpo_step(prompt, candidates, chosen, lr, clip, kl_coef, temperature, top_k, top_p)
             print(f"[SAVED] preference={chosen + 1}/{count}")
             print(f"[RL] loss={loss:.5f}")
 
