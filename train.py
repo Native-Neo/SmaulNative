@@ -23,14 +23,7 @@ if "--cpu" in sys.argv:
 import torch
 from torch.optim import Optimizer
 
-from dataset import (
-    PretrainStream,
-    SFTDataset,
-    discover_files,
-    iter_texts,
-    load_tokenizer,
-    tokenizer_vocab_size,
-)
+from dataset import PretrainStream, SFTDataset, discover_files, iter_texts, load_tokenizer, tokenizer_vocab_size
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE
 from stream_data import stream_dataset
 from tokenizer import train_tokenizer
@@ -42,8 +35,7 @@ STOP_REQUESTED = False
 def _sigint_handler(signum, frame):
     global STOP_REQUESTED
     STOP_REQUESTED = True
-    print("\n[Ctrl-C] Stop requested. Finishing current step, "
-          "then saving checkpoint.")
+    print("\n[Ctrl-C] Stop requested. Finishing current step, then saving checkpoint.")
 
 
 signal.signal(signal.SIGINT, _sigint_handler)
@@ -51,66 +43,46 @@ signal.signal(signal.SIGINT, _sigint_handler)
 
 class Lion(Optimizer):
 
-    def __init__(
-            self,
-            params,
-            lr=1e-4,
-            betas=(0.9, 0.99),
-            weight_decay=0.01,
-    ):
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
         if lr <= 0:
             raise ValueError("lr must be > 0")
-        super().__init__(
-            params,
-            dict(lr=lr, betas=betas, weight_decay=weight_decay),
-        )
+        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
 
     @torch.no_grad()
     def step(self, closure=None):
         loss = closure() if closure else None
-
         for group in self.param_groups:
             lr = group["lr"]
             b1, b2 = group["betas"]
             weight_decay = group["weight_decay"]
-
             for param in group["params"]:
                 if param.grad is None:
                     continue
-
                 state = self.state[param]
                 if not state:
                     state["exp_avg"] = torch.zeros_like(param)
-
                 exp_avg = state["exp_avg"]
-
                 if weight_decay:
                     param.mul_(1 - lr * weight_decay)
-
-                param.add_(
-                    exp_avg.mul(b1).add(param.grad, alpha=1 - b1).sign(),
-                    alpha=-lr,
-                )
+                param.add_(exp_avg.mul(b1).add(param.grad, alpha=1 - b1).sign(), alpha=-lr)
                 exp_avg.lerp_(param.grad, 1 - b2)
-
         return loss
 
 
 def set_router_only_training(model, router_only):
     if not model.cfg.is_moe:
         raise ValueError("set_router_only_training requires cfg.is_moe=True")
-
     gates = {
         id(param)
-        for module in model.modules() if isinstance(module, RWKV_CMix_MoE) for param in module.gate.parameters()
+        for module in model.modules()
+        if isinstance(module, RWKV_CMix_MoE)
+        for param in module.gate.parameters()
     }
-
     trainable_params = 0
     for param in model.parameters():
         param.requires_grad_(id(param) in gates if router_only else True)
         if param.requires_grad:
             trainable_params += param.numel()
-
     return trainable_params
 
 
@@ -127,7 +99,6 @@ class ResumeState:
     @classmethod
     def load(cls, path):
         state = cls()
-
         if path.exists():
             try:
                 data = json.loads(path.read_text())
@@ -139,7 +110,6 @@ class ResumeState:
                 state.buffer_tokens = data.get("buffer_tokens", [])
             except Exception as exc:
                 print(f"[WARN] could not load resume state: {exc}")
-
         return state
 
     def save(self, path):
@@ -151,10 +121,8 @@ class ResumeState:
 
 def _save_rng_state(path):
     state = {"torch": torch.get_rng_state()}
-
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
-
     tmp = path.with_suffix(".pt.tmp")
     torch.save(state, tmp)
     os.replace(tmp, path)
@@ -163,131 +131,80 @@ def _save_rng_state(path):
 def _load_rng_state(path):
     if not path.exists():
         return
-
     try:
-        state = torch.load(
-            path,
-            map_location="cpu",
-            weights_only=False,
-        )
+        state = torch.load(path, map_location="cpu", weights_only=False)
         torch.set_rng_state(state["torch"])
-
         if torch.cuda.is_available() and "cuda" in state:
             torch.cuda.set_rng_state_all(state["cuda"])
     except Exception as exc:
         print(f"[WARN] could not restore RNG state: {exc}")
 
 
-def save_checkpoint(
-    model,
-    optimizer,
-    resume,
-    output_dir,
-    checkpoint_dir,
-    tokenizer_path,
-    save_dtype="fp32",
-    save_optimizer=True,
-):
+def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path, save_dtype="fp32", save_optimizer=True):
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     model = getattr(model, "_orig_mod", model)
-    model.save_pretrained(
-        output_dir,
-        dtype=save_dtype,
-        include_upstream=False,
-    )
-
+    model.save_pretrained(output_dir, dtype=save_dtype, include_upstream=False)
     bundled = output_dir / "tokenizer.json"
     if tokenizer_path.resolve() != bundled.resolve():
         shutil.copy2(tokenizer_path, bundled)
-
     if save_optimizer:
         tmp = checkpoint_dir / "optimizer.pt.tmp"
         torch.save(optimizer.state_dict(), tmp)
         os.replace(tmp, checkpoint_dir / "optimizer.pt")
         _save_rng_state(checkpoint_dir / "rng_state.pt")
-
     resume.save(checkpoint_dir / "resume_state.json")
     print(f"[SAVE COMPLETE] {output_dir}")
 
 
 def _autocast(args, device):
     if device.type == "cuda":
-        dtype = (torch.float16 if args.precision == "fp16" else torch.bfloat16)
+        dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
         return torch.autocast(device_type="cuda", dtype=dtype)
-
     if args.precision == "bf16":
-        return torch.autocast(
-            device_type="cpu",
-            dtype=torch.bfloat16,
-        )
-
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
     return contextlib.nullcontext()
 
 
-def _optimizer_step(
-    args,
-    model,
-    optimizer,
-    xb,
-    yb,
-    device,
-    scaler,
-):
+def _optimizer_step(args, model, optimizer, xb, yb, device, scaler):
     optimizer.zero_grad(set_to_none=True)
-
     with _autocast(args, device):
         _, loss, _ = model(xb, labels=yb)
-
     if not torch.isfinite(loss):
         print(f"[WARN] non-finite loss {loss.item()}, skipping step")
         return None
-
     if scaler:
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
     else:
         loss.backward()
-
-    torch.nn.utils.clip_grad_norm_(
-        model.parameters(),
-        1.0,
-        foreach=True,
-    )
-
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
     if scaler:
         scaler.step(optimizer)
         scaler.update()
     else:
         optimizer.step()
-
     return loss
 
 
 def _remote_token_stream(name, tokenizer, ctx_len, resume):
     dataset = file_path = None
     record = 0
-
     if resume.file_path and "::" in resume.file_path:
         dataset, file_path = resume.file_path.split("::", 1)
         record = resume.record_index
-
     buffer_tokens = list(resume.buffer_tokens)
-
     for text, position in stream_dataset(
-            name,
-            start_dataset=dataset,
-            start_file=file_path,
-            start_record=record,
-            with_position=True,
+        name,
+        start_dataset=dataset,
+        start_file=file_path,
+        start_record=record,
+        with_position=True,
     ):
         buffer_tokens.extend(tokenizer.encode(text) + [tokenizer.eos_token_id])
-
         while len(buffer_tokens) >= ctx_len + 1:
             chunk = buffer_tokens[:ctx_len + 1]
             del buffer_tokens[:ctx_len]
-
             yield (
                 torch.tensor(chunk[:-1]),
                 torch.tensor(chunk[1:]),
@@ -297,32 +214,29 @@ def _remote_token_stream(name, tokenizer, ctx_len, resume):
             )
 
 
-def train_pretrain(
-    args,
-    model,
-    optimizer,
-    resume,
-    device,
-    tokenizer,
-    scaler,
-):
+def _train_pretrain_batch(args, model, optimizer, resume, device, scaler, batch_x, batch_y, path, record, buffer_tokens):
+    xb = torch.stack(batch_x).to(device)
+    yb = torch.stack(batch_y).to(device)
+    loss = _optimizer_step(args, model, optimizer, xb, yb, device, scaler)
+    if loss is None:
+        return None
+    resume.global_step += 1
+    resume.total_tokens += xb.numel()
+    resume.file_path = path
+    resume.record_index = record
+    resume.buffer_tokens = buffer_tokens
+    return loss
+
+
+def train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler):
     if args.stream_dataset != "none":
-        stream = _remote_token_stream(
-            args.stream_dataset,
-            tokenizer,
-            args.ctx_len,
-            resume,
-        )
+        stream = _remote_token_stream(args.stream_dataset, tokenizer, args.ctx_len, resume)
         remote = True
     else:
-        if (resume.file_path and not Path(resume.file_path).is_file()):
-            raise FileNotFoundError(f"resume dataset file no longer exists: "
-                                    f"{resume.file_path}")
-
+        if resume.file_path and not Path(resume.file_path).is_file():
+            raise FileNotFoundError(f"resume dataset file no longer exists: {resume.file_path}")
         stream = PretrainStream(
-            Path(args.dataset_dir),
-            tokenizer,
-            args.ctx_len,
+            Path(args.dataset_dir), tokenizer, args.ctx_len,
             resume_file=resume.file_path,
             resume_record=resume.record_index,
             buffer_tokens=resume.buffer_tokens,
@@ -330,8 +244,10 @@ def train_pretrain(
         remote = False
 
     model.train()
-    batch_x = []
-    batch_y = []
+    batch_x, batch_y = [], []
+    last_path = None
+    last_record = 0
+    last_buffer = []
     t0 = time.perf_counter()
     tokens_since_log = 0
 
@@ -342,252 +258,140 @@ def train_pretrain(
             x, y, position = item
             path, record = position
             buffer_tokens = stream.buffer_tokens
-
+        last_path, last_record, last_buffer = path, record, buffer_tokens
         batch_x.append(x)
         batch_y.append(y)
-
         if len(batch_x) < args.batch_size:
             continue
 
-        xb = torch.stack(batch_x).to(device)
-        yb = torch.stack(batch_y).to(device)
-        loss = _optimizer_step(
-            args,
-            model,
-            optimizer,
-            xb,
-            yb,
-            device,
-            scaler,
+        loss = _train_pretrain_batch(
+            args, model, optimizer, resume, device, scaler,
+            batch_x, batch_y, path, record, buffer_tokens,
         )
-
+        batch_x, batch_y = [], []
         if loss is None:
-            batch_x = []
-            batch_y = []
             continue
 
-        resume.global_step += 1
-        resume.total_tokens += xb.numel()
-        resume.file_path = path
-        resume.record_index = record
-        resume.buffer_tokens = buffer_tokens
-        tokens_since_log += xb.numel()
-
+        tokens_since_log += args.ctx_len * args.batch_size
         if resume.global_step % args.log_every == 0:
             elapsed = time.perf_counter() - t0
             tokens_per_second = tokens_since_log / max(elapsed, 1e-9)
-            print(f"step {resume.global_step} | "
-                  f"loss {loss.item():.4f} | "
-                  f"{tokens_per_second:.1f} tok/s | "
-                  f"tokens {resume.total_tokens:,}")
+            print(f"step {resume.global_step} | loss {loss.item():.4f} | {tokens_per_second:.1f} tok/s | tokens {resume.total_tokens:,}")
             t0 = time.perf_counter()
             tokens_since_log = 0
 
-        batch_x = []
-        batch_y = []
-
         if resume.global_step % args.save_every == 0:
             save_checkpoint(
-                model,
-                optimizer,
-                resume,
-                Path(args.output_dir),
-                Path(args.checkpoint_dir),
-                Path(args.tokenizer_path),
-                args.save_dtype,
+                model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir),
+                Path(args.tokenizer_path), args.save_dtype,
                 resume.global_step % args.optimizer_save_every == 0,
             )
-
         if STOP_REQUESTED:
             break
 
+    if batch_x and not STOP_REQUESTED:
+        loss = _train_pretrain_batch(
+            args, model, optimizer, resume, device, scaler,
+            batch_x, batch_y, last_path, last_record, last_buffer,
+        )
+        if loss is not None:
+            print(f"[FLUSH] final partial batch size={len(batch_x)} | loss={loss.item():.4f}")
 
-def train_sft(
-    args,
-    model,
-    optimizer,
-    resume,
-    device,
-    tokenizer,
-    scaler,
-):
-    dataset = SFTDataset(
-        Path(args.dataset_dir),
-        tokenizer,
-        args.ctx_len,
-    )
+
+def train_sft(args, model, optimizer, resume, device, tokenizer, scaler):
+    dataset = SFTDataset(Path(args.dataset_dir), tokenizer, args.ctx_len)
     model.train()
-
     for epoch in range(resume.epoch, args.epochs):
         generator = torch.Generator().manual_seed(epoch)
-        permutation = torch.randperm(
-            len(dataset),
-            generator=generator,
-        ).tolist()
-        start = (resume.record_index if epoch == resume.epoch else 0)
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            sampler=permutation[start:],
-        )
+        permutation = torch.randperm(len(dataset), generator=generator).tolist()
+        start = resume.record_index if epoch == resume.epoch else 0
+        loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, sampler=permutation[start:])
         consumed = start
-
         for xb, yb in loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            loss = _optimizer_step(
-                args,
-                model,
-                optimizer,
-                xb,
-                yb,
-                device,
-                scaler,
-            )
+            xb, yb = xb.to(device), yb.to(device)
+            loss = _optimizer_step(args, model, optimizer, xb, yb, device, scaler)
             consumed += len(xb)
-
             if loss is None:
                 continue
-
             resume.global_step += 1
             resume.total_tokens += xb.numel()
             resume.epoch = epoch
             resume.record_index = consumed
-
             if resume.global_step % args.log_every == 0:
-                print(f"epoch {epoch} step {resume.global_step} | "
-                      f"loss {loss.item():.4f}")
-
+                print(f"epoch {epoch} step {resume.global_step} | loss {loss.item():.4f}")
             if resume.global_step % args.save_every == 0:
                 save_checkpoint(
-                    model,
-                    optimizer,
-                    resume,
-                    Path(args.output_dir),
-                    Path(args.checkpoint_dir),
-                    Path(args.tokenizer_path),
-                    args.save_dtype,
+                    model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir),
+                    Path(args.tokenizer_path), args.save_dtype,
                     resume.global_step % args.optimizer_save_every == 0,
                 )
-
             if STOP_REQUESTED:
                 break
-
         if STOP_REQUESTED:
             break
-
         resume.epoch = epoch + 1
         resume.record_index = 0
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--mode",
-        choices=["pretrain", "sft"],
-        required=True,
-    )
+    parser.add_argument("--mode", choices=["pretrain", "sft"], required=True)
     parser.add_argument("--dataset_dir", default="./datasets")
-    parser.add_argument(
-        "--stream_dataset",
-        choices=["none", "hindi", "english", "openthoughts", "all"],
-        default="none",
-    )
+    parser.add_argument("--stream_dataset", choices=["none", "hindi", "english", "openthoughts", "all"], default="none")
     parser.add_argument("--output_dir", default="./SmaulNative")
     parser.add_argument("--checkpoint_dir", default="./SmaulNative")
-    parser.add_argument(
-        "--tokenizer_path",
-        default="./SmaulNative/tokenizer.json",
-    )
-    parser.add_argument(
-        "--tokenizer_vocab_size",
-        type=int,
-        default=65536,
-    )
-    parser.add_argument(
-        "--tokenizer_max_records",
-        type=int,
-        default=5_000_000,
-    )
+    parser.add_argument("--tokenizer_path", default="./SmaulNative/tokenizer.json")
+    parser.add_argument("--tokenizer_vocab_size", type=int, default=65536)
+    parser.add_argument("--tokenizer_max_records", type=int, default=5_000_000)
     parser.add_argument("--n_embd", type=int, default=832)
     parser.add_argument("--n_layer", type=int, default=17)
     parser.add_argument("--head_size", type=int, default=64)
     parser.add_argument("--n_moba_layer", type=int, default=3)
     parser.add_argument("--ctx_len", type=int, default=1024)
-    parser.add_argument(
-        "--precision",
-        choices=["fp32", "fp16", "bf16"],
-        default=None,
-    )
-    parser.add_argument(
-        "--save_dtype",
-        choices=["fp32", "fp16", "bf16"],
-        default="fp32",
-    )
+    parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=None)
+    parser.add_argument("--save_dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument(
-        "--optimizer",
-        choices=["adafactor", "lion", "adamw"],
-        default="adafactor",
-    )
+    parser.add_argument("--optimizer", choices=["adafactor", "lion", "adamw"], default="adafactor")
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=5000)
-    parser.add_argument(
-        "--optimizer_save_every",
-        type=int,
-        default=None,
-    )
+    parser.add_argument("--optimizer_save_every", type=int, default=None)
     parser.add_argument("--new_data", action="store_true")
-    parser.add_argument(
-        "--train_router_only",
-        action="store_true",
-    )
+    parser.add_argument("--train_router_only", action="store_true")
     parser.add_argument("--qat", action="store_true")
-    parser.add_argument(
-        "--qat_calib_batches",
-        type=int,
-        default=64,
-    )
+    parser.add_argument("--qat_calib_batches", type=int, default=64)
     parser.add_argument("--qat_export_dir", default=None)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--cpu", action="store_true")
-
     args = parser.parse_args()
     args.precision = args.precision or ("fp16" if torch.cuda.is_available() and not args.cpu else "fp32")
-    args.optimizer_save_every = (args.optimizer_save_every or args.save_every)
-
-    if (args.tokenizer_max_records < 0 or args.n_embd <= 0 or args.head_size <= 0 or args.n_layer <= 0
-            or args.n_moba_layer < 0 or args.n_moba_layer >= args.n_layer):
+    args.optimizer_save_every = args.optimizer_save_every or args.save_every
+    if (
+        args.tokenizer_max_records < 0 or args.n_embd <= 0 or args.head_size <= 0 or args.n_layer <= 0
+        or args.n_moba_layer < 0 or args.n_moba_layer >= args.n_layer or args.tokenizer_vocab_size <= 0
+        or args.batch_size <= 0 or args.ctx_len <= 0 or args.epochs <= 0
+        or args.learning_rate <= 0 or args.log_every <= 0 or args.save_every <= 0
+        or args.optimizer_save_every <= 0
+    ):
         parser.error("invalid model/training parameters")
-
     if args.n_embd % args.head_size:
         parser.error("--n_embd must be divisible by --head_size")
-
     if args.cpu and args.precision == "fp16":
         parser.error("--precision fp16 requires CUDA")
-
     if args.mode == "sft" and args.stream_dataset != "none":
         parser.error("--stream_dataset is supported for pretraining only")
-
     return args
 
 
 def build_model(args, tokenizer):
     output_dir = Path(args.output_dir)
-
-    if ((output_dir / "config.json").exists() and (output_dir / "model.safetensors").exists()):
+    if (output_dir / "config.json").exists() and (output_dir / "model.safetensors").exists():
         return RWKVXModel.from_pretrained(output_dir)
-
     from rwkv_x_core import RWKVXConfig
-
     config = RWKVXConfig(
-        vocab_size=tokenizer_vocab_size(tokenizer),
-        n_embd=args.n_embd,
-        n_layer=args.n_layer,
-        n_moba_layer=args.n_moba_layer,
-        head_size=args.head_size,
+        vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd, n_layer=args.n_layer,
+        n_moba_layer=args.n_moba_layer, head_size=args.head_size,
     )
     config.ctx_len_hint = args.ctx_len
     return RWKVXModel(config)
@@ -597,33 +401,20 @@ def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"[DEVICE] {device} | precision={args.precision}")
-
     if args.cpu:
         from cpu import configure
-
-        print(f"[CPU] {configure()} threads, "
-              f"native WKV, compile={args.compile}")
+        print(f"[CPU] {configure()} threads, native WKV, compile={args.compile}")
 
     tokenizer_path = Path(args.tokenizer_path)
     output_dir = Path(args.output_dir)
     bundled_tokenizer = output_dir / "tokenizer.json"
-
-    if ((output_dir / "config.json").exists() and bundled_tokenizer.exists()
-            and bundled_tokenizer.resolve() != tokenizer_path.resolve()):
+    if (output_dir / "config.json").exists() and bundled_tokenizer.exists() and bundled_tokenizer.resolve() != tokenizer_path.resolve():
         tokenizer_path = bundled_tokenizer
-
     if not tokenizer_path.exists():
-        train_tokenizer(
-            Path(args.dataset_dir),
-            tokenizer_path,
-            args.tokenizer_vocab_size,
-            args.stream_dataset,
-            args.tokenizer_max_records,
-        )
+        train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size, args.stream_dataset, args.tokenizer_max_records)
 
     tokenizer = load_tokenizer(tokenizer_path)
     model = build_model(args, tokenizer).to(device)
-
     if args.train_router_only:
         trainable = set_router_only_training(model, True)
         print(f"[ROUTER-ONLY] {trainable:,} trainable params")
@@ -631,20 +422,11 @@ def main():
     if args.qat:
         n = qat.prepare_qat(model)
         print(f"[QAT] fake-quantizing {n} linears")
-
         if args.stream_dataset != "none":
             calib_texts = stream_dataset(args.stream_dataset)
         else:
             calib_texts = (text for text, _path, _index in iter_texts(discover_files(Path(args.dataset_dir))))
-
-        calibrated = qat.calibrate(
-            model,
-            tokenizer,
-            calib_texts,
-            args.ctx_len,
-            device,
-            args.qat_calib_batches,
-        )
+        calibrated = qat.calibrate(model, tokenizer, calib_texts, args.ctx_len, device, args.qat_calib_batches)
         print(f"[QAT] calibrated {calibrated} batches")
 
     if args.compile:
@@ -652,84 +434,38 @@ def main():
 
     checkpoint_dir = Path(args.checkpoint_dir)
     resume = ResumeState.load(checkpoint_dir / "resume_state.json")
-
     if args.new_data:
         resume = ResumeState()
     else:
         _load_rng_state(checkpoint_dir / "rng_state.pt")
 
-    optimizer_classes = {
-        "lion": Lion,
-        "adamw": torch.optim.AdamW,
-        "adafactor": torch.optim.Adafactor,
-    }
-
+    optimizer_classes = {"lion": Lion, "adamw": torch.optim.AdamW, "adafactor": torch.optim.Adafactor}
     if args.cpu and args.optimizer == "lion":
         from cpu import NativeLion
-
         optimizer_classes["lion"] = NativeLion
-
-    optimizer = optimizer_classes[args.optimizer](
-        model.parameters(),
-        lr=args.learning_rate,
-    )
+    optimizer = optimizer_classes[args.optimizer](model.parameters(), lr=args.learning_rate)
     optimizer_path = checkpoint_dir / "optimizer.pt"
-
     if optimizer_path.exists() and not args.new_data:
         try:
-            optimizer.load_state_dict(torch.load(
-                optimizer_path,
-                map_location="cpu",
-                weights_only=False,
-            ))
+            optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
         except Exception as exc:
             print(f"[WARN] could not restore optimizer: {exc}")
 
-    scaler = (torch.amp.GradScaler("cuda") if device.type == "cuda" and args.precision == "fp16" else None)
-
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and args.precision == "fp16" else None
     try:
         if args.mode == "pretrain":
-            train_pretrain(
-                args,
-                model,
-                optimizer,
-                resume,
-                device,
-                tokenizer,
-                scaler,
-            )
+            train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler)
         else:
-            train_sft(
-                args,
-                model,
-                optimizer,
-                resume,
-                device,
-                tokenizer,
-                scaler,
-            )
+            train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
     finally:
-        save_checkpoint(
-            model,
-            optimizer,
-            resume,
-            Path(args.output_dir),
-            checkpoint_dir,
-            tokenizer_path,
-            args.save_dtype,
-            True,
-        )
+        save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path, args.save_dtype, True)
 
     if args.qat and args.qat_export_dir:
         import copy
-
         exported = copy.deepcopy(getattr(model, "_orig_mod", model)).cpu()
         n = qat.convert_qat(exported)
         exported.save_pretrained(Path(args.qat_export_dir))
-        shutil.copy2(
-            tokenizer_path,
-            Path(args.qat_export_dir) / "tokenizer.json",
-        )
+        shutil.copy2(tokenizer_path, Path(args.qat_export_dir) / "tokenizer.json")
         print(f"[QAT] converted {n} linears")
 
 
