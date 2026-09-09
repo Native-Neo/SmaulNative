@@ -8,7 +8,6 @@ from torch.ao.quantization import FakeQuantize, MovingAverageMinMaxObserver, Mov
 
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
-
 _CMIX_LINEAR_NAMES = ("key", "value")
 WBITS = 3
 NUM_LEVELS = 2**WBITS
@@ -84,12 +83,13 @@ def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
     device = packed.device
     shifts = torch.arange(7, -1, -1, dtype=torch.uint8, device=device)
     bits = (packed.unsqueeze(-1) >> shifts) & 1
-    flat_bits = bits.reshape(-1)[: numel * 3]
+    flat_bits = bits.reshape(-1)[:numel * 3]
     grouped = flat_bits.reshape(numel, 3)
     return grouped[:, 0] * 4 + grouped[:, 1] * 2 + grouped[:, 2]
 
 
 class QATLinear(nn.Module):
+
     def __init__(self, linear: nn.Linear, signed_activation: bool = False):
         super().__init__()
         if linear.bias is not None:
@@ -114,6 +114,7 @@ class QATLinear(nn.Module):
 
 
 class QuantizedLinear(nn.Module):
+
     def __init__(self, packed: torch.Tensor, scale: torch.Tensor, shape):
         super().__init__()
         self.register_buffer("packed", packed)
@@ -122,12 +123,10 @@ class QuantizedLinear(nn.Module):
         self.out_features, self.in_features = int(shape[0]), int(shape[1])
         self._code_cache = {}
 
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-    ):
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        )
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                                      error_msgs)
         self._code_cache.clear()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -190,7 +189,7 @@ def calibrate(
         buf.extend(tokenizer.encode(text))
         buf.append(tokenizer.eos_token_id)
         while len(buf) >= ctx_len + 1 and n_batches < max_batches:
-            chunk = buf[: ctx_len + 1]
+            chunk = buf[:ctx_len + 1]
             del buf[:ctx_len]
             x = torch.tensor(chunk[:-1], dtype=torch.long, device=device).unsqueeze(0)
             model(x)
