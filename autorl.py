@@ -5,7 +5,7 @@ import argparse
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -70,28 +70,27 @@ class AutoRL:
 
     @staticmethod
     def _sample(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> Tuple[int, float]:
-        logits = logits.float()
+        raw_logits = logits.float()
+        raw_log_probs = F.log_softmax(raw_logits, -1)
         if temperature <= 0:
-            probs = F.softmax(logits, -1)
-            token = int(probs.argmax())
-            return token, float(torch.log(probs[token].clamp_min(1e-12)))
+            token = int(raw_logits.argmax())
+            return token, float(raw_log_probs[token])
 
-        logits = logits / temperature
-        if top_k > 0 and top_k < logits.numel():
-            cutoff = torch.topk(logits, top_k).values[-1]
-            logits = logits.masked_fill(logits < cutoff, -float("inf"))
+        sample_logits = raw_logits / temperature
+        if top_k > 0 and top_k < sample_logits.numel():
+            cutoff = torch.topk(sample_logits, top_k).values[-1]
+            sample_logits = sample_logits.masked_fill(sample_logits < cutoff, -float("inf"))
         if 0 < top_p < 1:
-            values, indices = torch.sort(logits, descending=True)
+            values, indices = torch.sort(sample_logits, descending=True)
             probs = F.softmax(values, -1)
             remove = torch.cumsum(probs, -1) > top_p
             remove[1:] = remove[:-1].clone()
             remove[0] = False
             mask = torch.zeros_like(remove).scatter(0, indices, remove)
-            logits = logits.masked_fill(mask, -float("inf"))
+            sample_logits = sample_logits.masked_fill(mask, -float("inf"))
 
-        log_probs = F.log_softmax(logits, -1)
-        token = int(torch.multinomial(log_probs.exp(), 1))
-        return token, float(log_probs[token])
+        token = int(torch.multinomial(F.softmax(sample_logits, -1), 1))
+        return token, float(raw_log_probs[token])
 
     @torch.no_grad()
     def generate(self, prompt: str, max_new_tokens: int, temperature: float, top_k: int, top_p: float):
@@ -101,29 +100,27 @@ class AutoRL:
         ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
         logits, _, state = self.model(ids, state=None, use_cache=True, return_logits=True)
         response = []
-        old_logprob = 0.0
+        old_logprobs = []
         for _ in range(max_new_tokens):
             token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
             if token == self.eos_id:
                 break
             response.append(token)
-            old_logprob += logprob
+            old_logprobs.append(logprob)
             logits, _, state = self.model(
                 torch.tensor([[token]], device=self.device),
                 state=state,
                 use_cache=True,
                 return_logits=True,
             )
-        return self._decode(response), response, old_logprob
+        return self._decode(response), response, old_logprobs
 
     def candidates(self, prompt: str, count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float):
         candidates = []
         for i in range(count):
             torch.manual_seed(random.randrange(2**31))
-            text, tokens, old_logprob = self.generate(
-                prompt, max_new_tokens, temperature, top_k, top_p
-            )
-            candidates.append({"id": i, "text": text, "tokens": tokens, "old_logprob": old_logprob})
+            text, tokens, old_logprobs = self.generate(prompt, max_new_tokens, temperature, top_k, top_p)
+            candidates.append({"id": i, "text": text, "tokens": tokens, "old_logprobs": old_logprobs})
         return candidates
 
     def _batch(self, texts: List[str]):
@@ -167,9 +164,10 @@ class AutoRL:
         for epoch in range(epochs):
             random.shuffle(records)
             total = 0.0
+            valid = 0
             for record in records:
-                responses = record["responses"]
-                chosen = int(record["chosen"])
+                responses = record.get("responses", [])
+                chosen = int(record.get("chosen", -1))
                 if len(responses) < 2 or not 0 <= chosen < len(responses):
                     continue
                 tokens, mask = self._batch(responses)
@@ -180,7 +178,8 @@ class AutoRL:
                 loss.backward()
                 optimizer.step()
                 total += float(loss.detach())
-            print(f"[PREF] epoch={epoch + 1}/{epochs} loss={total / max(1, len(records)):.5f}")
+                valid += 1
+            print(f"[PREF] epoch={epoch + 1}/{epochs} loss={total / max(1, valid):.5f}")
         self._save_preference_model()
 
     def _show(self, candidates: List[Dict]):
@@ -190,7 +189,7 @@ class AutoRL:
 
     def _verify(self, candidates: List[Dict], predicted: int) -> int:
         while True:
-            answer = input(f"Did automated RL choose correctly? [Y/n]: ").strip().lower()
+            answer = input("Did automated RL choose correctly? [Y/n]: ").strip().lower()
             if answer in ("", "y", "yes"):
                 print(f"[AUTO] confirmed response {predicted + 1}/{len(candidates)}")
                 return predicted
@@ -239,15 +238,17 @@ class AutoRL:
         for candidate, advantage in zip(candidates, advantages):
             if not candidate["tokens"]:
                 continue
-            new_logprob = self._logprob(prompt, candidate["tokens"])
-            old_mean = candidate["old_logprob"] / max(1, len(candidate["tokens"]))
-            ratio = torch.exp(new_logprob.mean() - old_mean)
-            policy_loss = -torch.minimum(
-                ratio * advantage.detach(),
-                ratio.clamp(1 - clip, 1 + clip) * advantage.detach(),
-            )
-            kl = (new_logprob.mean() - old_mean).pow(2)
-            losses.append(policy_loss + kl_coef * kl)
+            new_logprobs = self._logprob(prompt, candidate["tokens"])
+            old_logprobs = torch.tensor(candidate["old_logprobs"], dtype=new_logprobs.dtype, device=self.device)
+            if old_logprobs.numel() != new_logprobs.numel():
+                raise ValueError("stored and recomputed token log-probabilities have different lengths")
+            log_ratio = new_logprobs - old_logprobs
+            ratio = torch.exp(log_ratio.clamp(-20, 20))
+            clipped_ratio = ratio.clamp(1 - clip, 1 + clip)
+            token_advantage = advantage.detach().expand_as(ratio)
+            policy_loss = -torch.minimum(ratio * token_advantage, clipped_ratio * token_advantage).mean()
+            stability = log_ratio.pow(2).mean()
+            losses.append(policy_loss + kl_coef * stability)
         if not losses:
             return 0.0
         loss = torch.stack(losses).mean()
