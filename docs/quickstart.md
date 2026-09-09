@@ -1,44 +1,85 @@
 # Quickstart
 
-The fastest way to "actually run this". Several one-time `pip` packages are needed; run the
-export from the repo root.
+Run commands from the repository root.
 
-## Setup
-
-```bash
-# All the dependencies for every branch
-pip install torch transformers tokenizers safetensors datasets pyarrow tqdm pyyaml psutil pandas huggingface_hub 
-
-# All dependencies for Main
-pip install torch tokenizers safetensors huggingface_hub pyarrow
-```
-
-A Hugging Face token is only required for the gated/rate-limited downloads in
-[download.md](download.md) (`huggingface-cli login`).
-
-## Suggested first run-through
-
-The pieces chain together, but most are optional depending on what you want:
-
-1. **Get data** -- either pull real web text with [download.md](download.md), or generate a
-   synthetic bilingual instruction set with [syntheticdata.md](syntheticdata.md).
-2. **Tokenizer** -- [tokenizer.md](tokenizer.md) trains a byte-level BPE tokenizer. You usually
-   don't run this by hand: `train.py` auto-trains one if `--tokenizer_path` doesn't exist.
-3. **Pretrain** -- [train.md](train.md) `--mode pretrain`.
-4. **SFT** -- [train.md](train.md) `--mode sft` on top of the pretrained checkpoint.
-5. **Optional** -- [merge_moe.md](merge_moe.md) to combine SFT domains into one MoE model;
-   [qat.md](qat.md) to quantize (via `train.py --qat`).
-
-## Full end-to-end
+## Install
 
 ```bash
-python download.py
-python tokenizer.py --dataset_dir ./datasets --output ./tokenizer.json --vocab_size 32768
-python train.py --mode pretrain --dataset_dir ./datasets --output_dir ./RWKV-X-256M --ctx_len 256
-python train.py --mode sft --dataset_dir ./sft_data --output_dir ./RWKV-X-SFT \
-    --tokenizer_path ./RWKV-X-256M/tokenizer.json --qat --qat_export_dir ./RWKV-X-SFT-int3
+python -m pip install -r requirements.txt
 ```
 
-Per-step flags and behavior are documented on each module's page: [download.md](download.md),
-[syntheticdata.md](syntheticdata.md), [tokenizer.md](tokenizer.md), [dataset.md](dataset.md),
-[train.md](train.md), [qat.md](qat.md), [merge_moe.md](merge_moe.md).
+For the native CPU WKV backend, `ninja` and a working C++ compiler are required.
+
+## Pretraining
+
+Create or provide data under `./datasets`. The tokenizer is trained automatically when the configured
+`tokenizer_path` does not exist.
+
+```bash
+python train.py --cpu --mode pretrain \
+    --dataset_dir ./datasets \
+    --output_dir ./SmaulNative \
+    --ctx_len 512
+```
+
+The default model configuration is 832 hidden dimensions, 17 layers, 64-wide heads, and 3 MOBA layers.
+For CPU training, keep `ctx_len` modest because MOBA attention is quadratic in sequence length.
+
+## SFT
+
+Use conversation JSON/JSONL records shaped like:
+
+```json
+{"conversations":[{"from":"user","value":"Hello"},{"from":"assistant","value":"Hi!"}]}
+```
+
+Reuse the pretrained tokenizer:
+
+```bash
+python train.py --cpu --mode sft \
+    --dataset_dir ./sft_data \
+    --output_dir ./SmaulNative-SFT \
+    --tokenizer_path ./SmaulNative/tokenizer.json
+```
+
+Only assistant response tokens contribute to SFT loss.
+
+## Streaming datasets
+
+For supported Hugging Face Parquet sources, pretraining can stream without storing the source dataset:
+
+```bash
+python train.py --cpu --mode pretrain \
+    --stream_dataset hindi \
+    --output_dir ./SmaulNative
+```
+
+Supported stream names are `hindi`, `english`, `openthoughts`, and `all`.
+
+## QAT
+
+```bash
+python train.py --mode sft \
+    --dataset_dir ./sft_data \
+    --output_dir ./SmaulNative-SFT \
+    --tokenizer_path ./SmaulNative/tokenizer.json \
+    --qat --qat_calib_batches 64 \
+    --qat_export_dir ./SmaulNative-int3
+```
+
+The training checkpoint remains fake-quantized FP32; `--qat_export_dir` writes the converted packed int3
+checkpoint.
+
+## Tokenizer
+
+To train one manually:
+
+```bash
+python tokenizer.py train \
+    --fromdataset ./datasets \
+    --vocab-size 65536 \
+    --output ./tokenizer.json
+```
+
+The tokenizer is the project's custom word/grapheme/character vocabulary format, not a Hugging Face
+`tokenizers` BPE tokenizer.
