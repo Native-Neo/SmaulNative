@@ -9,40 +9,42 @@ TOKEN_RE=re.compile(r"\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F]+|\d+(?:\.\d+)
 DEV_BASE=re.compile(r"[\u0900-\u097F]")
 
 
+class TokenIds(list):
+    @property
+    def ids(self):
+        return self
+
+
 def read_texts(path,max_records=0):
     files=[path] if path.is_file() else [p for p in path.rglob('*') if p.is_file()]
     seen=0
     for f in files:
         ext=f.suffix.lower()
         if ext in {'.txt','.text','.py','.cpp','.c','.h','.hpp','.cc','.cxx','.rs','.js','.ts','.tsx','.jsx','.java','.go','.cs','.php','.rb','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.html','.css','.scss','.sql','.md','.rst','.yaml','.yml','.toml','.xml'}:
-            with f.open('r',encoding='utf-8',errors='ignore') as h:
-                yield h.read()
-                seen+=1
+            with f.open('r',encoding='utf-8',errors='ignore') as h:yield h.read()
+            seen+=1
+            if max_records and seen>=max_records:return
         elif ext in {'.json','.jsonl'}:
             with f.open('r',encoding='utf-8',errors='ignore') as h:
                 for line in h:
                     try:x=json.loads(line)
                     except json.JSONDecodeError:continue
                     if isinstance(x,str):text=x
-                    elif isinstance(x,dict):
-                        text=next((x[k] for k in ('text','content','document','body','code','prompt','completion') if isinstance(x.get(k),str)),None)
+                    elif isinstance(x,dict):text=next((x[k] for k in ('text','content','document','body','code','prompt','completion') if isinstance(x.get(k),str)),None)
                     else:text=None
                     if text:
-                        yield text
-                        seen+=1
+                        yield text;seen+=1
                         if max_records and seen>=max_records:return
         elif ext=='.parquet':
             try:import pyarrow.parquet as pq
             except ImportError:raise SystemExit('Parquet support: pip install pyarrow')
-            pf=pq.ParquetFile(f)
-            names=pf.schema_arrow.names
+            pf=pq.ParquetFile(f);names=pf.schema_arrow.names
             col=next((c for c in names if c.lower() in {'text','content','document','body','code','prompt','completion'}),None)
             if col:
                 for batch in pf.iter_batches(batch_size=1024,columns=[col]):
                     for x in batch.column(0).to_pylist():
                         if isinstance(x,str):
-                            yield x
-                            seen+=1
+                            yield x;seen+=1
                             if max_records and seen>=max_records:return
 
 
@@ -122,7 +124,7 @@ class SmaulTokenizer:
 
     def token_to_id(self,token):return self.vocab.get(token)
 
-    def encode(self,text):return encode(text,self)
+    def encode(self,text):return TokenIds(encode(text,self))
 
     def decode(self,ids):return decode(ids,self)
 
@@ -133,8 +135,7 @@ def load(path):return SmaulTokenizer.from_file(path)
 def encode(text,tok):
     v=tok.vocab;u=tok.unk_token_id if hasattr(tok,'unk_token_id') else tok.unk_id;cap=v.get('<cap>');upper=v.get('<upper>');out=[]
     for t in tokenize_text(text):
-        if t.isspace():
-            out.extend(v.get(c,u) for c in t);continue
+        if t.isspace():out.extend(v.get(c,u) for c in t);continue
         b=canonical(t)
         if b in v:
             c=case_type(t)
