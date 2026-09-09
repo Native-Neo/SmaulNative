@@ -22,12 +22,7 @@ def _install_cuda_wkv_compile():
         import rwkv_x_core
         fn = rwkv_x_core._wkv_run_chunk
         if not getattr(fn, "_smaul_cuda_compiled", False):
-            compiled = torch.compile(
-                fn,
-                mode="max-autotune-no-cudagraphs",
-                dynamic=False,
-                fullgraph=False,
-            )
+            compiled = torch.compile(fn, mode="max-autotune-no-cudagraphs", dynamic=False, fullgraph=False)
             compiled._smaul_cuda_compiled = True
             rwkv_x_core._wkv_run_chunk = compiled
         print("[CUDA] WKV TorchInductor enabled")
@@ -54,11 +49,10 @@ def _pack_3bit(codes: torch.Tensor) -> torch.Tensor:
     bits = (codes.reshape(-1).to(torch.uint8).unsqueeze(-1) >> shifts) & 1
     flat_bits = bits.reshape(-1)
     pad_len = (8 - (flat_bits.numel() % 8)) % 8
-    if pad_len > 0:
+    if pad_len:
         flat_bits = torch.cat([flat_bits, torch.zeros(pad_len, dtype=torch.uint8, device=device)])
-    bit_groups = flat_bits.reshape(-1, 8)
     powers = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.uint8, device=device)
-    return (bit_groups * powers).sum(dim=-1)
+    return (flat_bits.reshape(-1, 8) * powers).sum(dim=-1)
 
 
 def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
@@ -73,7 +67,8 @@ def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
 class QATLinear(nn.Module):
     def __init__(self, linear: nn.Linear, signed_activation: bool = False):
         super().__init__()
-        assert linear.bias is None, "RWKV-X Channel-Mix linears are all bias=False"
+        if linear.bias is not None:
+            raise ValueError("RWKV-X Channel-Mix linears must have bias=False")
         self.weight = linear.weight
         self.weight_fq = _weight_fake_quant()
         self.act_fq = _activation_fake_quant(signed_activation)
@@ -85,27 +80,27 @@ class QATLinear(nn.Module):
         return F.linear(self.act_fq(x), self.weight_fq(self.weight))
 
     def to_quantized(self) -> "QuantizedLinear":
-        scale, _zero_point = self.weight_fq.calculate_qparams()
+        scale, _ = self.weight_fq.calculate_qparams()
         w = self.weight.detach().float()
+        scale = scale.float().clamp_min(torch.finfo(torch.float32).eps)
         q = torch.clamp(torch.round(w / scale.unsqueeze(1)), WEIGHT_QMIN, WEIGHT_QMAX)
         codes = (q - WEIGHT_QMIN).to(torch.uint8)
-        return QuantizedLinear(_pack_3bit(codes), scale.float(), w.shape)
+        return QuantizedLinear(_pack_3bit(codes), scale, w.shape)
 
 
 class QuantizedLinear(nn.Module):
-    def __init__(self, packed: torch.Tensor, scale: torch.Tensor, shape: torch.Size):
+    def __init__(self, packed: torch.Tensor, scale: torch.Tensor, shape):
         super().__init__()
         self.register_buffer("packed", packed)
         self.register_buffer("scale", scale)
+        self.register_buffer("weight_shape", torch.tensor([int(shape[0]), int(shape[1])], dtype=torch.int64))
         self.out_features, self.in_features = int(shape[0]), int(shape[1])
         self._code_cache = {}
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs,
-        )
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
         self._code_cache.clear()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
