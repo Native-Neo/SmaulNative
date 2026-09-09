@@ -24,15 +24,18 @@ def _load_wkv():
 
 
 class _NativeWKV(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, state, w, k, v, kk, a, r):
         ctx.save_for_backward(state, w, k, v, kk, a, r)
         ext = _load_wkv()
-        out_state, y = ext.wkv_forward(
-            state.contiguous(), w.float().contiguous(), k.float().contiguous(),
-            v.float().contiguous(), kk.float().contiguous(), a.float().contiguous(),
-            r.float().contiguous()
-        )
+        out_state, y = ext.wkv_forward(state.contiguous(),
+                                       w.float().contiguous(),
+                                       k.float().contiguous(),
+                                       v.float().contiguous(),
+                                       kk.float().contiguous(),
+                                       a.float().contiguous(),
+                                       r.float().contiguous())
         return out_state, y.to(dtype=r.dtype)
 
     @staticmethod
@@ -40,7 +43,8 @@ class _NativeWKV(torch.autograd.Function):
         state, w, k, v, kk, a, r = ctx.saved_tensors
         ext = _load_wkv()
         state_f, w_f, k_f = state.float().contiguous(), w.float().contiguous(), k.float().contiguous()
-        v_f, kk_f, a_f, r_f = v.float().contiguous(), kk.float().contiguous(), a.float().contiguous(), r.float().contiguous()
+        v_f, kk_f, a_f, r_f = v.float().contiguous(), kk.float().contiguous(), a.float().contiguous(), r.float(
+        ).contiguous()
         grad_state = torch.zeros_like(state_f) if grad_state is None else grad_state.float().contiguous()
         grad_y = torch.zeros_like(r_f) if grad_y is None else grad_y.float().contiguous()
         grads = ext.wkv_backward(state_f, w_f, k_f, v_f, kk_f, a_f, r_f, grad_state, grad_y)
