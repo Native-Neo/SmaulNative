@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate response groups and collect human preferences for SmaulNative."""
+"""Collect human preferences and RL-train SmaulNative from those choices."""
 
 import argparse
 import json
@@ -26,7 +26,7 @@ class SmaulRL:
         policy_dir = self.work_dir / "policy"
         load_dir = policy_dir if policy_dir.exists() else self.model_dir
         self.model = RWKVXModel.from_pretrained(load_dir).to(self.device)
-        self.model.eval()
+        self.model.train()
         self.eos_id = self.tokenizer.eos_token_id
         self.bos_id = self.tokenizer.bos_token_id
         self.preference_path = self.work_dir / "preferences.jsonl"
@@ -96,7 +96,15 @@ class SmaulRL:
             )
         return self._decode(response), response, old_logprob
 
-    def candidates(self, prompt: str, count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float):
+    def candidates(
+        self,
+        prompt: str,
+        count: int,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> List[Dict]:
         result = []
         for i in range(count):
             text, tokens, old_logprob = self.generate(
@@ -133,18 +141,89 @@ class SmaulRL:
         with self.preference_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def run(self, prompts: List[str], count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float):
+    def _logprob(self, prompt: str, response_tokens: List[int]) -> torch.Tensor:
+        prompt_ids = self._encode(prompt)
+        if not prompt_ids:
+            prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
+        if not response_tokens:
+            return torch.empty(0, device=self.device)
+
+        ids = torch.tensor([prompt_ids + response_tokens], dtype=torch.long, device=self.device)
+        logits, _, _ = self.model(ids, state=None, use_cache=False, return_logits=True)
+        start = len(prompt_ids) - 1
+        token_logits = logits[0, start:start + len(response_tokens)]
+        targets = torch.tensor(response_tokens, dtype=torch.long, device=self.device)
+        return F.log_softmax(token_logits.float(), -1).gather(1, targets[:, None]).squeeze(1)
+
+    def grpo_step(
+        self,
+        prompt: str,
+        candidates: List[Dict],
+        chosen: int,
+        lr: float,
+        clip: float,
+        kl_coef: float,
+    ) -> float:
+        if not 0 <= chosen < len(candidates):
+            raise ValueError("chosen response is out of range")
+
+        rewards = torch.full((len(candidates),), -1.0, device=self.device)
+        rewards[chosen] = 1.0
+        advantages = (rewards - rewards.mean()) / rewards.std().clamp_min(1e-6)
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
+        losses = []
+
+        for candidate, advantage in zip(candidates, advantages):
+            if not candidate["tokens"]:
+                continue
+            new_logprob = self._logprob(prompt, candidate["tokens"])
+            old_mean = candidate["old_logprob"] / len(candidate["tokens"])
+            new_mean = new_logprob.mean()
+            ratio = torch.exp(new_mean - old_mean)
+            clipped_ratio = ratio.clamp(1 - clip, 1 + clip)
+            policy_loss = -torch.minimum(ratio * advantage, clipped_ratio * advantage)
+            kl = (new_mean - old_mean).pow(2)
+            losses.append(policy_loss + kl_coef * kl)
+
+        if not losses:
+            return 0.0
+
+        loss = torch.stack(losses).mean()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        optimizer.step()
+
+        policy_dir = self.work_dir / "policy"
+        policy_dir.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(policy_dir, dtype="fp32", include_upstream=False)
+        return float(loss.detach())
+
+    def run(
+        self,
+        prompts: List[str],
+        count: int,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        lr: float,
+        clip: float,
+        kl_coef: float,
+    ):
         if count < 2:
             raise ValueError("--responses must be at least 2")
         for prompt in prompts:
             candidates = self.candidates(prompt, count, max_new_tokens, temperature, top_k, top_p)
             chosen = self._pick(candidates)
             self._save(prompt, candidates, chosen)
+            loss = self.grpo_step(prompt, candidates, chosen, lr, clip, kl_coef)
             print(f"[SAVED] preference={chosen + 1}/{count}")
+            print(f"[RL] loss={loss:.5f}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect human preferences for SmaulNative")
+    parser = argparse.ArgumentParser(description="Human preference collection and RL for SmaulNative")
     parser.add_argument("--model_dir", default="./SmaulNative")
     parser.add_argument("--work_dir", default="./rl")
     parser.add_argument("--prompt", action="append", required=True)
@@ -153,10 +232,21 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--rl_lr", type=float, default=1e-6)
+    parser.add_argument("--clip", type=float, default=0.2)
+    parser.add_argument("--kl_coef", type=float, default=0.02)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
     SmaulRL(args.model_dir, args.work_dir, args.device).run(
-        args.prompt, args.responses, args.max_new_tokens, args.temperature, args.top_k, args.top_p
+        args.prompt,
+        args.responses,
+        args.max_new_tokens,
+        args.temperature,
+        args.top_k,
+        args.top_p,
+        args.rl_lr,
+        args.clip,
+        args.kl_coef,
     )
 
 
