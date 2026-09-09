@@ -13,7 +13,6 @@ IGNORE_INDEX = -100
 
 
 class TokenizerWrapper:
-
     def __init__(self, tokenizer):
         self._tok = tokenizer
         self.pad_token_id = tokenizer.token_to_id("<pad>")
@@ -35,7 +34,6 @@ def load_tokenizer(path: Path) -> TokenizerWrapper:
     if not Path(path).exists():
         raise FileNotFoundError(f"No tokenizer found at {path}. Run tokenizer.py first")
     from tokenizer import SmaulTokenizer
-
     return TokenizerWrapper(SmaulTokenizer.from_file(path))
 
 
@@ -44,13 +42,7 @@ def tokenizer_vocab_size(tok: TokenizerWrapper) -> int:
 
 
 TEXT_KEYS = (
-    "text",
-    "content",
-    "document",
-    "body",
-    "code",
-    "prompt",
-    "completion",
+    "text", "content", "document", "body", "code", "prompt", "completion",
 )
 SUPPORTED_SUFFIXES = {
     ".txt", ".text", ".jsonl", ".json", ".csv", ".parquet", ".py", ".cpp", ".c", ".h", ".hpp",
@@ -105,11 +97,7 @@ def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
     return ""
 
 
-def iter_texts(
-    files: List[Path],
-    resume_file: Optional[str] = None,
-    resume_record: int = 0,
-) -> Iterator[Tuple[str, str, int]]:
+def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_record: int = 0) -> Iterator[Tuple[str, str, int]]:
     started = resume_file is None
     for path in files:
         if not started:
@@ -117,7 +105,6 @@ def iter_texts(
                 started = True
             else:
                 continue
-
         start_idx = resume_record if str(path) == resume_file else 0
         suffix = path.suffix.lower()
         try:
@@ -140,16 +127,11 @@ def iter_texts(
                         record += 1
                         if record >= start_idx:
                             yield "\n".join(doc), str(path), record + 1
-
             elif suffix in PLAIN_TEXT_SUFFIXES:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read().strip()
-                if content:
-                    record = 0
-                    if str(path) == resume_file:
-                        record = start_idx
-                    yield content, str(path), record + 1
-
+                if content and start_idx == 0:
+                    yield content, str(path), 1
             elif suffix == ".jsonl":
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f):
@@ -165,7 +147,6 @@ def iter_texts(
                         text = extract_text(obj, str(path)).strip()
                         if text:
                             yield text, str(path), i + 1
-
             elif suffix == ".json":
                 data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
                 records = data.get("data", data) if isinstance(data, dict) else data
@@ -175,7 +156,6 @@ def iter_texts(
                     text = extract_text(records[i], str(path)).strip()
                     if text:
                         yield text, str(path), i + 1
-
             elif suffix == ".csv":
                 with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
                     for i, row in enumerate(csv.DictReader(f)):
@@ -184,10 +164,8 @@ def iter_texts(
                         text = extract_text(row, str(path)).strip()
                         if text:
                             yield text, str(path), i + 1
-
             elif suffix == ".parquet":
                 import pyarrow.parquet as pq
-
                 pf = pq.ParquetFile(path)
                 schema_names = pf.schema_arrow.names
                 schema_lower = [c.lower() for c in schema_names]
@@ -196,7 +174,6 @@ def iter_texts(
                     if cand in schema_lower:
                         fast_col = schema_names[schema_lower.index(cand)]
                         break
-
                 i = -1
                 for batch in pf.iter_batches(batch_size=1024):
                     if fast_col is not None:
@@ -221,16 +198,8 @@ def iter_texts(
 
 
 class PretrainStream(IterableDataset):
-
-    def __init__(
-        self,
-        dataset_dir: Path,
-        tokenizer: TokenizerWrapper,
-        ctx_len: int,
-        resume_file: Optional[str] = None,
-        resume_record: int = 0,
-        buffer_tokens: Optional[List[int]] = None,
-    ):
+    def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int, resume_file: Optional[str] = None,
+                 resume_record: int = 0, buffer_tokens: Optional[List[int]] = None):
         self.files = discover_files(dataset_dir)
         if not self.files:
             raise RuntimeError(f"No supported files found under {dataset_dir}")
@@ -255,11 +224,7 @@ class PretrainStream(IterableDataset):
                     chunk = buf[:self.ctx_len + 1]
                     del buf[:self.ctx_len]
                     self.buffer_tokens = buf
-                    yield (
-                        torch.tensor(chunk[:-1], dtype=torch.long),
-                        torch.tensor(chunk[1:], dtype=torch.long),
-                        self.last_pos,
-                    )
+                    yield (torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long), self.last_pos)
 
 
 DEFAULT_STOP_TOKEN = "\n\n"
@@ -281,22 +246,13 @@ def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
             normalized = "Assistant"
         else:
             normalized = "Other"
-        out.append({
-            "from": normalized,
-            "value": normalized + ": " + value + DEFAULT_STOP_TOKEN,
-        })
+        out.append({"from": normalized, "value": normalized + ": " + value + DEFAULT_STOP_TOKEN})
     return out
 
 
-def _preprocess_conversation(
-    conversations: List[Dict],
-    tokenizer: TokenizerWrapper,
-    ctx_len: int,
-    pad_token_id: int,
-) -> Dict[str, torch.Tensor]:
+def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrapper, ctx_len: int, pad_token_id: int) -> Dict[str, torch.Tensor]:
     if not isinstance(conversations, list):
         raise ValueError("SFT record 'conversations' must be a list")
-
     input_ids, tokenized_lens, speakers, prefix_lens = [], [], [], []
     for c in _add_speaker_and_signal(conversations):
         ids = tokenizer.encode(c["value"])
@@ -304,24 +260,19 @@ def _preprocess_conversation(
         tokenized_lens.append(len(ids))
         speakers.append(c["from"])
         prefix_lens.append(len(tokenizer.encode(c["from"] + ": ")))
-
     targets = [IGNORE_INDEX] * len(input_ids)
     cur = 0
     for length, speaker, prefix_len in zip(tokenized_lens, speakers, prefix_lens):
         if speaker.lower() == "assistant":
             targets[cur + min(prefix_len, length):cur + length] = input_ids[cur + min(prefix_len, length):cur + length]
         cur += length
-
     input_ids = input_ids[:ctx_len]
     targets = targets[:ctx_len]
     pad_len = ctx_len - len(input_ids)
     if pad_len:
         input_ids.extend([pad_token_id] * pad_len)
         targets.extend([IGNORE_INDEX] * pad_len)
-    return {
-        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-        "labels": torch.tensor(targets, dtype=torch.long),
-    }
+    return {"input_ids": torch.tensor(input_ids, dtype=torch.long), "labels": torch.tensor(targets, dtype=torch.long)}
 
 
 def discover_sft_records(dataset_dir: Path) -> List[Dict]:
@@ -345,7 +296,6 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
                 records.extend(data if isinstance(data, list) else [data])
         except Exception as e:
             print(f"[WARN] skipping SFT file {path}: {e}")
-
     records = [r for r in records if isinstance(r, dict) and isinstance(r.get("conversations"), list)]
     if not records:
         raise RuntimeError(f"No valid SFT conversation records found under {dataset_dir}")
@@ -354,7 +304,6 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
 
 class SFTDataset(Dataset):
     _CACHE_MAX = 2048
-
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int):
         self.records = discover_sft_records(dataset_dir)
         self.tokenizer = tokenizer
@@ -369,12 +318,7 @@ class SFTDataset(Dataset):
         if idx in self._processed_cache:
             self._processed_cache.move_to_end(idx)
             return self._processed_cache[idx]
-        d = _preprocess_conversation(
-            self.records[idx]["conversations"],
-            self.tokenizer,
-            self.ctx_len,
-            self.pad_token_id,
-        )
+        d = _preprocess_conversation(self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id)
         item = (d["input_ids"], d["labels"])
         self._processed_cache[idx] = item
         if len(self._processed_cache) > self._CACHE_MAX:
