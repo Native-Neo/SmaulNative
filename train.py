@@ -99,8 +99,7 @@ def train_pretrain(args,model,optimizer,resume,device,tokenizer,scaler):
     model.train();batch_x=[];batch_y=[];t0=time.perf_counter();tok_since=0
     for item in stream:
         if remote:x,y,path,rec,buf=item
-        else:
-            x,y,pos=item;path,rec=pos;buf=stream.buffer_tokens
+        else:x,y,pos=item;path,rec=pos;buf=stream.buffer_tokens
         batch_x.append(x);batch_y.append(y)
         if len(batch_x)<args.batch_size:continue
         xb=torch.stack(batch_x).to(device);yb=torch.stack(batch_y).to(device);loss=_optimizer_step(args,model,optimizer,xb,yb,device,scaler)
@@ -147,7 +146,7 @@ def main():
     if args.train_router_only:print(f"[ROUTER-ONLY] {set_router_only_training(model,True):,} trainable params")
     if args.qat:
         n=qat.prepare_qat(model);print(f"[QAT] fake-quantizing {n} linears")
-        calib_texts=stream_dataset(args.stream_dataset) if args.stream_dataset else (text for text,_path,_idx in iter_texts(discover_files(Path(args.dataset_dir))))
+        calib_texts=stream_dataset(args.stream_dataset) if args.stream_dataset!="none" else (text for text,_path,_idx in iter_texts(discover_files(Path(args.dataset_dir))))
         print(f"[QAT] calibrated {qat.calibrate(model,tokenizer,calib_texts,args.ctx_len,device,args.qat_calib_batches)} batches")
     if args.compile:model=torch.compile(model,mode="max-autotune")
     checkpoint_dir=Path(args.checkpoint_dir);resume=ResumeState.load(checkpoint_dir/"resume_state.json")
