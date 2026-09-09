@@ -44,7 +44,6 @@ class SmaulRL:
         if temperature <= 0:
             token = int(raw_logits.argmax())
             return token, float(raw_log_probs[token])
-
         sample_logits = raw_logits / temperature
         if top_k > 0 and top_k < sample_logits.numel():
             cutoff = torch.topk(sample_logits, top_k).values[-1]
@@ -57,20 +56,12 @@ class SmaulRL:
             remove[0] = False
             mask = torch.zeros_like(remove).scatter(0, indices, remove)
             sample_logits = sample_logits.masked_fill(mask, -float("inf"))
-
         token = int(torch.multinomial(F.softmax(sample_logits, -1), 1))
         return token, float(raw_log_probs[token])
 
     @torch.no_grad()
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        seed: Optional[int] = None,
-    ) -> Tuple[str, List[int], List[float]]:
+    def generate(self, prompt: str, max_new_tokens: int, temperature: float, top_k: int, top_p: float,
+                 seed: Optional[int] = None) -> Tuple[str, List[int], List[float]]:
         if seed is not None:
             torch.manual_seed(seed)
             random.seed(seed)
@@ -79,36 +70,20 @@ class SmaulRL:
             prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
         ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
         logits, _, state = self.model(ids, state=None, use_cache=True, return_logits=True)
-        response = []
-        old_logprobs = []
+        response, old_logprobs = [], []
         for _ in range(max_new_tokens):
             token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
             if token == self.eos_id:
                 break
             response.append(token)
             old_logprobs.append(logprob)
-            logits, _, state = self.model(
-                torch.tensor([[token]], device=self.device),
-                state=state,
-                use_cache=True,
-                return_logits=True,
-            )
+            logits, _, state = self.model(torch.tensor([[token]], device=self.device), state=state, use_cache=True, return_logits=True)
         return self._decode(response), response, old_logprobs
 
-    def candidates(
-        self,
-        prompt: str,
-        count: int,
-        max_new_tokens: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-    ) -> List[Dict]:
+    def candidates(self, prompt: str, count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float) -> List[Dict]:
         result = []
         for i in range(count):
-            text, tokens, old_logprobs = self.generate(
-                prompt, max_new_tokens, temperature, top_k, top_p, seed=random.randrange(2**31)
-            )
+            text, tokens, old_logprobs = self.generate(prompt, max_new_tokens, temperature, top_k, top_p, seed=random.randrange(2**31))
             result.append({"id": i, "text": text, "tokens": tokens, "old_logprobs": old_logprobs})
         return result
 
@@ -131,12 +106,7 @@ class SmaulRL:
             print("Invalid choice.")
 
     def _save(self, prompt: str, candidates: List[Dict], chosen: int):
-        record = {
-            "prompt": prompt,
-            "responses": [candidate["text"] for candidate in candidates],
-            "chosen": chosen,
-            "source": "human",
-        }
+        record = {"prompt": prompt, "responses": [candidate["text"] for candidate in candidates], "chosen": chosen, "source": "human"}
         with self.preference_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -146,7 +116,6 @@ class SmaulRL:
             prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
         if not response_tokens:
             return torch.empty(0, device=self.device)
-
         ids = torch.tensor([prompt_ids + response_tokens], dtype=torch.long, device=self.device)
         logits, _, _ = self.model(ids, state=None, use_cache=False, return_logits=True)
         start = len(prompt_ids) - 1
@@ -154,24 +123,14 @@ class SmaulRL:
         targets = torch.tensor(response_tokens, dtype=torch.long, device=self.device)
         return F.log_softmax(token_logits.float(), -1).gather(1, targets[:, None]).squeeze(1)
 
-    def grpo_step(
-        self,
-        prompt: str,
-        candidates: List[Dict],
-        chosen: int,
-        lr: float,
-        clip: float,
-        kl_coef: float,
-    ) -> float:
+    def grpo_step(self, prompt: str, candidates: List[Dict], chosen: int, lr: float, clip: float, kl_coef: float) -> float:
         if not 0 <= chosen < len(candidates):
             raise ValueError("chosen response is out of range")
-
         rewards = torch.full((len(candidates),), -1.0, device=self.device)
         rewards[chosen] = 1.0
         advantages = (rewards - rewards.mean()) / rewards.std().clamp_min(1e-6)
         optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
         losses = []
-
         for candidate, advantage in zip(candidates, advantages):
             if not candidate["tokens"]:
                 continue
@@ -184,35 +143,22 @@ class SmaulRL:
             clipped_ratio = ratio.clamp(1 - clip, 1 + clip)
             token_advantage = advantage.detach().expand_as(ratio)
             policy_loss = -torch.minimum(ratio * token_advantage, clipped_ratio * token_advantage).mean()
-            stability = log_ratio.pow(2).mean()
-            losses.append(policy_loss + kl_coef * stability)
-
+            sampled_kl = (old_logprobs - new_logprobs).mean()
+            losses.append(policy_loss + kl_coef * sampled_kl)
         if not losses:
             return 0.0
-
         loss = torch.stack(losses).mean()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         optimizer.step()
-
         policy_dir = self.work_dir / "policy"
         policy_dir.mkdir(parents=True, exist_ok=True)
         self.model.save_pretrained(policy_dir, dtype="fp32", include_upstream=False)
         return float(loss.detach())
 
-    def run(
-        self,
-        prompts: List[str],
-        count: int,
-        max_new_tokens: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        lr: float,
-        clip: float,
-        kl_coef: float,
-    ):
+    def run(self, prompts: List[str], count: int, max_new_tokens: int, temperature: float, top_k: int,
+            top_p: float, lr: float, clip: float, kl_coef: float):
         if count < 2:
             raise ValueError("--responses must be at least 2")
         for prompt in prompts:
@@ -239,17 +185,8 @@ def main():
     parser.add_argument("--kl_coef", type=float, default=0.02)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
-    SmaulRL(args.model_dir, args.work_dir, args.device).run(
-        args.prompt,
-        args.responses,
-        args.max_new_tokens,
-        args.temperature,
-        args.top_k,
-        args.top_p,
-        args.rl_lr,
-        args.clip,
-        args.kl_coef,
-    )
+    SmaulRL(args.model_dir, args.work_dir, args.device).run(args.prompt, args.responses, args.max_new_tokens,
+        args.temperature, args.top_k, args.top_p, args.rl_lr, args.clip, args.kl_coef)
 
 
 if __name__ == "__main__":
