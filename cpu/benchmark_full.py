@@ -45,10 +45,8 @@ torch.manual_seed(42)
 
 torch.set_float32_matmul_precision("high")
 
-cfg = RWKVXConfig(
-    vocab_size=65536, n_embd=832, n_layer=17, head_size=64,
-    n_moba_layer=5, ctx_len_hint=args.ctx_len, wkv_chunk_size=64
-)
+cfg = RWKVXConfig(vocab_size=65536, n_embd=832, n_layer=17, head_size=64, n_moba_layer=5, ctx_len_hint=args.ctx_len,
+                  wkv_chunk_size=64)
 model = RWKVXModel(cfg)
 if args.compile:
     print("[COMPILE] torch.compile(model) ...")
@@ -93,9 +91,13 @@ for step in range(args.steps):
     tps = tok_per_step / total
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     results.append((t_fwd, t_bwd, t_opt, total, tps, rss))
-    print(f"  step {step+1}/{args.steps}: fwd={t_fwd:.2f}s  bwd={t_bwd:.2f}s  opt={t_opt:.3f}s  total={total:.2f}s  {tps:.1f} tok/s  RAM={rss:.0f}MB")
+    print(
+        f"  step {step+1}/{args.steps}: fwd={t_fwd:.2f}s  bwd={t_bwd:.2f}s  opt={t_opt:.3f}s  total={total:.2f}s  {tps:.1f} tok/s  RAM={rss:.0f}MB"
+    )
 
 if results:
-    avg = [sum(r[i] for r in results)/len(results) for i in range(6)]
+    avg = [sum(r[i] for r in results) / len(results) for i in range(6)]
     print(f"\nAverage over {args.steps} steps:")
-    print(f"  fwd={avg[0]:.2f}s  bwd={avg[1]:.2f}s  opt={avg[2]:.3f}s  total={avg[3]:.2f}s  {avg[4]:.1f} tok/s  peak_RAM={avg[5]:.0f}MB")
+    print(
+        f"  fwd={avg[0]:.2f}s  bwd={avg[1]:.2f}s  opt={avg[2]:.3f}s  total={avg[3]:.2f}s  {avg[4]:.1f} tok/s  peak_RAM={avg[5]:.0f}MB"
+    )
