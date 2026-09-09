@@ -26,67 +26,44 @@ def _json_texts(data):
     if isinstance(data, str):
         yield data
     elif isinstance(data, dict):
-        text = next((data[k] for k in ("text", "content", "document", "body", "code", "prompt", "completion")
-                     if isinstance(data.get(k), str)), None)
-        if text is not None:
-            yield text
-        elif "data" in data:
-            yield from _json_texts(data["data"])
+        prompt = data.get("prompt")
+        completion = data.get("completion")
+        if isinstance(prompt, str):
+            yield prompt
+        if isinstance(completion, str):
+            yield completion
+        if not isinstance(prompt, str) and not isinstance(completion, str):
+            text = next((data[k] for k in ("text", "content", "document", "body", "code")
+                         if isinstance(data.get(k), str)), None)
+            if text is not None:
+                yield text
+            elif "data" in data:
+                yield from _json_texts(data["data"])
     elif isinstance(data, list):
         for x in data:
             yield from _json_texts(x)
 
 
 def read_texts(path, max_records=0):
-    files = [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file()]
+    files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
     seen = 0
     plain = {
-        ".txt",
-        ".text",
-        ".py",
-        ".cpp",
-        ".c",
-        ".h",
-        ".hpp",
-        ".cc",
-        ".cxx",
-        ".rs",
-        ".js",
-        ".ts",
-        ".tsx",
-        ".jsx",
-        ".java",
-        ".go",
-        ".cs",
-        ".php",
-        ".rb",
-        ".swift",
-        ".kt",
-        ".kts",
-        ".scala",
-        ".sh",
-        ".bash",
-        ".zsh",
-        ".html",
-        ".css",
-        ".scss",
-        ".sql",
-        ".md",
-        ".rst",
-        ".yaml",
-        ".yml",
-        ".toml",
-        ".xml",
+        ".txt", ".text", ".py", ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".rs", ".js", ".ts",
+        ".tsx", ".jsx", ".java", ".go", ".cs", ".php", ".rb", ".swift", ".kt", ".kts", ".scala",
+        ".sh", ".bash", ".zsh", ".html", ".css", ".scss", ".sql", ".md", ".rst", ".yaml", ".yml",
+        ".toml", ".xml",
     }
 
     for f in files:
         ext = f.suffix.lower()
         if ext in plain:
-            with f.open("r", encoding="utf-8", errors="ignore") as h:
-                yield h.read()
-            seen += 1
+            with f.open("r", encoding="utf-8", errors="replace") as h:
+                text = h.read()
+            if text:
+                yield text
+                seen += 1
         elif ext == ".jsonl":
-            with f.open("r", encoding="utf-8", errors="ignore") as h:
+            with f.open("r", encoding="utf-8", errors="replace") as h:
                 for line in h:
                     try:
                         data = json.loads(line)
@@ -99,7 +76,7 @@ def read_texts(path, max_records=0):
                             return
         elif ext == ".json":
             try:
-                data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
+                data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
             except json.JSONDecodeError:
                 continue
             for text in _json_texts(data):
@@ -114,8 +91,8 @@ def read_texts(path, max_records=0):
                 raise SystemExit("Parquet support: pip install pyarrow")
             pf = pq.ParquetFile(f)
             names = pf.schema_arrow.names
-            col = next((c for c in names
-                        if c.lower() in {"text", "content", "document", "body", "code", "prompt", "completion"}), None)
+            lower = {name.lower(): name for name in names}
+            col = next((lower[name] for name in ("text", "content", "document", "body", "code") if name in lower), None)
             if col:
                 for batch in pf.iter_batches(batch_size=1024, columns=[col]):
                     for x in batch.column(0).to_pylist():
@@ -177,6 +154,11 @@ def case_type(x):
 
 
 def _build(texts, vocab_size, word_budget, max_records=0):
+    if vocab_size < len(SPECIAL) + len(CASE):
+        raise ValueError(f"vocab_size must be at least {len(SPECIAL) + len(CASE)}")
+    if word_budget < 0 or max_records < 0:
+        raise ValueError("word_budget and max_records must be non-negative")
+
     words = Counter()
     graphemes = Counter()
     chars = Counter()
@@ -240,10 +222,7 @@ def _build(texts, vocab_size, word_budget, max_records=0):
         "vocab": vocab,
         "special_tokens": SPECIAL,
         "case_tokens": CASE,
-        "case_stats": {
-            w: dict(c)
-            for w, c in cases.items()
-        },
+        "case_stats": {w: dict(c) for w, c in cases.items()},
         "unk_id": vocab["<unk>"],
         "stats": {
             "vocab_size": len(vocab),
