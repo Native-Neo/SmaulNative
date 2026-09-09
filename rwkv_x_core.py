@@ -31,222 +31,175 @@ class RWKVXConfig:
     num_experts: int = 1
     num_experts_per_tok: int = 1
 
-    def save(self, path: Path):
-        Path(path).write_text(json.dumps(asdict(self), indent=2))
+    def save(self, path: Path): Path(path).write_text(json.dumps(asdict(self), indent=2))
 
     @classmethod
-    def load(cls, path: Path):
-        return cls(**json.loads(Path(path).read_text()))
+    def load(cls, path: Path): return cls(**json.loads(Path(path).read_text()))
 
     def approx_param_count(self) -> int:
         C, V, L = self.n_embd, self.vocab_size, self.n_layer
-        emb_head = 2 * V * C
         d_decay = max(32, round(1.8 * (C ** 0.5) / 32) * 32)
-        d_aaa = d_decay
         d_mv = max(32, round(1.3 * (C ** 0.5) / 32) * 32)
         d_gate = max(32, round(0.6 * (C ** 0.8) / 32) * 32)
-        tmix = 4 * C * C + C * (2 * d_decay + 2 * d_aaa + 2 * d_mv + 2 * d_gate)
-        cmix = 8 * C * C
-        moba_att = 4 * C * C
-        rwkv_layers = (L - self.n_moba_layer) * (tmix + cmix)
-        moba_layers = self.n_moba_layer * (moba_att + cmix)
-        return emb_head + rwkv_layers + moba_layers
+        tmix = 4 * C * C + C * (4 * d_decay + 2 * d_mv + 2 * d_gate)
+        cmix, moba_att = 8 * C * C, 4 * C * C
+        return 2 * V * C + (L - self.n_moba_layer) * (tmix + cmix) + self.n_moba_layer * (moba_att + cmix)
 
 
-def config_for_target_params(target_params: int, vocab_size: int = 65530,
-                              n_embd: int = 832, n_moba_layer: int = 5,
-                              head_size: int = 64) -> RWKVXConfig:
-    if n_embd % head_size != 0:
-        raise ValueError(f"n_embd ({n_embd}) must be divisible by head_size ({head_size})")
+def config_for_target_params(target_params: int, vocab_size: int = 65530, n_embd: int = 832, n_moba_layer: int = 5, head_size: int = 64) -> RWKVXConfig:
+    if n_embd % head_size: raise ValueError(f"n_embd ({n_embd}) must be divisible by head_size ({head_size})")
     best = None
     for n_layer in range(4, 80):
-        cfg = RWKVXConfig(vocab_size=vocab_size, n_embd=n_embd, n_layer=n_layer,
-                           n_moba_layer=min(n_moba_layer, n_layer - 1), head_size=head_size)
+        cfg = RWKVXConfig(vocab_size=vocab_size, n_embd=n_embd, n_layer=n_layer, n_moba_layer=min(n_moba_layer, n_layer - 1), head_size=head_size)
         diff = abs(cfg.approx_param_count() - target_params)
-        if best is None or diff < best[0]:
-            best = (diff, cfg)
+        if best is None or diff < best[0]: best = diff, cfg
     return best[1]
 
 
-def _wkv_run_chunk(state: torch.Tensor, w_c: torch.Tensor, k_c: torch.Tensor, v_c: torch.Tensor,
-                    kk_c: torch.Tensor, a_c: torch.Tensor, r_c: torch.Tensor
-                    ) -> Tuple[torch.Tensor, torch.Tensor]:
-    Tc = w_c.shape[1]
+def _wkv_run_chunk(state, w_c, k_c, v_c, kk_c, a_c, r_c):
     k_c, v_c, kk_c, a_c = k_c.float(), v_c.float(), kk_c.float(), a_c.float()
     ys = []
-    for t in range(Tc):
+    for t in range(w_c.shape[1]):
         w_t, k_t, v_t, kk_t, a_t, r_t = w_c[:, t], k_c[:, t], v_c[:, t], kk_c[:, t], a_c[:, t], r_c[:, t]
-        u = (-kk_t).unsqueeze(-1)
-        v = (kk_t * a_t).unsqueeze(-2)
-        state = state * w_t.unsqueeze(-2) + torch.bmm(
-            torch.bmm(state.reshape(-1, state.shape[-2], state.shape[-1]), u.reshape(-1, state.shape[-2], 1)),
-            v.reshape(-1, 1, state.shape[-1])
-        ).reshape_as(state) + torch.bmm(
-            v_t.unsqueeze(-1).reshape(-1, state.shape[-1], 1),
-            k_t.unsqueeze(-2).reshape(-1, 1, state.shape[-1])
-        ).reshape_as(state)
-        y_t = torch.bmm(state.reshape(-1, state.shape[-2], state.shape[-1]), r_t.unsqueeze(-1).reshape(-1, state.shape[-1], 1)).reshape(r_t.shape)
-        ys.append(y_t.to(r_t.dtype) if y_t.dtype != r_t.dtype else y_t)
+        u = (-kk_t).unsqueeze(-1); av = (kk_t * a_t).unsqueeze(-2)
+        flat = state.reshape(-1, state.shape[-2], state.shape[-1])
+        state = state * w_t.unsqueeze(-2) + torch.bmm(torch.bmm(flat, u.reshape(-1, state.shape[-2], 1)), av.reshape(-1, 1, state.shape[-1])).reshape_as(state)
+        state = state + torch.bmm(v_t.unsqueeze(-1).reshape(-1, state.shape[-1], 1), k_t.unsqueeze(-2).reshape(-1, 1, state.shape[-1])).reshape_as(state)
+        ys.append(torch.bmm(state.reshape(-1, state.shape[-2], state.shape[-1]), r_t.unsqueeze(-1).reshape(-1, state.shape[-1], 1)).reshape(r_t.shape))
     return state, torch.stack(ys, dim=1)
 
 
 class RWKV_Tmix_x070(nn.Module):
-    def __init__(self, cfg: RWKVXConfig, layer_id: int):
-        super().__init__()
-        self.cfg, self.layer_id, self.head_size = cfg, layer_id, cfg.head_size
-        C = cfg.n_embd
-        self.n_head = C // self.head_size
-        assert C % self.head_size == 0, "n_embd must be divisible by head_size"
-        H, N = self.n_head, self.head_size
+    def __init__(self, cfg, layer_id):
+        super().__init__(); self.cfg, self.layer_id, self.head_size = cfg, layer_id, cfg.head_size
+        C, H, N = cfg.n_embd, cfg.n_embd // cfg.head_size, cfg.head_size; self.n_head = H
+        assert C % N == 0, "n_embd must be divisible by head_size"
         with torch.no_grad():
-            ratio_0_to_1 = layer_id / max(1, cfg.n_layer - 1)
-            ratio_1_to_almost0 = 1.0 - (layer_id / cfg.n_layer)
-            ddd = torch.arange(C, dtype=torch.float32).view(1, 1, C) / C
-            self.x_r = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
-            self.x_w = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
-            self.x_k = nn.Parameter(1.0 - (torch.pow(ddd, 0.9 * ratio_1_to_almost0) + 0.4 * ratio_0_to_1))
-            self.x_v = nn.Parameter(1.0 - (torch.pow(ddd, 0.4 * ratio_1_to_almost0) + 0.6 * ratio_0_to_1))
-            self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
-            self.x_g = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
-            def ortho_init(x, scale):
-                shape = x.shape
-                if len(shape) == 2:
-                    gain = math.sqrt(shape[0] / shape[1]) if shape[0] > shape[1] else 1
-                    nn.init.orthogonal_(x, gain=gain * scale)
-                elif len(shape) == 3:
-                    gain = math.sqrt(shape[1] / shape[2]) if shape[1] > shape[2] else 1
-                    for i in range(shape[0]): nn.init.orthogonal_(x[i], gain=gain * scale)
+            r0 = layer_id / max(1, cfg.n_layer - 1); r1 = 1.0 - layer_id / cfg.n_layer; ddd = torch.arange(C, dtype=torch.float32).view(1, 1, C) / C
+            self.x_r = nn.Parameter(1.0 - torch.pow(ddd, .2 * r1)); self.x_w = nn.Parameter(1.0 - torch.pow(ddd, .9 * r1)); self.x_k = nn.Parameter(1.0 - (torch.pow(ddd, .9 * r1) + .4 * r0)); self.x_v = nn.Parameter(1.0 - (torch.pow(ddd, .4 * r1) + .6 * r0)); self.x_a = nn.Parameter(1.0 - torch.pow(ddd, .9 * r1)); self.x_g = nn.Parameter(1.0 - torch.pow(ddd, .2 * r1))
+            def oi(x, scale):
+                if x.ndim == 2: nn.init.orthogonal_(x, gain=max(1.0, math.sqrt(x.shape[0] / x.shape[1])) * scale)
                 return x
-            d_decay = max(32, round(1.8 * (C ** 0.5) / 32) * 32)
-            self.w1 = nn.Parameter(torch.zeros(C, d_decay)); self.w2 = nn.Parameter(ortho_init(torch.zeros(d_decay, C), 0.1))
-            decay_speed = torch.tensor([-7 + 5 * (n / (C - 1)) ** (0.85 + ratio_0_to_1 ** 0.5) for n in range(C)])
-            self.w0 = nn.Parameter(decay_speed.reshape(1, 1, C) + 0.5)
-            d_aaa = d_decay
-            self.a1 = nn.Parameter(torch.zeros(C, d_aaa)); self.a2 = nn.Parameter(ortho_init(torch.zeros(d_aaa, C), 0.1)); self.a0 = nn.Parameter(torch.zeros(1, 1, C))
-            d_mv = max(32, round(1.3 * (C ** 0.5) / 32) * 32)
-            if layer_id != 0:
-                self.v1 = nn.Parameter(torch.zeros(C, d_mv)); self.v2 = nn.Parameter(ortho_init(torch.zeros(d_mv, C), 0.1)); self.v0 = nn.Parameter(torch.zeros(1, 1, C) + 1.0)
-            d_gate = max(32, round(0.6 * (C ** 0.8) / 32) * 32)
-            self.g1 = nn.Parameter(torch.zeros(C, d_gate)); self.g2 = nn.Parameter(ortho_init(torch.zeros(d_gate, C), 0.1))
-            self.k_k = nn.Parameter(torch.ones(1, 1, C) * 0.85); self.k_a = nn.Parameter(torch.ones(1, 1, C)); self.r_k = nn.Parameter(torch.zeros(H, N))
-            self.receptance = nn.Linear(C, C, bias=False); self.key = nn.Linear(C, C, bias=False); self.value = nn.Linear(C, C, bias=False); self.output = nn.Linear(C, C, bias=False)
-            self.ln_x = nn.GroupNorm(H, C, eps=(1e-5) * (cfg.head_size_divisor ** 2))
-            self.receptance.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5)); self.key.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5)); self.value.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5)); self.output.weight.data.zero_()
+            dd = max(32, round(1.8 * C ** .5 / 32) * 32); dm = max(32, round(1.3 * C ** .5 / 32) * 32); dg = max(32, round(.6 * C ** .8 / 32) * 32)
+            self.w1 = nn.Parameter(torch.zeros(C, dd)); self.w2 = nn.Parameter(oi(torch.zeros(dd, C), .1)); self.w0 = nn.Parameter(torch.tensor([-7 + 5 * (n / (C - 1)) ** (.85 + r0 ** .5) for n in range(C)]).reshape(1, 1, C) + .5)
+            self.a1 = nn.Parameter(torch.zeros(C, dd)); self.a2 = nn.Parameter(oi(torch.zeros(dd, C), .1)); self.a0 = nn.Parameter(torch.zeros(1, 1, C))
+            if layer_id: self.v1 = nn.Parameter(torch.zeros(C, dm)); self.v2 = nn.Parameter(oi(torch.zeros(dm, C), .1)); self.v0 = nn.Parameter(torch.ones(1, 1, C))
+            self.g1 = nn.Parameter(torch.zeros(C, dg)); self.g2 = nn.Parameter(oi(torch.zeros(dg, C), .1))
+            self.k_k = nn.Parameter(torch.ones(1, 1, C) * .85); self.k_a = nn.Parameter(torch.ones(1, 1, C)); self.r_k = nn.Parameter(torch.zeros(H, N))
+        self.receptance = nn.Linear(C, C, bias=False); self.key = nn.Linear(C, C, bias=False); self.value = nn.Linear(C, C, bias=False); self.output = nn.Linear(C, C, bias=False); self.ln_x = nn.GroupNorm(H, C, eps=1e-5 * cfg.head_size_divisor ** 2)
+        self.receptance.weight.data.uniform_(-.5 / C ** .5, .5 / C ** .5); self.key.weight.data.uniform_(-.05 / C ** .5, .05 / C ** .5); self.value.weight.data.uniform_(-.5 / C ** .5, .5 / C ** .5); self.output.weight.data.zero_()
 
     def forward(self, x, v_first, state=None):
         B, T, C = x.shape; H, N = self.n_head, self.head_size
-        if isinstance(state, tuple):
-            state, x_prev_last = state; prev0 = x_prev_last.unsqueeze(1)
+        if isinstance(state, tuple): state, prev = state; prev0 = prev.unsqueeze(1)
         else: prev0 = torch.zeros(B, 1, C, dtype=x.dtype, device=x.device)
-        xx = torch.cat([prev0, x[:, :-1, :]], dim=1) - x
-        xr, xw, xk, xv, xa, xg = (x + xx * p for p in (self.x_r, self.x_w, self.x_k, self.x_v, self.x_a, self.x_g))
+        xx = torch.cat([prev0, x[:, :-1],], 1) - x; xr, xw, xk, xv, xa, xg = (x + xx * p for p in (self.x_r, self.x_w, self.x_k, self.x_v, self.x_a, self.x_g))
         r = self.receptance(xr); g_ = torch.tanh(xw @ self.w1) @ self.w2; k = self.key(xk); v = self.value(xv)
         if self.layer_id == 0: v_first = v
         else: v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
-        a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2); g = torch.sigmoid(xg @ self.g1) @ self.g2
-        kk = F.normalize((k * self.k_k).view(B, T, H, N), dim=-1, p=2.0).view(B, T, C); k = k * (1 + (a - 1) * self.k_a); w = torch.exp(-0.606531 * torch.sigmoid((self.w0 + g_).float()))
-        r_, w_, k_, v_, kk_, a_ = (z.view(B, T, H, N) for z in (r, w, k, v, kk, a))
-        state = torch.zeros(B, H, N, N, dtype=torch.float32, device=x.device) if state is None else state.to(torch.float32)
-        use_checkpoint = self.training and torch.is_grad_enabled() and x.device.type != "cpu"
-        chunk_size = max(1, self.cfg.wkv_chunk_size) if use_checkpoint else T
-        ys_chunks = []
-        for t0 in range(0, T, chunk_size):
-            t1 = min(t0 + chunk_size, T)
-            args = (w_[:, t0:t1], k_[:, t0:t1], v_[:, t0:t1], kk_[:, t0:t1], a_[:, t0:t1], r_[:, t0:t1])
-            if use_checkpoint: state, y_c = torch.utils.checkpoint.checkpoint(_wkv_run_chunk, state, *args, use_reentrant=False)
-            else: state, y_c = _wkv_run_chunk(state, *args)
-            ys_chunks.append(y_c)
-        xx_out = torch.cat(ys_chunks, dim=1).reshape(B, T, C)
-        xx_out = self.ln_x(xx_out.reshape(B * T, C)).reshape(B, T, C)
-        xx_out = xx_out + ((r_ * k_ * self.r_k).sum(dim=-1, keepdim=True) * v_).reshape(B, T, C)
-        return self.output(xx_out * g), v_first, (state, x[:, -1, :])
+        a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2); g = torch.sigmoid(xg @ self.g1) @ self.g2; kk = F.normalize((k * self.k_k).view(B, T, H, N), dim=-1).view(B, T, C); k = k * (1 + (a - 1) * self.k_a); w = torch.exp(-.606531 * torch.sigmoid((self.w0 + g_).float()))
+        r_, w_, k_, v_, kk_, a_ = (z.view(B, T, H, N) for z in (r, w, k, v, kk, a)); state = torch.zeros(B, H, N, N, dtype=torch.float32, device=x.device) if state is None else state.float(); ys = []
+        use_checkpoint = self.training and torch.is_grad_enabled() and x.device.type != "cpu"; cs = max(1, self.cfg.wkv_chunk_size) if use_checkpoint else T
+        for t0 in range(0, T, cs):
+            args = (w_[:, t0:t0+cs], k_[:, t0:t0+cs], v_[:, t0:t0+cs], kk_[:, t0:t0+cs], a_[:, t0:t0+cs], r_[:, t0:t0+cs])
+            state, y = torch.utils.checkpoint.checkpoint(_wkv_run_chunk, state, *args, use_reentrant=False) if use_checkpoint else _wkv_run_chunk(state, *args); ys.append(y)
+        out = torch.cat(ys, 1).reshape(B, T, C); out = self.ln_x(out.reshape(B * T, C)).reshape(B, T, C); out = out + ((r_ * k_ * self.r_k).sum(-1, keepdim=True) * v_).reshape(B, T, C)
+        return self.output(out * g), v_first, (state, x[:, -1])
 
 
 class RWKV_CMix_x070(nn.Module):
-    def __init__(self, cfg: RWKVXConfig, layer_id: int):
-        super().__init__(); C = cfg.n_embd
-        with torch.no_grad():
-            ratio_1_to_almost0 = 1.0 - (layer_id / cfg.n_layer); ddd = torch.arange(C, dtype=torch.float32).view(1, 1, C) / C; self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0 ** 4))
-        self.key = nn.Linear(C, C * 4, bias=False); self.value = nn.Linear(C * 4, C, bias=False); self.key.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5)); self.value.weight.data.zero_()
-
+    def __init__(self, cfg, layer_id):
+        super().__init__(); C = cfg.n_embd; r = 1.0 - layer_id / cfg.n_layer; ddd = torch.arange(C, dtype=torch.float32).view(1, 1, C) / C; self.x_k = nn.Parameter(1.0 - torch.pow(ddd, r ** 4)); self.key = nn.Linear(C, C * 4, bias=False); self.value = nn.Linear(C * 4, C, bias=False); self.key.weight.data.uniform_(-.5 / C ** .5, .5 / C ** .5); self.value.weight.data.zero_()
     def forward(self, x, x_prev_last=None):
-        B, T, C = x.shape; prev0 = x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros(B, 1, C, dtype=x.dtype, device=x.device); xx = torch.cat([prev0, x[:, :-1, :]], dim=1) - x; k = torch.relu(self.key(x + xx * self.x_k)) ** 2; return self.value(k), x[:, -1, :]
+        prev = x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros(x.size(0), 1, x.size(-1), dtype=x.dtype, device=x.device); xx = torch.cat([prev, x[:, :-1]], 1) - x; return self.value(torch.relu(self.key(x + xx * self.x_k)) ** 2), x[:, -1]
 
 
 class RWKV_CMix_MoE(nn.Module):
-    """Top-k routed Channel-Mix."""
-    def __init__(self, cfg: RWKVXConfig, layer_id: int):
-        super().__init__(); self.num_experts = cfg.num_experts; self.top_k = min(cfg.num_experts, cfg.num_experts_per_tok)
+    def __init__(self, cfg, layer_id):
+        super().__init__(); self.num_experts = cfg.num_experts; self.top_k = min(cfg.num_experts, cfg.num_experts_per_tok); self.experts = nn.ModuleList([RWKV_CMix_x070(cfg, layer_id) for _ in range(self.num_experts)]); self.gate = nn.Linear(cfg.n_embd, self.num_experts, bias=False)
         if self.top_k < 1: raise ValueError("num_experts_per_tok must be >= 1")
-        self.experts = nn.ModuleList([RWKV_CMix_x070(cfg, layer_id) for _ in range(self.num_experts)]); self.gate = nn.Linear(cfg.n_embd, self.num_experts, bias=False)
-
     def forward(self, x, x_prev_last=None):
-        probs = torch.softmax(self.gate(x), dim=-1); topv, topi = torch.topk(probs, self.top_k, dim=-1); topv = topv / topv.sum(dim=-1, keepdim=True).clamp_min(1e-9); out = torch.zeros_like(x)
+        probs = torch.softmax(self.gate(x), -1); topv, topi = torch.topk(probs, self.top_k, -1); topv = topv / topv.sum(-1, keepdim=True).clamp_min(1e-9); out = torch.zeros_like(x)
         for e, expert in enumerate(self.experts):
-            weight = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(dim=-1); mask = weight > 0
+            weight = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(-1); mask = weight > 0
             if mask.any(): out[mask] += expert(x, x_prev_last)[0][mask] * weight[mask].unsqueeze(-1)
-        return out, x[:, -1, :]
+        return out, x[:, -1]
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, cfg: RWKVXConfig):
+    def __init__(self, cfg):
         super().__init__(); C = cfg.n_embd; self.n_head = C // cfg.head_size; self.chunk_size = cfg.moba_chunk_size; self.top_k = max(0, cfg.moba_topk); self.receptance = nn.Linear(C, C, bias=False); self.key = nn.Linear(C, C, bias=False); self.value = nn.Linear(C, C, bias=False); self.output = nn.Linear(C, C, bias=False)
-        self.receptance.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5)); self.key.weight.data.uniform_(-0.05 / (C ** 0.5), 0.05 / (C ** 0.5)); self.value.weight.data.uniform_(-0.5 / (C ** 0.5), 0.5 / (C ** 0.5)); self.output.weight.data.zero_()
+        self.receptance.weight.data.uniform_(-.5 / C ** .5, .5 / C ** .5); self.key.weight.data.uniform_(-.05 / C ** .5, .05 / C ** .5); self.value.weight.data.uniform_(-.5 / C ** .5, .5 / C ** .5); self.output.weight.data.zero_()
 
-    def forward(self, x):
-        B, T, C = x.shape; H, N, cs, k_top = self.n_head, C // self.n_head, self.chunk_size, self.top_k; q, k, v = self.receptance(x), self.key(x), self.value(x); q = q.view(B, T, H, N).transpose(1, 2); k = k.view(B, T, H, N).transpose(1, 2); v = v.view(B, T, H, N).transpose(1, 2); n_chunks = (T + cs - 1) // cs
-        if k_top <= 0 or n_chunks <= k_top + 1: return self.output(F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2).contiguous().view(B, T, C))
-        pad = n_chunks * cs - T; k_c = (F.pad(k, (0, 0, 0, pad)) if pad else k).view(B, H, n_chunks, cs, N); v_c = (F.pad(v, (0, 0, 0, pad)) if pad else v).view(B, H, n_chunks, cs, N); k_mean = k_c.mean(dim=3); out = torch.zeros(B, H, T, N, dtype=q.dtype, device=q.device)
-        for i in range(n_chunks):
-            lo, hi = i * cs, min((i + 1) * cs, T); q_i = q[:, :, lo:hi]; own_k, own_v = k_c[:, :, i, :hi - lo], v_c[:, :, i, :hi - lo]
-            if i == 0: y_i = F.scaled_dot_product_attention(q_i, own_k, own_v, is_causal=True)
-            else:
-                n_pick = min(k_top, i); scores = torch.einsum("bhn,bhcn->bhc", q_i.mean(dim=2), k_mean[:, :, :i]); top_c = scores.topk(n_pick, dim=-1).indices; idx = top_c.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, cs, N); k_sel = torch.gather(k_c[:, :, :i], 2, idx).reshape(B, H, n_pick * cs, N); v_sel = torch.gather(v_c[:, :, :i], 2, idx).reshape(B, H, n_pick * cs, N); k_cat, v_cat = torch.cat([k_sel, own_k], dim=2), torch.cat([v_sel, own_v], dim=2); mask = torch.zeros(hi - lo, n_pick * cs + (hi - lo), dtype=torch.bool, device=x.device); mask[:, :n_pick * cs] = True; mask[:, n_pick * cs:] = torch.tril(torch.ones(hi - lo, hi - lo, dtype=torch.bool, device=x.device)); y_i = F.scaled_dot_product_attention(q_i, k_cat, v_cat, attn_mask=mask)
-            out[:, :, lo:hi] = y_i
-        return self.output(out.transpose(1, 2).contiguous().view(B, T, C))
+    def forward(self, x, cache=None, use_cache=False):
+        B, T, C = x.shape; H, N, cs, kt = self.n_head, C // self.n_head, self.chunk_size, self.top_k
+        q = self.receptance(x).view(B, T, H, N).transpose(1, 2); k = self.key(x).view(B, T, H, N).transpose(1, 2); v = self.value(x).view(B, T, H, N).transpose(1, 2)
+        if cache is not None:
+            pk, pv = cache; past = pk.size(2); full_k, full_v = torch.cat((pk, k), 2), torch.cat((pv, v), 2)
+            if T != 1: raise ValueError("cached MOBA attention expects one-token decode")
+            pos = past; cur_start = (pos // cs) * cs; cur_k = full_k[:, :, cur_start:]; cur_v = full_v[:, :, cur_start:]; prev_k = full_k[:, :, :cur_start]
+            if prev_k.size(2) and kt > 0:
+                n_prev = (cur_start + cs - 1) // cs; prev_pad = n_prev * cs - cur_start; pkc = F.pad(prev_k, (0, 0, 0, prev_pad)).view(B, H, n_prev, cs, N); pvc = F.pad(prev_v := full_v[:, :, :cur_start], (0, 0, 0, prev_pad)).view(B, H, n_prev, cs, N); n_pick = min(kt, n_prev); scores = torch.einsum("bhn,bhcn->bhc", q.mean(2), pkc.mean(3)); top = scores.topk(n_pick, -1).indices; idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, cs, N); sel_k = torch.gather(pkc, 2, idx).reshape(B, H, n_pick * cs, N); sel_v = torch.gather(pvc, 2, idx).reshape(B, H, n_pick * cs, N); kcat, vcat = torch.cat((sel_k, cur_k), 2), torch.cat((sel_v, cur_v), 2)
+                y = F.scaled_dot_product_attention(q, kcat, vcat, is_causal=False)
+            else: y = F.scaled_dot_product_attention(q, cur_k, cur_v, is_causal=False)
+            return self.output(y.transpose(1, 2).reshape(B, 1, C)), (full_k, full_v) if use_cache else None
+        n_chunks = (T + cs - 1) // cs
+        if kt <= 0 or n_chunks <= kt + 1:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            pad = n_chunks * cs - T; kc = F.pad(k, (0, 0, 0, pad)).view(B, H, n_chunks, cs, N); vc = F.pad(v, (0, 0, 0, pad)).view(B, H, n_chunks, cs, N); km = kc.mean(3); out = torch.zeros(B, H, T, N, dtype=q.dtype, device=x.device)
+            for i in range(n_chunks):
+                lo, hi = i * cs, min((i + 1) * cs, T); qi = q[:, :, lo:hi]; ownk, ownv = kc[:, :, i, :hi-lo], vc[:, :, i, :hi-lo]
+                if i == 0: yi = F.scaled_dot_product_attention(qi, ownk, ownv, is_causal=True)
+                else:
+                    npick = min(kt, i); top = torch.einsum("bhn,bhcn->bhc", qi.mean(2), km[:, :, :i]).topk(npick, -1).indices; idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, cs, N); sk = torch.gather(kc[:, :, :i], 2, idx).reshape(B, H, npick * cs, N); sv = torch.gather(vc[:, :, :i], 2, idx).reshape(B, H, npick * cs, N); mask = torch.zeros(hi-lo, npick * cs + hi-lo, dtype=torch.bool, device=x.device); mask[:, :npick*cs] = True; mask[:, npick*cs:] = torch.tril(torch.ones(hi-lo, hi-lo, dtype=torch.bool, device=x.device)); yi = F.scaled_dot_product_attention(qi, torch.cat((sk, ownk), 2), torch.cat((sv, ownv), 2), attn_mask=mask)
+                out[:, :, lo:hi] = yi
+            y = out
+        return self.output(y.transpose(1, 2).contiguous().view(B, T, C)), (k, v) if use_cache else None
 
 
 class MOBABlock(nn.Module):
-    def __init__(self, cfg: RWKVXConfig, layer_id: int):
+    def __init__(self, cfg, layer_id):
         super().__init__(); self.cfg_checkpoint_ffn = cfg.checkpoint_ffn; self.ln1 = nn.LayerNorm(cfg.n_embd); self.ln2 = nn.LayerNorm(cfg.n_embd); self.att = CausalSelfAttention(cfg); self.ffn = RWKV_CMix_x070(cfg, layer_id) if not cfg.is_moe else RWKV_CMix_MoE(cfg, layer_id)
-
-    def forward(self, x, cmix_state=None):
-        use_checkpoint = self.training and torch.is_grad_enabled(); att_out = torch.utils.checkpoint.checkpoint(self.att, self.ln1(x), use_reentrant=False) if use_checkpoint else self.att(self.ln1(x)); x = x + att_out
+    def forward(self, x, cmix_state=None, att_state=None, use_cache=False):
+        checkpoint = self.training and torch.is_grad_enabled()
+        if checkpoint and att_state is None and not use_cache: att_out = torch.utils.checkpoint.checkpoint(self.att, self.ln1(x), use_reentrant=False); new_att_state = None
+        else: att_out, new_att_state = self.att(self.ln1(x), att_state, use_cache)
+        x = x + att_out
         if self.cfg_checkpoint_ffn and self.training and torch.is_grad_enabled(): ffn_out, new_cmix_state = torch.utils.checkpoint.checkpoint(self.ffn, self.ln2(x), cmix_state, use_reentrant=False)
         else: ffn_out, new_cmix_state = self.ffn(self.ln2(x), cmix_state)
-        return x + ffn_out, new_cmix_state
+        return x + ffn_out, new_cmix_state, new_att_state
 
 
 class RWKVBlock(nn.Module):
-    def __init__(self, cfg: RWKVXConfig, layer_id: int):
+    def __init__(self, cfg, layer_id):
         super().__init__(); self.layer_id = layer_id; self.cfg_checkpoint_ffn = cfg.checkpoint_ffn
         if layer_id == 0: self.ln0 = nn.LayerNorm(cfg.n_embd)
         self.ln1 = nn.LayerNorm(cfg.n_embd); self.ln2 = nn.LayerNorm(cfg.n_embd); self.att = RWKV_Tmix_x070(cfg, layer_id); self.ffn = RWKV_CMix_x070(cfg, layer_id) if not cfg.is_moe else RWKV_CMix_MoE(cfg, layer_id)
-
     def forward(self, x, v_first, tmix_state=None, cmix_state=None):
         if self.layer_id == 0: x = self.ln0(x)
-        xx, v_first, new_tmix_state = self.att(self.ln1(x), v_first, tmix_state); x = x + xx
-        if self.cfg_checkpoint_ffn and self.training and torch.is_grad_enabled(): ffn_out, new_cmix_state = torch.utils.checkpoint.checkpoint(self.ffn, self.ln2(x), cmix_state, use_reentrant=False)
-        else: ffn_out, new_cmix_state = self.ffn(self.ln2(x), cmix_state)
-        return x + ffn_out, v_first, new_tmix_state, new_cmix_state
+        xx, v_first, ts = self.att(self.ln1(x), v_first, tmix_state); x = x + xx
+        if self.cfg_checkpoint_ffn and self.training and torch.is_grad_enabled(): fo, cs = torch.utils.checkpoint.checkpoint(self.ffn, self.ln2(x), cmix_state, use_reentrant=False)
+        else: fo, cs = self.ffn(self.ln2(x), cmix_state)
+        return x + fo, v_first, ts, cs
 
 
 class RWKVXModel(nn.Module):
-    def __init__(self, cfg: RWKVXConfig):
-        super().__init__(); self.cfg = cfg; self.emb = nn.Embedding(cfg.vocab_size, cfg.n_embd); self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout > 0 else None; n_moba = cfg.n_moba_layer; n_rwkv = cfg.n_layer - n_moba; assert n_rwkv > 0, "n_moba_layer must be < n_layer"; self.rwkv_blocks = nn.ModuleList([RWKVBlock(cfg, i) for i in range(n_rwkv)]); self.moba_blocks = nn.ModuleList([MOBABlock(cfg, n_rwkv + i) for i in range(n_moba)]); interval = max(1, n_rwkv // max(1, n_moba)) if n_moba > 0 else n_rwkv; order = []; ri = 0
+    def __init__(self, cfg):
+        super().__init__(); self.cfg = cfg; self.emb = nn.Embedding(cfg.vocab_size, cfg.n_embd); self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout else None; n_moba, n_rwkv = cfg.n_moba_layer, cfg.n_layer - cfg.n_moba_layer; assert n_rwkv > 0, "n_moba_layer must be < n_layer"; self.rwkv_blocks = nn.ModuleList([RWKVBlock(cfg, i) for i in range(n_rwkv)]); self.moba_blocks = nn.ModuleList([MOBABlock(cfg, n_rwkv + i) for i in range(n_moba)]); interval = max(1, n_rwkv // max(1, n_moba)) if n_moba else n_rwkv; self._order = []; ri = 0
         for m in range(n_moba):
-            take = interval if m < n_moba - 1 else n_rwkv - ri; order += [("rwkv", ri + k) for k in range(take)]; ri += take; order.append(("moba", m))
-        order += [("rwkv", ri + k) for k in range(n_rwkv - ri)]; self._order = order; self.ln_out = nn.LayerNorm(cfg.n_embd); self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+            take = interval if m < n_moba - 1 else n_rwkv - ri; self._order += [("rwkv", ri + k) for k in range(take)]; ri += take; self._order.append(("moba", m))
+        self._order += [("rwkv", ri + k) for k in range(n_rwkv - ri)]; self.ln_out = nn.LayerNorm(cfg.n_embd); self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
 
     def forward(self, idx, labels=None, state=None, use_cache=False, return_logits=True):
-        B, T = idx.shape; x = self.emb(idx); x = self.dropout(x) if self.dropout is not None else x; v_first = None
-        if state is None: tmix_state, cmix_state = [None] * len(self.rwkv_blocks), [None] * len(self._order)
-        else: tmix_state, cmix_state = state["tmix"], state["cmix"]
-        new_tmix_state, new_cmix_state = list(tmix_state), list(cmix_state)
+        B, T = idx.shape; x = self.emb(idx); x = self.dropout(x) if self.dropout else x; v_first = None
+        if state is None: tmix_state, cmix_state, att_state = [None] * len(self.rwkv_blocks), [None] * len(self._order), [None] * len(self.moba_blocks)
+        else: tmix_state, cmix_state = state["tmix"], state["cmix"]; att_state = state.get("moba_att", [None] * len(self.moba_blocks))
+        nts, ncs, nas = list(tmix_state), list(cmix_state), list(att_state)
         for pos, (kind, i) in enumerate(self._order):
-            if kind == "rwkv": x, v_first, ts, cs = self.rwkv_blocks[i](x, v_first, tmix_state[i], cmix_state[pos]); new_tmix_state[i], new_cmix_state[pos] = ts, cs
-            else: x, cs = self.moba_blocks[i](x, cmix_state[pos]); new_cmix_state[pos] = cs
-        x = self.ln_out(x); logits = self.head(x); loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100) if labels is not None else None; logits = logits if return_logits else None; new_state = {"tmix": new_tmix_state, "cmix": new_cmix_state} if use_cache else None
+            if kind == "rwkv": x, v_first, ts, cs = self.rwkv_blocks[i](x, v_first, tmix_state[i], cmix_state[pos]); nts[i], ncs[pos] = ts, cs
+            else: x, cs, ats = self.moba_blocks[i](x, cmix_state[pos], att_state[i], use_cache); ncs[pos], nas[i] = cs, ats
+        x = self.ln_out(x); logits = self.head(x); loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100) if labels is not None else None; logits = logits if return_logits else None; new_state = {"tmix": nts, "cmix": ncs, "moba_att": nas} if use_cache else None
         return logits, loss, new_state
 
     def num_parameters(self): return sum(p.numel() for p in self.parameters())
@@ -271,13 +224,11 @@ class RWKVXModel(nn.Module):
     @classmethod
     def from_pretrained(cls, in_dir: Path):
         from safetensors.torch import load_file
-        in_dir = Path(in_dir); cfg = RWKVXConfig.load(in_dir / "config.json"); sd = load_file(str(in_dir / "model.safetensors")); model = cls(cfg)
-        packed = [k[:-len(".packed")] for k in sd if k.endswith(".packed")]
+        in_dir = Path(in_dir); cfg = RWKVXConfig.load(in_dir / "config.json"); sd = load_file(str(in_dir / "model.safetensors")); model = cls(cfg); packed = [k[:-7] for k in sd if k.endswith(".packed")]
         if packed:
             from qat import QuantizedLinear
             for path in packed:
-                shape_key = path + ".weight_shape"; scale_key = path + ".scale"; packed_key = path + ".packed"
-                if shape_key not in sd or scale_key not in sd: raise RuntimeError(f"quantized layer {path} is missing shape metadata")
-                parent_path, name = path.rsplit(".", 1) if "." in path else ("", path); parent = model.get_submodule(parent_path) if parent_path else model
-                setattr(parent, name, QuantizedLinear(sd[packed_key], sd[scale_key], sd[shape_key].tolist()))
+                sk, pk, shape = path + ".scale", path + ".packed", path + ".weight_shape"
+                if sk not in sd or shape not in sd: raise RuntimeError(f"quantized layer {path} is missing shape metadata")
+                parent_path, name = path.rsplit(".", 1) if "." in path else ("", path); parent = model.get_submodule(parent_path) if parent_path else model; setattr(parent, name, QuantizedLinear(sd[pk], sd[sk], sd[shape].tolist()))
         model.load_state_dict(sd, strict=True); return model
