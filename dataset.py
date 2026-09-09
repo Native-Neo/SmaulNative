@@ -126,7 +126,9 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read().strip()
                 if content:
-                    record = start_idx if str(path) == resume_file else 0
+                    record = 0
+                    if str(path) == resume_file:
+                        record = start_idx
                     yield content, str(path), record + 1
             elif suffix == ".jsonl":
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -165,7 +167,11 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None,
                 pf = pq.ParquetFile(path)
                 schema_names = pf.schema_arrow.names
                 schema_lower = [c.lower() for c in schema_names]
-                fast_col = next((schema_names[schema_lower.index(c)] for c in TEXT_KEYS if c in schema_lower), None)
+                fast_col = None
+                for cand in TEXT_KEYS:
+                    if cand in schema_lower:
+                        fast_col = schema_names[schema_lower.index(cand)]
+                        break
                 i = -1
                 for batch in pf.iter_batches(batch_size=1024):
                     if fast_col is not None:
@@ -214,33 +220,94 @@ class PretrainStream(IterableDataset):
                 while len(buf) >= self.ctx_len + 1:
                     chunk = buf[:self.ctx_len + 1]
                     del buf[:self.ctx_len]
-                    self.last_pos = (path, rec_idx)
+                    self.buffer_tokens = buf
                     yield torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long), self.last_pos
 
-        if len(buf) >= 2:
-            while len(buf) >= self.ctx_len + 1:
-                chunk = buf[:self.ctx_len + 1]
-                del buf[:self.ctx_len]
-                yield torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long), self.last_pos
+
+DEFAULT_STOP_TOKEN = "\n\n"
+
+
+def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
+    out = []
+    for sentence in conversations:
+        frm = sentence["from"]
+        frm_str = "User" if frm.lower() in ("user", "human") else "Assistant" if frm.lower() in ("assistant", "gpt") else frm
+        new = dict(sentence)
+        new["from"] = frm_str
+        new["value"] = frm_str + ": " + sentence.get("value", "") + DEFAULT_STOP_TOKEN
+        out.append(new)
+    return out
+
+
+def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrapper, ctx_len: int,
+                              pad_token_id: int) -> Dict[str, torch.Tensor]:
+    input_ids, tokenized_lens, speakers, prefix_lens = [], [], [], []
+    for c in _add_speaker_and_signal(conversations):
+        ids = tokenizer.encode(c["value"])
+        input_ids.extend(ids)
+        tokenized_lens.append(len(ids))
+        speakers.append(c["from"])
+        prefix_lens.append(len(tokenizer.encode(c["from"] + ": ")))
+    targets = list(input_ids)
+    cur = 0
+    for length, speaker, prefix_len in zip(tokenized_lens, speakers, prefix_lens):
+        if speaker.lower() == "user":
+            targets[cur:cur + length] = [IGNORE_INDEX] * length
+        elif speaker.lower() == "assistant":
+            targets[cur:min(cur + prefix_len, cur + length)] = [IGNORE_INDEX] * min(prefix_len, length)
+        cur += length
+    input_ids = input_ids[:ctx_len]
+    targets = targets[:ctx_len]
+    pad_len = ctx_len - len(input_ids)
+    if pad_len:
+        input_ids.extend([pad_token_id] * pad_len)
+        targets.extend([IGNORE_INDEX] * pad_len)
+    return {"input_ids": torch.tensor(input_ids, dtype=torch.long), "labels": torch.tensor(targets, dtype=torch.long)}
+
+
+def discover_sft_records(dataset_dir: Path) -> List[Dict]:
+    records = []
+    for path in discover_files(dataset_dir):
+        if path.suffix.lower() not in (".json", ".jsonl"):
+            continue
+        try:
+            if path.suffix.lower() == ".jsonl":
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            records.append(json.loads(line))
+            else:
+                data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+                records.extend(data if isinstance(data, list) else [data])
+        except Exception as e:
+            print(f"[WARN] skipping SFT file {path}: {e}")
+    records = [r for r in records if isinstance(r, dict) and "conversations" in r]
+    if not records:
+        raise RuntimeError(f"No SFT conversation records found under {dataset_dir}")
+    return records
 
 
 class SFTDataset(Dataset):
+    _CACHE_MAX = 2048
+
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int):
+        self.records = discover_sft_records(dataset_dir)
         self.tokenizer = tokenizer
         self.ctx_len = ctx_len
-        files = discover_files(dataset_dir)
-        self.records = []
-        for text, path, idx in iter_texts(files):
-            ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
-            if len(ids) >= 2:
-                ids = ids[:ctx_len + 1]
-                self.records.append((ids[:-1], ids[1:]))
-        if not self.records:
-            raise RuntimeError(f"No usable SFT records found under {dataset_dir}")
+        self.pad_token_id = tokenizer.pad_token_id
+        self._processed_cache: "OrderedDict[int, Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
-        x, y = self.records[idx]
-        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+        if idx in self._processed_cache:
+            self._processed_cache.move_to_end(idx)
+            return self._processed_cache[idx]
+        d = _preprocess_conversation(self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id)
+        item = (d["input_ids"], d["labels"])
+        self._processed_cache[idx] = item
+        if len(self._processed_cache) > self._CACHE_MAX:
+            self._processed_cache.popitem(last=False)
+        return item
