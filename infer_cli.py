@@ -60,12 +60,12 @@ def main():
         answer = []
         try:
             for chunk in engine.stream(
-                prompt,
-                max_new_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repeat_penalty,
+                    prompt,
+                    max_new_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    repetition_penalty=args.repeat_penalty,
             ):
                 print(chunk, end="", flush=True)
                 answer.append(chunk)
@@ -75,10 +75,8 @@ def main():
         text = "".join(answer)
         messages.append({"role": "assistant", "content": text})
         tokens = len(engine.encode(text))
-        print(
-            f"\n[{tokens} tokens | {elapsed:.2f}s | "
-            f"{tokens / max(elapsed, 1e-6):.2f} tok/s]"
-        )
+        print(f"\n[{tokens} tokens | {elapsed:.2f}s | "
+              f"{tokens / max(elapsed, 1e-6):.2f} tok/s]")
 
 
 if __name__ == "__main__":
