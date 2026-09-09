@@ -26,22 +26,9 @@ def _json_texts(data):
     if isinstance(data, str):
         yield data
     elif isinstance(data, dict):
-        text = next(
-            (
-                data[k]
-                for k in (
-                    "text",
-                    "content",
-                    "document",
-                    "body",
-                    "code",
-                    "prompt",
-                    "completion",
-                )
-                if isinstance(data.get(k), str)
-            ),
-            None,
-        )
+        text = next((data[k] for k in (
+            "text", "content", "document", "body", "code", "prompt", "completion"
+        ) if isinstance(data.get(k), str)), None)
         if text is not None:
             yield text
         elif "data" in data:
@@ -97,15 +84,9 @@ def read_texts(path, max_records=0):
                 raise SystemExit("Parquet support: pip install pyarrow")
             pf = pq.ParquetFile(f)
             names = pf.schema_arrow.names
-            col = next(
-                (
-                    c
-                    for c in names
-                    if c.lower()
-                    in {"text", "content", "document", "body", "code", "prompt", "completion"}
-                ),
-                None,
-            )
+            col = next((c for c in names if c.lower() in {
+                "text", "content", "document", "body", "code", "prompt", "completion"
+            }), None)
             if col:
                 for batch in pf.iter_batches(batch_size=1024, columns=[col]):
                     for x in batch.column(0).to_pylist():
@@ -246,12 +227,7 @@ def _build(texts, vocab_size, word_budget, max_records=0):
 
 
 def train(dataset, vocab_size=64000, word_budget=40000, max_records=0):
-    return _build(
-        read_texts(Path(dataset), max_records),
-        vocab_size,
-        word_budget,
-        max_records,
-    )
+    return _build(read_texts(Path(dataset), max_records), vocab_size, word_budget, max_records)
 
 
 class SmaulTokenizer:
@@ -270,8 +246,7 @@ class SmaulTokenizer:
 
     def save(self, path):
         Path(path).write_text(
-            json.dumps(self.data, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
+            json.dumps(self.data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
         )
 
     def get_vocab_size(self):
@@ -341,13 +316,7 @@ def decode(ids, tok):
     return "".join(out)
 
 
-def train_tokenizer(
-    dataset_dir,
-    output_path,
-    vocab_size=64000,
-    stream_name="none",
-    max_records=0,
-):
+def train_tokenizer(dataset_dir, output_path, vocab_size=64000, stream_name="none", max_records=0):
     if stream_name != "none":
         from stream_data import stream_dataset
 
@@ -387,15 +356,9 @@ def main():
 
 
 def train_cmd(a):
-    d = _build(
-        read_texts(Path(a.fromdataset), a.max_records),
-        a.vocab_size,
-        a.word_budget,
-        a.max_records,
-    )
+    d = _build(read_texts(Path(a.fromdataset), a.max_records), a.vocab_size, a.word_budget, a.max_records)
     Path(a.output).write_text(
-        json.dumps(d, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
+        json.dumps(d, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
     )
     s = d["stats"]
     print(
