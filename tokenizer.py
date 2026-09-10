@@ -190,6 +190,8 @@ def _build(texts, vocab_size, word_budget, max_records=0):
                 chars.update(token)
         if max_records and seen >= max_records:
             break
+    if seen == 0 or total_tokens == 0:
+        raise RuntimeError("no usable text records found for tokenizer training")
     tokens = SPECIAL + CASE
     seen_tokens = set(tokens)
     for x, _ in words.most_common(word_budget):
