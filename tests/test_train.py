@@ -35,6 +35,41 @@ def test_final_partial_batch_is_flushed(monkeypatch):
     assert calls == [1]
 
 
+def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
+    class Args:
+        stream_dataset = "none"
+        ctx_len = 4
+        batch_size = 1
+        log_every = 999
+        save_every = 1
+        optimizer_save_every = 2
+        output_dir = "."
+        checkpoint_dir = "."
+        tokenizer_path = "tokenizer.json"
+        save_dtype = "fp32"
+
+    class Stream:
+        buffer_tokens = []
+        def __iter__(self):
+            yield torch.arange(4), torch.arange(1, 5), ("data.txt", 1)
+            yield torch.arange(4), torch.arange(1, 5), ("data.txt", 2)
+
+    saves = []
+
+    def train_batch(*args):
+        args[3].global_step += 1
+        return torch.tensor(1.0)
+
+    monkeypatch.setattr(train, "PretrainStream", lambda *args, **kwargs: Stream())
+    monkeypatch.setattr(train, "_train_pretrain_batch", train_batch)
+    monkeypatch.setattr(train, "save_checkpoint", lambda *args, **kwargs: saves.append(args))
+    resume = train.ResumeState()
+    train.STOP_REQUESTED = False
+    train.train_pretrain(Args(), object(), object(), resume, torch.device("cpu"), object(), None)
+    assert len(saves) == 1
+    assert saves[0][2].global_step == 2
+
+
 def test_resume_state_round_trip(tmp_path):
     state = train.ResumeState()
     state.global_step = 7
