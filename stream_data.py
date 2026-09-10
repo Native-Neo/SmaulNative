@@ -82,7 +82,12 @@ def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str, min_c
     with fs.open(remote, "rb") as handle:
         pf = pq.ParquetFile(handle)
         column, conversation = _text_column(pf)
-        columns = [column] if column else None
+        schema_names = pf.schema_arrow.names
+        lower = {name.lower(): name for name in schema_names}
+        prompt_col = lower.get("prompt")
+        completion_col = lower.get("completion")
+        pair_columns = prompt_col is not None and completion_col is not None and prompt_col != completion_col
+        columns = [prompt_col, completion_col] if pair_columns else ([column] if column else None)
         row_groups = pf.num_row_groups
 
     record = 0
@@ -103,7 +108,11 @@ def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str, min_c
                     if record < skip:
                         record += 1
                         continue
-                    if column:
+                    if pair_columns and isinstance(value, dict):
+                        prompt = value.get(prompt_col)
+                        completion = value.get(completion_col)
+                        text = f"{prompt}\n{completion}" if isinstance(prompt, str) and isinstance(completion, str) else ""
+                    elif column:
                         text = _conversation(value) if conversation else value
                     else:
                         text = (max(
