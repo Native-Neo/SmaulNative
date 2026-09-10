@@ -98,11 +98,7 @@ def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str, min_c
                 try:
                     rows = future.result()
                 except Exception as exc:
-                    print(
-                        f"[WARN] skipping row group {group_index} in {rel_path}: {exc}",
-                        file=sys.stderr,
-                    )
-                    continue
+                    raise RuntimeError(f"failed to read row group {group_index} in {rel_path}") from exc
                 for value in rows:
                     if record < skip:
                         record += 1
