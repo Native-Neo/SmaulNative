@@ -364,7 +364,7 @@ class RWKVXModel(nn.Module):
         B, T = idx.shape
         x = self.emb(idx)
         x = self.dropout(x) if self.dropout else x
-        v_first = None
+        v_first = state.get("v_first") if state is not None else None
         if state is None:
             tmix_state, cmix_state, att_state = [None] * len(self.rwkv_blocks), [None] * len(self._order), [None] * len(self.moba_blocks)
         else:
@@ -381,7 +381,7 @@ class RWKVXModel(nn.Module):
         logits = self.head(x)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100) if labels is not None else None
         logits = logits if return_logits else None
-        new_state = {"tmix": nts, "cmix": ncs, "moba_att": nas} if use_cache else None
+        new_state = {"tmix": nts, "cmix": ncs, "moba_att": nas, "v_first": v_first} if use_cache else None
         return logits, loss, new_state
 
     def num_parameters(self):
