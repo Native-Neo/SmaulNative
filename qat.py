@@ -99,6 +99,9 @@ class QATLinear(nn.Module):
         self.act_fq = _activation_fake_quant(signed_activation)
         self.fake_quant_enabled = True
 
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        destination[prefix + "weight"] = self.weight if keep_vars else self.weight.detach()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.fake_quant_enabled:
             return F.linear(x, self.weight)
