@@ -3,7 +3,10 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dataset import IGNORE_INDEX, SFTDataset, _preprocess_conversation, iter_texts
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from dataset import IGNORE_INDEX, _preprocess_conversation, iter_texts
 
 
 class Tok:
@@ -25,6 +28,13 @@ def test_prompt_and_completion_are_combined():
     path = tmp_path / "x.jsonl"
     path.write_text(json.dumps({"prompt": "Q", "completion": "A"}) + "\n")
     assert list(iter_texts([path]))[0][0] == "Q\nA"
+
+
+def test_parquet_prompt_and_completion_are_combined(tmp_path):
+    path = tmp_path / "x.parquet"
+    pq.write_table(pa.table({"prompt": ["Q1", "Q2"], "completion": ["A1", "A2"]}), path)
+    rows = list(iter_texts([path]))
+    assert [row[0] for row in rows] == ["Q1\nA1", "Q2\nA2"]
 
 
 def test_sft_only_assistant_is_target():
