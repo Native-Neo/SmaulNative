@@ -34,6 +34,28 @@ def test_sampling_temperature_zero_is_deterministic():
     assert obj._sample(logits, 0.0, 0, 1.0, 1.0, []) == 1
 
 
+def test_sampling_top_k_top_p_matches_full_sort_reference():
+    obj = RWKVXInference.__new__(RWKVXInference)
+    logits = torch.linspace(-4.0, 4.0, 1000)
+    top_k, top_p = 50, 0.9
+
+    reference = logits.float().clone()
+    reference /= 0.8
+    reference[reference < torch.topk(reference, top_k).values[-1]] = -float("inf")
+    sorted_logits, sorted_idx = torch.sort(reference, descending=True)
+    probs = torch.softmax(sorted_logits, dim=-1)
+    remove = torch.cumsum(probs, dim=-1) > top_p
+    remove[1:] = remove[:-1].clone()
+    remove[0] = False
+    reference[sorted_idx[remove]] = -float("inf")
+    torch.manual_seed(123)
+    expected = int(torch.multinomial(torch.softmax(reference, dim=-1), 1).item())
+
+    torch.manual_seed(123)
+    actual = obj._sample(logits, 0.8, top_k, top_p, 1.0, [])
+    assert actual == expected
+
+
 def test_incremental_decoder_matches_tokenizer_decode():
     data = {
         "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "<cap>": 4, "<upper>": 5, "hello": 6, "world": 7, " ": 8, "!": 9},
