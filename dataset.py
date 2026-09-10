@@ -98,14 +98,21 @@ def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
 
 
 def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_record: int = 0) -> Iterator[Tuple[str, str, int]]:
+    if resume_record < 0:
+        raise ValueError("resume_record must be non-negative")
+    if resume_file is not None:
+        resume_file = str(Path(resume_file).resolve())
+        resolved_files = {str(path.resolve()) for path in files}
+        if resume_file not in resolved_files:
+            raise FileNotFoundError(f"resume file not found in discovered dataset files: {resume_file}")
     started = resume_file is None
     for path in files:
         if not started:
-            if str(path) == resume_file:
+            if str(path.resolve()) == resume_file:
                 started = True
             else:
                 continue
-        start_idx = resume_record if str(path) == resume_file else 0
+        start_idx = resume_record if str(path.resolve()) == resume_file else 0
         suffix = path.suffix.lower()
         try:
             if suffix in (".txt", ".text"):
