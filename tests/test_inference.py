@@ -59,12 +59,17 @@ def test_sampling_top_k_top_p_matches_full_sort_reference():
     assert actual == expected
 
 
-def test_sampling_top_k_excludes_tied_logits():
+def test_sampling_top_k_excludes_tied_logits(monkeypatch):
     obj = RWKVXInference.__new__(RWKVXInference)
-    logits = torch.tensor([5.0, 5.0, 5.0, 4.0])
-    torch.manual_seed(0)
-    samples = {obj._sample(logits, 1.0, 1, 1.0, 1.0, []) for _ in range(32)}
-    assert samples == {0}
+    captured = {}
+
+    def multinomial(probs, count):
+        captured["probs"] = probs
+        return torch.tensor([0], device=probs.device)
+
+    monkeypatch.setattr(torch, "multinomial", multinomial)
+    obj._sample(torch.tensor([5.0, 5.0, 5.0, 4.0]), 1.0, 1, 1.0, 1.0, [])
+    assert torch.count_nonzero(captured["probs"]).item() == 1
 
 
 def test_incremental_decoder_matches_tokenizer_decode():
@@ -103,6 +108,7 @@ def test_stream_stop_sequence_can_cross_tokens(monkeypatch):
         "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "h": 4, "e": 5, "l": 6, "o": 7, "!": 8},
         "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
         "case_tokens": [],
+        "case_stats": {},
         "unk_id": 1,
         "stats": {"vocab_size": 9},
     }
@@ -125,6 +131,7 @@ def test_stream_stop_sequence_preserves_text_before_boundary(monkeypatch):
         "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "z": 4, "h": 5, "e": 6, "l": 7, "o": 8},
         "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
         "case_tokens": [],
+        "case_stats": {},
         "unk_id": 1,
         "stats": {"vocab_size": 9},
     }
