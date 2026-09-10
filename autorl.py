@@ -253,7 +253,7 @@ class AutoRL:
             clipped_ratio = ratio.clamp(1 - clip, 1 + clip)
             token_advantage = advantage.detach().expand_as(ratio)
             policy_loss = -torch.minimum(ratio * token_advantage, clipped_ratio * token_advantage).mean()
-            sampled_kl = (torch.exp(log_ratio.clamp(-20, 20)) - log_ratio - 1).mean()
+            sampled_kl = -log_ratio.mean()
             losses.append(policy_loss + kl_coef * sampled_kl)
         if not losses:
             return 0.0
