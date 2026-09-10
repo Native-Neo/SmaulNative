@@ -97,20 +97,25 @@ class AutoRL:
 
     @torch.no_grad()
     def generate(self, prompt: str, max_new_tokens: int, temperature: float, top_k: int, top_p: float):
-        prompt_ids = self._encode(prompt)
-        if not prompt_ids:
-            prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
-        ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-        logits, _, state = self.model(ids, state=None, use_cache=True, return_logits=True)
-        response, old_logprobs = [], []
-        for _ in range(max_new_tokens):
-            token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
-            if token == self.eos_id:
-                break
-            response.append(token)
-            old_logprobs.append(logprob)
-            logits, _, state = self.model(torch.tensor([[token]], device=self.device), state=state, use_cache=True, return_logits=True)
-        return self._decode(response), response, old_logprobs
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            prompt_ids = self._encode(prompt)
+            if not prompt_ids:
+                prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
+            ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+            logits, _, state = self.model(ids, state=None, use_cache=True, return_logits=True)
+            response, old_logprobs = [], []
+            for _ in range(max_new_tokens):
+                token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
+                if token == self.eos_id:
+                    break
+                response.append(token)
+                old_logprobs.append(logprob)
+                logits, _, state = self.model(torch.tensor([[token]], device=self.device), state=state, use_cache=True, return_logits=True)
+            return self._decode(response), response, old_logprobs
+        finally:
+            self.model.train(was_training)
 
     def candidates(self, prompt: str, count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float):
         candidates = []
