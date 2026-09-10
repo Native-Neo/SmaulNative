@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import re
 import unicodedata
@@ -45,6 +46,23 @@ def _json_texts(data):
             yield from _json_texts(x)
 
 
+def _record_text(record):
+    lower = {str(k).lower(): v for k, v in record.items()}
+    prompt = lower.get("prompt")
+    completion = lower.get("completion")
+    if isinstance(prompt, str) and isinstance(completion, str):
+        return prompt + "\n" + completion
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(completion, str):
+        return completion
+    for key in ("text", "content", "document", "body", "code"):
+        value = lower.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
 def read_texts(path, max_records=0):
     files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
     seen = 0
@@ -79,6 +97,16 @@ def read_texts(path, max_records=0):
                 seen += 1
                 if max_records and seen >= max_records:
                     return
+        elif ext == ".csv":
+            with f.open("r", encoding="utf-8", newline="") as h:
+                for row in csv.DictReader(h):
+                    text = _record_text(row)
+                    if not text:
+                        continue
+                    yield text
+                    seen += 1
+                    if max_records and seen >= max_records:
+                        return
         elif ext == ".parquet":
             try:
                 import pyarrow.parquet as pq
