@@ -63,3 +63,49 @@ def test_cached_decode_preserves_first_token_v():
             logits, _, state = model(continuation[:, i:i + 1], state=state, use_cache=True)
             expected = full_logits[:, prompt.size(1) + i:prompt.size(1) + i + 1]
             assert torch.allclose(logits, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_stream_stop_sequence_can_cross_tokens(monkeypatch):
+    data = {
+        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "h": 4, "e": 5, "l": 6, "o": 7, "!": 8},
+        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
+        "case_tokens": [],
+        "case_stats": {},
+        "unk_id": 1,
+        "stats": {"vocab_size": 9},
+    }
+    obj = RWKVXInference.__new__(RWKVXInference)
+    obj.device = torch.device("cpu")
+    obj.tokenizer = SmaulTokenizer(data)
+    obj.eos_id = 3
+    obj.bos_id = 2
+    obj.last_prompt_tokens = 0
+    monkeypatch.setattr(obj, "_prepare", lambda prompt: [2])
+    monkeypatch.setattr(obj, "_forward", lambda tokens, state=None: (torch.zeros(1, 1, 9), None, state))
+    tokens = iter([4, 5, 6, 6, 7, 8])
+    monkeypatch.setattr(obj, "_sample", lambda *args: next(tokens))
+    output = "".join(obj.stream("", max_new_tokens=6, temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0, stop=["hello"]))
+    assert output == ""
+
+
+def test_stream_stop_sequence_preserves_text_before_boundary(monkeypatch):
+    data = {
+        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "a": 4, "b": 5, "c": 6, "x": 7},
+        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
+        "case_tokens": [],
+        "case_stats": {},
+        "unk_id": 1,
+        "stats": {"vocab_size": 8},
+    }
+    obj = RWKVXInference.__new__(RWKVXInference)
+    obj.device = torch.device("cpu")
+    obj.tokenizer = SmaulTokenizer(data)
+    obj.eos_id = 3
+    obj.bos_id = 2
+    obj.last_prompt_tokens = 0
+    monkeypatch.setattr(obj, "_prepare", lambda prompt: [2])
+    monkeypatch.setattr(obj, "_forward", lambda tokens, state=None: (torch.zeros(1, 1, 8), None, state))
+    tokens = iter([4, 5, 6, 7, 3])
+    monkeypatch.setattr(obj, "_sample", lambda *args: next(tokens))
+    output = "".join(obj.stream("", max_new_tokens=5, temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0, stop=["abc"]))
+    assert output == ""
