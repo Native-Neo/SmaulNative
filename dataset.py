@@ -275,6 +275,8 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
         tokenized_lens.append(len(ids))
         speakers.append(c["from"])
         prefix_lens.append(len(tokenizer.encode(c["from"] + ": ")))
+    if not input_ids:
+        raise ValueError("SFT record contains no valid conversation turns")
     targets = [IGNORE_INDEX] * len(input_ids)
     cur = 0
     for length, speaker, prefix_len in zip(tokenized_lens, speakers, prefix_lens):
@@ -283,6 +285,8 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
         cur += length
     input_ids = input_ids[:ctx_len]
     targets = targets[:ctx_len]
+    if not any(x != IGNORE_INDEX for x in targets):
+        raise ValueError("SFT record contains no assistant targets within ctx_len")
     pad_len = ctx_len - len(input_ids)
     if pad_len:
         input_ids.extend([pad_token_id] * pad_len)
