@@ -1,17 +1,17 @@
 # Run this on your machine (where torch is installed) before training with the
-# updated RWKV_CMix_MoE. Confirms the sparse-gather rewrite == old dense-mask math.
+# sparse RWKV_CMix_MoE. Confirms sparse expert dispatch matches dense-mask math.
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from rwkv_x_core import RWKVXConfig, RWKV_CMix_MoE  # no dots
+from rwkv_x_core import RWKVXConfig, RWKV_CMix_MoE
 
 torch.manual_seed(0)
 cfg = RWKVXConfig(n_embd=128, num_experts=8, num_experts_per_tok=2, is_moe=True, n_layer=4)
 moe = RWKV_CMix_MoE(cfg, 0)
-x = torch.randn(2, 64, 128)
+x = torch.randn(2, 64, 128, requires_grad=True)
 
 
 def dense_ref(moe, x, x_prev_last=None):
@@ -32,7 +32,13 @@ def dense_ref(moe, x, x_prev_last=None):
 
 new_out, _ = moe(x)
 ref_out = dense_ref(moe, x)
-print("max abs diff:", (new_out - ref_out).abs().max().item())  # should be ~0 (fp rounding only)
+diff = (new_out - ref_out).abs().max().item()
+print("max abs diff:", diff)
+assert diff < 1e-5
+new_out.sum().backward()
+assert x.grad is not None and torch.isfinite(x.grad).all()
+assert all(expert.key.weight.grad is not None for expert in moe.experts)
+assert moe.gate.weight.grad is not None
 
 import time
 
