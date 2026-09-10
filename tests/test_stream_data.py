@@ -26,6 +26,12 @@ def test_stream_validation_requires_dataset_for_resume_file():
         list(stream_data.stream_dataset("english", start_file="data.parquet"))
 
 
+def test_stream_validation_rejects_missing_resume_file(monkeypatch):
+    monkeypatch.setattr(stream_data, "_files", lambda *args, **kwargs: ["other.parquet"])
+    with pytest.raises(FileNotFoundError, match="resume file not found"):
+        list(stream_data.stream_dataset("english", start_dataset="english", start_file="missing.parquet"))
+
+
 def test_failed_row_group_is_not_silently_skipped(monkeypatch):
     def fail(*args, **kwargs):
         raise OSError("network failure")
