@@ -209,7 +209,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                             if text:
                                 yield text, str(path), i + 1
         except Exception as e:
-            print(f"[WARN] skipping {path}: {e}")
+            raise RuntimeError(f"failed to read dataset file {path}") from e
 
 
 class PretrainStream(IterableDataset):
