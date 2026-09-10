@@ -95,3 +95,10 @@ def test_invalid_rng_checkpoint_fails_loudly(tmp_path):
     torch.save({}, path)
     with pytest.raises(RuntimeError, match="missing torch RNG state"):
         train._load_rng_state(path)
+
+
+def test_malformed_remote_resume_position_fails_loudly():
+    resume = train.ResumeState()
+    resume.file_path = "local_dataset.txt"
+    with pytest.raises(ValueError, match="invalid remote resume position"):
+        next(train._remote_token_stream("hindi", object(), 4, resume))
