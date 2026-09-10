@@ -283,9 +283,7 @@ class CausalSelfAttention(nn.Module):
                     hist_mask = torch.ones(hi - lo, npick * cs, dtype=torch.bool, device=x.device)
                     causal = torch.tril(torch.ones(hi - lo, hi - lo, dtype=torch.bool, device=x.device))
                     base_mask = torch.cat((hist_mask, causal), 1)
-                    mask = base_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1).reshape(B * H * (hi - lo), 1, npick * cs + hi - lo)
-                    yi = F.scaled_dot_product_attention(qflat, torch.cat((sk, ownk_flat), 1), torch.cat((sv, ownv_flat), 1), attn_mask=mask)
-                    yi = yi.reshape(B, H, hi - lo, N)
+                    yi = F.scaled_dot_product_attention(qi, torch.cat((sk, ownk), 2), torch.cat((sv, ownv), 2), attn_mask=base_mask)
                 out[:, :, lo:hi] = yi
             y = out
         return self.output(y.transpose(1, 2).contiguous().view(B, T, C)), (k, v) if use_cache else None
