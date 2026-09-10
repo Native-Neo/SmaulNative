@@ -284,11 +284,10 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler):
             t0 = time.perf_counter()
             tokens_since_log = 0
 
-        if resume.global_step % args.save_every == 0:
+        if resume.global_step % args.save_every == 0 and resume.global_step % args.optimizer_save_every == 0:
             save_checkpoint(
                 model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir),
-                Path(args.tokenizer_path), args.save_dtype,
-                resume.global_step % args.optimizer_save_every == 0,
+                Path(args.tokenizer_path), args.save_dtype, True,
             )
         if STOP_REQUESTED:
             break
@@ -323,11 +322,10 @@ def train_sft(args, model, optimizer, resume, device, tokenizer, scaler):
             resume.record_index = consumed
             if resume.global_step % args.log_every == 0:
                 print(f"epoch {epoch} step {resume.global_step} | loss {loss.item():.4f}")
-            if resume.global_step % args.save_every == 0:
+            if resume.global_step % args.save_every == 0 and resume.global_step % args.optimizer_save_every == 0:
                 save_checkpoint(
                     model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir),
-                    Path(args.tokenizer_path), args.save_dtype,
-                    resume.global_step % args.optimizer_save_every == 0,
+                    Path(args.tokenizer_path), args.save_dtype, True,
                 )
             if STOP_REQUESTED:
                 break
