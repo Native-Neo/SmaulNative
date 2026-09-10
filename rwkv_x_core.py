@@ -45,7 +45,7 @@ class RWKVXConfig:
         dg = max(32, round(0.6 * C**0.8 / 32) * 32)
         tmix = 4 * C * C + C * (4 * dd + 2 * dm + 2 * dg)
         cmix = 8 * C * C
-        return (2 * V * C + (L - self.n_moba_layer) * (tmix + cmix) + self.n_moba_layer * (4 * C * C + cmix))
+        return 2 * V * C + (L - self.n_moba_layer) * (tmix + cmix) + self.n_moba_layer * (4 * C * C + cmix)
 
 
 def config_for_target_params(target_params: int, vocab_size: int = 65530, n_embd: int = 832,
@@ -275,7 +275,7 @@ class CausalSelfAttention(nn.Module):
                     ownv_flat = ownv.unsqueeze(2).expand(-1, -1, hi - lo, -1, -1).reshape(B * H * (hi - lo), hi - lo, N)
                     hist_mask = torch.ones(hi - lo, npick * cs, dtype=torch.bool, device=x.device)
                     causal = torch.tril(torch.ones(hi - lo, hi - lo, dtype=torch.bool, device=x.device))
-                    mask = torch.cat((hist_mask, causal), 1).unsqueeze(0).expand(B * H * (hi - lo), -1, -1)
+                    mask = torch.cat((hist_mask, causal), 1).reshape(B * H * (hi - lo), 1, npick * cs + hi - lo)
                     yi = F.scaled_dot_product_attention(qflat, torch.cat((sk, ownk_flat), 1), torch.cat((sv, ownv_flat), 1), attn_mask=mask)
                     yi = yi.reshape(B, H, hi - lo, N)
                 out[:, :, lo:hi] = yi
