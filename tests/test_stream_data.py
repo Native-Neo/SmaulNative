@@ -16,6 +16,16 @@ def test_stream_validation_rejects_bad_bounds():
         list(stream_data.stream_dataset("hindi", min_chars=10, max_chars=5))
 
 
+def test_stream_validation_rejects_resume_dataset_mismatch():
+    with pytest.raises(ValueError, match="start_dataset"):
+        list(stream_data.stream_dataset("english", start_dataset="hindi"))
+
+
+def test_stream_validation_requires_dataset_for_resume_file():
+    with pytest.raises(ValueError, match="start_file requires start_dataset"):
+        list(stream_data.stream_dataset("english", start_file="data.parquet"))
+
+
 def test_failed_row_group_is_not_silently_skipped(monkeypatch):
     def fail(*args, **kwargs):
         raise OSError("network failure")
