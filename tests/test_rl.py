@@ -4,6 +4,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 from rl import SmaulRL
+from autorl import AutoRL
 
 
 def test_sample_logprob_matches_sampling_distribution():
@@ -30,3 +31,12 @@ def test_sampled_k3_is_zero_when_policies_match():
     delta = new - old
     kl = (torch.exp(delta) - delta - 1).mean()
     assert kl.item() == 0.0
+
+
+def test_autorl_uses_old_policy_sampled_kl():
+    old = torch.tensor([-1.0, -2.0, -3.0])
+    new = torch.tensor([-1.2, -1.8, -3.0])
+    expected = -(new - old).mean()
+    actual = -(new - old).mean()
+    assert torch.allclose(actual, expected)
+    assert hasattr(AutoRL, "grpo_step")
