@@ -77,15 +77,26 @@ class RWKVXInference:
         if temperature <= 0:
             return int(torch.argmax(logits).item())
         logits /= temperature
+        candidate_idx = None
         if top_k > 0 and top_k < logits.numel():
-            logits[logits < torch.topk(logits, top_k).values[-1]] = -float("inf")
+            candidate_idx = torch.topk(logits, top_k).indices
+            logits[logits < logits[candidate_idx].min()] = -float("inf")
         if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-            probs = torch.softmax(sorted_logits, dim=-1)
-            remove = torch.cumsum(probs, dim=-1) > top_p
-            remove[1:] = remove[:-1].clone()
-            remove[0] = False
-            logits[sorted_idx[remove]] = -float("inf")
+            if candidate_idx is None:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+                probs = torch.softmax(sorted_logits, dim=-1)
+                remove = torch.cumsum(probs, dim=-1) > top_p
+                remove[1:] = remove[:-1].clone()
+                remove[0] = False
+                logits[sorted_idx[remove]] = -float("inf")
+            else:
+                candidate_logits = logits[candidate_idx]
+                sorted_logits, order = torch.sort(candidate_logits, descending=True)
+                probs = torch.softmax(sorted_logits, dim=-1)
+                remove = torch.cumsum(probs, dim=-1) > top_p
+                remove[1:] = remove[:-1].clone()
+                remove[0] = False
+                logits[candidate_idx[order[remove]]] = -float("inf")
         return int(torch.multinomial(torch.softmax(logits, dim=-1), 1).item())
 
     @torch.inference_mode()
