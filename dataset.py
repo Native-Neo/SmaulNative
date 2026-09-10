@@ -314,7 +314,7 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
                 data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
                 records.extend(data if isinstance(data, list) else [data])
         except Exception as e:
-            print(f"[WARN] skipping SFT file {path}: {e}")
+            raise RuntimeError(f"failed to read SFT file {path}") from e
     records = [r for r in records if isinstance(r, dict) and isinstance(r.get("conversations"), list)]
     if not records:
         raise RuntimeError(f"No valid SFT conversation records found under {dataset_dir}")
