@@ -194,7 +194,9 @@ def _optimizer_step(args, model, optimizer, xb, yb, device, scaler):
 def _remote_token_stream(name, tokenizer, ctx_len, resume):
     dataset = file_path = None
     record = 0
-    if resume.file_path and "::" in resume.file_path:
+    if resume.file_path:
+        if "::" not in resume.file_path:
+            raise ValueError(f"invalid remote resume position: {resume.file_path!r}")
         dataset, file_path = resume.file_path.split("::", 1)
         record = resume.record_index
     buffer_tokens = list(resume.buffer_tokens)
