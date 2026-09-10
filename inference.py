@@ -80,7 +80,9 @@ class RWKVXInference:
         candidate_idx = None
         if top_k > 0 and top_k < logits.numel():
             candidate_idx = torch.topk(logits, top_k).indices
-            logits[logits < logits[candidate_idx].min()] = -float("inf")
+            mask = torch.ones_like(logits, dtype=torch.bool)
+            mask[candidate_idx] = False
+            logits[mask] = -float("inf")
         if 0.0 < top_p < 1.0:
             if candidate_idx is None:
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True)
