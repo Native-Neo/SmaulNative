@@ -22,7 +22,6 @@ def test_qat_checkpoint_restores_observers(tmp_path):
         expected = model(x)[0]
 
     model.save_pretrained(tmp_path, include_upstream=False)
-    state = torch.load(tmp_path / "config.json") if False else None
     restored = RWKVXModel.from_pretrained(tmp_path)
 
     qat_modules = list(qat._iter_cmix_modules(restored))
@@ -31,6 +30,8 @@ def test_qat_checkpoint_restores_observers(tmp_path):
     for original, loaded in zip(qat._iter_cmix_modules(model), qat._iter_cmix_modules(restored)):
         assert torch.equal(original.key.weight_fq.scale, loaded.key.weight_fq.scale)
         assert torch.equal(original.key.weight_fq.zero_point, loaded.key.weight_fq.zero_point)
+        assert torch.equal(original.key.act_fq.scale, loaded.key.act_fq.scale)
+        assert torch.equal(original.key.act_fq.zero_point, loaded.key.act_fq.zero_point)
         assert torch.equal(original.value.act_fq.scale, loaded.value.act_fq.scale)
         assert torch.equal(original.value.act_fq.zero_point, loaded.value.act_fq.zero_point)
 
