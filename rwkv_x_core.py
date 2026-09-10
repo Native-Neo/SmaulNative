@@ -424,5 +424,10 @@ class RWKVXModel(nn.Module):
                 parent_path, name = path.rsplit(".", 1) if "." in path else ("", path)
                 parent = model.get_submodule(parent_path) if parent_path else model
                 setattr(parent, name, QuantizedLinear(sd[pk], sd[sk], sd[shape].tolist()))
+        else:
+            qat_keys = [k for k in sd if k.endswith(".weight_fq.scale") or k.endswith(".act_fq.scale")]
+            if qat_keys:
+                from qat import prepare_qat
+                prepare_qat(model)
         model.load_state_dict(sd, strict=True)
         return model
