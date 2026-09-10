@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # qat.py -- Quantization-Aware Training for RWKV-X, int3.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.ao.quantization import FakeQuantize, MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver
 
-from rwkv_x_core import RWKVXModel, RWKV_CMix_x070, RWKV_CMix_MoE
+from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
 _CMIX_LINEAR_NAMES = ("key", "value")
 WBITS = 3
-NUM_LEVELS = 2 ** WBITS
+NUM_LEVELS = 2**WBITS
 WEIGHT_QMIN, WEIGHT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
 ACT_QMIN, ACT_QMAX = 0, NUM_LEVELS - 1
 SIGNED_ACT_QMIN, SIGNED_ACT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
@@ -20,14 +21,10 @@ def _install_cuda_wkv_compile():
         return
     try:
         import rwkv_x_core
+
         fn = rwkv_x_core._wkv_run_chunk
         if not getattr(fn, "_smaul_cuda_compiled", False):
-            compiled = torch.compile(
-                fn,
-                mode="max-autotune-no-cudagraphs",
-                dynamic=False,
-                fullgraph=False,
-            )
+            compiled = torch.compile(fn, mode="max-autotune-no-cudagraphs", dynamic=False, fullgraph=False)
             compiled._smaul_cuda_compiled = True
             rwkv_x_core._wkv_run_chunk = compiled
         print("[CUDA] WKV TorchInductor enabled")
@@ -39,13 +36,32 @@ _install_cuda_wkv_compile()
 
 
 def _weight_fake_quant() -> FakeQuantize:
-    return FakeQuantize.with_args(observer=MovingAveragePerChannelMinMaxObserver, quant_min=WEIGHT_QMIN, quant_max=WEIGHT_QMAX, dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0)()
+    return FakeQuantize.with_args(
+        observer=MovingAveragePerChannelMinMaxObserver,
+        quant_min=WEIGHT_QMIN,
+        quant_max=WEIGHT_QMAX,
+        dtype=torch.qint8,
+        qscheme=torch.per_channel_symmetric,
+        ch_axis=0,
+    )()
 
 
 def _activation_fake_quant(signed: bool = False) -> FakeQuantize:
     if signed:
-        return FakeQuantize.with_args(observer=MovingAverageMinMaxObserver, quant_min=SIGNED_ACT_QMIN, quant_max=SIGNED_ACT_QMAX, dtype=torch.qint8, qscheme=torch.per_tensor_symmetric)()
-    return FakeQuantize.with_args(observer=MovingAverageMinMaxObserver, quant_min=ACT_QMIN, quant_max=ACT_QMAX, dtype=torch.quint8, qscheme=torch.per_tensor_affine)()
+        return FakeQuantize.with_args(
+            observer=MovingAverageMinMaxObserver,
+            quant_min=SIGNED_ACT_QMIN,
+            quant_max=SIGNED_ACT_QMAX,
+            dtype=torch.qint8,
+            qscheme=torch.per_tensor_symmetric,
+        )()
+    return FakeQuantize.with_args(
+        observer=MovingAverageMinMaxObserver,
+        quant_min=ACT_QMIN,
+        quant_max=ACT_QMAX,
+        dtype=torch.quint8,
+        qscheme=torch.per_tensor_affine,
+    )()
 
 
 def _pack_3bit(codes: torch.Tensor) -> torch.Tensor:
@@ -54,11 +70,13 @@ def _pack_3bit(codes: torch.Tensor) -> torch.Tensor:
     bits = (codes.reshape(-1).to(torch.uint8).unsqueeze(-1) >> shifts) & 1
     flat_bits = bits.reshape(-1)
     pad_len = (8 - (flat_bits.numel() % 8)) % 8
-    if pad_len > 0:
-        flat_bits = torch.cat([flat_bits, torch.zeros(pad_len, dtype=torch.uint8, device=device)])
-    bit_groups = flat_bits.reshape(-1, 8)
+    if pad_len:
+        flat_bits = torch.cat([
+            flat_bits,
+            torch.zeros(pad_len, dtype=torch.uint8, device=device),
+        ])
     powers = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.uint8, device=device)
-    return (bit_groups * powers).sum(dim=-1)
+    return (flat_bits.reshape(-1, 8) * powers).sum(dim=-1)
 
 
 def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
@@ -71,9 +89,11 @@ def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
 
 
 class QATLinear(nn.Module):
+
     def __init__(self, linear: nn.Linear, signed_activation: bool = False):
         super().__init__()
-        assert linear.bias is None, "RWKV-X Channel-Mix linears are all bias=False"
+        if linear.bias is not None:
+            raise ValueError("RWKV-X Channel-Mix linears must have bias=False")
         self.weight = linear.weight
         self.weight_fq = _weight_fake_quant()
         self.act_fq = _activation_fake_quant(signed_activation)
@@ -85,27 +105,28 @@ class QATLinear(nn.Module):
         return F.linear(self.act_fq(x), self.weight_fq(self.weight))
 
     def to_quantized(self) -> "QuantizedLinear":
-        scale, _zero_point = self.weight_fq.calculate_qparams()
+        scale, _ = self.weight_fq.calculate_qparams()
         w = self.weight.detach().float()
+        scale = scale.float().clamp_min(torch.finfo(torch.float32).eps)
         q = torch.clamp(torch.round(w / scale.unsqueeze(1)), WEIGHT_QMIN, WEIGHT_QMAX)
         codes = (q - WEIGHT_QMIN).to(torch.uint8)
-        return QuantizedLinear(_pack_3bit(codes), scale.float(), w.shape)
+        return QuantizedLinear(_pack_3bit(codes), scale, w.shape)
 
 
 class QuantizedLinear(nn.Module):
-    def __init__(self, packed: torch.Tensor, scale: torch.Tensor, shape: torch.Size):
+
+    def __init__(self, packed: torch.Tensor, scale: torch.Tensor, shape):
         super().__init__()
         self.register_buffer("packed", packed)
         self.register_buffer("scale", scale)
+        self.register_buffer("weight_shape", torch.tensor([int(shape[0]), int(shape[1])], dtype=torch.int64))
         self.out_features, self.in_features = int(shape[0]), int(shape[1])
         self._code_cache = {}
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs,
-        )
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                                      error_msgs)
         self._code_cache.clear()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -151,7 +172,14 @@ def convert_qat(model: RWKVXModel) -> int:
 
 
 @torch.no_grad()
-def calibrate(model: RWKVXModel, tokenizer, calib_texts, ctx_len: int, device, max_batches: int = 64):
+def calibrate(
+    model: RWKVXModel,
+    tokenizer,
+    calib_texts,
+    ctx_len: int,
+    device,
+    max_batches: int = 64,
+):
     was_training = model.training
     model.eval()
     buf, n_batches = [], 0

@@ -1,95 +1,334 @@
 #!/usr/bin/env python3
-# tokenizer.py -- trains byte-level BPE tokenizer.
 import argparse
-from itertools import islice
+import json
+import re
+import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Iterator, List
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.pre_tokenizers import ByteLevel as ByteLevelPreTokenizer
-from tokenizers.decoders import ByteLevel as ByteLevelDecoder
-from tokenizers.processors import ByteLevel as ByteLevelProcessor
-from tokenizers.trainers import BpeTrainer
-from dataset import discover_files, iter_texts
-from stream_data import stream_dataset
 
-SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
+SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>"]
+CASE = ["<cap>", "<upper>"]
+TOKEN_RE = re.compile(
+    r"\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F]+|\d+(?:\.\d+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]",
+    re.UNICODE,
+)
+DEV_BASE = re.compile(r"[\u0900-\u097F]")
 
 
-def text_iterator(dataset_dir: Path) -> Iterator[str]:
-    files = discover_files(dataset_dir)
-    if not files:
-        raise RuntimeError(f"No supported files found under {dataset_dir}")
-    for text, _path, _idx in iter_texts(files):
-        yield text
+class TokenIds(list):
+    @property
+    def ids(self):
+        return self
 
 
-def remote_text_iterator(dataset_name: str, max_records: int = 0) -> Iterator[str]:
-    if dataset_name == "all":
-        for name in ("hindi", "english", "openthoughts"):
-            iterator = stream_dataset(name)
-            if max_records:
-                from itertools import islice
-                iterator = islice(iterator, max_records)
-            yield from iterator
-        return
-    iterator = stream_dataset(dataset_name)
-    if max_records:
-        from itertools import islice
-        iterator = islice(iterator, max_records)
-    yield from iterator
+def _json_texts(data):
+    if isinstance(data, str):
+        yield data
+    elif isinstance(data, dict):
+        prompt = data.get("prompt")
+        completion = data.get("completion")
+        if isinstance(prompt, str):
+            yield prompt
+        if isinstance(completion, str):
+            yield completion
+        if not isinstance(prompt, str) and not isinstance(completion, str):
+            text = next((data[k] for k in ("text", "content", "document", "body", "code") if isinstance(data.get(k), str)), None)
+            if text is not None:
+                yield text
+            elif "data" in data:
+                yield from _json_texts(data["data"])
+    elif isinstance(data, list):
+        for x in data:
+            yield from _json_texts(x)
 
 
-def train_tokenizer(dataset_dir: Path, output_path: Path, vocab_size: int = 65536,
-                     min_frequency: int = 2, special_tokens: List[str] = None,
-                     stream_name: str = "none", max_records: int = 0) -> Tokenizer:
-    special_tokens = special_tokens or SPECIAL_TOKENS
-    tok = Tokenizer(BPE(unk_token="<unk>"))
-    pre_tok = ByteLevelPreTokenizer(add_prefix_space=False)
-    tok.pre_tokenizer = pre_tok
-    tok.decoder = ByteLevelDecoder()
-    tok.post_processor = ByteLevelProcessor(trim_offsets=True)
-    trainer = BpeTrainer(
-        vocab_size=vocab_size,
-        min_frequency=min_frequency,
-        special_tokens=special_tokens,
-        show_progress=True,
-        initial_alphabet=pre_tok.alphabet(),
-    )
-    if stream_name != "none":
-        if max_records:
-            limit = f", {max_records:,} records per dataset" if stream_name == "all" else f", max {max_records:,} records"
+def read_texts(path, max_records=0):
+    files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+    seen = 0
+    plain = {".txt", ".text", ".py", ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".rs", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".cs", ".php", ".rb", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".html", ".css", ".scss", ".sql", ".md", ".rst", ".yaml", ".yml", ".toml", ".xml"}
+    for f in files:
+        ext = f.suffix.lower()
+        if ext in plain:
+            with f.open("r", encoding="utf-8") as h:
+                text = h.read()
+            if text:
+                yield text
+                seen += 1
+        elif ext == ".jsonl":
+            with f.open("r", encoding="utf-8") as h:
+                for line in h:
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    for text in _json_texts(data):
+                        yield text
+                        seen += 1
+                        if max_records and seen >= max_records:
+                            return
+        elif ext == ".json":
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            for text in _json_texts(data):
+                yield text
+                seen += 1
+                if max_records and seen >= max_records:
+                    return
+        elif ext == ".parquet":
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                raise SystemExit("Parquet support: pip install pyarrow")
+            pf = pq.ParquetFile(f)
+            names = pf.schema_arrow.names
+            lower = {name.lower(): name for name in names}
+            col = next((lower[name] for name in ("text", "content", "document", "body", "code") if name in lower), None)
+            if col:
+                for batch in pf.iter_batches(batch_size=1024, columns=[col]):
+                    for x in batch.column(0).to_pylist():
+                        if isinstance(x, str):
+                            yield x
+                            seen += 1
+                            if max_records and seen >= max_records:
+                                return
+        if max_records and seen >= max_records:
+            return
+
+
+def tokenize_text(text):
+    return TOKEN_RE.findall(text)
+
+
+def devanagari_units(text):
+    out = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if not DEV_BASE.fullmatch(c):
+            out.append(c)
+            i += 1
+            continue
+        u = c
+        i += 1
+        while i < len(text):
+            c = text[i]
+            if unicodedata.combining(c) or c in "\u200c\u200d":
+                u += c
+                i += 1
+                continue
+            if c == "्":
+                u += c
+                i += 1
+                if i < len(text) and DEV_BASE.fullmatch(text[i]):
+                    u += text[i]
+                    i += 1
+                continue
+            break
+        out.append(u)
+    return out
+
+
+def canonical(x):
+    return x.lower()
+
+
+def case_type(x):
+    letters = "".join(c for c in x if c.isalpha())
+    if not letters:
+        return None
+    if letters.isupper():
+        return "upper"
+    if x[:1].isupper() and x[1:].lower() == x[1:]:
+        return "cap"
+    return None
+
+
+def _build(texts, vocab_size, word_budget, max_records=0):
+    if vocab_size < len(SPECIAL) + len(CASE):
+        raise ValueError(f"vocab_size must be at least {len(SPECIAL) + len(CASE)}")
+    if word_budget < 0 or max_records < 0:
+        raise ValueError("word_budget and max_records must be non-negative")
+    words, graphemes, chars, symbols = Counter(), Counter(), Counter(), Counter()
+    cases = defaultdict(Counter)
+    total_words = total_tokens = seen = 0
+    for text in texts:
+        seen += 1
+        for token in tokenize_text(text):
+            total_tokens += 1
+            if token.isspace():
+                chars.update(token)
+                continue
+            if token.isalpha() or token.isdigit():
+                base = canonical(token)
+                words[base] += 1
+                total_words += 1
+                case = case_type(token)
+                if case:
+                    cases[base][case] += 1
+                if DEV_BASE.search(token):
+                    graphemes.update(devanagari_units(token))
+                chars.update(token)
+            else:
+                symbols[token] += 1
+                chars.update(token)
+        if max_records and seen >= max_records:
+            break
+    tokens = SPECIAL + CASE
+    seen_tokens = set(tokens)
+    for x, _ in words.most_common(word_budget):
+        if x not in seen_tokens:
+            tokens.append(x)
+            seen_tokens.add(x)
+        if len(tokens) >= vocab_size:
+            break
+    for x, _ in graphemes.most_common():
+        if x not in seen_tokens:
+            tokens.append(x)
+            seen_tokens.add(x)
+        if len(tokens) >= vocab_size:
+            break
+    for x, _ in symbols.most_common():
+        if x not in seen_tokens:
+            tokens.append(x)
+            seen_tokens.add(x)
+        if len(tokens) >= vocab_size:
+            break
+    for x, _ in chars.most_common():
+        if x not in seen_tokens:
+            tokens.append(x)
+            seen_tokens.add(x)
+        if len(tokens) >= vocab_size:
+            break
+    vocab = {x: i for i, x in enumerate(tokens)}
+    return {"version": 5, "vocab": vocab, "special_tokens": SPECIAL, "case_tokens": CASE, "case_stats": {w: dict(c) for w, c in cases.items()}, "unk_id": vocab["<unk>"], "stats": {"vocab_size": len(vocab), "whole_words": min(word_budget, len(words)), "unique_words": len(words), "total_words": total_words, "total_tokens": total_tokens, "devanagari_units": len(graphemes), "characters": len(chars), "symbols": len(symbols)}}
+
+
+def train(dataset, vocab_size=64000, word_budget=40000, max_records=0):
+    return _build(read_texts(Path(dataset), max_records), vocab_size, word_budget, max_records)
+
+
+class SmaulTokenizer:
+    def __init__(self, data):
+        self.data = data
+        self.vocab = data["vocab"]
+        self.id_to_token = {int(i): x for x, i in self.vocab.items()}
+        self.unk_token_id = data["unk_id"]
+        self.pad_token_id = self.vocab["<pad>"]
+        self.bos_token_id = self.vocab["<bos>"]
+        self.eos_token_id = self.vocab["<eos>"]
+
+    @classmethod
+    def from_file(cls, path):
+        return cls(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def save(self, path):
+        Path(path).write_text(json.dumps(self.data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+    def get_vocab_size(self):
+        return len(self.vocab)
+
+    def token_to_id(self, token):
+        return self.vocab.get(token)
+
+    def encode(self, text):
+        return TokenIds(encode(text, self))
+
+    def decode(self, ids):
+        return decode(ids, self)
+
+
+def load(path):
+    return SmaulTokenizer.from_file(path)
+
+
+def encode(text, tok):
+    v, u = tok.vocab, tok.unk_token_id
+    cap, upper = v.get("<cap>"), v.get("<upper>")
+    out = []
+    for t in tokenize_text(text):
+        if t.isspace():
+            out.extend(v.get(c, u) for c in t)
+            continue
+        b = canonical(t)
+        if b in v:
+            c = case_type(t)
+            if c == "cap" and cap is not None:
+                out.append(cap)
+            elif c == "upper" and upper is not None:
+                out.append(upper)
+            out.append(v[b])
+            continue
+        if DEV_BASE.search(t):
+            for g in devanagari_units(t):
+                out.extend([v[g]] if g in v else [v.get(c, u) for c in g])
         else:
-            limit = ""
-        print(f"[TOKENIZER] streaming {stream_name} from Hugging Face{limit} ...")
-        iterator = remote_text_iterator(stream_name, max_records)
+            out.extend(v.get(c, u) for c in t)
+    return out
+
+
+def decode(ids, tok):
+    tab = tok.id_to_token
+    out, case = [], None
+    for i in ids:
+        t = tab.get(int(i), "<unk>")
+        if t == "<cap>":
+            case = "cap"
+            continue
+        if t == "<upper>":
+            case = "upper"
+            continue
+        if t in {"<pad>", "<bos>", "<eos>"}:
+            continue
+        if case == "cap":
+            t = t[:1].upper() + t[1:]
+        elif case == "upper":
+            t = t.upper()
+        out.append(t)
+        case = None
+    return "".join(out)
+
+
+def train_tokenizer(dataset_dir, output_path, vocab_size=64000, stream_name="none", max_records=0):
+    if stream_name != "none":
+        from stream_data import stream_dataset
+        texts = stream_dataset(stream_name)
+        data = _build(texts, vocab_size, 40000, max_records)
     else:
-        print(f"[TOKENIZER] training BPE on {dataset_dir} ...")
-        iterator = text_iterator(dataset_dir)
-    tok.train_from_iterator(iterator, trainer=trainer)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tok.save(str(output_path))
-    print(f"[TOKENIZER] saved -> {output_path} (actual vocab_size={tok.get_vocab_size()})")
+        data = train(dataset_dir, vocab_size=vocab_size, max_records=max_records)
+    tok = SmaulTokenizer(data)
+    tok.save(output_path)
     return tok
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Train a byte-level BPE tokenizer")
-    p.add_argument("--dataset_dir", type=str, default="./datasets")
-    p.add_argument("--stream_dataset", choices=["none", "hindi", "english", "openthoughts", "all"], default="none",
-                    help="Stream training text directly from Hugging Face")
-    p.add_argument("--max_records", type=int, default=5_000_000,
-                    help="Maximum streamed records per dataset when using all; 0 means unlimited")
-    p.add_argument("--output", type=str, default="./SmaulNative/tokenizer.json")
-    p.add_argument("--vocab_size", type=int, default=65536)
-    p.add_argument("--min_frequency", type=int, default=2)
-    return p.parse_args()
-
-
 def main():
-    args = parse_args()
-    train_tokenizer(Path(args.dataset_dir), Path(args.output), args.vocab_size, args.min_frequency,
-                    stream_name=args.stream_dataset, max_records=args.max_records)
+    p = argparse.ArgumentParser()
+    s = p.add_subparsers(dest="cmd", required=True)
+    x = s.add_parser("train")
+    x.add_argument("--fromdataset", required=True)
+    x.add_argument("--vocab-size", type=int, default=64000)
+    x.add_argument("--word-budget", type=int, default=40000)
+    x.add_argument("--max-records", type=int, default=0)
+    x.add_argument("--output", default="tokenizer.json")
+    x.set_defaults(f=lambda a: train_cmd(a))
+    x = s.add_parser("encode")
+    x.add_argument("--tokenizer", required=True)
+    x.add_argument("--text", required=True)
+    x.set_defaults(f=lambda a: print(*load(a.tokenizer).encode(a.text)))
+    x = s.add_parser("decode")
+    x.add_argument("--tokenizer", required=True)
+    x.add_argument("--ids", required=True)
+    x.set_defaults(f=lambda a: print(load(a.tokenizer).decode(a.ids.split())))
+    a = p.parse_args()
+    a.f(a)
+
+
+def train_cmd(a):
+    d = _build(read_texts(Path(a.fromdataset), a.max_records), a.vocab_size, a.word_budget, a.max_records)
+    Path(a.output).write_text(json.dumps(d, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    s = d["stats"]
+    print(f"Vocabulary: {s['vocab_size']:,}\nWhole words: {s['whole_words']:,}\nUnique words: {s['unique_words']:,}\nCorpus words: {s['total_words']:,}\nDevanagari units: {s['devanagari_units']:,}\nCharacters: {s['characters']:,}\nSymbols/operators: {s['symbols']:,}\nSaved: {a.output}")
 
 
 if __name__ == "__main__":

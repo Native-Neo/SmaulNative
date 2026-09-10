@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import torch
-from tokenizers import Tokenizer
 
 from rwkv_x_core import RWKVXModel
+from tokenizer import SmaulTokenizer
 
 
 class RWKVXInference:
@@ -16,17 +16,23 @@ class RWKVXInference:
         self.model_dir = Path(model_dir)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but CUDA is unavailable")
+        if device not in {"cpu", "cuda"}:
+            raise ValueError(f"unsupported device: {device}")
         self.device = torch.device(device)
         self.model = RWKVXModel.from_pretrained(self.model_dir).to(self.device)
-        self.tokenizer = Tokenizer.from_file(str(self.model_dir / "tokenizer.json"))
-        self.eos_id = self.tokenizer.token_to_id("<eos>")
-        self.bos_id = self.tokenizer.token_to_id("<bos>")
-        if self.eos_id is None:
-            raise ValueError("tokenizer.json is missing <eos>")
+        self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
+        self.eos_id = self.tokenizer.eos_token_id
+        self.bos_id = self.tokenizer.bos_token_id
+        self.last_prompt_tokens = 0
         if dtype != "auto":
+            if dtype not in {"fp32", "fp16", "bf16"}:
+                raise ValueError(f"unsupported dtype: {dtype}")
+            if self.device.type == "cpu" and dtype == "fp16":
+                dtype = "fp32"
             self.model = self.model.to({"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype])
         self.model.eval()
-        self.last_prompt_tokens = 0
 
     @property
     def vocab_size(self):
@@ -71,15 +77,28 @@ class RWKVXInference:
         self.last_prompt_tokens = len(tokens)
         return tokens
 
+    def _validate_generation_args(self, max_new_tokens: int, temperature: float, top_k: int,
+                                  top_p: float, repetition_penalty: float):
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be positive")
+
     def generate(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7,
                  top_k: int = 50, top_p: float = 0.95, repetition_penalty: float = 1.05,
                  stop: Optional[List[str]] = None, seed: Optional[int] = None) -> str:
-        return "".join(self.stream(prompt, max_new_tokens, temperature, top_k, top_p,
-                                     repetition_penalty, stop, seed))
+        return "".join(self.stream(prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty, stop, seed))
 
     def stream(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7,
                top_k: int = 50, top_p: float = 0.95, repetition_penalty: float = 1.05,
                stop: Optional[List[str]] = None, seed: Optional[int] = None) -> Iterable[str]:
+        self._validate_generation_args(max_new_tokens, temperature, top_k, top_p, repetition_penalty)
         if seed is not None:
             random.seed(seed)
             torch.manual_seed(seed)
@@ -90,7 +109,7 @@ class RWKVXInference:
         recent = prompt_tokens[-128:]
         generated: List[int] = []
         emitted = ""
-        stops = stop or []
+        stops = [s for s in (stop or []) if s]
         for _ in range(max_new_tokens):
             token = self._sample(logits[0, -1], temperature, top_k, top_p, repetition_penalty, recent)
             if token == self.eos_id:
@@ -98,11 +117,16 @@ class RWKVXInference:
             generated.append(token)
             recent = (recent + [token])[-128:]
             current = self.decode(generated)
-            delta = current[len(emitted):]
-            emitted = current
+            end = len(current)
+            for s in stops:
+                pos = current.find(s, len(emitted))
+                if pos >= 0:
+                    end = min(end, pos)
+            delta = current[len(emitted):end]
+            emitted = current[:end]
             if delta:
                 yield delta
-            if any(emitted.endswith(s) for s in stops):
+            if end < len(current):
                 break
             logits, _, state = self._forward([token], state)
 

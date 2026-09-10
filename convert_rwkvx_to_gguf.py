@@ -11,11 +11,11 @@ from safetensors.torch import load_file
 
 def _load_tokenizer(path: Path):
     data = json.loads(path.read_text(encoding="utf-8"))
-    model = data.get("model", {})
-    vocab = model.get("vocab")
-    merges = model.get("merges", [])
+    vocab = data.get("vocab")
+    if vocab is None:
+        vocab = data.get("model", {}).get("vocab")
     if not isinstance(vocab, dict) or not vocab:
-        raise ValueError("tokenizer.json has no BPE vocabulary")
+        raise ValueError("tokenizer.json has no vocabulary")
     tokens = [None] * (max(vocab.values()) + 1)
     for token, idx in vocab.items():
         if not isinstance(idx, int) or idx < 0:
@@ -23,10 +23,10 @@ def _load_tokenizer(path: Path):
         tokens[idx] = token
     if any(t is None for t in tokens):
         raise ValueError("tokenizer vocabulary contains gaps")
-    return tokens, merges
+    return tokens, data
 
 
-def _write_metadata(writer, cfg, tokens, merges):
+def _write_metadata(writer, cfg, tokens, tokenizer):
     writer.add_name("SmaulNative RWKV-X")
     writer.add_description("RWKV-X checkpoint exported from SmaulNative")
     writer.add_uint32("vocab_size", int(cfg["vocab_size"]))
@@ -45,10 +45,9 @@ def _write_metadata(writer, cfg, tokens, merges):
     writer.add_uint32("rwkv_x.num_experts", int(cfg.get("num_experts", 1)))
     writer.add_uint32("rwkv_x.num_experts_per_tok", int(cfg.get("num_experts_per_tok", 1)))
 
-    writer.add_tokenizer_model("gpt2")
+    writer.add_tokenizer_model("rwkv")
     writer.add_token_list(tokens)
     writer.add_token_scores([0.0] * len(tokens))
-    writer.add_token_merges([" ".join(m) if isinstance(m, list) else str(m) for m in merges])
 
 
 def convert(input_dir: Path, output: Path, dtype: str):
@@ -65,7 +64,7 @@ def convert(input_dir: Path, output: Path, dtype: str):
             raise FileNotFoundError(path)
 
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
-    tokens, merges = _load_tokenizer(tokenizer_path)
+    tokens, tokenizer = _load_tokenizer(tokenizer_path)
     state = load_file(str(weights_path), device="cpu")
 
     expected_vocab = int(cfg["vocab_size"])
@@ -75,7 +74,7 @@ def convert(input_dir: Path, output: Path, dtype: str):
     output.parent.mkdir(parents=True, exist_ok=True)
     requested_dtype = torch.float16 if dtype == "f16" else torch.float32
     writer = gguf.GGUFWriter(str(output), "rwkv_x")
-    _write_metadata(writer, cfg, tokens, merges)
+    _write_metadata(writer, cfg, tokens, tokenizer)
 
     for name, tensor in state.items():
         if not torch.is_floating_point(tensor):

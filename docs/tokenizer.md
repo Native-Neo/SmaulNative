@@ -1,37 +1,43 @@
 # tokenizer.py
 
-Trains a single byte-level BPE tokenizer (vocab + merges + `<pad>`/`<eos>` specials) over
-everything `dataset.py` can discover under `--dataset_dir`.
+The repository uses a custom lightweight tokenizer stored as one JSON file. It is designed for the
+project's English/Hindi training data and does not depend on the Hugging Face `tokenizers` BPE runtime.
 
-## Run it
+## Train
 
 ```bash
-python tokenizer.py --dataset_dir ./datasets --output ./tokenizer.json --vocab_size 32768
+python tokenizer.py train \
+    --fromdataset ./datasets \
+    --vocab-size 65536 \
+    --word-budget 40000 \
+    --output ./tokenizer.json
 ```
 
-| Flag | Default | What it does |
-|---|---|---|
-| `--dataset_dir` | `./datasets` | recursively scanned for text (txt/json/jsonl/csv/parquet/source) |
-| `--output` | `./tokenizer.json` | where the trained tokenizer is saved |
-| `--vocab_size` | `32768` | target vocab size |
-| `--min_frequency` | `2` | minimum pair frequency to merge |
+Important options:
 
-## How it works
+- `--fromdataset`: file or directory containing training text.
+- `--vocab-size`: maximum vocabulary size.
+- `--word-budget`: maximum number of whole-word entries considered.
+- `--max-records`: optional record limit; `0` means unlimited.
+- `--output`: output JSON path.
 
-- Builds a `Tokenizers` `BPE` model with the **ByteLevel** pre-tokenizer, decoder, and
-  post-processor (`tokenizer.py:33`), so the vocabulary is strictly byte-level and never runs out
-  of OOV handling -- any byte sequence can be encoded and decoded losslessly.
-- `SPECIAL_TOKENS = ["<pad>", "<eos>"]` (`tokenizer.py:18`) are added automatically. These two are
-  load-bearing: `dataset.py`'s `TokenizerWrapper` **requires** both to exist, and raises an error
-  if you point `--tokenizer_path` at a tokenizer that lacks them (`dataset.py:26`).
-- Reads text via `dataset.discover_files()` + `iter_texts()`, so `.json/.jsonl/.csv/.parquet`
-  containers are decoded down to raw text first -- it's not just plain `.txt`.
-- Saves everything (vocab, merges, specials) into one `tokenizer.json` file (`tokenizer.py:49`).
+## Vocabulary
 
-## When to run it yourself
+The tokenizer reserves `<pad>`, `<unk>`, `<bos>`, and `<eos>`, plus `<cap>` and `<upper>` case markers.
+English words are normalized to lowercase with case markers retained. Devanagari text is represented using
+whole words where possible, then Devanagari grapheme units and individual characters as fallbacks.
 
-- You usually don't need to run this by hand: `train.py` auto-trains one at `--tokenizer_path` if
-  it doesn't exist yet.
-- Run it yourself when you want to pre-train a tokenizer **once** and reuse it across several
-  `train.py` runs (pretrain + multiple SFT branches) without retraining each time -- SFT after
-  pretrain must reuse the pretrained tokenizer so vocab stays consistent.
+## Determinism
+
+Directory inputs are traversed in sorted path order, so the same corpus and settings produce stable
+vocabulary ordering. Text is decoded with replacement rather than silently deleting invalid bytes.
+
+## Encoding
+
+```bash
+python tokenizer.py encode --tokenizer ./tokenizer.json --text "Hello नमस्ते"
+python tokenizer.py decode --tokenizer ./tokenizer.json --ids "1 2 3"
+```
+
+`SmaulTokenizer.encode()` returns a list-like object with an `.ids` property for compatibility with the
+training code.

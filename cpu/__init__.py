@@ -17,50 +17,38 @@ def _load_wkv():
         _WKV_EXT = load(
             name="smaulnative_wkv",
             sources=[str(root / "wkv_kernel.cpp")],
-            extra_cflags=["-O3", "-mavx", "-mtune=native", "-fno-tree-vectorize"],
+            extra_cflags=["-O3", "-march=native", "-mtune=native"],
             verbose=False,
         )
     return _WKV_EXT
 
 
 class _NativeWKV(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, state, w, k, v, kk, a, r):
         ctx.save_for_backward(state, w, k, v, kk, a, r)
         ext = _load_wkv()
-        out_state, y = ext.wkv_forward(
-            state.contiguous(), w.float().contiguous(), k.float().contiguous(),
-            v.float().contiguous(), kk.float().contiguous(), a.float().contiguous(),
-            r.float().contiguous()
-        )
+        out_state, y = ext.wkv_forward(state.contiguous(),
+                                       w.float().contiguous(),
+                                       k.float().contiguous(),
+                                       v.float().contiguous(),
+                                       kk.float().contiguous(),
+                                       a.float().contiguous(),
+                                       r.float().contiguous())
         return out_state, y.to(dtype=r.dtype)
 
     @staticmethod
     def backward(ctx, grad_state, grad_y):
         state, w, k, v, kk, a, r = ctx.saved_tensors
         ext = _load_wkv()
-        state_f = state.float().contiguous()
-        w_f = w.float().contiguous()
-        k_f = k.float().contiguous()
-        v_f = v.float().contiguous()
-        kk_f = kk.float().contiguous()
-        a_f = a.float().contiguous()
-        r_f = r.float().contiguous()
-        if grad_state is None:
-            grad_state = torch.zeros_like(state_f)
-        else:
-            grad_state = grad_state.float().contiguous()
-        if grad_y is None:
-            grad_y = torch.zeros_like(r_f)
-        else:
-            grad_y = grad_y.float().contiguous()
-        grads = ext.wkv_backward(
-            state_f, w_f, k_f, v_f, kk_f, a_f, r_f, grad_state, grad_y
-        )
-        return tuple(
-            None if g is None else g.to(dtype=src.dtype)
-            for g, src in zip(grads, (state, w, k, v, kk, a, r))
-        )
+        state_f, w_f, k_f = state.float().contiguous(), w.float().contiguous(), k.float().contiguous()
+        v_f, kk_f, a_f, r_f = v.float().contiguous(), kk.float().contiguous(), a.float().contiguous(), r.float(
+        ).contiguous()
+        grad_state = torch.zeros_like(state_f) if grad_state is None else grad_state.float().contiguous()
+        grad_y = torch.zeros_like(r_f) if grad_y is None else grad_y.float().contiguous()
+        grads = ext.wkv_backward(state_f, w_f, k_f, v_f, kk_f, a_f, r_f, grad_state, grad_y)
+        return tuple(None if g is None else g.to(dtype=src.dtype) for g, src in zip(grads, (state, w, k, v, kk, a, r)))
 
 
 def _native_wkv(state, w, k, v, kk, a, r):

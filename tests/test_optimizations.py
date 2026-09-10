@@ -24,7 +24,7 @@ def test_quantized_linear_code_cache():
     weight = torch.randn(6, 4)
     q = torch.clamp(torch.round(weight / 0.1), -4, 3)
     packed = _pack_3bit((q + 4).to(torch.uint8))
-    layer = QuantizedLinear(packed, torch.full((6,), 0.1), weight.shape)
+    layer = QuantizedLinear(packed, torch.full((6, ), 0.1), weight.shape)
     x = torch.randn(3, 4)
     y1 = layer(x)
     y2 = layer(x)
@@ -58,6 +58,7 @@ def test_quantized_linear_load_state_dict_clears_code_cache():
 
 
 def test_sft_dataset_caches_processed_records():
+
     class CountingTokenizer:
         pad_token_id = 0
 
@@ -71,8 +72,14 @@ def test_sft_dataset_caches_processed_records():
     with TemporaryDirectory() as dataset_dir:
         record = {
             "conversations": [
-                {"from": "user", "value": "Hello"},
-                {"from": "assistant", "value": "Hi"},
+                {
+                    "from": "user",
+                    "value": "Hello"
+                },
+                {
+                    "from": "assistant",
+                    "value": "Hi"
+                },
             ]
         }
         Path(dataset_dir, "sample.json").write_text(json.dumps([record]), encoding="utf-8")
@@ -90,8 +97,8 @@ def test_sft_dataset_caches_processed_records():
 
 def test_moe_matches_dense_reference():
     torch.manual_seed(0)
-    cfg = RWKVXConfig(vocab_size=32, n_embd=16, n_layer=4, head_size=4,
-                      n_moba_layer=1, is_moe=True, num_experts=4, num_experts_per_tok=2)
+    cfg = RWKVXConfig(vocab_size=32, n_embd=16, n_layer=4, head_size=4, n_moba_layer=1, is_moe=True, num_experts=4,
+                      num_experts_per_tok=2)
     moe = RWKV_CMix_MoE(cfg, 0)
     x = torch.randn(2, 7, 16)
     prev = torch.randn(2, 16)

@@ -15,9 +15,7 @@ def configure(threads=None):
         else:
             import subprocess
             try:
-                cores = int(subprocess.check_output(
-                    ["nproc", "--all"], text=True
-                ).strip())
+                cores = int(subprocess.check_output(["nproc", "--all"], text=True).strip())
                 threads = max(1, cores // 2)
             except Exception:
                 threads = min(os.cpu_count() or 1, 2)
@@ -48,6 +46,7 @@ def _load():
 
 
 class NativeLion(Optimizer):
+
     def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
         if lr <= 0:
             raise ValueError("lr must be > 0")
@@ -76,8 +75,8 @@ class NativeLion(Optimizer):
         if not state:
             state["exp_avg"] = torch.zeros_like(p)
         avg = state["exp_avg"]
-        avg.mul_(b1).add_(g, alpha=1 - b1)
+        update = avg.clone().mul_(b1).add_(g, alpha=1 - b1)
         if wd:
             p.mul_(1 - lr * wd)
-        p.add_(avg.sign(), alpha=-lr)
-        avg.lerp_(g, 1 - b2)
+        p.add_(update.sign(), alpha=-lr)
+        avg.mul_(b2).add_(g, alpha=1 - b2)
