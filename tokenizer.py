@@ -25,8 +25,9 @@ def _json_texts(data):
     if isinstance(data, str):
         yield data
     elif isinstance(data, dict):
-        prompt = data.get("prompt")
-        completion = data.get("completion")
+        lower = {str(k).lower(): v for k, v in data.items()}
+        prompt = lower.get("prompt")
+        completion = lower.get("completion")
         if isinstance(prompt, str) and isinstance(completion, str):
             yield prompt + "\n" + completion
         elif isinstance(prompt, str):
@@ -34,11 +35,11 @@ def _json_texts(data):
         elif isinstance(completion, str):
             yield completion
         else:
-            text = next((data[k] for k in ("text", "content", "document", "body", "code") if isinstance(data.get(k), str)), None)
+            text = next((lower[k] for k in ("text", "content", "document", "body", "code") if isinstance(lower.get(k), str)), None)
             if text is not None:
                 yield text
-            elif "data" in data:
-                yield from _json_texts(data["data"])
+            elif "data" in lower:
+                yield from _json_texts(lower["data"])
     elif isinstance(data, list):
         for x in data:
             yield from _json_texts(x)
