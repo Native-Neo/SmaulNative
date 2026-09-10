@@ -90,12 +90,12 @@ def test_stream_stop_sequence_can_cross_tokens(monkeypatch):
 
 def test_stream_stop_sequence_preserves_text_before_boundary(monkeypatch):
     data = {
-        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "a": 4, "b": 5, "c": 6, "x": 7},
+        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "z": 4, "h": 5, "e": 6, "l": 7, "o": 8},
         "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
         "case_tokens": [],
         "case_stats": {},
         "unk_id": 1,
-        "stats": {"vocab_size": 8},
+        "stats": {"vocab_size": 9},
     }
     obj = RWKVXInference.__new__(RWKVXInference)
     obj.device = torch.device("cpu")
@@ -104,8 +104,8 @@ def test_stream_stop_sequence_preserves_text_before_boundary(monkeypatch):
     obj.bos_id = 2
     obj.last_prompt_tokens = 0
     monkeypatch.setattr(obj, "_prepare", lambda prompt: [2])
-    monkeypatch.setattr(obj, "_forward", lambda tokens, state=None: (torch.zeros(1, 1, 8), None, state))
-    tokens = iter([4, 5, 6, 7, 3])
+    monkeypatch.setattr(obj, "_forward", lambda tokens, state=None: (torch.zeros(1, 1, 9), None, state))
+    tokens = iter([4, 5, 6, 7, 7, 8, 3])
     monkeypatch.setattr(obj, "_sample", lambda *args: next(tokens))
-    output = "".join(obj.stream("", max_new_tokens=5, temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0, stop=["abc"]))
-    assert output == ""
+    output = "".join(obj.stream("", max_new_tokens=7, temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0, stop=["hello"]))
+    assert output == "z"
