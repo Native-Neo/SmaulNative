@@ -75,6 +75,16 @@ def read_texts(path, max_records=0):
             if text:
                 yield text
                 seen += 1
+        elif ext == ".csv":
+            with f.open("r", encoding="utf-8", newline="") as h:
+                for row in csv.DictReader(h):
+                    text = _record_text(row)
+                    if not text:
+                        continue
+                    yield text
+                    seen += 1
+                    if max_records and seen >= max_records:
+                        return
         elif ext == ".jsonl":
             with f.open("r", encoding="utf-8") as h:
                 for line in h:
@@ -97,16 +107,6 @@ def read_texts(path, max_records=0):
                 seen += 1
                 if max_records and seen >= max_records:
                     return
-        elif ext == ".csv":
-            with f.open("r", encoding="utf-8", newline="") as h:
-                for row in csv.DictReader(h):
-                    text = _record_text(row)
-                    if not text:
-                        continue
-                    yield text
-                    seen += 1
-                    if max_records and seen >= max_records:
-                        return
         elif ext == ".parquet":
             try:
                 import pyarrow.parquet as pq
