@@ -75,8 +75,8 @@ class NativeLion(Optimizer):
         if not state:
             state["exp_avg"] = torch.zeros_like(p)
         avg = state["exp_avg"]
-        avg.mul_(b1).add_(g, alpha=1 - b1)
+        update = avg.clone().mul_(b1).add_(g, alpha=1 - b1)
         if wd:
             p.mul_(1 - lr * wd)
-        p.add_(avg.sign(), alpha=-lr)
-        avg.lerp_(g, 1 - b2)
+        p.add_(update.sign(), alpha=-lr)
+        avg.mul_(b2).add_(g, alpha=1 - b2)
