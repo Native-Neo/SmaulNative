@@ -109,7 +109,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
         suffix = path.suffix.lower()
         try:
             if suffix in (".txt", ".text"):
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     doc = []
                     record = -1
                     for line in f:
@@ -128,12 +128,12 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                         if record >= start_idx:
                             yield "\n".join(doc), str(path), record + 1
             elif suffix in PLAIN_TEXT_SUFFIXES:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     content = f.read().strip()
                 if content and start_idx == 0:
                     yield content, str(path), 1
             elif suffix == ".jsonl":
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     for i, line in enumerate(f):
                         if i < start_idx:
                             continue
@@ -148,7 +148,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                         if text:
                             yield text, str(path), i + 1
             elif suffix == ".json":
-                data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+                data = json.loads(path.read_text(encoding="utf-8"))
                 records = data.get("data", data) if isinstance(data, dict) else data
                 if not isinstance(records, list):
                     records = [records]
@@ -157,7 +157,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                     if text:
                         yield text, str(path), i + 1
             elif suffix == ".csv":
-                with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                with open(path, "r", encoding="utf-8", newline="") as f:
                     for i, row in enumerate(csv.DictReader(f)):
                         if i < start_idx:
                             continue
@@ -301,7 +301,7 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
             continue
         try:
             if path.suffix.lower() == ".jsonl":
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -311,7 +311,7 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
                         except json.JSONDecodeError:
                             print(f"[WARN] skipping malformed SFT record in {path}")
             else:
-                data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+                data = json.loads(path.read_text(encoding="utf-8"))
                 records.extend(data if isinstance(data, list) else [data])
         except Exception as e:
             raise RuntimeError(f"failed to read SFT file {path}") from e
