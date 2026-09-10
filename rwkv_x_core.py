@@ -265,7 +265,7 @@ class CausalSelfAttention(nn.Module):
                 else:
                     npick = min(kt, i)
                     top = torch.einsum("bhd,bhkd->bhk", qi.mean(2), km[:, :, :i]).topk(npick, -1).indices
-                    idx = top.unsqueeze(2).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, hi - lo, -1, cs, N)
+                    idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, cs, N)
                     hist_k = kc[:, :, :i].unsqueeze(2).expand(-1, -1, hi - lo, -1, -1, -1)
                     hist_v = vc[:, :, :i].unsqueeze(2).expand(-1, -1, hi - lo, -1, -1, -1)
                     sk = torch.gather(hist_k, 3, idx).reshape(B * H * (hi - lo), npick * cs, N)
@@ -275,7 +275,8 @@ class CausalSelfAttention(nn.Module):
                     ownv_flat = ownv.unsqueeze(2).expand(-1, -1, hi - lo, -1, -1).reshape(B * H * (hi - lo), hi - lo, N)
                     hist_mask = torch.ones(hi - lo, npick * cs, dtype=torch.bool, device=x.device)
                     causal = torch.tril(torch.ones(hi - lo, hi - lo, dtype=torch.bool, device=x.device))
-                    mask = torch.cat((hist_mask, causal), 1).reshape(B * H * (hi - lo), 1, npick * cs + hi - lo)
+                    base_mask = torch.cat((hist_mask, causal), 1)
+                    mask = base_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1).reshape(B * H * (hi - lo), 1, npick * cs + hi - lo)
                     yi = F.scaled_dot_product_attention(qflat, torch.cat((sk, ownk_flat), 1), torch.cat((sv, ownv_flat), 1), attn_mask=mask)
                     yi = yi.reshape(B, H, hi - lo, N)
                 out[:, :, lo:hi] = yi
