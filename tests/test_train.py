@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
 import torch
 import train
 
@@ -45,3 +46,17 @@ def test_resume_state_round_trip(tmp_path):
     state.save(path)
     loaded = train.ResumeState.load(path)
     assert loaded.__dict__ == state.__dict__
+
+
+def test_corrupt_resume_state_fails_loudly(tmp_path):
+    path = tmp_path / "resume_state.json"
+    path.write_text("not json")
+    with pytest.raises(RuntimeError, match="could not load resume state"):
+        train.ResumeState.load(path)
+
+
+def test_invalid_rng_checkpoint_fails_loudly(tmp_path):
+    path = tmp_path / "rng_state.pt"
+    torch.save({}, path)
+    with pytest.raises(RuntimeError, match="missing torch RNG state"):
+        train._load_rng_state(path)
