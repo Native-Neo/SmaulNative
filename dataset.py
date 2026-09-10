@@ -174,9 +174,24 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                     if cand in schema_lower:
                         fast_col = schema_names[schema_lower.index(cand)]
                         break
+                prompt_col = schema_names[schema_lower.index("prompt")] if "prompt" in schema_lower else None
+                completion_col = schema_names[schema_lower.index("completion")] if "completion" in schema_lower else None
                 i = -1
-                for batch in pf.iter_batches(batch_size=1024):
-                    if fast_col is not None:
+                columns = [fast_col] if fast_col is not None else None
+                if prompt_col and completion_col and prompt_col != completion_col:
+                    columns = [prompt_col, completion_col]
+                for batch in pf.iter_batches(batch_size=1024, columns=columns):
+                    if prompt_col and completion_col and prompt_col != completion_col:
+                        prompt_data = batch.column(prompt_col).to_pylist()
+                        completion_data = batch.column(completion_col).to_pylist()
+                        for prompt, completion in zip(prompt_data, completion_data):
+                            i += 1
+                            if i < start_idx:
+                                continue
+                            text = extract_text({"prompt": prompt, "completion": completion}, str(path)).strip()
+                            if text:
+                                yield text, str(path), i + 1
+                    elif fast_col is not None:
                         col = batch.column(fast_col)
                         for row_idx in range(batch.num_rows):
                             i += 1
