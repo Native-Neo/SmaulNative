@@ -27,11 +27,13 @@ def _json_texts(data):
     elif isinstance(data, dict):
         prompt = data.get("prompt")
         completion = data.get("completion")
-        if isinstance(prompt, str):
+        if isinstance(prompt, str) and isinstance(completion, str):
+            yield prompt + "\n" + completion
+        elif isinstance(prompt, str):
             yield prompt
-        if isinstance(completion, str):
+        elif isinstance(completion, str):
             yield completion
-        if not isinstance(prompt, str) and not isinstance(completion, str):
+        else:
             text = next((data[k] for k in ("text", "content", "document", "body", "code") if isinstance(data.get(k), str)), None)
             if text is not None:
                 yield text
@@ -84,15 +86,28 @@ def read_texts(path, max_records=0):
             pf = pq.ParquetFile(f)
             names = pf.schema_arrow.names
             lower = {name.lower(): name for name in names}
-            col = next((lower[name] for name in ("text", "content", "document", "body", "code") if name in lower), None)
-            if col:
-                for batch in pf.iter_batches(batch_size=1024, columns=[col]):
-                    for x in batch.column(0).to_pylist():
-                        if isinstance(x, str):
-                            yield x
+            prompt_col = lower.get("prompt")
+            completion_col = lower.get("completion")
+            if prompt_col and completion_col and prompt_col != completion_col:
+                for batch in pf.iter_batches(batch_size=1024, columns=[prompt_col, completion_col]):
+                    prompts = batch.column(prompt_col).to_pylist()
+                    completions = batch.column(completion_col).to_pylist()
+                    for prompt, completion in zip(prompts, completions):
+                        if isinstance(prompt, str) and isinstance(completion, str):
+                            yield prompt + "\n" + completion
                             seen += 1
                             if max_records and seen >= max_records:
                                 return
+            else:
+                col = next((lower[name] for name in ("text", "content", "document", "body", "code") if name in lower), None)
+                if col:
+                    for batch in pf.iter_batches(batch_size=1024, columns=[col]):
+                        for x in batch.column(0).to_pylist():
+                            if isinstance(x, str):
+                                yield x
+                                seen += 1
+                                if max_records and seen >= max_records:
+                                    return
         if max_records and seen >= max_records:
             return
 
