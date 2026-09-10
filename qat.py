@@ -101,6 +101,10 @@ class QATLinear(nn.Module):
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         destination[prefix + "weight"] = self.weight if keep_vars else self.weight.detach()
+        for name, value in self.weight_fq.state_dict().items():
+            destination[prefix + "weight_fq." + name] = value if keep_vars else value.detach()
+        for name, value in self.act_fq.state_dict().items():
+            destination[prefix + "act_fq." + name] = value if keep_vars else value.detach()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.fake_quant_enabled:
