@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from dataset import IGNORE_INDEX, _preprocess_conversation, iter_texts
 
@@ -22,6 +23,21 @@ def test_plain_text_resume_is_one_based(tmp_path):
     files = [path.resolve()]
     assert list(iter_texts(files, str(path.resolve()), 1))[0][0] == "two"
     assert list(iter_texts(files, str(path.resolve()), 2)) == []
+
+
+def test_resume_file_must_be_in_discovered_files(tmp_path):
+    path = tmp_path / "x.txt"
+    path.write_text("text")
+    missing = tmp_path / "missing.txt"
+    with pytest.raises(FileNotFoundError, match="resume file not found"):
+        list(iter_texts([path.resolve()], str(missing), 0))
+
+
+def test_negative_resume_record_is_rejected(tmp_path):
+    path = tmp_path / "x.txt"
+    path.write_text("text")
+    with pytest.raises(ValueError, match="resume_record"):
+        list(iter_texts([path.resolve()], None, -1))
 
 
 def test_prompt_and_completion_are_combined():
