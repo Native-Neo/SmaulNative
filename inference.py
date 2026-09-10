@@ -142,7 +142,7 @@ class RWKVXInference:
             current = emitted + piece
             end = len(current)
             for s in stops:
-                pos = current.find(s, len(emitted))
+                pos = current.find(s)
                 if pos >= 0:
                     end = min(end, pos)
             delta = current[len(emitted):end]
