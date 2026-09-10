@@ -264,7 +264,7 @@ class CausalSelfAttention(nn.Module):
                     yi = F.scaled_dot_product_attention(qi, ownk, ownv, is_causal=True)
                 else:
                     npick = min(kt, i)
-                    top = torch.einsum("bhqd,bhkd->bhqk", qi.mean(2), km[:, :, :i]).topk(npick, -1).indices
+                    top = torch.einsum("bhd,bhkd->bhk", qi.mean(2), km[:, :, :i]).topk(npick, -1).indices
                     idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, cs, N)
                     hist_k = kc[:, :, :i].unsqueeze(2).expand(-1, -1, hi - lo, -1, -1, -1)
                     hist_v = vc[:, :, :i].unsqueeze(2).expand(-1, -1, hi - lo, -1, -1, -1)
