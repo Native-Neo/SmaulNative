@@ -16,12 +16,14 @@ def test_qat_checkpoint_loads_as_normal_model():
     state = model.state_dict()
     assert all("weight_fq" not in key and "act_fq" not in key for key in state)
 
+    reference = RWKVXModel(cfg)
+    reference.load_state_dict(state, strict=True)
     restored = RWKVXModel(cfg)
     restored.load_state_dict(state, strict=True)
     x = torch.randint(0, cfg.vocab_size, (1, 4))
     with torch.no_grad():
-        model.eval()
+        reference.eval()
         restored.eval()
-        expected = model(x)[0]
+        expected = reference(x)[0]
         actual = restored(x)[0]
     assert torch.equal(expected, actual)
