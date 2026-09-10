@@ -16,6 +16,10 @@ class RWKVXInference:
         self.model_dir = Path(model_dir)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but CUDA is unavailable")
+        if device not in {"cpu", "cuda"}:
+            raise ValueError(f"unsupported device: {device}")
         self.device = torch.device(device)
         self.model = RWKVXModel.from_pretrained(self.model_dir).to(self.device)
         self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
@@ -73,6 +77,19 @@ class RWKVXInference:
         self.last_prompt_tokens = len(tokens)
         return tokens
 
+    def _validate_generation_args(self, max_new_tokens: int, temperature: float, top_k: int,
+                                  top_p: float, repetition_penalty: float):
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be positive")
+
     def generate(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7,
                  top_k: int = 50, top_p: float = 0.95, repetition_penalty: float = 1.05,
                  stop: Optional[List[str]] = None, seed: Optional[int] = None) -> str:
@@ -81,6 +98,7 @@ class RWKVXInference:
     def stream(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7,
                top_k: int = 50, top_p: float = 0.95, repetition_penalty: float = 1.05,
                stop: Optional[List[str]] = None, seed: Optional[int] = None) -> Iterable[str]:
+        self._validate_generation_args(max_new_tokens, temperature, top_k, top_p, repetition_penalty)
         if seed is not None:
             random.seed(seed)
             torch.manual_seed(seed)
@@ -91,7 +109,7 @@ class RWKVXInference:
         recent = prompt_tokens[-128:]
         generated: List[int] = []
         emitted = ""
-        stops = stop or []
+        stops = [s for s in (stop or []) if s]
         for _ in range(max_new_tokens):
             token = self._sample(logits[0, -1], temperature, top_k, top_p, repetition_penalty, recent)
             if token == self.eos_id:
@@ -99,11 +117,16 @@ class RWKVXInference:
             generated.append(token)
             recent = (recent + [token])[-128:]
             current = self.decode(generated)
-            delta = current[len(emitted):]
-            emitted = current
+            end = len(current)
+            for s in stops:
+                pos = current.find(s, len(emitted))
+                if pos >= 0:
+                    end = min(end, pos)
+            delta = current[len(emitted):end]
+            emitted = current[:end]
             if delta:
                 yield delta
-            if any(emitted.endswith(s) for s in stops):
+            if end < len(current):
                 break
             logits, _, state = self._forward([token], state)
 
