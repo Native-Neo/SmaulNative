@@ -178,6 +178,9 @@ class RWKV_CMix_x070(nn.Module):
         xx = torch.cat([prev, x[:, :-1]], 1) - x
         return self.value(torch.relu(self.key(x + xx * self.x_k))**2), x[:, -1]
 
+    def forward_selected(self, x, prev):
+        return self.value(torch.relu(self.key(x + (prev - x) * self.x_k))**2)
+
 
 class RWKV_CMix_MoE(nn.Module):
     def __init__(self, cfg, layer_id):
@@ -193,11 +196,15 @@ class RWKV_CMix_MoE(nn.Module):
         topv, topi = torch.topk(probs, self.top_k, -1)
         topv = topv / topv.sum(-1, keepdim=True).clamp_min(1e-9)
         out = torch.zeros_like(x)
+        prev = torch.cat([
+            x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros_like(x[:, :1]),
+            x[:, :-1],
+        ], 1)
         for e, expert in enumerate(self.experts):
             weight = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(-1)
             mask = weight > 0
             if mask.any():
-                out[mask] += expert(x, x_prev_last)[0][mask] * weight[mask].unsqueeze(-1)
+                out[mask] += expert.forward_selected(x[mask], prev[mask]) * weight[mask].unsqueeze(-1)
         return out, x[:, -1]
 
 
