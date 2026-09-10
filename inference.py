@@ -11,6 +11,29 @@ from rwkv_x_core import RWKVXModel
 from tokenizer import SmaulTokenizer
 
 
+class _IncrementalDecoder:
+    def __init__(self, tokenizer: SmaulTokenizer):
+        self.table = tokenizer.id_to_token
+        self.case = None
+
+    def push(self, token_id: int) -> str:
+        token = self.table.get(int(token_id), "<unk>")
+        if token == "<cap>":
+            self.case = "cap"
+            return ""
+        if token == "<upper>":
+            self.case = "upper"
+            return ""
+        if token in {"<pad>", "<bos>", "<eos>"}:
+            return ""
+        if self.case == "cap":
+            token = token[:1].upper() + token[1:]
+        elif self.case == "upper":
+            token = token.upper()
+        self.case = None
+        return token
+
+
 class RWKVXInference:
     def __init__(self, model_dir: str = "./SmaulNative", device: str = "auto", dtype: str = "auto"):
         self.model_dir = Path(model_dir)
@@ -107,16 +130,16 @@ class RWKVXInference:
         prompt_tokens = self._prepare(prompt)
         logits, _, state = self._forward(prompt_tokens)
         recent = prompt_tokens[-128:]
-        generated: List[int] = []
-        emitted = ""
         stops = [s for s in (stop or []) if s]
+        decoder = _IncrementalDecoder(self.tokenizer)
+        emitted = ""
         for _ in range(max_new_tokens):
             token = self._sample(logits[0, -1], temperature, top_k, top_p, repetition_penalty, recent)
             if token == self.eos_id:
                 break
-            generated.append(token)
             recent = (recent + [token])[-128:]
-            current = self.decode(generated)
+            piece = decoder.push(token)
+            current = emitted + piece
             end = len(current)
             for s in stops:
                 pos = current.find(s, len(emitted))
