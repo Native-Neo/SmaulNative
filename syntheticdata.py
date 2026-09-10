@@ -70,6 +70,7 @@ def gen_linear_equation() -> Dict[str, str]:
     return {"instruction": prompt, "response": response, "think": think, "domain": domain}
 
 
+
 def gen_quadratic_equation() -> Dict[str, str]:
     """Generates unique quadratic equations ax^2 + bx + c = 0."""
     a = random.randint(1, 50)
@@ -95,6 +96,7 @@ def gen_quadratic_equation() -> Dict[str, str]:
         f"- **Root 2 ($x_2$):** {root2}\n\n"
         f"**Solutions:** $x = {root1}$ and $x = {root2}$")
     return {"instruction": prompt, "response": response, "think": think, "domain": "math_quadratic"}
+
 
 
 def gen_system_linear_equations() -> Dict[str, str]:
@@ -320,6 +322,11 @@ def build_unique_dataset(target_count: int) -> List[Dict[str, str]]:
                             "text": format_chatml(item["instruction"], item["response"], item.get("think", ""))})
             if len(samples) % 50000 == 0 or len(samples) == target_count:
                 print(f"  └─ Generated {len(samples):,} / {target_count:,} unique records ({time.time() - start_t:.2f}s)")
+    if len(samples) != target_count:
+        raise RuntimeError(
+            f"Could not generate {target_count:,} unique records after {attempts:,} attempts; "
+            f"generated {len(samples):,}."
+        )
     print(f"[Generator] Uniqueness check: {len(seen_prompts):,} unique prompts out of {len(samples):,} generated.")
     return samples
 
