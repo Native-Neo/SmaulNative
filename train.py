@@ -102,6 +102,8 @@ class ResumeState:
         if path.exists():
             try:
                 data = json.loads(path.read_text())
+                if not isinstance(data, dict):
+                    raise ValueError("resume state must be a JSON object")
                 state.global_step = data.get("global_step", 0)
                 state.total_tokens = data.get("total_tokens", 0)
                 state.file_path = data.get("file_path")
@@ -109,7 +111,7 @@ class ResumeState:
                 state.epoch = data.get("epoch", 0)
                 state.buffer_tokens = data.get("buffer_tokens", [])
             except Exception as exc:
-                print(f"[WARN] could not load resume state: {exc}")
+                raise RuntimeError(f"could not load resume state {path}: {exc}") from exc
         return state
 
     def save(self, path):
@@ -133,11 +135,13 @@ def _load_rng_state(path):
         return
     try:
         state = torch.load(path, map_location="cpu", weights_only=False)
+        if "torch" not in state:
+            raise ValueError("missing torch RNG state")
         torch.set_rng_state(state["torch"])
         if torch.cuda.is_available() and "cuda" in state:
             torch.cuda.set_rng_state_all(state["cuda"])
     except Exception as exc:
-        print(f"[WARN] could not restore RNG state: {exc}")
+        raise RuntimeError(f"could not restore RNG state {path}: {exc}") from exc
 
 
 def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path, save_dtype="fp32", save_optimizer=True):
@@ -449,7 +453,7 @@ def main():
         try:
             optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
         except Exception as exc:
-            print(f"[WARN] could not restore optimizer: {exc}")
+            raise RuntimeError(f"could not restore optimizer {optimizer_path}: {exc}") from exc
 
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and args.precision == "fp16" else None
     try:
