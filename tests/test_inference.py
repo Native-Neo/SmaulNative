@@ -4,6 +4,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 from inference import RWKVXInference, _IncrementalDecoder
+from rwkv_x_core import RWKVXConfig, RWKVXModel
 from tokenizer import SmaulTokenizer
 
 
@@ -47,3 +48,18 @@ def test_incremental_decoder_matches_tokenizer_decode():
     decoder = _IncrementalDecoder(tokenizer)
     incremental = "".join(decoder.push(token) for token in ids)
     assert incremental == tokenizer.decode(ids)
+
+
+def test_cached_decode_preserves_first_token_v():
+    torch.manual_seed(0)
+    cfg = RWKVXConfig(vocab_size=32, n_embd=32, n_layer=3, head_size=8, n_moba_layer=0, checkpoint_ffn=False)
+    model = RWKVXModel(cfg).eval()
+    prompt = torch.tensor([[1, 4, 7, 9]])
+    continuation = torch.tensor([[2, 6, 3]])
+    with torch.no_grad():
+        full_logits = model(torch.cat((prompt, continuation), 1))[0]
+        _, _, state = model(prompt, use_cache=True)
+        for i in range(continuation.size(1)):
+            logits, _, state = model(continuation[:, i:i + 1], state=state, use_cache=True)
+            expected = full_logits[:, prompt.size(1) + i:prompt.size(1) + i + 1]
+            assert torch.allclose(logits, expected, rtol=1e-5, atol=1e-6)
