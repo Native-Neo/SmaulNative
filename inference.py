@@ -132,26 +132,30 @@ class RWKVXInference:
         recent = prompt_tokens[-128:]
         stops = [s for s in (stop or []) if s]
         decoder = _IncrementalDecoder(self.tokenizer)
-        emitted = ""
+        pending = ""
+        max_stop_len = max((len(s) for s in stops), default=0)
         for _ in range(max_new_tokens):
             token = self._sample(logits[0, -1], temperature, top_k, top_p, repetition_penalty, recent)
             if token == self.eos_id:
                 break
             recent = (recent + [token])[-128:]
-            piece = decoder.push(token)
-            current = emitted + piece
-            end = len(current)
-            for s in stops:
-                pos = current.find(s)
-                if pos >= 0:
-                    end = min(end, pos)
-            delta = current[len(emitted):end]
-            emitted = current[:end]
-            if delta:
-                yield delta
-            if end < len(current):
-                break
+            pending += decoder.push(token)
+            stop_pos = min((pending.find(s) for s in stops if pending.find(s) >= 0), default=-1)
+            if stop_pos >= 0:
+                if stop_pos:
+                    yield pending[:stop_pos]
+                return
+            if max_stop_len:
+                safe_len = max(0, len(pending) - max_stop_len + 1)
+                if safe_len:
+                    yield pending[:safe_len]
+                    pending = pending[safe_len:]
+            elif pending:
+                yield pending
+                pending = ""
             logits, _, state = self._forward([token], state)
+        if pending:
+            yield pending
 
     def chat_prompt(self, messages: List[Dict[str, str]], system: Optional[str] = None) -> str:
         parts = [f"System:\n{system}\n"] if system else []
