@@ -92,20 +92,15 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                     const int c1 = (byte >> 4) & 3;
                     const int c2 = (byte >> 2) & 3;
                     const int c3 = byte & 3;
-                    const float l0 = c0 == 0 ? -1.0f : c0 == 2 ? 1.0f : 0.0f;
-                    const float l1 = c1 == 0 ? -1.0f : c1 == 2 ? 1.0f : 0.0f;
-                    const float l2 = c2 == 0 ? -1.0f : c2 == 2 ? 1.0f : 0.0f;
-                    const float l3 = c3 == 0 ? -1.0f : c3 == 2 ? 1.0f : 0.0f;
-                    sum += xr[k] * l0;
-                    sum += xr[k + 1] * l1;
-                    sum += xr[k + 2] * l2;
-                    sum += xr[k + 3] * l3;
+                    if (c0 == 0) sum -= xr[k]; else if (c0 == 2) sum += xr[k];
+                    if (c1 == 0) sum -= xr[k + 1]; else if (c1 == 2) sum += xr[k + 1];
+                    if (c2 == 0) sum -= xr[k + 2]; else if (c2 == 2) sum += xr[k + 2];
+                    if (c3 == 0) sum -= xr[k + 3]; else if (c3 == 2) sum += xr[k + 3];
                     k += 4;
                 }
                 for (; k < in_features; ++k) {
                     const int code = (wr[k >> 2] >> (6 - (k & 3) * 2)) & 3;
-                    const float level = code == 0 ? -1.0f : code == 2 ? 1.0f : 0.0f;
-                    sum += xr[k] * level;
+                    if (code == 0) sum -= xr[k]; else if (code == 2) sum += xr[k];
                 }
                 yp[index] = sum;
                 if (++o == out_features) {
