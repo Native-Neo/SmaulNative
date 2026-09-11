@@ -12,6 +12,7 @@ from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
 _CMIX_LINEAR_NAMES = ("key", "value")
 _SUPPORTED_BITS = (2, 4, 8)
+_PACK_CHUNK = 256
 
 if "--qt" in sys.argv:
     i = sys.argv.index("--qt")
@@ -69,6 +70,28 @@ def _unpack_codes(packed, bits, numel):
     return ((packed.unsqueeze(-1) >> shifts) & ((1 << bits) - 1)).reshape(-1)[:numel]
 
 
+def _packed_linear(x, packed, scale, shape, bits, numel):
+    if bits == 8:
+        return F.linear(x, packed.to(device=x.device, dtype=x.dtype))
+    if x.device.type != "cpu":
+        return F.linear(x, packed.unpack(x.device, x.dtype))
+    out_features, in_features = shape
+    if x.shape[-1] != in_features:
+        raise ValueError(f"input features {x.shape[-1]} != {in_features}")
+    levels = _float_levels(bits, x.device).to(x.dtype)
+    flat_codes = _unpack_codes(packed, bits, numel).long()
+    flat_scale = scale.to(device=x.device, dtype=x.dtype).reshape(-1)
+    result = x.new_zeros(*x.shape[:-1], out_features)
+    for start in range(0, in_features, _PACK_CHUNK):
+        end = min(start + _PACK_CHUNK, in_features)
+        first = start * out_features
+        last = end * out_features
+        codes = flat_codes[first:last].reshape(end - start, out_features).transpose(0, 1)
+        weight = levels[codes] * flat_scale[start:end].unsqueeze(0)
+        result.add_(F.linear(x[..., start:end], weight))
+    return result
+
+
 class FloatQATLinear(nn.Module):
     def __init__(self, linear: nn.Linear, bits: int):
         super().__init__()
@@ -109,7 +132,7 @@ class PackedFloatWeight(nn.Module):
         return levels[codes].reshape(self.shape) * self.scale.to(device=device, dtype=dtype)
 
     def forward(self, x):
-        return F.linear(x, self.unpack(x.device, x.dtype))
+        return _packed_linear(x, self, self.scale, self.shape, self.bits, self.numel) if self.bits < 8 else F.linear(x, self.codes.to(device=x.device, dtype=x.dtype))
 
 
 def _iter_cmix_modules(model: RWKVXModel):
