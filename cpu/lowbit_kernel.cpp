@@ -93,7 +93,29 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                 const uint8_t* wr = wp + o * row_bytes;
                 float sum = 0.0f;
                 int64_t k = 0;
-                for (int64_t b = 0; b < full_bytes; ++b) {
+                int64_t b = 0;
+                for (; b + 1 < full_bytes; b += 2) {
+                    const uint8_t byte0 = wr[b];
+                    const uint8_t byte1 = wr[b + 1];
+                    const int c0 = byte0 >> 6;
+                    const int c1 = (byte0 >> 4) & 3;
+                    const int c2 = (byte0 >> 2) & 3;
+                    const int c3 = byte0 & 3;
+                    if (c0 == 0) sum -= xr[k]; else if (c0 == 2) sum += xr[k];
+                    if (c1 == 0) sum -= xr[k + 1]; else if (c1 == 2) sum += xr[k + 1];
+                    if (c2 == 0) sum -= xr[k + 2]; else if (c2 == 2) sum += xr[k + 2];
+                    if (c3 == 0) sum -= xr[k + 3]; else if (c3 == 2) sum += xr[k + 3];
+                    const int c4 = byte1 >> 6;
+                    const int c5 = (byte1 >> 4) & 3;
+                    const int c6 = (byte1 >> 2) & 3;
+                    const int c7 = byte1 & 3;
+                    if (c4 == 0) sum -= xr[k + 4]; else if (c4 == 2) sum += xr[k + 4];
+                    if (c5 == 0) sum -= xr[k + 5]; else if (c5 == 2) sum += xr[k + 5];
+                    if (c6 == 0) sum -= xr[k + 6]; else if (c6 == 2) sum += xr[k + 6];
+                    if (c7 == 0) sum -= xr[k + 7]; else if (c7 == 2) sum += xr[k + 7];
+                    k += 8;
+                }
+                for (; b < full_bytes; ++b) {
                     const uint8_t byte = wr[b];
                     const int c0 = byte >> 6;
                     const int c1 = (byte >> 4) & 3;
