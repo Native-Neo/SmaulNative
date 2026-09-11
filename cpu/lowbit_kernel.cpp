@@ -235,7 +235,18 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
             for (int64_t o = begin; o < end; ++o) {
                 const float* wr = wp + o * in_features;
                 float* qr = qwp + o * in_features;
-                for (int64_t k = 0; k < in_features; ++k)
+                int64_t k = 0;
+                for (; k + 7 < in_features; k += 8) {
+                    qr[k] = quantize2(wr[k], scale[k]);
+                    qr[k + 1] = quantize2(wr[k + 1], scale[k + 1]);
+                    qr[k + 2] = quantize2(wr[k + 2], scale[k + 2]);
+                    qr[k + 3] = quantize2(wr[k + 3], scale[k + 3]);
+                    qr[k + 4] = quantize2(wr[k + 4], scale[k + 4]);
+                    qr[k + 5] = quantize2(wr[k + 5], scale[k + 5]);
+                    qr[k + 6] = quantize2(wr[k + 6], scale[k + 6]);
+                    qr[k + 7] = quantize2(wr[k + 7], scale[k + 7]);
+                }
+                for (; k < in_features; ++k)
                     qr[k] = quantize2(wr[k], scale[k]);
             }
         });
@@ -244,7 +255,18 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
             for (int64_t o = begin; o < end; ++o) {
                 const float* wr = wp + o * in_features;
                 float* qr = qwp + o * in_features;
-                for (int64_t k = 0; k < in_features; ++k)
+                int64_t k = 0;
+                for (; k + 7 < in_features; k += 8) {
+                    qr[k] = quantize4(wr[k], scale[k]);
+                    qr[k + 1] = quantize4(wr[k + 1], scale[k + 1]);
+                    qr[k + 2] = quantize4(wr[k + 2], scale[k + 2]);
+                    qr[k + 3] = quantize4(wr[k + 3], scale[k + 3]);
+                    qr[k + 4] = quantize4(wr[k + 4], scale[k + 4]);
+                    qr[k + 5] = quantize4(wr[k + 5], scale[k + 5]);
+                    qr[k + 6] = quantize4(wr[k + 6], scale[k + 6]);
+                    qr[k + 7] = quantize4(wr[k + 7], scale[k + 7]);
+                }
+                for (; k < in_features; ++k)
                     qr[k] = quantize4(wr[k], scale[k]);
             }
         });
