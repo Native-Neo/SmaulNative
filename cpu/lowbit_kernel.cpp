@@ -22,33 +22,6 @@ inline float decode4(uint8_t byte, int index) {
     return levels[(byte >> (4 - index * 4)) & 15];
 }
 
-inline float quantize(float value, float scale, int bits) {
-    if (bits == 2) {
-        const float half = scale * 0.5f;
-        if (value <= -half) return -scale;
-        if (value <= half) return 0.0f;
-        return scale;
-    }
-
-    const float t1 = scale * -1.5f;
-    const float t2 = scale * -0.75f;
-    const float t3 = scale * -0.375f;
-    const float t4 = scale * -0.125f;
-    const float t5 = scale * 0.125f;
-    const float t6 = scale * 0.375f;
-    const float t7 = scale * 0.75f;
-    const float t8 = scale * 1.5f;
-    if (value <= t1) return scale * -2.0f;
-    if (value <= t2) return scale * -1.0f;
-    if (value <= t3) return scale * -0.5f;
-    if (value <= t4) return scale * -0.25f;
-    if (value <= t5) return 0.0f;
-    if (value <= t6) return scale * 0.25f;
-    if (value <= t7) return scale * 0.5f;
-    if (value <= t8) return scale;
-    return scale * 2.0f;
-}
-
 inline float quantize2(float value, float scale) {
     const float half = scale * 0.5f;
     if (value <= -half) return -scale;
@@ -202,19 +175,25 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
 
     auto qweight = torch::empty_like(weight);
     float* qwp = qweight.data_ptr<float>();
-    at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t o = begin; o < end; ++o) {
-            const float* wr = wp + o * in_features;
-            float* qr = qwp + o * in_features;
-            if (bits == 2) {
+    if (bits == 2) {
+        at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t o = begin; o < end; ++o) {
+                const float* wr = wp + o * in_features;
+                float* qr = qwp + o * in_features;
                 for (int64_t k = 0; k < in_features; ++k)
                     qr[k] = quantize2(wr[k], scale[k]);
-            } else {
+            }
+        });
+    } else {
+        at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+            for (int64_t o = begin; o < end; ++o) {
+                const float* wr = wp + o * in_features;
+                float* qr = qwp + o * in_features;
                 for (int64_t k = 0; k < in_features; ++k)
                     qr[k] = quantize4(wr[k], scale[k]);
             }
-        }
-    });
+        });
+    }
 
     auto out = torch::empty({batch, out_features}, x.options());
     const float* xp = x.data_ptr<float>();
