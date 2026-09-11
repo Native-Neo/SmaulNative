@@ -89,23 +89,28 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
             const float* xr = xp + n * in_features;
             const uint8_t* wr = wp + o * row_bytes;
             float sum = 0.0f;
+
             if (bits == 2) {
+                const int64_t full_bytes = in_features >> 2;
                 int64_t k = 0;
-                for (; k + 3 < in_features; k += 4) {
-                    const uint8_t byte = wr[k >> 2];
+                for (int64_t b = 0; b < full_bytes; ++b) {
+                    const uint8_t byte = wr[b];
                     sum += xr[k] * decode(byte, 0, 2) * sp[k];
                     sum += xr[k + 1] * decode(byte, 1, 2) * sp[k + 1];
                     sum += xr[k + 2] * decode(byte, 2, 2) * sp[k + 2];
                     sum += xr[k + 3] * decode(byte, 3, 2) * sp[k + 3];
+                    k += 4;
                 }
                 for (; k < in_features; ++k)
                     sum += xr[k] * decode(wr[k >> 2], static_cast<int>(k & 3), 2) * sp[k];
             } else {
+                const int64_t full_bytes = in_features >> 1;
                 int64_t k = 0;
-                for (; k + 1 < in_features; k += 2) {
-                    const uint8_t byte = wr[k >> 1];
+                for (int64_t b = 0; b < full_bytes; ++b) {
+                    const uint8_t byte = wr[b];
                     sum += xr[k] * decode(byte, 0, 4) * sp[k];
                     sum += xr[k + 1] * decode(byte, 1, 4) * sp[k + 1];
+                    k += 2;
                 }
                 for (; k < in_features; ++k)
                     sum += xr[k] * decode(wr[k >> 1], static_cast<int>(k & 1), 4) * sp[k];
