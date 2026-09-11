@@ -118,12 +118,17 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
     std::vector<float> scale(in_features, eps);
     const float* wp = weight.data_ptr<float>();
 
-    at::parallel_for(0, in_features, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t k = begin; k < end; ++k) {
-            float max_abs = 0.0f;
-            for (int64_t o = 0; o < out_features; ++o)
-                max_abs = std::max(max_abs, std::abs(wp[o * in_features + k]));
-            scale[k] = std::max(max_abs, eps);
+    constexpr int64_t block = 32;
+    at::parallel_for(0, in_features, block, [&](int64_t begin, int64_t end) {
+        for (int64_t k0 = begin; k0 < end; k0 += block) {
+            const int64_t k1 = std::min(k0 + block, end);
+            for (int64_t o = 0; o < out_features; ++o) {
+                const float* wr = wp + o * in_features + k0;
+                for (int64_t k = k0; k < k1; ++k)
+                    scale[k] = std::max(scale[k], std::abs(wr[k - k0]));
+            }
+            for (int64_t k = k0; k < k1; ++k)
+                scale[k] = std::max(scale[k], eps);
         }
     });
 
