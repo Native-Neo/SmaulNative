@@ -50,6 +50,33 @@ inline float quantize(float value, float scale, int bits) {
     return scale * 2.0f;
 }
 
+inline float quantize2(float value, float scale) {
+    const float half = scale * 0.5f;
+    if (value <= -half) return -scale;
+    if (value <= half) return 0.0f;
+    return scale;
+}
+
+inline float quantize4(float value, float scale) {
+    const float t1 = scale * -1.5f;
+    const float t2 = scale * -0.75f;
+    const float t3 = scale * -0.375f;
+    const float t4 = scale * -0.125f;
+    const float t5 = scale * 0.125f;
+    const float t6 = scale * 0.375f;
+    const float t7 = scale * 0.75f;
+    const float t8 = scale * 1.5f;
+    if (value <= t1) return scale * -2.0f;
+    if (value <= t2) return scale * -1.0f;
+    if (value <= t3) return scale * -0.5f;
+    if (value <= t4) return scale * -0.25f;
+    if (value <= t5) return 0.0f;
+    if (value <= t6) return scale * 0.25f;
+    if (value <= t7) return scale * 0.5f;
+    if (value <= t8) return scale;
+    return scale * 2.0f;
+}
+
 }
 
 torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
@@ -160,8 +187,13 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
         for (int64_t o = begin; o < end; ++o) {
             const float* wr = wp + o * in_features;
             float* qr = qwp + o * in_features;
-            for (int64_t k = 0; k < in_features; ++k)
-                qr[k] = quantize(wr[k], scale[k], static_cast<int>(bits));
+            if (bits == 2) {
+                for (int64_t k = 0; k < in_features; ++k)
+                    qr[k] = quantize2(wr[k], scale[k]);
+            } else {
+                for (int64_t k = 0; k < in_features; ++k)
+                    qr[k] = quantize4(wr[k], scale[k]);
+            }
         }
     });
 
