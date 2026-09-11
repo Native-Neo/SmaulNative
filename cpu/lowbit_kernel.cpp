@@ -1,5 +1,9 @@
 #include <torch/extension.h>
 #include <ATen/Parallel.h>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <vector>
 
 namespace {
 
