@@ -31,19 +31,39 @@ def _bits(bits=None):
 def _float_levels(bits, device):
     if bits == 2:
         return torch.tensor([-1.0, 0.0, 1.0], device=device)
-    return torch.tensor([-2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0], device=device)
+    if bits == 4:
+        return torch.tensor([-2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0], device=device)
+    raise ValueError("FP8 uses hardware-supported E4M3 conversion")
 
 
-def _float_quantize(x, bits):
+def _fake_quantize(x, bits):
     if bits == 8:
         q = x.to(torch.float8_e4m3fn).to(x.dtype)
-        return x + (q - x).detach()
+    else:
+        levels = _float_levels(bits, x.device).to(x.dtype)
+        scale = x.detach().abs().amax(dim=0, keepdim=True).clamp_min(torch.finfo(x.dtype).eps)
+        y = x / scale
+        idx = (y.unsqueeze(-1) - levels).abs().argmin(dim=-1)
+        q = levels[idx] * scale
+    return x + (q - x).detach()
+
+
+def _pack_fp_codes(x, bits):
+    if bits == 8:
+        return x.to(torch.float8_e4m3fn)
     levels = _float_levels(bits, x.device).to(x.dtype)
     scale = x.detach().abs().amax(dim=0, keepdim=True).clamp_min(torch.finfo(x.dtype).eps)
-    y = x / scale
-    idx = (y.unsqueeze(-1) - levels).abs().argmin(dim=-1)
-    q = levels[idx] * scale
-    return x + (q - x).detach()
+    idx = (x / scale).unsqueeze(-1).sub(levels).abs().argmin(dim=-1)
+    if bits == 2:
+        return idx.to(torch.uint8), scale
+    return idx.to(torch.uint8), scale
+
+
+def _unpack_fp_codes(codes, scale, bits, shape, dtype):
+    if bits == 8:
+        return codes.to(dtype)
+    levels = _float_levels(bits, codes.device).to(dtype)
+    return levels[codes.long()].reshape(shape) * scale.to(dtype)
 
 
 class FloatQATLinear(nn.Module):
@@ -52,10 +72,30 @@ class FloatQATLinear(nn.Module):
         if linear.bias is not None:
             raise ValueError("RWKV-X Channel-Mix linears must have bias=False")
         self.weight = linear.weight
-        self.bits = bits
+        self.bits = _bits(bits)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, _float_quantize(self.weight, self.bits))
+        return F.linear(x, _fake_quantize(self.weight, self.bits))
+
+    @torch.no_grad()
+    def pack(self):
+        codes, scale = _pack_fp_codes(self.weight.detach(), self.bits)
+        return PackedFloatWeight(codes.cpu(), scale.cpu(), self.weight.shape, self.bits)
+
+
+class PackedFloatWeight(nn.Module):
+    def __init__(self, codes, scale, shape, bits):
+        super().__init__()
+        self.bits = _bits(bits)
+        self.shape = tuple(shape)
+        self.register_buffer("codes", codes)
+        self.register_buffer("scale", scale)
+
+    def unpack(self, device, dtype):
+        return _unpack_fp_codes(self.codes.to(device), self.scale.to(device), self.bits, self.shape, dtype)
+
+    def forward(self, x):
+        return F.linear(x, self.unpack(x.device, x.dtype))
 
 
 def _iter_cmix_modules(model: RWKVXModel):
@@ -76,13 +116,20 @@ def prepare_qat(model: RWKVXModel, bits=None) -> int:
             if isinstance(mod, nn.Linear):
                 setattr(cmix, name, FloatQATLinear(mod, bits))
                 n += 1
-    print(f"[QAT] floating-point {bits}-bit weights")
+    print(f"[QAT] FP{bits} training weights")
     return n
 
 
 def convert_qat(model: RWKVXModel, bits=None) -> int:
-    _bits(bits)
-    return sum(isinstance(getattr(cmix, name), FloatQATLinear) for cmix in _iter_cmix_modules(model) for name in _CMIX_LINEAR_NAMES)
+    bits = _bits(bits)
+    n = 0
+    for cmix in _iter_cmix_modules(model):
+        for name in _CMIX_LINEAR_NAMES:
+            mod = getattr(cmix, name)
+            if isinstance(mod, FloatQATLinear):
+                setattr(cmix, name, mod.pack())
+                n += 1
+    return n
 
 
 @torch.no_grad()
