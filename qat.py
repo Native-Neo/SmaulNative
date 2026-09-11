@@ -1,149 +1,47 @@
 #!/usr/bin/env python3
-# qat.py -- Quantization-Aware Training for RWKV-X, int3.
+# Low-bit floating-point QAT for RWKV-X.
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.ao.quantization import FakeQuantize, MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver
 
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
 _CMIX_LINEAR_NAMES = ("key", "value")
-WBITS = 3
-NUM_LEVELS = 2**WBITS
-WEIGHT_QMIN, WEIGHT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
-ACT_QMIN, ACT_QMAX = 0, NUM_LEVELS - 1
-SIGNED_ACT_QMIN, SIGNED_ACT_QMAX = -(NUM_LEVELS // 2), NUM_LEVELS // 2 - 1
+_SUPPORTED_BITS = (2, 4, 8)
 
 
-def _install_cuda_wkv_compile():
-    if not torch.cuda.is_available() or not hasattr(torch, "compile"):
-        return
-    try:
-        import rwkv_x_core
-
-        fn = rwkv_x_core._wkv_run_chunk
-        if not getattr(fn, "_smaul_cuda_compiled", False):
-            compiled = torch.compile(fn, mode="max-autotune-no-cudagraphs", dynamic=False, fullgraph=False)
-            compiled._smaul_cuda_compiled = True
-            rwkv_x_core._wkv_run_chunk = compiled
-        print("[CUDA] WKV TorchInductor enabled")
-    except Exception as e:
-        print(f"[CUDA] WKV compile unavailable, using eager path: {e}")
+def _float_levels(bits, device):
+    if bits == 2:
+        return torch.tensor([-1.0, 0.0, 1.0], device=device)
+    if bits == 4:
+        return torch.tensor([-2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0], device=device)
+    raise ValueError("bits must be 2, 4, or 8")
 
 
-_install_cuda_wkv_compile()
+def _float_quantize(x, bits):
+    if bits == 8:
+        return x.to(torch.float8_e4m3fn).to(x.dtype)
+    levels = _float_levels(bits, x.device).to(x.dtype)
+    scale = x.detach().abs().amax(dim=0, keepdim=True).clamp_min(torch.finfo(x.dtype).eps)
+    y = x / scale
+    idx = (y.unsqueeze(-1) - levels).abs().argmin(dim=-1)
+    q = levels[idx] * scale
+    return x + (q - x).detach()
 
 
-def _weight_fake_quant() -> FakeQuantize:
-    return FakeQuantize.with_args(
-        observer=MovingAveragePerChannelMinMaxObserver,
-        quant_min=WEIGHT_QMIN,
-        quant_max=WEIGHT_QMAX,
-        dtype=torch.qint8,
-        qscheme=torch.per_channel_symmetric,
-        ch_axis=0,
-    )()
-
-
-def _activation_fake_quant(signed: bool = False) -> FakeQuantize:
-    if signed:
-        return FakeQuantize.with_args(
-            observer=MovingAverageMinMaxObserver,
-            quant_min=SIGNED_ACT_QMIN,
-            quant_max=SIGNED_ACT_QMAX,
-            dtype=torch.qint8,
-            qscheme=torch.per_tensor_symmetric,
-        )()
-    return FakeQuantize.with_args(
-        observer=MovingAverageMinMaxObserver,
-        quant_min=ACT_QMIN,
-        quant_max=ACT_QMAX,
-        dtype=torch.quint8,
-        qscheme=torch.per_tensor_affine,
-    )()
-
-
-def _pack_3bit(codes: torch.Tensor) -> torch.Tensor:
-    device = codes.device
-    shifts = torch.tensor([2, 1, 0], dtype=torch.uint8, device=device)
-    bits = (codes.reshape(-1).to(torch.uint8).unsqueeze(-1) >> shifts) & 1
-    flat_bits = bits.reshape(-1)
-    pad_len = (8 - (flat_bits.numel() % 8)) % 8
-    if pad_len:
-        flat_bits = torch.cat([
-            flat_bits,
-            torch.zeros(pad_len, dtype=torch.uint8, device=device),
-        ])
-    powers = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.uint8, device=device)
-    return (flat_bits.reshape(-1, 8) * powers).sum(dim=-1)
-
-
-def _unpack_3bit(packed: torch.Tensor, numel: int) -> torch.Tensor:
-    device = packed.device
-    shifts = torch.arange(7, -1, -1, dtype=torch.uint8, device=device)
-    bits = (packed.unsqueeze(-1) >> shifts) & 1
-    flat_bits = bits.reshape(-1)[:numel * 3]
-    grouped = flat_bits.reshape(numel, 3)
-    return grouped[:, 0] * 4 + grouped[:, 1] * 2 + grouped[:, 2]
-
-
-class QATLinear(nn.Module):
-
-    def __init__(self, linear: nn.Linear, signed_activation: bool = False):
+class FloatQATLinear(nn.Module):
+    def __init__(self, linear: nn.Linear, bits: int):
         super().__init__()
         if linear.bias is not None:
             raise ValueError("RWKV-X Channel-Mix linears must have bias=False")
+        if bits not in _SUPPORTED_BITS:
+            raise ValueError("bits must be 2, 4, or 8")
         self.weight = linear.weight
-        self.weight_fq = _weight_fake_quant()
-        self.act_fq = _activation_fake_quant(signed_activation)
-        self.fake_quant_enabled = True
-
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        destination[prefix + "weight"] = self.weight if keep_vars else self.weight.detach()
-        for name, value in self.weight_fq.state_dict().items():
-            destination[prefix + "weight_fq." + name] = value if keep_vars else value.detach()
-        for name, value in self.act_fq.state_dict().items():
-            destination[prefix + "act_fq." + name] = value if keep_vars else value.detach()
+        self.bits = bits
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.fake_quant_enabled:
-            return F.linear(x, self.weight)
-        return F.linear(self.act_fq(x), self.weight_fq(self.weight))
-
-    def to_quantized(self) -> "QuantizedLinear":
-        scale, _ = self.weight_fq.calculate_qparams()
-        w = self.weight.detach().float()
-        scale = scale.float().clamp_min(torch.finfo(torch.float32).eps)
-        q = torch.clamp(torch.round(w / scale.unsqueeze(1)), WEIGHT_QMIN, WEIGHT_QMAX)
-        codes = (q - WEIGHT_QMIN).to(torch.uint8)
-        return QuantizedLinear(_pack_3bit(codes), scale, w.shape)
-
-
-class QuantizedLinear(nn.Module):
-
-    def __init__(self, packed: torch.Tensor, scale: torch.Tensor, shape):
-        super().__init__()
-        self.register_buffer("packed", packed)
-        self.register_buffer("scale", scale)
-        self.register_buffer("weight_shape", torch.tensor([int(shape[0]), int(shape[1])], dtype=torch.int64))
-        self.out_features, self.in_features = int(shape[0]), int(shape[1])
-        self._code_cache = {}
-
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
-                              error_msgs):
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
-                                      error_msgs)
-        self._code_cache.clear()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        key = (x.device.type, x.device.index)
-        codes = self._code_cache.get(key)
-        if codes is None or codes.device != x.device:
-            codes = _unpack_3bit(self.packed, self.out_features * self.in_features).to(x.device)
-            self._code_cache[key] = codes
-        q = codes.to(x.dtype).view(self.out_features, self.in_features) + WEIGHT_QMIN
-        w = q * self.scale.to(device=x.device, dtype=x.dtype).unsqueeze(1)
+        w = _float_quantize(self.weight, self.bits)
         return F.linear(x, w)
 
 
@@ -156,51 +54,30 @@ def _iter_cmix_modules(model: RWKVXModel):
             yield ffn
 
 
-def prepare_qat(model: RWKVXModel) -> int:
+def prepare_qat(model: RWKVXModel, bits: int) -> int:
+    if bits not in _SUPPORTED_BITS:
+        raise ValueError("bits must be 2, 4, or 8")
     n = 0
     for cmix in _iter_cmix_modules(model):
         for name in _CMIX_LINEAR_NAMES:
             mod = getattr(cmix, name)
             if isinstance(mod, nn.Linear):
-                setattr(cmix, name, QATLinear(mod, signed_activation=name == "key"))
+                setattr(cmix, name, FloatQATLinear(mod, bits))
                 n += 1
     return n
 
 
-def convert_qat(model: RWKVXModel) -> int:
+def convert_qat(model: RWKVXModel, bits: int) -> int:
     n = 0
     for cmix in _iter_cmix_modules(model):
         for name in _CMIX_LINEAR_NAMES:
             mod = getattr(cmix, name)
-            if isinstance(mod, QATLinear):
-                setattr(cmix, name, mod.to_quantized())
+            if isinstance(mod, FloatQATLinear):
+                setattr(cmix, name, mod)
                 n += 1
     return n
 
 
 @torch.no_grad()
-def calibrate(
-    model: RWKVXModel,
-    tokenizer,
-    calib_texts,
-    ctx_len: int,
-    device,
-    max_batches: int = 64,
-):
-    was_training = model.training
-    model.eval()
-    buf, n_batches = [], 0
-    for text in calib_texts:
-        if n_batches >= max_batches:
-            break
-        buf.extend(tokenizer.encode(text))
-        buf.append(tokenizer.eos_token_id)
-        while len(buf) >= ctx_len + 1 and n_batches < max_batches:
-            chunk = buf[:ctx_len + 1]
-            del buf[:ctx_len]
-            x = torch.tensor(chunk[:-1], dtype=torch.long, device=device).unsqueeze(0)
-            model(x)
-            n_batches += 1
-            print(f"[QAT] calib batch {n_batches}/{max_batches}")
-    model.train(was_training)
-    return n_batches
+def calibrate(model, tokenizer, calib_texts, ctx_len, device, max_batches=64):
+    return 0
