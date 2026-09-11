@@ -66,13 +66,23 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
     const float* sp = scale.data_ptr<float>();
     float* yp = out.data_ptr<float>();
 
+    auto scaled_x = torch::empty_like(x);
+    float* sxp = scaled_x.data_ptr<float>();
+    at::parallel_for(0, batch * in_features, 256, [&](int64_t begin, int64_t end) {
+        int64_t k = begin % in_features;
+        for (int64_t index = begin; index < end; ++index) {
+            sxp[index] = xp[index] * sp[k];
+            if (++k == in_features) k = 0;
+        }
+    });
+
     if (bits == 2) {
         const int64_t full_bytes = in_features >> 2;
         at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
             int64_t n = begin / out_features;
             int64_t o = begin - n * out_features;
             for (int64_t index = begin; index < end; ++index) {
-                const float* xr = xp + n * in_features;
+                const float* xr = sxp + n * in_features;
                 const uint8_t* wr = wp + o * row_bytes;
                 float sum = 0.0f;
                 int64_t k = 0;
@@ -86,16 +96,16 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                     const float l1 = c1 == 0 ? -1.0f : c1 == 2 ? 1.0f : 0.0f;
                     const float l2 = c2 == 0 ? -1.0f : c2 == 2 ? 1.0f : 0.0f;
                     const float l3 = c3 == 0 ? -1.0f : c3 == 2 ? 1.0f : 0.0f;
-                    sum += xr[k] * sp[k] * l0;
-                    sum += xr[k + 1] * sp[k + 1] * l1;
-                    sum += xr[k + 2] * sp[k + 2] * l2;
-                    sum += xr[k + 3] * sp[k + 3] * l3;
+                    sum += xr[k] * l0;
+                    sum += xr[k + 1] * l1;
+                    sum += xr[k + 2] * l2;
+                    sum += xr[k + 3] * l3;
                     k += 4;
                 }
                 for (; k < in_features; ++k) {
                     const int code = (wr[k >> 2] >> (6 - (k & 3) * 2)) & 3;
                     const float level = code == 0 ? -1.0f : code == 2 ? 1.0f : 0.0f;
-                    sum += xr[k] * sp[k] * level;
+                    sum += xr[k] * level;
                 }
                 yp[index] = sum;
                 if (++o == out_features) {
@@ -110,7 +120,7 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
             int64_t n = begin / out_features;
             int64_t o = begin - n * out_features;
             for (int64_t index = begin; index < end; ++index) {
-                const float* xr = xp + n * in_features;
+                const float* xr = sxp + n * in_features;
                 const uint8_t* wr = wp + o * row_bytes;
                 float sum = 0.0f;
                 int64_t k = 0;
@@ -120,14 +130,14 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                     const int c1 = byte & 15;
                     const float l0 = c0 == 0 ? -2.0f : c0 == 1 ? -1.0f : c0 == 2 ? -0.5f : c0 == 3 ? -0.25f : c0 == 5 ? 0.25f : c0 == 6 ? 0.5f : c0 == 7 ? 1.0f : c0 == 8 ? 2.0f : 0.0f;
                     const float l1 = c1 == 0 ? -2.0f : c1 == 1 ? -1.0f : c1 == 2 ? -0.5f : c1 == 3 ? -0.25f : c1 == 5 ? 0.25f : c1 == 6 ? 0.5f : c1 == 7 ? 1.0f : c1 == 8 ? 2.0f : 0.0f;
-                    sum += xr[k] * sp[k] * l0;
-                    sum += xr[k + 1] * sp[k + 1] * l1;
+                    sum += xr[k] * l0;
+                    sum += xr[k + 1] * l1;
                     k += 2;
                 }
                 for (; k < in_features; ++k) {
                     const int code = (wr[k >> 1] >> (4 - (k & 1) * 4)) & 15;
                     const float level = code == 0 ? -2.0f : code == 1 ? -1.0f : code == 2 ? -0.5f : code == 3 ? -0.25f : code == 5 ? 0.25f : code == 6 ? 0.5f : code == 7 ? 1.0f : code == 8 ? 2.0f : 0.0f;
-                    sum += xr[k] * sp[k] * level;
+                    sum += xr[k] * level;
                 }
                 yp[index] = sum;
                 if (++o == out_features) {
