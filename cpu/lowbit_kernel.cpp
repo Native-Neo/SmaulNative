@@ -287,9 +287,9 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
     at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
         int64_t n = begin / out_features;
         int64_t o = begin - n * out_features;
+        const float* xr = xp + n * in_features;
+        const float* qr = qwp + o * in_features;
         for (int64_t index = begin; index < end; ++index) {
-            const float* xr = xp + n * in_features;
-            const float* qr = qwp + o * in_features;
             float sum = 0.0f;
             int64_t k = 0;
             for (; k + 7 < in_features; k += 8) {
@@ -308,6 +308,10 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
             if (++o == out_features) {
                 o = 0;
                 ++n;
+                xr += in_features;
+                qr = qwp;
+            } else {
+                qr += in_features;
             }
         }
     });
