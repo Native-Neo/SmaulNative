@@ -13,6 +13,7 @@ from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
 _CMIX_LINEAR_NAMES = ("key", "value")
 _SUPPORTED_BITS = (2, 4, 8)
+_LOWBIT_EXT = None
 
 if "--qt" in sys.argv:
     i = sys.argv.index("--qt")
@@ -20,9 +21,6 @@ if "--qt" in sys.argv:
         raise SystemExit("--qt requires 2, 4, or 8")
     os.environ["SMAUL_QT_BITS"] = sys.argv[i + 1]
     sys.argv[i:i + 2] = ["--qat"]
-
-
-_LOWBIT_EXT = None
 
 
 def _load_lowbit():
@@ -54,14 +52,19 @@ def _float_levels(bits, device):
     raise ValueError("FP8 uses E4M3")
 
 
+def _quantize_codes(x, bits):
+    levels = _float_levels(bits, x.device).to(x.dtype)
+    scale = x.detach().abs().amax(dim=0, keepdim=True).clamp_min(torch.finfo(x.dtype).eps)
+    codes = (x.detach() / scale).unsqueeze(-1).sub(levels).abs().argmin(dim=-1).to(torch.uint8)
+    return codes, scale
+
+
 def _fake_quantize(x, bits):
     if bits == 8:
         q = x.to(torch.float8_e4m3fn).to(x.dtype)
     else:
-        levels = _float_levels(bits, x.device).to(x.dtype)
-        scale = x.detach().abs().amax(dim=0, keepdim=True).clamp_min(torch.finfo(x.dtype).eps)
-        idx = (x / scale).unsqueeze(-1).sub(levels).abs().argmin(dim=-1)
-        q = levels[idx] * scale
+        codes, scale = _quantize_codes(x, bits)
+        q = _float_levels(bits, x.device).to(x.dtype)[codes.long()] * scale
     return x + (q - x).detach()
 
 
@@ -107,6 +110,38 @@ def _packed_linear(x, packed, scale, shape, bits, numel):
     return result.reshape(*x.shape[:-1], out_features)
 
 
+class _PackedQATFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, packed, scale, bits):
+        ctx.save_for_backward(x, weight)
+        ctx.bits = bits
+        out_features, in_features = weight.shape
+        if x.device.type == "cpu" and x.dtype == torch.float32 and bits < 8:
+            x2 = x.reshape(-1, in_features).contiguous()
+            y = _load_lowbit().packed_linear(
+                x2,
+                packed,
+                scale.reshape(-1).float().contiguous(),
+                bits,
+                out_features,
+                in_features,
+            )
+            return y.reshape(*x.shape[:-1], out_features)
+        q = _fake_quantize(weight, bits)
+        return F.linear(x, q)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        bits = ctx.bits
+        q = _fake_quantize(weight, bits)
+        x2 = x.reshape(-1, x.shape[-1])
+        go = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_x = go.matmul(q).reshape_as(x)
+        grad_weight = go.transpose(0, 1).matmul(x2)
+        return grad_x, grad_weight, None, None, None
+
+
 class FloatQATLinear(nn.Module):
     def __init__(self, linear: nn.Linear, bits: int):
         super().__init__()
@@ -114,17 +149,31 @@ class FloatQATLinear(nn.Module):
             raise ValueError("RWKV-X Channel-Mix linears must have bias=False")
         self.weight = linear.weight
         self.bits = _bits(bits)
+        self._packed_version = -1
+        self._packed_codes = None
+        self._packed_scale = None
+
+    def _packed(self):
+        version = self.weight._version
+        if self._packed_version != version or self._packed_codes is None:
+            codes, scale = _quantize_codes(self.weight, self.bits)
+            packed, _ = _pack_codes(codes, self.bits)
+            self._packed_codes = packed.detach().cpu()
+            self._packed_scale = scale.detach().cpu()
+            self._packed_version = version
+        return self._packed_codes, self._packed_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bits < 8 and x.device.type == "cpu" and x.dtype == torch.float32:
+            packed, scale = self._packed()
+            return _PackedQATFunction.apply(x, self.weight, packed, scale, self.bits)
         return F.linear(x, _fake_quantize(self.weight, self.bits))
 
     @torch.no_grad()
     def pack(self):
         if self.bits == 8:
             return PackedFloatWeight(self.weight.detach().cpu().to(torch.float8_e4m3fn), None, self.weight.shape, self.bits)
-        levels = _float_levels(self.bits, self.weight.device).to(self.weight.dtype)
-        scale = self.weight.detach().abs().amax(dim=0, keepdim=True).clamp_min(torch.finfo(self.weight.dtype).eps)
-        codes = (self.weight.detach() / scale).unsqueeze(-1).sub(levels).abs().argmin(dim=-1).to(torch.uint8)
+        codes, scale = _quantize_codes(self.weight, self.bits)
         packed, numel = _pack_codes(codes, self.bits)
         return PackedFloatWeight(packed.cpu(), scale.cpu(), self.weight.shape, self.bits, numel)
 
