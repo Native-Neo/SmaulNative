@@ -126,7 +126,23 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                 const uint8_t* wr = wp + o * row_bytes;
                 float sum = 0.0f;
                 int64_t k = 0;
-                for (int64_t b = 0; b < full_bytes; ++b) {
+                int64_t b = 0;
+                for (; b + 3 < full_bytes; b += 4) {
+                    const uint8_t byte0 = wr[b];
+                    const uint8_t byte1 = wr[b + 1];
+                    const uint8_t byte2 = wr[b + 2];
+                    const uint8_t byte3 = wr[b + 3];
+                    sum += xr[k] * fp4_levels[byte0 >> 4];
+                    sum += xr[k + 1] * fp4_levels[byte0 & 15];
+                    sum += xr[k + 2] * fp4_levels[byte1 >> 4];
+                    sum += xr[k + 3] * fp4_levels[byte1 & 15];
+                    sum += xr[k + 4] * fp4_levels[byte2 >> 4];
+                    sum += xr[k + 5] * fp4_levels[byte2 & 15];
+                    sum += xr[k + 6] * fp4_levels[byte3 >> 4];
+                    sum += xr[k + 7] * fp4_levels[byte3 & 15];
+                    k += 8;
+                }
+                for (; b < full_bytes; ++b) {
                     const uint8_t byte = wr[b];
                     sum += xr[k] * fp4_levels[byte >> 4];
                     sum += xr[k + 1] * fp4_levels[byte & 15];
