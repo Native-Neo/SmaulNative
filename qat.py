@@ -112,20 +112,13 @@ def _packed_linear(x, packed, scale, shape, bits, numel):
 
 class _PackedQATFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, packed, scale, bits):
+    def forward(ctx, x, weight, bits):
         ctx.save_for_backward(x, weight)
         ctx.bits = bits
         out_features, in_features = weight.shape
         if x.device.type == "cpu" and x.dtype == torch.float32 and bits < 8:
             x2 = x.reshape(-1, in_features).contiguous()
-            y = _load_lowbit().packed_linear(
-                x2,
-                packed,
-                scale.reshape(-1).float().contiguous(),
-                bits,
-                out_features,
-                in_features,
-            )
+            y = _load_lowbit().qat_linear(x2, weight, bits)
             return y.reshape(*x.shape[:-1], out_features)
         q = _fake_quantize(weight, bits)
         return F.linear(x, q)
@@ -139,7 +132,7 @@ class _PackedQATFunction(torch.autograd.Function):
         go = grad_output.reshape(-1, grad_output.shape[-1])
         grad_x = go.matmul(q).reshape_as(x)
         grad_weight = go.transpose(0, 1).matmul(x2)
-        return grad_x, grad_weight, None, None, None
+        return grad_x, grad_weight, None
 
 
 class FloatQATLinear(nn.Module):
@@ -149,24 +142,10 @@ class FloatQATLinear(nn.Module):
             raise ValueError("RWKV-X Channel-Mix linears must have bias=False")
         self.weight = linear.weight
         self.bits = _bits(bits)
-        self._packed_version = -1
-        self._packed_codes = None
-        self._packed_scale = None
-
-    def _packed(self):
-        version = self.weight._version
-        if self._packed_version != version or self._packed_codes is None:
-            codes, scale = _quantize_codes(self.weight, self.bits)
-            packed, _ = _pack_codes(codes, self.bits)
-            self._packed_codes = packed.detach().cpu()
-            self._packed_scale = scale.detach().cpu()
-            self._packed_version = version
-        return self._packed_codes, self._packed_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.bits < 8 and x.device.type == "cpu" and x.dtype == torch.float32:
-            packed, scale = self._packed()
-            return _PackedQATFunction.apply(x, self.weight, packed, scale, self.bits)
+            return _PackedQATFunction.apply(x, self.weight, self.bits)
         return F.linear(x, _fake_quantize(self.weight, self.bits))
 
     @torch.no_grad()
