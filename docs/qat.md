@@ -1,48 +1,50 @@
 # qat.py
 
-Quantization-Aware Training for RWKV-X at **3-bit (int3)** precision. Not run directly -- it's
-what `train.py --qat` uses. Only the Channel-Mix (FFN) `key`/`value` linears get fake-quantized;
-embeddings, head, and both attention variants (RWKV time-mix, MOBA) stay FP32.
+Quantization-Aware Training for RWKV-X at **2-bit (FP2), 4-bit (FP4), and 8-bit (FP8)** floating-point precision. It is normally used through `train.py`; the module also exposes helpers for preparing, calibrating, and converting a model.
 
 ## Run through train.py
 
 ```bash
+# FP2
 python train.py --mode sft --dataset_dir ./sft_data --output_dir ./RWKV-X-SFT \
-    --qat --qat_calib_batches 64 --qat_export_dir ./RWKV-X-SFT-int3
+    --qt 2 --qat_calib_batches 64 --qat_export_dir ./RWKV-X-SFT-fp2
+
+# FP4
+python train.py --mode sft --dataset_dir ./sft_data --output_dir ./RWKV-X-SFT \
+    --qt 4 --qat_calib_batches 64 --qat_export_dir ./RWKV-X-SFT-fp4
+
+# FP8
+python train.py --mode sft --dataset_dir ./sft_data --output_dir ./RWKV-X-SFT \
+    --qt 8 --qat_calib_batches 64 --qat_export_dir ./RWKV-X-SFT-fp8
 ```
 
-- `--output_dir` keeps a **fake-quantized, still fine-tunable** checkpoint (FP32 storage, but
-  every forward pass simulates 3-bit noise) -- keep training/resuming from this normally.
-- `--qat_export_dir` is a **separate**, one-shot export: real packed int3 weights (~10.7x smaller
-  than FP32 for those layers), not meant to be resumed/fine-tuned further.
+`--qt 2`, `--qt 4`, and `--qt 8` select FP2, FP4, and FP8. `qat.py` translates the `--qt N` compatibility option into the generic QAT mode before `train.py` parses its arguments. `--qat` remains available when the default QAT mode is sufficient.
+
+- `--output_dir` keeps the normal fine-tunable checkpoint. QAT uses FP32 master weights and simulates the selected low-bit representation during the forward pass.
+- `--qat_export_dir` is a separate conversion/export path. FP2 and FP4 weights are physically packed into sub-byte storage; FP8 weights use PyTorch's `float8_e4m3fn` representation where supported.
+- Packed FP2/FP4 storage is primarily a memory/bandwidth optimization. It should not be assumed to outperform a tuned FP32 GEMM on CPUs without native low-bit floating-point instructions.
 
 ## Scripting it directly
 
 ```python
 import qat
-qat.prepare_qat(model)                                   # wrap the FFN linears
-qat.calibrate(model, tokenizer, some_texts, ctx_len=512, device=device)  # settle ranges
+qat.prepare_qat(model, bits=4)
+qat.calibrate(model, tokenizer, some_texts, ctx_len=512, device=device)
 # ... fine-tune model as normal ...
-qat.convert_qat(model)                                    # bake in real int3 weights
+qat.convert_qat(model)
 ```
 
 ## How it works
 
-- **Which linears**: every `RWKV_CMix_x070` FFN's `key` (expand, `C -> 4C`) and `value`
-  (contract, `4C -> C`) projections are replaced, including each MoE expert
-  (`_iter_cmix_modules`, `qat.py:107`). All are bias-free, so a bias-free `QATLinear` is an exact
-  drop-in and the `state_dict` key stays `weight` (`qat.py:59`).
-- **Ranges** (`qat.py:19`): weights are symmetric signed int3 in `[-4, 3]` per-channel; activations
-  are asymmetric unsigned int3 in `[0, 7]` per-tensor. A `FakeQuantize` with a moving
-  min/max observer wraps each (`_weight_fake_quant` / `_activation_fake_quant`).
-- **Calibration** (`qat.calibrate`, `qat.py:145`): before fine-tuning, a handful of forward passes
-  over a representative slice of the training data lets the observers' ranges settle
-  (no gradients, no optimizer step). `train.py` pulls `--qat_calib_batches` worth from `--dataset_dir`.
-- **Conversion** (`qat.convert_qat` -> `QATLinear.to_quantized`, `qat.py:77`): bakes the calibrated
-  weight range into real int3 codes and packs them sub-byte (8 codes / 3 bytes, MSB-first) into a
-  `QuantizedLinear` (`qat.py:86`). On each forward it unpacks, dequantizes `q * scale`, and runs a
-  normal `F.linear` -- CPU-portable with no fbgemm/qnnpack dependency, but the on-the-fly unpacking
-  costs some forward time (fine for this CPU-first project, not a packed-kernel inference engine).
-- **`prepare_qat`** wraps whatever `nn.Linear` is present, so it's safe to call on a freshly
-  constructed model *or* one loaded via `from_pretrained` -- loaded weights are preserved
-  (`qat.py:117`).
+- **Floating-point levels**: FP2 and FP4 use compact custom floating-point codebooks represented by low-bit codes; FP8 uses PyTorch's `float8_e4m3fn`. FP2/FP4 are not IEEE interchange formats.
+- **QAT training**: `FloatQATLinear` keeps the original FP32 parameter as the master weight and applies a straight-through fake-quantized weight in the forward pass. This avoids replacing optimizer state with 2/4-bit values during training.
+- **Packed FP2/FP4 weights**: conversion encodes the quantized codes into bytes instead of storing one byte or one FP32 value per code. FP2 stores four codes per byte and FP4 stores two codes per byte.
+- **CPU packed path**: converted FP2/FP4 weights use a chunked CPU matmul path. It decodes only the weight values needed for each input chunk before calling the normal CPU linear operation, avoiding full FP32 materialization of the packed matrix at once.
+- **Current scope**: QAT wrapping currently targets the Channel-Mix `key` and `value` projections, including MoE experts. Time-Mix, MOBA attention, embeddings, and the model head are not automatically converted by `prepare_qat`.
+- **Scale**: FP2/FP4 weight quantization uses per-input-column scaling. The packed representation stores the quantized codes separately from the scale values.
+- **Calibration**: `qat.calibrate` runs representative forward passes without gradients or optimizer updates so the selected quantization ranges can settle before fine-tuning.
+- **Conversion**: `qat.convert_qat` replaces prepared QAT linears with packed low-bit weight modules. The exported/converted model is intended for inference rather than continued QAT training.
+
+## CPU notes
+
+The packed FP2/FP4 implementation is CPU-portable and does not require fbgemm or qnnpack. On older CPUs such as Ivy Bridge, there is no native FP2/FP4 arithmetic, so the implementation decodes the compact representation and accumulates through normal floating-point CPU operations. Physical packing can reduce memory traffic, but a dedicated native low-bit GEMM kernel is required for a substantial compute-speed improvement.
