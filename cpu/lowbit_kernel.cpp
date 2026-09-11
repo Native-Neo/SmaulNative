@@ -261,7 +261,18 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
             const float* xr = xp + n * in_features;
             const float* qr = qwp + o * in_features;
             float sum = 0.0f;
-            for (int64_t k = 0; k < in_features; ++k)
+            int64_t k = 0;
+            for (; k + 7 < in_features; k += 8) {
+                sum += xr[k] * qr[k];
+                sum += xr[k + 1] * qr[k + 1];
+                sum += xr[k + 2] * qr[k + 2];
+                sum += xr[k + 3] * qr[k + 3];
+                sum += xr[k + 4] * qr[k + 4];
+                sum += xr[k + 5] * qr[k + 5];
+                sum += xr[k + 6] * qr[k + 6];
+                sum += xr[k + 7] * qr[k + 7];
+            }
+            for (; k < in_features; ++k)
                 sum += xr[k] * qr[k];
             yp[index] = sum;
             if (++o == out_features) {
