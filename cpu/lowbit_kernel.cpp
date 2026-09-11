@@ -7,21 +7,6 @@
 
 namespace {
 
-inline float decode2(uint8_t byte, int index) {
-    static constexpr float levels[] = {-1.0f, 0.0f, 1.0f, 0.0f};
-    return levels[(byte >> (6 - index * 2)) & 3];
-}
-
-inline float decode4(uint8_t byte, int index) {
-    static constexpr float levels[] = {
-        -2.0f, -1.0f, -0.5f, -0.25f,
-        0.0f, 0.25f, 0.5f, 1.0f,
-        2.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 0.0f, 0.0f
-    };
-    return levels[(byte >> (4 - index * 4)) & 15];
-}
-
 inline float quantize2(float value, float scale) {
     const float half = scale * 0.5f;
     if (value <= -half) return -scale;
@@ -93,14 +78,21 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                 int64_t k = 0;
                 for (int64_t b = 0; b < full_bytes; ++b) {
                     const uint8_t byte = wr[b];
-                    sum += xr[k] * decode2(byte, 0) * sp[k];
-                    sum += xr[k + 1] * decode2(byte, 1) * sp[k + 1];
-                    sum += xr[k + 2] * decode2(byte, 2) * sp[k + 2];
-                    sum += xr[k + 3] * decode2(byte, 3) * sp[k + 3];
+                    const float s0 = sp[k];
+                    const float s1 = sp[k + 1];
+                    const float s2 = sp[k + 2];
+                    const float s3 = sp[k + 3];
+                    sum += xr[k] * s0 * (static_cast<int>(byte >> 6) - 1);
+                    sum += xr[k + 1] * s1 * (((byte >> 4) & 3) == 0 ? -1.0f : ((byte >> 4) & 3) == 2 ? 1.0f : 0.0f);
+                    sum += xr[k + 2] * s2 * (((byte >> 2) & 3) == 0 ? -1.0f : ((byte >> 2) & 3) == 2 ? 1.0f : 0.0f);
+                    sum += xr[k + 3] * s3 * ((byte & 3) == 0 ? -1.0f : (byte & 3) == 2 ? 1.0f : 0.0f);
                     k += 4;
                 }
-                for (; k < in_features; ++k)
-                    sum += xr[k] * decode2(wr[k >> 2], static_cast<int>(k & 3)) * sp[k];
+                for (; k < in_features; ++k) {
+                    const int code = (wr[k >> 2] >> (6 - (k & 3) * 2)) & 3;
+                    const float level = code == 0 ? -1.0f : code == 2 ? 1.0f : 0.0f;
+                    sum += xr[k] * sp[k] * level;
+                }
                 yp[index] = sum;
                 if (++o == out_features) {
                     o = 0;
@@ -120,12 +112,19 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                 int64_t k = 0;
                 for (int64_t b = 0; b < full_bytes; ++b) {
                     const uint8_t byte = wr[b];
-                    sum += xr[k] * decode4(byte, 0) * sp[k];
-                    sum += xr[k + 1] * decode4(byte, 1) * sp[k + 1];
+                    const int c0 = byte >> 4;
+                    const int c1 = byte & 15;
+                    const float l0 = c0 == 0 ? -2.0f : c0 == 1 ? -1.0f : c0 == 2 ? -0.5f : c0 == 3 ? -0.25f : c0 == 5 ? 0.25f : c0 == 6 ? 0.5f : c0 == 7 ? 1.0f : c0 == 8 ? 2.0f : 0.0f;
+                    const float l1 = c1 == 0 ? -2.0f : c1 == 1 ? -1.0f : c1 == 2 ? -0.5f : c1 == 3 ? -0.25f : c1 == 5 ? 0.25f : c1 == 6 ? 0.5f : c1 == 7 ? 1.0f : c1 == 8 ? 2.0f : 0.0f;
+                    sum += xr[k] * sp[k] * l0;
+                    sum += xr[k + 1] * sp[k + 1] * l1;
                     k += 2;
                 }
-                for (; k < in_features; ++k)
-                    sum += xr[k] * decode4(wr[k >> 1], static_cast<int>(k & 1)) * sp[k];
+                for (; k < in_features; ++k) {
+                    const int code = (wr[k >> 1] >> (4 - (k & 1) * 4)) & 15;
+                    const float level = code == 0 ? -2.0f : code == 1 ? -1.0f : code == 2 ? -0.5f : code == 3 ? -0.25f : code == 5 ? 0.25f : code == 6 ? 0.5f : code == 7 ? 1.0f : code == 8 ? 2.0f : 0.0f;
+                    sum += xr[k] * sp[k] * level;
+                }
                 yp[index] = sum;
                 if (++o == out_features) {
                     o = 0;
