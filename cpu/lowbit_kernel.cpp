@@ -110,9 +110,9 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
     float* yp = out.data_ptr<float>();
 
     at::parallel_for(0, batch * out_features, 1, [&](int64_t begin, int64_t end) {
+        int64_t n = begin / out_features;
+        int64_t o = begin - n * out_features;
         for (int64_t index = begin; index < end; ++index) {
-            const int64_t n = index / out_features;
-            const int64_t o = index % out_features;
             const float* xr = xp + n * in_features;
             const uint8_t* wr = wp + o * row_bytes;
             float sum = 0.0f;
@@ -143,6 +143,10 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                     sum += xr[k] * decode(wr[k >> 1], static_cast<int>(k & 1), 4) * sp[k];
             }
             yp[index] = sum;
+            if (++o == out_features) {
+                o = 0;
+                ++n;
+            }
         }
     });
     return out;
@@ -171,13 +175,16 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
     at::parallel_for(0, in_features, block, [&](int64_t begin, int64_t end) {
         for (int64_t k0 = begin; k0 < end; k0 += block) {
             const int64_t k1 = std::min(k0 + block, end);
+            float local[32];
+            for (int64_t k = k0; k < k1; ++k)
+                local[k - k0] = eps;
             for (int64_t o = 0; o < out_features; ++o) {
                 const float* wr = wp + o * in_features + k0;
                 for (int64_t k = k0; k < k1; ++k)
-                    scale[k] = std::max(scale[k], std::abs(wr[k - k0]));
+                    local[k - k0] = std::max(local[k - k0], std::abs(wr[k - k0]));
             }
             for (int64_t k = k0; k < k1; ++k)
-                scale[k] = std::max(scale[k], eps);
+                scale[k] = local[k - k0];
         }
     });
 
@@ -202,15 +209,19 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
     float* yp = out.data_ptr<float>();
 
     at::parallel_for(0, batch * out_features, 1, [&](int64_t begin, int64_t end) {
+        int64_t n = begin / out_features;
+        int64_t o = begin - n * out_features;
         for (int64_t index = begin; index < end; ++index) {
-            const int64_t n = index / out_features;
-            const int64_t o = index % out_features;
             const float* xr = xp + n * in_features;
             const float* qr = qwp + o * in_features;
             float sum = 0.0f;
             for (int64_t k = 0; k < in_features; ++k)
                 sum += xr[k] * qr[k];
             yp[index] = sum;
+            if (++o == out_features) {
+                o = 0;
+                ++n;
+            }
         }
     });
     return out;
