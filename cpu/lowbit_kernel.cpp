@@ -68,7 +68,7 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
 
     if (bits == 2) {
         const int64_t full_bytes = in_features >> 2;
-        at::parallel_for(0, batch * out_features, 1, [&](int64_t begin, int64_t end) {
+        at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
             int64_t n = begin / out_features;
             int64_t o = begin - n * out_features;
             for (int64_t index = begin; index < end; ++index) {
@@ -102,7 +102,7 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
         });
     } else {
         const int64_t full_bytes = in_features >> 1;
-        at::parallel_for(0, batch * out_features, 1, [&](int64_t begin, int64_t end) {
+        at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
             int64_t n = begin / out_features;
             int64_t o = begin - n * out_features;
             for (int64_t index = begin; index < end; ++index) {
@@ -175,7 +175,7 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
     auto qweight = torch::empty_like(weight);
     float* qwp = qweight.data_ptr<float>();
     if (bits == 2) {
-        at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+        at::parallel_for(0, out_features, 64, [&](int64_t begin, int64_t end) {
             for (int64_t o = begin; o < end; ++o) {
                 const float* wr = wp + o * in_features;
                 float* qr = qwp + o * in_features;
@@ -184,7 +184,7 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
             }
         });
     } else {
-        at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+        at::parallel_for(0, out_features, 64, [&](int64_t begin, int64_t end) {
             for (int64_t o = begin; o < end; ++o) {
                 const float* wr = wp + o * in_features;
                 float* qr = qwp + o * in_features;
@@ -198,7 +198,7 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
     const float* xp = x.data_ptr<float>();
     float* yp = out.data_ptr<float>();
 
-    at::parallel_for(0, batch * out_features, 1, [&](int64_t begin, int64_t end) {
+    at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
         int64_t n = begin / out_features;
         int64_t o = begin - n * out_features;
         for (int64_t index = begin; index < end; ++index) {
