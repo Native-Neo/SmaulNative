@@ -7,20 +7,19 @@
 
 namespace {
 
-inline float decode(uint8_t byte, int index, int bits) {
-    const int shift = (8 - bits) - index * bits;
-    const int code = (byte >> shift) & ((1 << bits) - 1);
-    if (bits == 2) {
-        static constexpr float levels[] = {-1.0f, 0.0f, 1.0f, 0.0f};
-        return levels[code];
-    }
+inline float decode2(uint8_t byte, int index) {
+    static constexpr float levels[] = {-1.0f, 0.0f, 1.0f, 0.0f};
+    return levels[(byte >> (6 - index * 2)) & 3];
+}
+
+inline float decode4(uint8_t byte, int index) {
     static constexpr float levels[] = {
         -2.0f, -1.0f, -0.5f, -0.25f,
         0.0f, 0.25f, 0.5f, 1.0f,
         2.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 0.0f, 0.0f, 0.0f
     };
-    return levels[code];
+    return levels[(byte >> (4 - index * 4)) & 15];
 }
 
 inline float quantize(float value, float scale, int bits) {
@@ -122,25 +121,25 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                 int64_t k = 0;
                 for (int64_t b = 0; b < full_bytes; ++b) {
                     const uint8_t byte = wr[b];
-                    sum += xr[k] * decode(byte, 0, 2) * sp[k];
-                    sum += xr[k + 1] * decode(byte, 1, 2) * sp[k + 1];
-                    sum += xr[k + 2] * decode(byte, 2, 2) * sp[k + 2];
-                    sum += xr[k + 3] * decode(byte, 3, 2) * sp[k + 3];
+                    sum += xr[k] * decode2(byte, 0) * sp[k];
+                    sum += xr[k + 1] * decode2(byte, 1) * sp[k + 1];
+                    sum += xr[k + 2] * decode2(byte, 2) * sp[k + 2];
+                    sum += xr[k + 3] * decode2(byte, 3) * sp[k + 3];
                     k += 4;
                 }
                 for (; k < in_features; ++k)
-                    sum += xr[k] * decode(wr[k >> 2], static_cast<int>(k & 3), 2) * sp[k];
+                    sum += xr[k] * decode2(wr[k >> 2], static_cast<int>(k & 3)) * sp[k];
             } else {
                 const int64_t full_bytes = in_features >> 1;
                 int64_t k = 0;
                 for (int64_t b = 0; b < full_bytes; ++b) {
                     const uint8_t byte = wr[b];
-                    sum += xr[k] * decode(byte, 0, 4) * sp[k];
-                    sum += xr[k + 1] * decode(byte, 1, 4) * sp[k + 1];
+                    sum += xr[k] * decode4(byte, 0) * sp[k];
+                    sum += xr[k + 1] * decode4(byte, 1) * sp[k + 1];
                     k += 2;
                 }
                 for (; k < in_features; ++k)
-                    sum += xr[k] * decode(wr[k >> 1], static_cast<int>(k & 1), 4) * sp[k];
+                    sum += xr[k] * decode4(wr[k >> 1], static_cast<int>(k & 1)) * sp[k];
             }
             yp[index] = sum;
             if (++o == out_features) {
