@@ -24,29 +24,30 @@ inline float decode(uint8_t byte, int index, int bits) {
 }
 
 inline float quantize(float value, float scale, int bits) {
-    const float normalized = value / scale;
     if (bits == 2) {
-        const float d0 = std::abs(normalized + 1.0f);
-        const float d1 = std::abs(normalized);
-        const float d2 = std::abs(normalized - 1.0f);
-        if (d0 <= d1 && d0 <= d2) return -scale;
-        if (d1 <= d2) return 0.0f;
+        const float half = scale * 0.5f;
+        if (value <= -half) return -scale;
+        if (value <= half) return 0.0f;
         return scale;
     }
-    static constexpr float levels[] = {
-        -2.0f, -1.0f, -0.5f, -0.25f,
-        0.0f, 0.25f, 0.5f, 1.0f, 2.0f
-    };
-    float best = levels[0];
-    float best_dist = std::abs(normalized - best);
-    for (int i = 1; i < 9; ++i) {
-        const float dist = std::abs(normalized - levels[i]);
-        if (dist < best_dist) {
-            best_dist = dist;
-            best = levels[i];
-        }
-    }
-    return best * scale;
+
+    const float t1 = scale * -1.5f;
+    const float t2 = scale * -0.75f;
+    const float t3 = scale * -0.375f;
+    const float t4 = scale * -0.125f;
+    const float t5 = scale * 0.125f;
+    const float t6 = scale * 0.375f;
+    const float t7 = scale * 0.75f;
+    const float t8 = scale * 1.5f;
+    if (value <= t1) return scale * -2.0f;
+    if (value <= t2) return scale * -1.0f;
+    if (value <= t3) return scale * -0.5f;
+    if (value <= t4) return scale * -0.25f;
+    if (value <= t5) return 0.0f;
+    if (value <= t6) return scale * 0.25f;
+    if (value <= t7) return scale * 0.5f;
+    if (value <= t8) return scale;
+    return scale * 2.0f;
 }
 
 }
