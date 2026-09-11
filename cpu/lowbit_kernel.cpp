@@ -95,9 +95,9 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
         at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
             int64_t n = begin / out_features;
             int64_t o = begin - n * out_features;
+            const float* xr = sxp + n * in_features;
+            const uint8_t* wr = wp + o * row_bytes;
             for (int64_t index = begin; index < end; ++index) {
-                const float* xr = sxp + n * in_features;
-                const uint8_t* wr = wp + o * row_bytes;
                 float sum = 0.0f;
                 int64_t k = 0;
                 int64_t b = 0;
@@ -142,6 +142,10 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                 if (++o == out_features) {
                     o = 0;
                     ++n;
+                    xr += in_features;
+                    wr = wp;
+                } else {
+                    wr += row_bytes;
                 }
             }
         });
@@ -150,9 +154,9 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
         at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
             int64_t n = begin / out_features;
             int64_t o = begin - n * out_features;
+            const float* xr = sxp + n * in_features;
+            const uint8_t* wr = wp + o * row_bytes;
             for (int64_t index = begin; index < end; ++index) {
-                const float* xr = sxp + n * in_features;
-                const uint8_t* wr = wp + o * row_bytes;
                 float sum = 0.0f;
                 int64_t k = 0;
                 int64_t b = 0;
@@ -185,6 +189,10 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
                 if (++o == out_features) {
                     o = 0;
                     ++n;
+                    xr += in_features;
+                    wr = wp;
+                } else {
+                    wr += row_bytes;
                 }
             }
         });
