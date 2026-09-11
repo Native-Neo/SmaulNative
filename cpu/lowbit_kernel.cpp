@@ -154,11 +154,12 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
         }
     });
 
-    std::vector<float> qweight(static_cast<size_t>(out_features) * in_features);
+    auto qweight = torch::empty_like(weight);
+    float* qwp = qweight.data_ptr<float>();
     at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
         for (int64_t o = begin; o < end; ++o) {
             const float* wr = wp + o * in_features;
-            float* qr = qweight.data() + o * in_features;
+            float* qr = qwp + o * in_features;
             for (int64_t k = 0; k < in_features; ++k)
                 qr[k] = quantize(wr[k], scale[k], static_cast<int>(bits));
         }
@@ -173,7 +174,7 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
             const int64_t n = index / out_features;
             const int64_t o = index % out_features;
             const float* xr = xp + n * in_features;
-            const float* qr = qweight.data() + o * in_features;
+            const float* qr = qwp + o * in_features;
             float sum = 0.0f;
             for (int64_t k = 0; k < in_features; ++k)
                 sum += xr[k] * qr[k];
