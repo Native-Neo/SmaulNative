@@ -3,6 +3,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -12,7 +13,6 @@ from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
 _CMIX_LINEAR_NAMES = ("key", "value")
 _SUPPORTED_BITS = (2, 4, 8)
-_PACK_CHUNK = 256
 
 if "--qt" in sys.argv:
     i = sys.argv.index("--qt")
@@ -20,6 +20,23 @@ if "--qt" in sys.argv:
         raise SystemExit("--qt requires 2, 4, or 8")
     os.environ["SMAUL_QT_BITS"] = sys.argv[i + 1]
     sys.argv[i:i + 2] = ["--qat"]
+
+
+_LOWBIT_EXT = None
+
+
+def _load_lowbit():
+    global _LOWBIT_EXT
+    if _LOWBIT_EXT is None:
+        from torch.utils.cpp_extension import load
+        root = Path(__file__).resolve().parent / "cpu"
+        _LOWBIT_EXT = load(
+            name="smaulnative_lowbit",
+            sources=[str(root / "lowbit_kernel.cpp")],
+            extra_cflags=["-O3", "-march=native", "-mtune=native"],
+            verbose=False,
+        )
+    return _LOWBIT_EXT
 
 
 def _bits(bits=None):
@@ -52,14 +69,14 @@ def _pack_codes(codes, bits):
     if bits == 8:
         return codes.to(torch.float8_e4m3fn), codes.numel()
     per_byte = 8 // bits
-    flat = codes.reshape(-1).to(torch.uint8)
-    numel = flat.numel()
-    pad = (-numel) % per_byte
+    rows, cols = codes.shape
+    flat = codes.reshape(rows, cols).to(torch.uint8)
+    pad = (-cols) % per_byte
     if pad:
-        flat = torch.cat((flat, torch.zeros(pad, dtype=torch.uint8, device=flat.device)))
-    flat = flat.reshape(-1, per_byte)
+        flat = torch.cat((flat, torch.zeros((rows, pad), dtype=torch.uint8, device=flat.device)), dim=1)
+    packed = flat.reshape(rows, -1, per_byte)
     shifts = torch.arange(per_byte - 1, -1, -1, device=flat.device, dtype=torch.uint8) * bits
-    return (flat << shifts).sum(dim=-1), numel
+    return (packed << shifts).sum(dim=-1), rows * cols
 
 
 def _unpack_codes(packed, bits, numel):
@@ -73,23 +90,21 @@ def _unpack_codes(packed, bits, numel):
 def _packed_linear(x, packed, scale, shape, bits, numel):
     if bits == 8:
         return F.linear(x, packed.to(device=x.device, dtype=x.dtype))
-    if x.device.type != "cpu":
+    if x.device.type != "cpu" or x.dtype != torch.float32:
         return F.linear(x, packed.unpack(x.device, x.dtype))
     out_features, in_features = shape
     if x.shape[-1] != in_features:
         raise ValueError(f"input features {x.shape[-1]} != {in_features}")
-    levels = _float_levels(bits, x.device).to(x.dtype)
-    flat_codes = _unpack_codes(packed, bits, numel).long()
-    flat_scale = scale.to(device=x.device, dtype=x.dtype).reshape(-1)
-    result = x.new_zeros(*x.shape[:-1], out_features)
-    for start in range(0, in_features, _PACK_CHUNK):
-        end = min(start + _PACK_CHUNK, in_features)
-        first = start * out_features
-        last = end * out_features
-        codes = flat_codes[first:last].reshape(end - start, out_features).transpose(0, 1)
-        weight = levels[codes] * flat_scale[start:end].unsqueeze(0)
-        result.add_(F.linear(x[..., start:end], weight))
-    return result
+    x2 = x.reshape(-1, in_features).contiguous()
+    result = _load_lowbit().packed_linear(
+        x2,
+        packed.codes,
+        scale.reshape(-1).float().contiguous(),
+        bits,
+        out_features,
+        in_features,
+    )
+    return result.reshape(*x.shape[:-1], out_features)
 
 
 class FloatQATLinear(nn.Module):
