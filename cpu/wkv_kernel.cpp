@@ -96,13 +96,13 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
   at::parallel_for(0, BH, 1, [&](int64_t bh0, int64_t bh1) {
     std::vector<float> checkpoints((blocks + 1) * state_stride);
     std::vector<float> hist((CHUNK + 1) * state_stride);
+    std::vector<float> current(state_stride);
     std::vector<float> gnext(state_stride), gcur(state_stride), su(N), c(N), gsu(N), gc(N);
 
     for (int64_t bh = bh0; bh < bh1; ++bh) {
       const int64_t b = bh / H, h = bh - b * H;
       const int64_t sbase = bh * state_stride, base = (b * T * H + h) * N;
       std::copy(sp0 + sbase, sp0 + sbase + state_stride, checkpoints.data());
-      std::vector<float> current(state_stride);
       std::copy(sp0 + sbase, sp0 + sbase + state_stride, current.data());
 
       for (int64_t block = 0; block < blocks; ++block) {
@@ -166,8 +166,10 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
           }
           for (int64_t j = 0; j < N; ++j) c[j] = kkt[j] * at[j];
           std::copy(gnext.begin(), gnext.end(), gcur.begin());
-          for (int64_t i = 0; i < N; ++i)
+          for (int64_t i = 0; i < N; ++i) {
+#pragma GCC ivdep
             for (int64_t j = 0; j < N; ++j) gcur[i * N + j] += gy[i] * rt[j];
+          }
 
           float *grt = grp + off;
           for (int64_t j = 0; j < N; ++j) {
