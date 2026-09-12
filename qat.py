@@ -20,6 +20,7 @@ if "--qt" in sys.argv:
     if i + 1 >= len(sys.argv) or sys.argv[i + 1] not in {"2", "4", "8"}:
         raise SystemExit("--qt requires 2, 4, or 8")
     os.environ["SMAUL_QT_BITS"] = sys.argv[i + 1]
+    os.environ["SMAUL_QT_REQUESTED"] = "1"
     sys.argv[i:i + 2] = ["--qat"]
 
 
