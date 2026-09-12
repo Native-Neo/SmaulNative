@@ -43,10 +43,15 @@ class RealQuantLinear(nn.Module):
         self.weight = linear.weight
         self.bits = _bits(bits)
         self.quant = QuantizedLinear.from_linear(linear, self.bits)
+        self._make_quant_nonpersistent()
+
+    def _make_quant_nonpersistent(self):
+        self.quant._non_persistent_buffers_set.update({"packed", "scale", "weight_shape"})
 
     @torch.no_grad()
     def refresh(self):
         self.quant = QuantizedLinear.from_linear(self._linear_view(), self.bits)
+        self._make_quant_nonpersistent()
 
     def _linear_view(self):
         linear = nn.Linear(self.weight.shape[1], self.weight.shape[0], bias=False, device=self.weight.device, dtype=self.weight.dtype)
