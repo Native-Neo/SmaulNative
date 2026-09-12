@@ -15,7 +15,13 @@ if "--cpu" in sys.argv:
     threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(key, threads)
-    os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "SSE4.2")
+    if "MKL_ENABLE_INSTRUCTIONS" not in os.environ:
+        try:
+            flags = Path("/proc/cpuinfo").read_text(errors="ignore")
+            if " avx" in flags or "\navx " in flags:
+                os.environ["MKL_ENABLE_INSTRUCTIONS"] = "AVX"
+        except OSError:
+            pass
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
