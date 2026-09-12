@@ -36,7 +36,7 @@ std::vector<torch::Tensor> wkv_forward(torch::Tensor state, torch::Tensor w, tor
   float *sp = out_state.data_ptr<float>(), *yp = y.data_ptr<float>();
   const int64_t BH = B * H;
   at::parallel_for(0, BH, 1, [&](int64_t bh0, int64_t bh1) {
-    alignas(32) float su[128];
+    alignas(32) float su[128], c[128];
     for (int64_t bh = bh0; bh < bh1; ++bh) {
       const int64_t b = bh / H, h = bh - b * H;
       const int64_t base = (b * T * H + h) * N, sbase = bh * N * N;
@@ -44,11 +44,12 @@ std::vector<torch::Tensor> wkv_forward(torch::Tensor state, torch::Tensor w, tor
         const int64_t off = base + t * H * N;
         const float *wt = wp + off, *kt = kp + off, *vt = vp + off, *kkt = kkp + off, *at = ap + off, *rt = rp + off;
         float *st = sp + sbase, *yt = yp + off;
+        for (int64_t j = 0; j < N; ++j) c[j] = kkt[j] * at[j];
         for (int64_t i = 0; i < N; ++i) {
           float sum = 0.0f;
           const float *row = st + i * N;
 #pragma GCC ivdep
-          for (int64_t j = 0; j < N; ++j) sum += row[j] * (-kkt[j]);
+          for (int64_t j = 0; j < N; ++j) sum -= row[j] * kkt[j];
           su[i] = sum;
         }
 #pragma GCC ivdep
@@ -56,7 +57,7 @@ std::vector<torch::Tensor> wkv_forward(torch::Tensor state, torch::Tensor w, tor
           float *row = st + i * N;
           const float vi = vt[i];
 #pragma GCC ivdep
-          for (int64_t j = 0; j < N; ++j) row[j] = row[j] * wt[j] + su[i] * (kkt[j] * at[j]) + vi * kt[j];
+          for (int64_t j = 0; j < N; ++j) row[j] = row[j] * wt[j] + su[i] * c[j] + vi * kt[j];
           float out = 0.0f;
 #pragma GCC ivdep
           for (int64_t j = 0; j < N; ++j) out += row[j] * rt[j];
@@ -110,6 +111,7 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
         for (int64_t t = lo; t < hi; ++t) {
           const int64_t off = base + t * token_stride;
           const float *wt = wp + off, *kt = kp + off, *vt = vp + off, *kkt = kkp + off, *at = ap + off;
+          for (int64_t j = 0; j < N; ++j) c[j] = kkt[j] * at[j];
           for (int64_t i = 0; i < N; ++i) {
             float s = 0.0f;
             const float *row = current.data() + i * N;
@@ -120,7 +122,7 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
           for (int64_t i = 0; i < N; ++i) {
             float *row = current.data() + i * N;
 #pragma GCC ivdep
-            for (int64_t j = 0; j < N; ++j) row[j] = row[j] * wt[j] + su[i] * (kkt[j] * at[j]) + vt[i] * kt[j];
+            for (int64_t j = 0; j < N; ++j) row[j] = row[j] * wt[j] + su[i] * c[j] + vt[i] * kt[j];
           }
         }
       }
@@ -135,6 +137,7 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
           const float *wt = wp + off, *kt = kp + off, *vt = vp + off, *kkt = kkp + off, *at = ap + off;
           const float *prev = hist.data() + local * state_stride;
           float *next = hist.data() + (local + 1) * state_stride;
+          for (int64_t j = 0; j < N; ++j) c[j] = kkt[j] * at[j];
           for (int64_t i = 0; i < N; ++i) {
             float s = 0.0f;
             const float *prow = prev + i * N;
@@ -146,7 +149,7 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
             const float *prow = prev + i * N;
             float *nrow = next + i * N;
 #pragma GCC ivdep
-            for (int64_t j = 0; j < N; ++j) nrow[j] = prow[j] * wt[j] + su[i] * (kkt[j] * at[j]) + vt[i] * kt[j];
+            for (int64_t j = 0; j < N; ++j) nrow[j] = prow[j] * wt[j] + su[i] * c[j] + vt[i] * kt[j];
           }
         }
 
