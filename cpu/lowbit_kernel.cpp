@@ -236,85 +236,73 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
         }
     });
 
-    auto qweight = torch::empty_like(weight);
-    float* qwp = qweight.data_ptr<float>();
-    if (bits == 2) {
-        at::parallel_for(0, out_features, 64, [&](int64_t begin, int64_t end) {
-            for (int64_t o = begin; o < end; ++o) {
-                const float* wr = wp + o * in_features;
-                float* qr = qwp + o * in_features;
-                int64_t k = 0;
-                for (; k + 7 < in_features; k += 8) {
-                    qr[k] = quantize2(wr[k], scale[k]);
-                    qr[k + 1] = quantize2(wr[k + 1], scale[k + 1]);
-                    qr[k + 2] = quantize2(wr[k + 2], scale[k + 2]);
-                    qr[k + 3] = quantize2(wr[k + 3], scale[k + 3]);
-                    qr[k + 4] = quantize2(wr[k + 4], scale[k + 4]);
-                    qr[k + 5] = quantize2(wr[k + 5], scale[k + 5]);
-                    qr[k + 6] = quantize2(wr[k + 6], scale[k + 6]);
-                    qr[k + 7] = quantize2(wr[k + 7], scale[k + 7]);
-                }
-                for (; k < in_features; ++k)
-                    qr[k] = quantize2(wr[k], scale[k]);
-            }
-        });
-    } else {
-        at::parallel_for(0, out_features, 64, [&](int64_t begin, int64_t end) {
-            for (int64_t o = begin; o < end; ++o) {
-                const float* wr = wp + o * in_features;
-                float* qr = qwp + o * in_features;
-                int64_t k = 0;
-                for (; k + 7 < in_features; k += 8) {
-                    qr[k] = quantize4(wr[k], scale[k]);
-                    qr[k + 1] = quantize4(wr[k + 1], scale[k + 1]);
-                    qr[k + 2] = quantize4(wr[k + 2], scale[k + 2]);
-                    qr[k + 3] = quantize4(wr[k + 3], scale[k + 3]);
-                    qr[k + 4] = quantize4(wr[k + 4], scale[k + 4]);
-                    qr[k + 5] = quantize4(wr[k + 5], scale[k + 5]);
-                    qr[k + 6] = quantize4(wr[k + 6], scale[k + 6]);
-                    qr[k + 7] = quantize4(wr[k + 7], scale[k + 7]);
-                }
-                for (; k < in_features; ++k)
-                    qr[k] = quantize4(wr[k], scale[k]);
-            }
-        });
-    }
-
     auto out = torch::empty({batch, out_features}, x.options());
     const float* xp = x.data_ptr<float>();
     float* yp = out.data_ptr<float>();
 
-    at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
-        int64_t n = begin / out_features;
-        int64_t o = begin - n * out_features;
-        const float* xr = xp + n * in_features;
-        const float* qr = qwp + o * in_features;
-        for (int64_t index = begin; index < end; ++index) {
-            float sum = 0.0f;
-            int64_t k = 0;
-            for (; k + 7 < in_features; k += 8) {
-                sum += xr[k] * qr[k];
-                sum += xr[k + 1] * qr[k + 1];
-                sum += xr[k + 2] * qr[k + 2];
-                sum += xr[k + 3] * qr[k + 3];
-                sum += xr[k + 4] * qr[k + 4];
-                sum += xr[k + 5] * qr[k + 5];
-                sum += xr[k + 6] * qr[k + 6];
-                sum += xr[k + 7] * qr[k + 7];
+    if (bits == 2) {
+        at::parallel_for(0, out_features, 64, [&](int64_t begin, int64_t end) {
+            std::vector<float> sums(batch, 0.0f);
+            for (int64_t o = begin; o < end; ++o) {
+                const float* wr = wp + o * in_features;
+                std::fill(sums.begin(), sums.end(), 0.0f);
+                int64_t k = 0;
+                for (; k + 7 < in_features; k += 8) {
+                    const float q0 = quantize2(wr[k], scale[k]);
+                    const float q1 = quantize2(wr[k + 1], scale[k + 1]);
+                    const float q2 = quantize2(wr[k + 2], scale[k + 2]);
+                    const float q3 = quantize2(wr[k + 3], scale[k + 3]);
+                    const float q4 = quantize2(wr[k + 4], scale[k + 4]);
+                    const float q5 = quantize2(wr[k + 5], scale[k + 5]);
+                    const float q6 = quantize2(wr[k + 6], scale[k + 6]);
+                    const float q7 = quantize2(wr[k + 7], scale[k + 7]);
+                    for (int64_t n = 0; n < batch; ++n) {
+                        const float* xr = xp + n * in_features + k;
+                        sums[n] += xr[0] * q0 + xr[1] * q1 + xr[2] * q2 + xr[3] * q3;
+                        sums[n] += xr[4] * q4 + xr[5] * q5 + xr[6] * q6 + xr[7] * q7;
+                    }
+                }
+                for (; k < in_features; ++k) {
+                    const float q = quantize2(wr[k], scale[k]);
+                    for (int64_t n = 0; n < batch; ++n)
+                        sums[n] += xp[n * in_features + k] * q;
+                }
+                for (int64_t n = 0; n < batch; ++n)
+                    yp[n * out_features + o] = sums[n];
             }
-            for (; k < in_features; ++k)
-                sum += xr[k] * qr[k];
-            yp[index] = sum;
-            if (++o == out_features) {
-                o = 0;
-                ++n;
-                xr += in_features;
-                qr = qwp;
-            } else {
-                qr += in_features;
+        });
+    } else {
+        at::parallel_for(0, out_features, 64, [&](int64_t begin, int64_t end) {
+            std::vector<float> sums(batch, 0.0f);
+            for (int64_t o = begin; o < end; ++o) {
+                const float* wr = wp + o * in_features;
+                std::fill(sums.begin(), sums.end(), 0.0f);
+                int64_t k = 0;
+                for (; k + 7 < in_features; k += 8) {
+                    const float q0 = quantize4(wr[k], scale[k]);
+                    const float q1 = quantize4(wr[k + 1], scale[k + 1]);
+                    const float q2 = quantize4(wr[k + 2], scale[k + 2]);
+                    const float q3 = quantize4(wr[k + 3], scale[k + 3]);
+                    const float q4 = quantize4(wr[k + 4], scale[k + 4]);
+                    const float q5 = quantize4(wr[k + 5], scale[k + 5]);
+                    const float q6 = quantize4(wr[k + 6], scale[k + 6]);
+                    const float q7 = quantize4(wr[k + 7], scale[k + 7]);
+                    for (int64_t n = 0; n < batch; ++n) {
+                        const float* xr = xp + n * in_features + k;
+                        sums[n] += xr[0] * q0 + xr[1] * q1 + xr[2] * q2 + xr[3] * q3;
+                        sums[n] += xr[4] * q4 + xr[5] * q5 + xr[6] * q6 + xr[7] * q7;
+                    }
+                }
+                for (; k < in_features; ++k) {
+                    const float q = quantize4(wr[k], scale[k]);
+                    for (int64_t n = 0; n < batch; ++n)
+                        sums[n] += xp[n * in_features + k] * q;
+                }
+                for (int64_t n = 0; n < batch; ++n)
+                    yp[n * out_features + o] = sums[n];
             }
-        }
-    });
+        });
+    }
     return out;
 }
 
