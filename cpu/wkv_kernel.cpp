@@ -173,17 +173,20 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
           float *grt = grp + off;
           for (int64_t j = 0; j < N; ++j) {
             float sum = 0.0f;
+#pragma GCC ivdep
             for (int64_t i = 0; i < N; ++i) sum += gy[i] * next[i * N + j];
             grt[j] += sum;
           }
           for (int64_t i = 0; i < N; ++i) {
             float z = 0.0f;
+#pragma GCC ivdep
             for (int64_t j = 0; j < N; ++j) z += gcur[i * N + j] * c[j];
             gsu[i] = z;
           }
           std::fill(gc.begin(), gc.end(), 0.0f);
           for (int64_t j = 0; j < N; ++j) {
             float z = 0.0f;
+#pragma GCC ivdep
             for (int64_t i = 0; i < N; ++i) z += gcur[i * N + j] * su[i];
             gc[j] = z;
           }
@@ -191,6 +194,7 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
           float *gwt = gwp + off, *gkt = gkp + off, *gvt = gvp + off, *gkkt = gkkp + off, *gat = gap + off;
           for (int64_t j = 0; j < N; ++j) {
             float sw = 0.0f, sk = 0.0f;
+#pragma GCC ivdep
             for (int64_t i = 0; i < N; ++i) {
               const float gij = gcur[i * N + j];
               sw += gij * prev[i * N + j];
@@ -211,6 +215,7 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
           }
           for (int64_t j = 0; j < N; ++j) {
             float z = 0.0f;
+#pragma GCC ivdep
             for (int64_t i = 0; i < N; ++i) z -= gsu[i] * prev[i * N + j];
             gkkt[j] += z;
           }
