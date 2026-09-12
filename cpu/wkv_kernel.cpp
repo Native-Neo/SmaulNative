@@ -206,6 +206,7 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
           float *gs = (t == 0) ? gs0p + sbase : gnext.data();
           for (int64_t i = 0; i < N; ++i) {
             const float gsu_i = gsu[i];
+#pragma GCC ivdep
             for (int64_t j = 0; j < N; ++j) gs[i * N + j] = gcur[i * N + j] * wt[j] - gsu_i * kkt[j];
           }
           for (int64_t j = 0; j < N; ++j) {
