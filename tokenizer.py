@@ -14,6 +14,7 @@ TOKEN_RE = re.compile(
     re.UNICODE,
 )
 DEV_BASE = re.compile(r"[\u0900-\u097F]")
+TEXT_KEYS = ("text", "content", "document", "body", "code", "prompt", "completion", "input", "output", "question", "answer")
 
 
 class TokenIds(list):
@@ -22,28 +23,40 @@ class TokenIds(list):
         return self
 
 
-def _json_texts(data):
+def _string_values(data):
     if isinstance(data, str):
         yield data
     elif isinstance(data, dict):
         lower = {str(k).lower(): v for k, v in data.items()}
+        used = False
         prompt = lower.get("prompt")
         completion = lower.get("completion")
-        if isinstance(prompt, str) and isinstance(completion, str):
-            yield prompt + "\n" + completion
-        elif isinstance(prompt, str):
-            yield prompt
+        if isinstance(prompt, str):
+            used = True
+            if isinstance(completion, str):
+                yield prompt + "\n" + completion
+            else:
+                yield prompt
         elif isinstance(completion, str):
+            used = True
             yield completion
-        else:
-            text = next((lower[k] for k in ("text", "content", "document", "body", "code") if isinstance(lower.get(k), str)), None)
-            if text is not None:
-                yield text
-            elif "data" in lower:
-                yield from _json_texts(lower["data"])
-    elif isinstance(data, list):
-        for x in data:
-            yield from _json_texts(x)
+        if not used:
+            for key in TEXT_KEYS:
+                value = lower.get(key)
+                if isinstance(value, str):
+                    used = True
+                    yield value
+            if used:
+                return
+            for value in data.values():
+                yield from _string_values(value)
+    elif isinstance(data, (list, tuple)):
+        for value in data:
+            yield from _string_values(value)
+
+
+def _json_texts(data):
+    yield from _string_values(data)
 
 
 def _record_text(record):
@@ -56,11 +69,12 @@ def _record_text(record):
         return prompt
     if isinstance(completion, str):
         return completion
-    for key in ("text", "content", "document", "body", "code"):
+    for key in TEXT_KEYS:
         value = lower.get(key)
         if isinstance(value, str):
             return value
-    return ""
+    values = [x for value in record.values() for x in _string_values(value)]
+    return "\n".join(values)
 
 
 def read_texts(path, max_records=0):
@@ -93,6 +107,8 @@ def read_texts(path, max_records=0):
                     except json.JSONDecodeError:
                         continue
                     for text in _json_texts(data):
+                        if not text:
+                            continue
                         yield text
                         seen += 1
                         if max_records and seen >= max_records:
@@ -103,6 +119,8 @@ def read_texts(path, max_records=0):
             except json.JSONDecodeError:
                 continue
             for text in _json_texts(data):
+                if not text:
+                    continue
                 yield text
                 seen += 1
                 if max_records and seen >= max_records:
@@ -114,13 +132,14 @@ def read_texts(path, max_records=0):
                 raise SystemExit("Parquet support: pip install pyarrow")
             pf = pq.ParquetFile(f)
             names = pf.schema_arrow.names
-            lower = {name.lower(): name for name in names}
+            lower = {str(name).lower(): name for name in names}
             prompt_col = lower.get("prompt")
             completion_col = lower.get("completion")
             if prompt_col and completion_col and prompt_col != completion_col:
-                for batch in pf.iter_batches(batch_size=1024, columns=[prompt_col, completion_col]):
-                    prompts = batch.column(prompt_col).to_pylist()
-                    completions = batch.column(completion_col).to_pylist()
+                columns = [prompt_col, completion_col]
+                for batch in pf.iter_batches(batch_size=1024, columns=columns):
+                    prompts = batch.column(0).to_pylist()
+                    completions = batch.column(1).to_pylist()
                     for prompt, completion in zip(prompts, completions):
                         if isinstance(prompt, str) and isinstance(completion, str):
                             text = prompt + "\n" + completion
@@ -129,21 +148,29 @@ def read_texts(path, max_records=0):
                         elif isinstance(completion, str):
                             text = completion
                         else:
+                            text = ""
+                        if text:
+                            yield text
+                            seen += 1
+                        if max_records and seen >= max_records:
+                            return
+            else:
+                preferred = next((lower[name] for name in TEXT_KEYS if name in lower), None)
+                columns = [preferred] if preferred else names
+                for batch in pf.iter_batches(batch_size=1024, columns=columns):
+                    rows = zip(*(batch.column(i).to_pylist() for i in range(len(columns))))
+                    for row in rows:
+                        if preferred:
+                            values = _string_values(row[0])
+                        else:
+                            values = (text for value in row for text in _string_values(value))
+                        text = "\n".join(x for x in values if x)
+                        if not text:
                             continue
                         yield text
                         seen += 1
                         if max_records and seen >= max_records:
                             return
-            else:
-                col = next((lower[name] for name in ("text", "content", "document", "body", "code") if name in lower), None)
-                if col:
-                    for batch in pf.iter_batches(batch_size=1024, columns=[col]):
-                        for x in batch.column(0).to_pylist():
-                            if isinstance(x, str):
-                                yield x
-                                seen += 1
-                                if max_records and seen >= max_records:
-                                    return
         if max_records and seen >= max_records:
             return
 
@@ -290,6 +317,7 @@ class SmaulTokenizer:
 
     def decode(self, ids):
         return decode(ids, self)
+
 
 
 def load(path):
