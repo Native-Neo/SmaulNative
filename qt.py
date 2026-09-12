@@ -75,7 +75,7 @@ class QuantizedLinear(nn.Module):
         shape = tuple(int(v) for v in weight_shape)
         if len(shape) != 2:
             raise ValueError("quantized linear weight must be 2D")
-        self.weight_shape = shape
+        self._shape = shape
         self.register_buffer("packed", packed.contiguous())
         self.register_buffer("scale", scale.contiguous())
         self.register_buffer("weight_shape", torch.tensor(shape, dtype=torch.int64))
@@ -98,7 +98,7 @@ class QuantizedLinear(nn.Module):
     def _infer_bits(self):
         if self.packed.dtype == torch.float8_e4m3fn:
             return 8
-        in_features = self.weight_shape[1]
+        in_features = self._shape[1]
         packed_cols = self.packed.shape[1]
         for bits in (2, 4):
             if packed_cols == (in_features + 8 // bits - 1) // (8 // bits):
@@ -109,12 +109,12 @@ class QuantizedLinear(nn.Module):
         device = device or self.packed.device
         if self.bits == 8:
             return self.packed.to(device=device, dtype=dtype)
-        codes = _unpack_codes(self.packed.to(device), self.bits, self.weight_shape[0] * self.weight_shape[1]).long()
-        return (_levels(self.bits, device, dtype)[codes] * self.scale.to(device=device, dtype=dtype)).reshape(self.weight_shape)
+        codes = _unpack_codes(self.packed.to(device), self.bits, self._shape[0] * self._shape[1]).long()
+        return (_levels(self.bits, device, dtype)[codes] * self.scale.to(device=device, dtype=dtype)).reshape(self._shape)
 
     def forward(self, x):
         if self.bits < 8 and x.device.type == "cpu" and x.dtype == torch.float32:
-            out_features, in_features = self.weight_shape
+            out_features, in_features = self._shape
             if x.shape[-1] != in_features:
                 raise ValueError(f"input features {x.shape[-1]} != {in_features}")
             x2 = x.reshape(-1, in_features).contiguous()
