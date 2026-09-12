@@ -64,7 +64,7 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
     const auto batch = x.size(0);
     auto out = torch::empty({batch, out_features}, x.options());
     const int per_byte = 8 / bits;
-    const int row_bytes = (in_features + per_byte - 1) / per_byte;
+    const int64_t row_bytes = (in_features + per_byte - 1) / per_byte;
     TORCH_CHECK(packed.numel() >= out_features * row_bytes,
                 "packed weight is too small");
 
@@ -84,110 +84,81 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
         }
     });
 
+    constexpr int64_t tile = 4;
+    const int64_t out_tiles = (out_features + tile - 1) / tile;
+
     if (bits == 2) {
         const int64_t full_bytes = in_features >> 2;
-        at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
-            int64_t n = begin / out_features;
-            int64_t o = begin - n * out_features;
-            const float* xr = sxp + n * in_features;
-            const uint8_t* wr = wp + o * row_bytes;
-            for (int64_t index = begin; index < end; ++index) {
-                float sum = 0.0f;
+        at::parallel_for(0, batch * out_tiles, 1, [&](int64_t begin, int64_t end) {
+            float sums[tile];
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t n = task / out_tiles;
+                const int64_t ob = (task - n * out_tiles) * tile;
+                const int64_t count = std::min(tile, out_features - ob);
+                const float* xr = sxp + n * in_features;
+                const uint8_t* wr[tile];
+                for (int64_t j = 0; j < count; ++j) wr[j] = wp + (ob + j) * row_bytes;
+                for (int64_t j = 0; j < count; ++j) sums[j] = 0.0f;
+
                 int64_t k = 0;
-                int64_t b = 0;
-                for (; b + 1 < full_bytes; b += 2) {
-                    const uint8_t byte0 = wr[b];
-                    const uint8_t byte1 = wr[b + 1];
-                    const int c0 = byte0 >> 6;
-                    const int c1 = (byte0 >> 4) & 3;
-                    const int c2 = (byte0 >> 2) & 3;
-                    const int c3 = byte0 & 3;
-                    if (c0 == 0) sum -= xr[k]; else if (c0 == 2) sum += xr[k];
-                    if (c1 == 0) sum -= xr[k + 1]; else if (c1 == 2) sum += xr[k + 1];
-                    if (c2 == 0) sum -= xr[k + 2]; else if (c2 == 2) sum += xr[k + 2];
-                    if (c3 == 0) sum -= xr[k + 3]; else if (c3 == 2) sum += xr[k + 3];
-                    const int c4 = byte1 >> 6;
-                    const int c5 = (byte1 >> 4) & 3;
-                    const int c6 = (byte1 >> 2) & 3;
-                    const int c7 = byte1 & 3;
-                    if (c4 == 0) sum -= xr[k + 4]; else if (c4 == 2) sum += xr[k + 4];
-                    if (c5 == 0) sum -= xr[k + 5]; else if (c5 == 2) sum += xr[k + 5];
-                    if (c6 == 0) sum -= xr[k + 6]; else if (c6 == 2) sum += xr[k + 6];
-                    if (c7 == 0) sum -= xr[k + 7]; else if (c7 == 2) sum += xr[k + 7];
-                    k += 8;
-                }
-                for (; b < full_bytes; ++b) {
-                    const uint8_t byte = wr[b];
-                    const int c0 = byte >> 6;
-                    const int c1 = (byte >> 4) & 3;
-                    const int c2 = (byte >> 2) & 3;
-                    const int c3 = byte & 3;
-                    if (c0 == 0) sum -= xr[k]; else if (c0 == 2) sum += xr[k];
-                    if (c1 == 0) sum -= xr[k + 1]; else if (c1 == 2) sum += xr[k + 1];
-                    if (c2 == 0) sum -= xr[k + 2]; else if (c2 == 2) sum += xr[k + 2];
-                    if (c3 == 0) sum -= xr[k + 3]; else if (c3 == 2) sum += xr[k + 3];
-                    k += 4;
+                for (int64_t b = 0; b < full_bytes; ++b, k += 4) {
+                    const int shift0 = 6;
+                    const int shift1 = 4;
+                    const int shift2 = 2;
+                    for (int64_t j = 0; j < count; ++j) {
+                        const uint8_t byte = wr[j][b];
+                        const int c0 = byte >> shift0;
+                        const int c1 = (byte >> shift1) & 3;
+                        const int c2 = (byte >> shift2) & 3;
+                        const int c3 = byte & 3;
+                        if (c0 == 0) sums[j] -= xr[k]; else if (c0 == 2) sums[j] += xr[k];
+                        if (c1 == 0) sums[j] -= xr[k + 1]; else if (c1 == 2) sums[j] += xr[k + 1];
+                        if (c2 == 0) sums[j] -= xr[k + 2]; else if (c2 == 2) sums[j] += xr[k + 2];
+                        if (c3 == 0) sums[j] -= xr[k + 3]; else if (c3 == 2) sums[j] += xr[k + 3];
+                    }
                 }
                 for (; k < in_features; ++k) {
-                    const int code = (wr[k >> 2] >> (6 - (k & 3) * 2)) & 3;
-                    if (code == 0) sum -= xr[k]; else if (code == 2) sum += xr[k];
+                    const int code_shift = 6 - (k & 3) * 2;
+                    for (int64_t j = 0; j < count; ++j) {
+                        const int code = (wr[j][k >> 2] >> code_shift) & 3;
+                        if (code == 0) sums[j] -= xr[k]; else if (code == 2) sums[j] += xr[k];
+                    }
                 }
-                yp[index] = sum;
-                if (++o == out_features) {
-                    o = 0;
-                    ++n;
-                    xr += in_features;
-                    wr = wp;
-                } else {
-                    wr += row_bytes;
-                }
+                for (int64_t j = 0; j < count; ++j)
+                    yp[n * out_features + ob + j] = sums[j];
             }
         });
     } else {
         const int64_t full_bytes = in_features >> 1;
-        at::parallel_for(0, batch * out_features, 64, [&](int64_t begin, int64_t end) {
-            int64_t n = begin / out_features;
-            int64_t o = begin - n * out_features;
-            const float* xr = sxp + n * in_features;
-            const uint8_t* wr = wp + o * row_bytes;
-            for (int64_t index = begin; index < end; ++index) {
-                float sum = 0.0f;
+        at::parallel_for(0, batch * out_tiles, 1, [&](int64_t begin, int64_t end) {
+            float sums[tile];
+            for (int64_t task = begin; task < end; ++task) {
+                const int64_t n = task / out_tiles;
+                const int64_t ob = (task - n * out_tiles) * tile;
+                const int64_t count = std::min(tile, out_features - ob);
+                const float* xr = sxp + n * in_features;
+                const uint8_t* wr[tile];
+                for (int64_t j = 0; j < count; ++j) wr[j] = wp + (ob + j) * row_bytes;
+                for (int64_t j = 0; j < count; ++j) sums[j] = 0.0f;
+
                 int64_t k = 0;
-                int64_t b = 0;
-                for (; b + 3 < full_bytes; b += 4) {
-                    const uint8_t byte0 = wr[b];
-                    const uint8_t byte1 = wr[b + 1];
-                    const uint8_t byte2 = wr[b + 2];
-                    const uint8_t byte3 = wr[b + 3];
-                    sum += xr[k] * fp4_levels[byte0 >> 4];
-                    sum += xr[k + 1] * fp4_levels[byte0 & 15];
-                    sum += xr[k + 2] * fp4_levels[byte1 >> 4];
-                    sum += xr[k + 3] * fp4_levels[byte1 & 15];
-                    sum += xr[k + 4] * fp4_levels[byte2 >> 4];
-                    sum += xr[k + 5] * fp4_levels[byte2 & 15];
-                    sum += xr[k + 6] * fp4_levels[byte3 >> 4];
-                    sum += xr[k + 7] * fp4_levels[byte3 & 15];
-                    k += 8;
-                }
-                for (; b < full_bytes; ++b) {
-                    const uint8_t byte = wr[b];
-                    sum += xr[k] * fp4_levels[byte >> 4];
-                    sum += xr[k + 1] * fp4_levels[byte & 15];
-                    k += 2;
+                for (int64_t b = 0; b < full_bytes; ++b, k += 2) {
+                    const int64_t byte_index = b;
+                    for (int64_t j = 0; j < count; ++j) {
+                        const uint8_t byte = wr[j][byte_index];
+                        sums[j] += xr[k] * fp4_levels[byte >> 4];
+                        sums[j] += xr[k + 1] * fp4_levels[byte & 15];
+                    }
                 }
                 for (; k < in_features; ++k) {
-                    const int code = (wr[k >> 1] >> (4 - (k & 1) * 4)) & 15;
-                    sum += xr[k] * fp4_levels[code];
+                    const int shift = 4 - (k & 1) * 4;
+                    for (int64_t j = 0; j < count; ++j) {
+                        const int code = (wr[j][k >> 1] >> shift) & 15;
+                        sums[j] += xr[k] * fp4_levels[code];
+                    }
                 }
-                yp[index] = sum;
-                if (++o == out_features) {
-                    o = 0;
-                    ++n;
-                    xr += in_features;
-                    wr = wp;
-                } else {
-                    wr += row_bytes;
-                }
+                for (int64_t j = 0; j < count; ++j)
+                    yp[n * out_features + ob + j] = sums[j];
             }
         });
     }
@@ -218,15 +189,13 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
         for (int64_t k0 = begin; k0 < end; k0 += block) {
             const int64_t k1 = std::min(k0 + block, end);
             float local[32];
-            for (int64_t k = k0; k < k1; ++k)
-                local[k - k0] = eps;
+            for (int64_t k = k0; k < k1; ++k) local[k - k0] = eps;
             for (int64_t o = 0; o < out_features; ++o) {
                 const float* wr = wp + o * in_features + k0;
                 for (int64_t k = k0; k < k1; ++k)
                     local[k - k0] = std::max(local[k - k0], std::abs(wr[k - k0]));
             }
-            for (int64_t k = k0; k < k1; ++k)
-                scale[k] = local[k - k0];
+            for (int64_t k = k0; k < k1; ++k) scale[k] = local[k - k0];
         }
     });
 
@@ -258,11 +227,9 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
                 }
                 for (; k < in_features; ++k) {
                     const float q = quantize2(wr[k], scale[k]);
-                    for (int64_t n = 0; n < batch; ++n)
-                        sums[n] += xp[n * in_features + k] * q;
+                    for (int64_t n = 0; n < batch; ++n) sums[n] += xp[n * in_features + k] * q;
                 }
-                for (int64_t n = 0; n < batch; ++n)
-                    yp[n * out_features + o] = sums[n];
+                for (int64_t n = 0; n < batch; ++n) yp[n * out_features + o] = sums[n];
             }
         });
     } else {
@@ -289,11 +256,9 @@ torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
                 }
                 for (; k < in_features; ++k) {
                     const float q = quantize4(wr[k], scale[k]);
-                    for (int64_t n = 0; n < batch; ++n)
-                        sums[n] += xp[n * in_features + k] * q;
+                    for (int64_t n = 0; n < batch; ++n) sums[n] += xp[n * in_features + k] * q;
                 }
-                for (int64_t n = 0; n < batch; ++n)
-                    yp[n * out_features + o] = sums[n];
+                for (int64_t n = 0; n < batch; ++n) yp[n * out_features + o] = sums[n];
             }
         });
     }
