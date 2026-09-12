@@ -4,10 +4,9 @@
 import torch
 import torch.nn as nn
 
-from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
+from rwkv_x_core import RWKVXModel
 from qt import QuantizedLinear
 
-_CMIX_LINEAR_NAMES = ("key", "value")
 _SUPPORTED_BITS = (2, 4, 8)
 
 
@@ -39,7 +38,9 @@ class RealQuantLinear(nn.Module):
     def __init__(self, linear: nn.Linear, bits: int):
         super().__init__()
         if linear.bias is not None:
-            raise ValueError("RWKV-X Channel-Mix linears must have bias=False")
+            self.bias = linear.bias
+        else:
+            self.register_parameter("bias", None)
         self.weight = linear.weight
         self.bits = _bits(bits)
         self.quant = QuantizedLinear.from_linear(linear, self.bits)
@@ -61,29 +62,39 @@ class RealQuantLinear(nn.Module):
     def forward(self, x):
         if self.weight.device != x.device:
             self.quant = self.quant.to(x.device)
-        return _RQTFunction.apply(x, self.weight, self.quant)
+        out = _RQTFunction.apply(x, self.weight, self.quant)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
 
 
-def _iter_cmix_modules(model):
-    for blk in list(model.rwkv_blocks) + list(model.moba_blocks):
-        ffn = blk.ffn
-        if isinstance(ffn, RWKV_CMix_MoE):
-            yield from ffn.experts
-        elif isinstance(ffn, RWKV_CMix_x070):
-            yield ffn
+def _iter_linear_modules(model):
+    root = getattr(model, "_orig_mod", model)
+    for module in root.modules():
+        if isinstance(module, nn.Linear):
+            yield module
 
 
 def prepare_rqt(model: RWKVXModel, bits):
     bits = _bits(bits)
-    count = 0
-    for cmix in _iter_cmix_modules(model):
-        for name in _CMIX_LINEAR_NAMES:
-            mod = getattr(cmix, name)
-            if isinstance(mod, nn.Linear):
-                setattr(cmix, name, RealQuantLinear(mod, bits))
-                count += 1
+    root = getattr(model, "_orig_mod", model)
+    targets = [module for module in root.modules() if isinstance(module, nn.Linear)]
+    for module in targets:
+        parent = root
+        parts = []
+        for name, child in root.named_modules():
+            if child is module:
+                parts = name.split(".")
+                break
+        if not parts:
+            continue
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        name = parts[-1]
+        setattr(parent, name, RealQuantLinear(module, bits))
     print(f"[RQT] FP{bits} packed training weights")
-    return count
+    print(f"[RQT] real-quantizing {len(targets)} linear weights")
+    return len(targets)
 
 
 @torch.no_grad()
