@@ -11,10 +11,17 @@ import time
 from pathlib import Path
 from typing import Optional
 
-if "--cpu" in sys.argv or "--qt" in sys.argv:
+if "--cpu" in sys.argv or "--rqt" in sys.argv:
     threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(key, threads)
+    if "MKL_ENABLE_INSTRUCTIONS" not in os.environ:
+        try:
+            flags = Path("/proc/cpuinfo").read_text(errors="ignore")
+            if " avx" in flags or "\navx " in flags:
+                os.environ["MKL_ENABLE_INSTRUCTIONS"] = "AVX"
+        except OSError:
+            pass
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
@@ -185,6 +192,9 @@ def _optimizer_step(args, model, optimizer, xb, yb, device, scaler):
         scaler.update()
     else:
         optimizer.step()
+    if args.rqt:
+        import rqt
+        rqt.refresh_rqt(model)
     return loss
 
 
@@ -324,15 +334,17 @@ def parse_args():
     parser.add_argument("--optimizer_save_every", type=int, default=None)
     parser.add_argument("--new_data", action="store_true")
     parser.add_argument("--train_router_only", action="store_true")
-    parser.add_argument("--qat", action="store_true")
-    parser.add_argument("--qat_export_dir", default=None)
+    parser.add_argument("--qat", type=int, choices=(2, 4, 8), nargs="?", const=8, default=None)
+    parser.add_argument("--rqt", type=int, choices=(2, 4, 8), nargs="?", const=8, default=None)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
-    if os.environ.get("SMAUL_QT_REQUESTED") == "1":
-        args.cpu = True
     args.precision = args.precision or ("fp16" if torch.cuda.is_available() and not args.cpu else "fp32")
     args.optimizer_save_every = args.optimizer_save_every or args.save_every
+    if args.qat and args.rqt:
+        parser.error("--qat and --rqt cannot be used together")
+    if args.rqt and not args.cpu:
+        parser.error("--rqt requires --cpu")
     if (args.tokenizer_max_records < 0 or args.n_embd <= 0 or args.head_size <= 0 or args.n_layer <= 0 or args.n_moba_layer < 0 or args.n_moba_layer >= args.n_layer or args.tokenizer_vocab_size <= 0 or args.batch_size <= 0 or args.ctx_len <= 0 or args.epochs <= 0 or args.learning_rate <= 0 or args.log_every <= 0 or args.save_every <= 0 or args.optimizer_save_every <= 0):
         parser.error("invalid model/training parameters")
     if args.n_embd % args.head_size:
@@ -374,8 +386,12 @@ def main():
         trainable = set_router_only_training(model, True)
         print(f"[ROUTER-ONLY] {trainable:,} trainable params")
     if args.qat:
-        n = qat.prepare_qat(model)
+        n = qat.prepare_qat(model, args.qat)
         print(f"[QAT] fake-quantizing {n} linears")
+    if args.rqt:
+        import rqt
+        n = rqt.prepare_rqt(model, args.rqt)
+        print(f"[RQT] real-quantizing {n} linears")
     if args.compile:
         model = torch.compile(model, mode="max-autotune")
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -403,13 +419,6 @@ def main():
             train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
     finally:
         save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path, args.save_dtype, True)
-    if args.qat and args.qat_export_dir:
-        import copy
-        exported = copy.deepcopy(getattr(model, "_orig_mod", model)).cpu()
-        n = qat.convert_qat(exported)
-        exported.save_pretrained(Path(args.qat_export_dir))
-        shutil.copy2(tokenizer_path, Path(args.qat_export_dir) / "tokenizer.json")
-        print(f"[QAT] converted {n} linears")
 
 
 if __name__ == "__main__":
