@@ -155,7 +155,7 @@ class RWKV_Tmix_x070(nn.Module):
             state, y = (torch.utils.checkpoint.checkpoint(_wkv_run_chunk, state, *args, use_reentrant=False)
                         if checkpoint else _wkv_run_chunk(state, *args))
             ys.append(y)
-        out = torch.cat(ys, 1).reshape(B, T, C)
+        out = ys[0].reshape(B, T, C) if len(ys) == 1 else torch.cat(ys, 1).reshape(B, T, C)
         out = self.ln_x(out.reshape(B * T, C)).reshape(B, T, C)
         out = out + ((r_ * k_ * self.r_k).sum(-1, keepdim=True) * v_).reshape(B, T, C)
         return self.output(out * g), v_first, (state, x[:, -1])
