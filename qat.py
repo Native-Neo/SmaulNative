@@ -121,3 +121,7 @@ def prepare_qat(model: RWKVXModel, bits=None) -> int:
 @torch.no_grad()
 def calibrate(model, tokenizer, calib_texts, ctx_len, device, max_batches=64):
     return 0
+
+
+# Compatibility for loading real QT checkpoints.
+from qt import QuantizedLinear
