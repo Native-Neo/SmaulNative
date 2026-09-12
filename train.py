@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-if "--cpu" in sys.argv:
+if "--cpu" in sys.argv or "--qt" in sys.argv:
     threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(key, threads)
@@ -375,6 +375,8 @@ def parse_args():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
+    if os.environ.get("SMAUL_QT_REQUESTED") == "1":
+        args.cpu = True
     args.precision = args.precision or ("fp16" if torch.cuda.is_available() and not args.cpu else "fp32")
     args.optimizer_save_every = args.optimizer_save_every or args.save_every
     if (
@@ -432,12 +434,6 @@ def main():
     if args.qat:
         n = qat.prepare_qat(model)
         print(f"[QAT] fake-quantizing {n} linears")
-        if args.stream_dataset != "none":
-            calib_texts = stream_dataset(args.stream_dataset)
-        else:
-            calib_texts = (text for text, _path, _index in iter_texts(discover_files(Path(args.dataset_dir))))
-        calibrated = qat.calibrate(model, tokenizer, calib_texts, args.ctx_len, device, args.qat_calib_batches)
-        print(f"[QAT] calibrated {calibrated} batches")
 
     if args.compile:
         model = torch.compile(model, mode="max-autotune")
