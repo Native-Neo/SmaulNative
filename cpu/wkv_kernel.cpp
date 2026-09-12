@@ -102,7 +102,6 @@ std::vector<torch::Tensor> wkv_backward(torch::Tensor state, torch::Tensor w, to
     for (int64_t bh = bh0; bh < bh1; ++bh) {
       const int64_t b = bh / H, h = bh - b * H;
       const int64_t sbase = bh * state_stride, base = (b * T * H + h) * N;
-      std::copy(sp0 + sbase, sp0 + sbase + state_stride, checkpoints.data());
       std::copy(sp0 + sbase, sp0 + sbase + state_stride, current.data());
 
       for (int64_t block = 0; block < blocks; ++block) {
