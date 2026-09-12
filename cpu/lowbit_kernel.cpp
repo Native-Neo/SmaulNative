@@ -75,18 +75,12 @@ torch::Tensor packed_linear(torch::Tensor x, torch::Tensor packed,
 
     auto scaled_x = torch::empty_like(x);
     float* sxp = scaled_x.data_ptr<float>();
-    at::parallel_for(0, batch * in_features, 256, [&](int64_t begin, int64_t end) {
-        const int64_t n = begin / in_features;
-        int64_t k = begin - n * in_features;
-        const float* xr = xp + n * in_features;
-        float* sr = sxp + n * in_features;
-        for (int64_t index = begin; index < end; ++index) {
-            sr[k] = xr[k] * sp[k];
-            if (++k == in_features) {
-                k = 0;
-                ++xr;
-                ++sr;
-            }
+    at::parallel_for(0, batch, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t n = begin; n < end; ++n) {
+            const float* xr = xp + n * in_features;
+            float* sr = sxp + n * in_features;
+            for (int64_t k = 0; k < in_features; ++k)
+                sr[k] = xr[k] * sp[k];
         }
     });
 
