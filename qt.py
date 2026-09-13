@@ -111,7 +111,8 @@ class QuantizedLinear(nn.Module):
         if self.bits == 8:
             return self.packed.to(device=device, dtype=dtype)
         codes = _unpack_codes(self.packed.to(device), self.bits, self._shape[0] * self._shape[1]).long()
-        return (_levels(self.bits, device, dtype)[codes] * self.scale.to(device=device, dtype=dtype)).reshape(self._shape)
+        levels = _levels(self.bits, device, dtype)[codes].reshape(self._shape)
+        return levels * self.scale.to(device=device, dtype=dtype)
 
     def forward(self, x):
         if self.bits < 8 and x.device.type == "cpu" and x.dtype == torch.float32:
