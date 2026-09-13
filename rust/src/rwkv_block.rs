@@ -25,7 +25,6 @@ impl RwkvBlock {
         assert!(channels > 0);
         assert!(heads > 0);
         assert_eq!(channels % heads, 0);
-
         Self {
             channels,
             heads,
@@ -33,7 +32,7 @@ impl RwkvBlock {
             ln0: if layer_id == 0 { Some(LayerNorm::new(channels, 1e-5)) } else { None },
             ln1: LayerNorm::new(channels, 1e-5),
             ln2: LayerNorm::new(channels, 1e-5),
-            time_mix: RwkvTimeMix::new(channels, heads, channels / heads),
+            time_mix: RwkvTimeMix::new(channels, heads, layer_id, n_layer),
             cmix: RwkvCmix::new(channels, layer_id, n_layer),
         }
     }
@@ -44,27 +43,20 @@ impl RwkvBlock {
         state: Option<&RwkvBlockState>,
     ) -> (Array2<f32>, RwkvBlockState) {
         assert_eq!(x.ncols(), self.channels);
-
-        let input = match &self.ln0 {
-            Some(norm) => norm.forward(x),
-            None => x.clone(),
-        };
-
+        let input = match &self.ln0 { Some(norm) => norm.forward(x), None => x.clone() };
         let time_input = self.ln1.forward(&input);
-        let zero_prev = Array1::<f32>::zeros(self.channels);
-        let zero_state = Array4::<f32>::zeros((1, self.heads, self.channels / self.heads, self.channels / self.heads));
-        let time_prev = state.map(|s| &s.time_prev).unwrap_or(&zero_prev);
-        let time_state = state.map(|s| s.time_state.clone()).unwrap_or(zero_state);
-
-        let (time_output, next_time_state, next_time_prev) =
-            self.time_mix.forward(&time_input, time_prev, time_state);
-
+        let time_state = state.map(|s| s.time_state.clone());
+        let time_prev = state.map(|s| s.time_prev.clone());
+        let (time_output, next_time_state, next_time_prev) = self.time_mix.forward(
+            &time_input,
+            time_state,
+            time_prev,
+        );
         let residual = &input + &time_output;
         let cmix_input = self.ln2.forward(&residual);
         let cmix_prev = state.map(|s| &s.cmix_prev);
         let (cmix_output, next_cmix_prev) = self.cmix.forward(&cmix_input, cmix_prev);
         let output = &residual + &cmix_output;
-
         (
             output,
             RwkvBlockState {
@@ -79,21 +71,7 @@ impl RwkvBlock {
         let norm_params = self.ln0.as_ref().map_or(0, |n| n.weight.len() + n.bias.len())
             + self.ln1.weight.len() + self.ln1.bias.len()
             + self.ln2.weight.len() + self.ln2.bias.len();
-        norm_params + self.time_mix.receptance.len()
-            + self.time_mix.key.len()
-            + self.time_mix.value.len()
-            + self.time_mix.output.len()
-            + self.time_mix.x_r.len()
-            + self.time_mix.x_w.len()
-            + self.time_mix.x_k.len()
-            + self.time_mix.x_v.len()
-            + self.time_mix.x_a.len()
-            + self.time_mix.x_g.len()
-            + self.time_mix.w0.len()
-            + self.time_mix.k_k.len()
-            + self.time_mix.k_a.len()
-            + self.time_mix.r_k.len()
-            + self.cmix.parameter_count()
+        norm_params + self.time_mix.parameter_count() + self.cmix.parameter_count()
     }
 }
 
