@@ -107,6 +107,8 @@ def _iter_cmix_modules(model: RWKVXModel):
 
 
 def prepare_qat(model: RWKVXModel, bits=None) -> int:
+    if bits is None:
+        bits = getattr(model.cfg, "qat_bits", 0) or None
     bits = _bits(bits)
     model.cfg.qat_bits = bits
     n = 0
