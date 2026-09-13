@@ -9,7 +9,7 @@ from rwkv_x_core import RWKVXConfig, RWKVXModel
 
 
 def test_qat_checkpoint_restores_bit_width(tmp_path):
-    cfg = RWKVXConfig(vocab_size=32, n_embd=32, n_layer=2, head_size=8, n_moba_layer=1, qat_bits=4)
+    cfg = RWKVXConfig(vocab_size=32, n_embd=32, n_layer=2, head_size=8, n_moba_layer=1)
     model = RWKVXModel(cfg)
     assert qat.prepare_qat(model, 4) == 4
 
