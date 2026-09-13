@@ -32,7 +32,7 @@ from torch.optim import Optimizer
 from dataset import PretrainStream, SFTDataset, discover_files, iter_texts, load_tokenizer, tokenizer_vocab_size
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE
 from stream_data import stream_dataset
-from tokenizer import train_tokenizer
+from tokenizer import ensure_tokenizer
 import qat
 
 STOP_REQUESTED = False
@@ -428,10 +428,9 @@ def main():
         from cpu import configure
         print(f"[CPU] {configure()} threads, native WKV, compile={args.compile}")
     tokenizer_path = Path(args.tokenizer_path)
-    output_dir = Path(args.output_dir)
-    if not tokenizer_path.exists():
-        train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size, args.stream_dataset, args.tokenizer_max_records)
-    tokenizer = load_tokenizer(tokenizer_path)
+    tokenizer, tokenizer_rebuilt = ensure_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size, args.stream_dataset, args.tokenizer_max_records)
+    if tokenizer_rebuilt:
+        print(f"[TOKENIZER] using requested vocabulary={tokenizer.get_vocab_size()}")
     model, loaded_checkpoint = build_model(args, tokenizer)
     model = model.to(device)
     print(f"[MODEL CONFIG] vocab={model.cfg.vocab_size} n_embd={model.cfg.n_embd} n_layer={model.cfg.n_layer} n_moba_layer={model.cfg.n_moba_layer} head_size={model.cfg.head_size} ctx_len={args.ctx_len} batch_size={args.batch_size}")
