@@ -188,6 +188,19 @@ mod tests {
     }
 
     #[test]
+    fn moba_decode_matches_full_sequence() {
+        let config = RwkvModelConfig::new(32, 16, 5, 4).with_moba(2, 2, 1);
+        let model = RwkvModel::new(config, 1234);
+        let (full_logits, _) = model.forward(&[1, 2, 3, 4], None);
+        let (_, state) = model.forward(&[1, 2, 3], None);
+        let (decode_logits, _) = model.forward(&[4], Some(&state));
+        let full = full_logits.row(3);
+        let decode = decode_logits.row(0);
+        let max_error = full.iter().zip(decode.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+        assert!(max_error < 1e-5, "max decode error: {max_error}");
+    }
+
+    #[test]
     fn argmax_selects_each_row() {
         let logits = Array2::from_shape_vec((2, 4), vec![1.0, 7.0, 2.0, 3.0, 9.0, 2.0, 8.0, 1.0]).unwrap();
         assert_eq!(RwkvModel::argmax(&logits).to_vec(), vec![1, 0]);
