@@ -3,15 +3,23 @@ use ndarray::{Array1, Array2, Axis};
 pub struct Linear {
     pub weight: Array2<f32>,
     pub bias: Array1<f32>,
+    pub has_bias: bool,
     pub grad_weight: Array2<f32>,
     pub grad_bias: Array1<f32>,
 }
 
 impl Linear {
     pub fn new(in_features: usize, out_features: usize) -> Self {
+        Self::new_with_bias(in_features, out_features, true)
+    }
+
+    pub fn new_no_bias(in_features: usize, out_features: usize) -> Self {
+        Self::new_with_bias(in_features, out_features, false)
+    }
+
+    fn new_with_bias(in_features: usize, out_features: usize, has_bias: bool) -> Self {
         assert!(in_features > 0);
         assert!(out_features > 0);
-
         let scale = (2.0 / in_features as f32).sqrt();
         let mut weight = Array2::<f32>::zeros((out_features, in_features));
         for o in 0..out_features {
@@ -20,10 +28,10 @@ impl Linear {
                 weight[[o, i]] = (value / 50000.0 - 1.0) * scale;
             }
         }
-
         Self {
             weight,
             bias: Array1::zeros(out_features),
+            has_bias,
             grad_weight: Array2::zeros((out_features, in_features)),
             grad_bias: Array1::zeros(out_features),
         }
@@ -36,13 +44,27 @@ impl Linear {
             grad_bias: Array1::zeros(bias.raw_dim()),
             weight,
             bias,
+            has_bias: true,
+        }
+    }
+
+    pub fn from_weight(weight: Array2<f32>) -> Self {
+        let out_features = weight.nrows();
+        Self {
+            grad_weight: Array2::zeros(weight.raw_dim()),
+            grad_bias: Array1::zeros(out_features),
+            weight,
+            bias: Array1::zeros(out_features),
+            has_bias: false,
         }
     }
 
     pub fn forward(&self, input: &Array2<f32>) -> Array2<f32> {
         assert_eq!(input.ncols(), self.weight.ncols());
         let mut output = input.dot(&self.weight.t());
-        output += &self.bias;
+        if self.has_bias {
+            output += &self.bias;
+        }
         output
     }
 
@@ -50,9 +72,10 @@ impl Linear {
         assert_eq!(input.ncols(), self.weight.ncols());
         assert_eq!(grad_output.nrows(), input.nrows());
         assert_eq!(grad_output.ncols(), self.weight.nrows());
-
         self.grad_weight += &grad_output.t().dot(input);
-        self.grad_bias += &grad_output.sum_axis(Axis(0));
+        if self.has_bias {
+            self.grad_bias += &grad_output.sum_axis(Axis(0));
+        }
         grad_output.dot(&self.weight)
     }
 
@@ -62,7 +85,7 @@ impl Linear {
     }
 
     pub fn parameter_count(&self) -> usize {
-        self.weight.len() + self.bias.len()
+        self.weight.len() + if self.has_bias { self.bias.len() } else { 0 }
     }
 }
 
@@ -73,25 +96,22 @@ mod tests {
 
     #[test]
     fn forward_matches_matrix_multiplication() {
-        let layer = Linear::from_weights(
-            array![[1.0, 2.0], [3.0, 4.0]],
-            array![0.5, -0.5],
-        );
-        let input = array![[2.0, 3.0]];
-        let output = layer.forward(&input);
+        let layer = Linear::from_weights(array![[1.0, 2.0], [3.0, 4.0]], array![0.5, -0.5]);
+        let output = layer.forward(&array![[2.0, 3.0]]);
         assert_eq!(output, array![[8.5, 16.5]]);
     }
 
     #[test]
-    fn backward_accumulates_gradients() {
-        let mut layer = Linear::from_weights(
-            array![[1.0, 2.0], [3.0, 4.0]],
-            array![0.0, 0.0],
-        );
-        let input = array![[2.0, 3.0]];
-        let grad = array![[5.0, 7.0]];
-        let grad_input = layer.backward(&input, &grad);
+    fn no_bias_has_only_weight_parameters() {
+        let layer = Linear::new_no_bias(2, 3);
+        assert!(!layer.has_bias);
+        assert_eq!(layer.parameter_count(), 6);
+    }
 
+    #[test]
+    fn backward_accumulates_gradients() {
+        let mut layer = Linear::from_weights(array![[1.0, 2.0], [3.0, 4.0]], array![0.0, 0.0]);
+        let grad_input = layer.backward(&array![[2.0, 3.0]], &array![[5.0, 7.0]]);
         assert_eq!(layer.grad_weight, array![[10.0, 15.0], [14.0, 21.0]]);
         assert_eq!(layer.grad_bias, array![5.0, 7.0]);
         assert_eq!(grad_input, array![[26.0, 38.0]]);
