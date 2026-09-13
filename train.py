@@ -450,7 +450,12 @@ def main():
     _print_model_size(model)
     if args.compile:
         model = torch.compile(model, mode="max-autotune")
-    optimizer = Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if device.type == "cpu":
+        from cpu_backend import NativeLion
+        optimizer = NativeLion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        print("[OPTIMIZER] native CPU Lion")
+    else:
+        optimizer = Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json") if args.resume else ResumeState()
     if args.resume:
         optimizer_path = Path(args.checkpoint_dir) / "optimizer.pt"
