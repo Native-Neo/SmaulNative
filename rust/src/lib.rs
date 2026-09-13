@@ -1,10 +1,15 @@
+pub mod activation;
 pub mod attention;
+pub mod autograd;
 pub mod embedding;
 pub mod ffn;
+pub mod gradient;
 pub mod group_norm;
 pub mod init;
 pub mod layer_norm;
 pub mod linear;
+pub mod loss;
+pub mod matmul;
 pub mod moba_attention;
 pub mod moba_block;
 pub mod model_loader;
