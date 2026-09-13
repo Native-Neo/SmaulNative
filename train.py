@@ -47,6 +47,37 @@ def _sigint_handler(signum, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
+def _format_size(num_bytes):
+    units = ("B", "KiB", "MiB", "GiB")
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+
+
+def _print_model_size(model):
+    parameters = sum(param.numel() for param in model.parameters())
+    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    fp32_bytes = parameters * 4
+    print(f"[MODEL] {parameters:,} parameters | trainable={trainable:,} | FP32={_format_size(fp32_bytes)}")
+    return parameters
+
+
+def _print_rqt_storage(model):
+    packed_bytes = 0
+    scale_bytes = 0
+    for module in model.modules():
+        quant = getattr(module, "quant", None)
+        if quant is None or not hasattr(quant, "packed"):
+            continue
+        packed_bytes += quant.packed.numel() * quant.packed.element_size()
+        if hasattr(quant, "scale"):
+            scale_bytes += quant.scale.numel() * quant.scale.element_size()
+    master_bytes = sum(param.numel() for param in model.parameters()) * 4
+    print(f"[RQT] packed storage={_format_size(packed_bytes + scale_bytes)} | master FP32={_format_size(master_bytes)}")
+
+
 class Lion(Optimizer):
     def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
         if lr <= 0:
@@ -382,6 +413,7 @@ def main():
         train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size, args.stream_dataset, args.tokenizer_max_records)
     tokenizer = load_tokenizer(tokenizer_path)
     model = build_model(args, tokenizer).to(device)
+    _print_model_size(model)
     if args.train_router_only:
         trainable = set_router_only_training(model, True)
         print(f"[ROUTER-ONLY] {trainable:,} trainable params")
@@ -392,6 +424,7 @@ def main():
         import rqt
         n = rqt.prepare_rqt(model, args.rqt)
         print(f"[RQT] real-quantizing {n} linears")
+        _print_rqt_storage(model)
     if args.compile:
         model = torch.compile(model, mode="max-autotune")
     checkpoint_dir = Path(args.checkpoint_dir)
