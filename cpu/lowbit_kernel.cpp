@@ -75,11 +75,11 @@ torch::Tensor packed_linear(
     const int64_t batch = x.size(0);
     const int per_byte = 8 / bits;
     const int64_t row_bytes =
-    (in_features + per_byte - 1) / per_byte;
+        (in_features + per_byte - 1) / per_byte;
 
     TORCH_CHECK(
         packed.numel() >= out_features * row_bytes,
-                "packed weight is too small"
+        "packed weight is too small"
     );
 
     auto out = torch::empty(
@@ -94,7 +94,7 @@ torch::Tensor packed_linear(
 
     constexpr int64_t tile = 4;
     const int64_t out_tiles =
-    (out_features + tile - 1) / tile;
+        (out_features + tile - 1) / tile;
 
     if (bits == 2) {
         const int64_t full_bytes = in_features >> 2;
@@ -105,22 +105,22 @@ torch::Tensor packed_linear(
             1,
             [&](int64_t begin, int64_t end) {
                 float sums[tile];
+                int64_t n = begin / out_tiles;
+                int64_t tile_index = begin - n * out_tiles;
+                int64_t ob = tile_index * tile;
 
                 for (int64_t task = begin; task < end; ++task) {
-                    const int64_t n = task / out_tiles;
-                    const int64_t ob =
-                    (task - n * out_tiles) * tile;
                     const int64_t count =
-                    std::min(tile, out_features - ob);
+                        std::min(tile, out_features - ob);
 
                     const float* xr =
-                    xp + n * in_features;
+                        xp + n * in_features;
 
                     const uint8_t* wr[tile];
 
                     for (int64_t j = 0; j < count; ++j)
                         wr[j] =
-                        wp + (ob + j) * row_bytes;
+                            wp + (ob + j) * row_bytes;
 
                     for (int64_t j = 0; j < count; ++j)
                         sums[j] = 0.0f;
@@ -153,13 +153,21 @@ torch::Tensor packed_linear(
 
                         for (int64_t j = 0; j < count; ++j) {
                             const int code =
-                            (wr[j][k >> 2] >> shift) & 3;
+                                (wr[j][k >> 2] >> shift) & 3;
                             sums[j] += p * fp2_levels[code];
                         }
                     }
 
                     for (int64_t j = 0; j < count; ++j)
                         yp[n * out_features + ob + j] = sums[j];
+
+                    ++tile_index;
+                    ob += tile;
+                    if (tile_index == out_tiles) {
+                        tile_index = 0;
+                        ob = 0;
+                        ++n;
+                    }
                 }
             }
         );
@@ -172,22 +180,22 @@ torch::Tensor packed_linear(
             1,
             [&](int64_t begin, int64_t end) {
                 float sums[tile];
+                int64_t n = begin / out_tiles;
+                int64_t tile_index = begin - n * out_tiles;
+                int64_t ob = tile_index * tile;
 
                 for (int64_t task = begin; task < end; ++task) {
-                    const int64_t n = task / out_tiles;
-                    const int64_t ob =
-                    (task - n * out_tiles) * tile;
                     const int64_t count =
-                    std::min(tile, out_features - ob);
+                        std::min(tile, out_features - ob);
 
                     const float* xr =
-                    xp + n * in_features;
+                        xp + n * in_features;
 
                     const uint8_t* wr[tile];
 
                     for (int64_t j = 0; j < count; ++j)
                         wr[j] =
-                        wp + (ob + j) * row_bytes;
+                            wp + (ob + j) * row_bytes;
 
                     for (int64_t j = 0; j < count; ++j)
                         sums[j] = 0.0f;
@@ -211,13 +219,21 @@ torch::Tensor packed_linear(
 
                         for (int64_t j = 0; j < count; ++j) {
                             const int code =
-                            (wr[j][k >> 1] >> shift) & 15;
+                                (wr[j][k >> 1] >> shift) & 15;
                             sums[j] += p * fp4_levels[code];
                         }
                     }
 
                     for (int64_t j = 0; j < count; ++j)
                         yp[n * out_features + ob + j] = sums[j];
+
+                    ++tile_index;
+                    ob += tile;
+                    if (tile_index == out_tiles) {
+                        tile_index = 0;
+                        ob = 0;
+                        ++n;
+                    }
                 }
             }
         );
