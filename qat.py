@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Fake low-bit floating-point QAT for RWKV-X.
 
+import json
 import os
 from pathlib import Path
 
@@ -107,6 +108,7 @@ def _iter_cmix_modules(model: RWKVXModel):
 
 def prepare_qat(model: RWKVXModel, bits=None) -> int:
     bits = _bits(bits)
+    model.cfg.qat_bits = bits
     n = 0
     for cmix in _iter_cmix_modules(model):
         for name in _CMIX_LINEAR_NAMES:
@@ -125,3 +127,47 @@ def calibrate(model, tokenizer, calib_texts, ctx_len, device, max_batches=64):
 
 # Compatibility for loading real QT checkpoints.
 from qt import QuantizedLinear
+
+
+_ORIGINAL_SAVE = RWKVXModel.save_pretrained
+_ORIGINAL_LOAD = RWKVXModel.from_pretrained.__func__
+
+
+def _save_pretrained(model, out_dir, *args, **kwargs):
+    _ORIGINAL_SAVE(model, out_dir, *args, **kwargs)
+    config_path = Path(out_dir) / "config.json"
+    data = json.loads(config_path.read_text())
+    for name in ("qat_bits", "rqt_bits", "quantization_bits"):
+        value = getattr(model.cfg, name, 0)
+        if value:
+            data[name] = int(value)
+    config_path.write_text(json.dumps(data, indent=2))
+
+
+def _from_pretrained(cls, in_dir, *args, load_upstream=True, **kwargs):
+    in_dir = Path(in_dir)
+    config_path = in_dir / "config.json"
+    data = json.loads(config_path.read_text())
+    metadata = {name: int(data.pop(name, 0) or 0) for name in ("qat_bits", "rqt_bits", "quantization_bits")}
+    original_text = config_path.read_text()
+    config_path.write_text(json.dumps(data, indent=2))
+    try:
+        model = _ORIGINAL_LOAD(cls, in_dir, *args, **kwargs)
+    finally:
+        config_path.write_text(original_text)
+
+    if metadata["qat_bits"]:
+        prepare_qat(model, metadata["qat_bits"])
+    if metadata["rqt_bits"]:
+        import rqt
+        rqt.prepare_rqt(model, metadata["rqt_bits"])
+        rqt.refresh_rqt(model)
+    if metadata["quantization_bits"]:
+        model.cfg.quantization_bits = metadata["quantization_bits"]
+    return model
+
+
+if not getattr(RWKVXModel.save_pretrained, "_smaul_checkpoint_compat", False):
+    _save_pretrained._smaul_checkpoint_compat = True
+    RWKVXModel.save_pretrained = _save_pretrained
+    RWKVXModel.from_pretrained = classmethod(_from_pretrained)
