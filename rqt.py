@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from rwkv_x_core import RWKVXModel
-from qt import QuantizedLinear, _levels, _pack_codes
+from qt import QuantizedLinear, _levels, _pack_codes, packed_linear_transpose
 
 _SUPPORTED_BITS = (2, 4, 8)
 _REFRESH_ROWS = 64
@@ -27,10 +27,20 @@ class _RQTFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x, weight = ctx.saved_tensors
-        q = ctx.quant.unpack(x.device, x.dtype)
+        quant = ctx.quant
+        out_features, in_features = quant._shape
+        if x.device.type == "cuda" and x.dtype == torch.float32 and quant.bits < 8:
+            grad_x = packed_linear_transpose(
+                grad_output, quant.packed, quant.scale,
+                quant.bits, out_features, in_features,
+            ).reshape_as(x)
+        else:
+            q = quant.unpack(x.device, x.dtype)
+            x2 = x.reshape(-1, x.shape[-1])
+            go = grad_output.reshape(-1, grad_output.shape[-1])
+            grad_x = go.matmul(q).reshape_as(x)
         x2 = x.reshape(-1, x.shape[-1])
         go = grad_output.reshape(-1, grad_output.shape[-1])
-        grad_x = go.matmul(q).reshape_as(x)
         grad_weight = go.transpose(0, 1).matmul(x2)
         return grad_x, grad_weight, None
 
