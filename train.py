@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-if "--cpu" in sys.argv or "--rqt" in sys.argv:
+if "--cpu" in sys.argv:
     threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(key, threads)
@@ -365,68 +365,65 @@ def parse_args():
     parser.add_argument("--ctx_len", type=int, default=1024)
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default=None)
     parser.add_argument("--save_dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--optimizer", choices=["adafactor", "lion", "adamw"], default="adafactor")
-    parser.add_argument("--log_every", type=int, default=1)
-    parser.add_argument("--save_every", type=int, default=5000)
-    parser.add_argument("--optimizer_save_every", type=int, default=None)
-    parser.add_argument("--new_data", action="store_true")
-    parser.add_argument("--train_router_only", action="store_true")
-    parser.add_argument("--qat", type=int, choices=(2, 4, 8), nargs="?", const=8, default=None)
-    parser.add_argument("--rqt", type=int, choices=(2, 4, 8), nargs="?", const=8, default=None)
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--optimizer_save_every", type=int, default=500)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--qat", type=int, choices=[2, 4, 8], default=0)
+    parser.add_argument("--rqt", type=int, choices=[2, 4, 8], default=0)
+    parser.add_argument("--router_only", action="store_true")
     args = parser.parse_args()
-    args.precision = args.precision or ("fp16" if torch.cuda.is_available() and not args.cpu else "fp32")
-    args.optimizer_save_every = args.optimizer_save_every or args.save_every
     if args.qat and args.rqt:
-        parser.error("--qat and --rqt cannot be used together")
-    if args.rqt and not args.cpu:
-        parser.error("--rqt requires --cpu")
-    if (args.tokenizer_max_records < 0 or args.n_embd <= 0 or args.head_size <= 0 or args.n_layer <= 0 or args.n_moba_layer < 0 or args.n_moba_layer >= args.n_layer or args.tokenizer_vocab_size <= 0 or args.batch_size <= 0 or args.ctx_len <= 0 or args.epochs <= 0 or args.learning_rate <= 0 or args.log_every <= 0 or args.save_every <= 0 or args.optimizer_save_every <= 0):
-        parser.error("invalid model/training parameters")
-    if args.n_embd % args.head_size:
-        parser.error("--n_embd must be divisible by --head_size")
-    if args.cpu and args.precision == "fp16":
-        parser.error("--precision fp16 requires CUDA")
-    if args.mode == "sft" and args.stream_dataset != "none":
-        parser.error("--stream_dataset is supported for pretraining only")
+        parser.error("--qat and --rqt cannot be combined")
+    if args.n_layer < 1:
+        parser.error("--n_layer must be >= 1")
+    if args.n_moba_layer < 0 or args.n_moba_layer >= args.n_layer:
+        parser.error("--n_moba_layer must satisfy 0 <= n_moba_layer < n_layer")
+    if args.precision is None:
+        args.precision = "fp16" if torch.cuda.is_available() and not args.cpu else "fp32"
     return args
 
 
-def _requested_config(args, tokenizer):
-    from rwkv_x_core import RWKVXConfig
-    return RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd, n_layer=args.n_layer, n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len)
+def _tokenizer_path(args):
+    return Path(args.tokenizer_path)
 
 
-def _checkpoint_matches(config, requested):
-    fields = ("vocab_size", "n_embd", "n_layer", "n_moba_layer", "head_size", "ctx_len_hint")
-    return all(getattr(config, field) == getattr(requested, field) for field in fields)
+def _load_or_build_tokenizer(args):
+    path = _tokenizer_path(args)
+    if path.exists() and tokenizer_vocab_size(path) == args.tokenizer_vocab_size:
+        return load_tokenizer(path)
+    files = discover_files(Path(args.dataset_dir))
+    texts = iter_texts(files, max_records=args.tokenizer_max_records)
+    return ensure_tokenizer(path, texts, args.tokenizer_vocab_size, max_records=args.tokenizer_max_records)
 
 
-def build_model(args, tokenizer):
-    output_dir = Path(args.output_dir)
-    requested = _requested_config(args, tokenizer)
-    config_path = output_dir / "config.json"
-    model_path = output_dir / "model.safetensors"
-    if config_path.exists() and model_path.exists():
-        from rwkv_x_core import RWKVXConfig
-        try:
-            existing = RWKVXConfig.load(config_path)
-        except Exception as exc:
-            print(f"[MODEL] ignoring invalid checkpoint config: {exc}")
-        else:
-            if _checkpoint_matches(existing, requested):
-                print("[MODEL] loading compatible checkpoint")
-                return RWKVXModel.from_pretrained(output_dir), True
-            print(
-                "[MODEL] checkpoint architecture mismatch; starting fresh "
-                f"(requested {args.n_embd}/{args.n_layer}/{args.n_moba_layer}/{args.head_size}, "
-                f"checkpoint {existing.n_embd}/{existing.n_layer}/{existing.n_moba_layer}/{existing.head_size})"
-            )
-    return RWKVXModel(requested), False
+def _checkpoint_config(output_dir):
+    path = Path(output_dir) / "config.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _build_model(args, tokenizer):
+    config = dict(vocab_size=args.tokenizer_vocab_size, n_embd=args.n_embd, n_layer=args.n_layer, n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len)
+    checkpoint = _checkpoint_config(args.output_dir)
+    checkpoint_path = Path(args.output_dir) / "model.safetensors"
+    if checkpoint_path.exists() and checkpoint == config:
+        model = RWKVXModel.from_pretrained(args.output_dir, load_upstream=False)
+        print(f"[MODEL CONFIG] checkpoint={config}")
+        return model
+    model = RWKVXModel(config)
+    print(f"[MODEL CONFIG] cli={config}")
+    return model
 
 
 def main():
@@ -439,55 +436,33 @@ def main():
         print("[LOWBIT] native FP2/FP4 kernels")
     else:
         print(f"[CPU BACKEND] {backend_name(backend)}")
-    if args.cpu:
-        from cpu import configure
-        print(f"[CPU] {configure()} threads, native WKV, compile={args.compile}")
-    tokenizer_path = Path(args.tokenizer_path)
-    tokenizer, tokenizer_rebuilt = ensure_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size, args.stream_dataset, args.tokenizer_max_records)
-    if tokenizer_rebuilt:
-        print(f"[TOKENIZER] using requested vocabulary={tokenizer.get_vocab_size()}")
-    model, loaded_checkpoint = build_model(args, tokenizer)
-    model = model.to(device)
-    print(f"[MODEL CONFIG] vocab={model.cfg.vocab_size} n_embd={model.cfg.n_embd} n_layer={model.cfg.n_layer} n_moba_layer={model.cfg.n_moba_layer} head_size={model.cfg.head_size} ctx_len={args.ctx_len} batch_size={args.batch_size}")
-    _print_model_size(model)
-    if args.train_router_only:
+    tokenizer = _load_or_build_tokenizer(args)
+    model = _build_model(args, tokenizer).to(device)
+    if args.router_only:
         trainable = set_router_only_training(model, True)
-        print(f"[ROUTER-ONLY] {trainable:,} trainable params")
+        print(f"[ROUTER ONLY] trainable={trainable:,}")
     if args.qat:
-        n = qat.prepare_qat(model, args.qat)
-        print(f"[QAT] fake-quantizing {n} linears")
+        qat.prepare_qat(model, args.qat)
     if args.rqt:
         import rqt
-        n = rqt.prepare_rqt(model, args.rqt)
-        print(f"[RQT] real-quantizing {n} linears")
+        rqt.prepare_rqt(model, args.rqt)
         _print_rqt_storage(model)
+    _print_model_size(model)
     if args.compile:
         model = torch.compile(model, mode="max-autotune")
-    checkpoint_dir = Path(args.checkpoint_dir)
-    resume = ResumeState.load(checkpoint_dir / "resume_state.json") if loaded_checkpoint else ResumeState()
-    if args.new_data:
-        resume = ResumeState()
-    elif loaded_checkpoint:
-        _load_rng_state(checkpoint_dir / "rng_state.pt")
-    optimizer_classes = {"lion": Lion, "adamw": torch.optim.AdamW, "adafactor": torch.optim.Adafactor}
-    if args.cpu and args.optimizer == "lion":
-        from cpu import NativeLion
-        optimizer_classes["lion"] = NativeLion
-    optimizer = optimizer_classes[args.optimizer](model.parameters(), lr=args.learning_rate)
-    optimizer_path = checkpoint_dir / "optimizer.pt"
-    if optimizer_path.exists() and loaded_checkpoint and not args.new_data:
-        try:
+    optimizer = Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json") if args.resume else ResumeState()
+    if args.resume:
+        optimizer_path = Path(args.checkpoint_dir) / "optimizer.pt"
+        if optimizer_path.exists():
             optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
-        except Exception as exc:
-            raise RuntimeError(f"could not restore optimizer {optimizer_path}: {exc}") from exc
+        _load_rng_state(Path(args.checkpoint_dir) / "rng_state.pt")
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and args.precision == "fp16" else None
-    try:
-        if args.mode == "pretrain":
-            train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler)
-        else:
-            train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
-    finally:
-        save_checkpoint(model, optimizer, resume, Path(args.output_dir), checkpoint_dir, tokenizer_path, args.save_dtype, True)
+    if args.mode == "pretrain":
+        train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler)
+    else:
+        train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
+    save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), _tokenizer_path(args), args.save_dtype, True)
 
 
 if __name__ == "__main__":
