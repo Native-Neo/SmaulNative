@@ -4,7 +4,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
-from tokenizer import _build, read_texts
+from tokenizer import SmaulTokenizer, _build, read_texts
 
 
 def test_recursive_text_order_is_deterministic(tmp_path):
@@ -35,3 +35,10 @@ def test_csv_prompt_completion_records_are_read(tmp_path):
     path = tmp_path / "data.csv"
     path.write_text("Prompt,Completion\nHello,World\n")
     assert list(read_texts(path)) == ["Hello\nWorld"]
+
+
+def test_tiny_tokenizer_preserves_whitespace():
+    data = _build(["a b"], vocab_size=9, word_budget=8)
+    tok = SmaulTokenizer(data)
+    assert " " in tok.vocab
+    assert tok.decode(tok.encode("a b")) == "a b"
