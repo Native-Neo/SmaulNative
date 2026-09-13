@@ -290,12 +290,15 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
     cur = 0
     for length, speaker, prefix_len in zip(tokenized_lens, speakers, prefix_lens):
         if speaker.lower() == "assistant":
-            targets[cur + min(prefix_len, length):cur + length] = input_ids[cur + min(prefix_len, length):cur + length]
+            start = cur + min(prefix_len, length)
+            targets[start:cur + length] = input_ids[start:cur + length]
         cur += length
-    input_ids = input_ids[:ctx_len]
-    targets = targets[:ctx_len]
-    if not any(x != IGNORE_INDEX for x in targets):
+    input_ids = input_ids[:ctx_len + 1]
+    targets = targets[:ctx_len + 1]
+    if not any(x != IGNORE_INDEX for x in targets[1:]):
         raise ValueError("SFT record contains no assistant targets within ctx_len")
+    input_ids = input_ids[:-1]
+    targets = targets[1:]
     pad_len = ctx_len - len(input_ids)
     if pad_len:
         input_ids.extend([pad_token_id] * pad_len)
