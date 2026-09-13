@@ -33,10 +33,7 @@ class _RQTFunction(torch.autograd.Function):
         go = grad_output.reshape(-1, out_features)
         if x.device.type == "cuda" and quant.bits < 8:
             go32 = go.float().contiguous()
-            grad_x = packed_linear_transpose(
-                go32, quant.packed, quant.scale,
-                quant.bits, out_features, in_features,
-            ).reshape_as(x)
+            grad_x = packed_linear_transpose(go32, quant.packed, quant.scale, quant.bits, out_features, in_features).reshape_as(x)
             grad_weight = go32.transpose(0, 1).matmul(x2.float())
         else:
             q = quant.unpack(x.device, x.dtype)
@@ -84,25 +81,17 @@ class RealQuantLinear(nn.Module):
 
         for start in range(0, weight.shape[0], _REFRESH_ROWS):
             end = min(start + _REFRESH_ROWS, weight.shape[0])
-            codes = (
-                (weight[start:end] / scale).unsqueeze(-1)
-                .sub(levels)
-                .abs()
-                .argmin(dim=-1)
-                .to(torch.uint8)
-            )
+            codes = ((weight[start:end] / scale).unsqueeze(-1).sub(levels).abs().argmin(dim=-1).to(torch.uint8))
             pad = packed_cols * per_byte - cols
             if pad:
-                padded = torch.zeros(
-                    (codes.shape[0], cols + pad), dtype=torch.uint8, device=codes.device
-                )
+                padded = torch.zeros((codes.shape[0], cols + pad), dtype=torch.uint8, device=codes.device)
                 padded[:, :cols].copy_(codes)
                 codes = padded
             self.quant.packed[start:end].copy_(_pack_codes(codes, self.bits))
 
     def forward(self, x):
         if self.weight.device != x.device:
-            self.quant = self.quant.to(x.device)
+            raise RuntimeError(f"RQT weight/device mismatch: weight={self.weight.device}, input={x.device}")
         if x.device.type == "cuda" and x.dtype != torch.float32 and self.bits < 8:
             out = _RQTFunction.apply(x.float(), self.weight, self.quant).to(x.dtype)
         else:
@@ -121,6 +110,7 @@ def _iter_linear_modules(model):
 
 def prepare_rqt(model: RWKVXModel, bits):
     bits = _bits(bits)
+    model.cfg.rqt_bits = bits
     root = getattr(model, "_orig_mod", model)
     targets = [module for module in root.modules() if isinstance(module, nn.Linear)]
     for module in targets:
