@@ -42,6 +42,7 @@ pub mod rwkv_time_mix_backward;
 pub mod safetensors;
 pub mod sequence_loss;
 pub mod training;
+pub mod training_state;
 pub mod wkv;
 pub mod wkv_backward;
 pub mod wkv_backward_check;
