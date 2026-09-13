@@ -2,14 +2,17 @@
 # Fake low-bit floating-point QAT for RWKV-X.
 
 import os
+import sys
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from backend import require_backend
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
+_BACKEND = require_backend(torch, force_cpu="--cpu" in sys.argv or "--rqt" in sys.argv)
 _CMIX_LINEAR_NAMES = ("key", "value")
 _SUPPORTED_BITS = (2, 4, 8)
 _LOWBIT_EXT = None
