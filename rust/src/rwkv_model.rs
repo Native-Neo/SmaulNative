@@ -2,6 +2,7 @@ use crate::embedding::Embedding;
 use crate::layer_norm::LayerNorm;
 use crate::linear::Linear;
 use crate::moba_block::{MobaBlock, MobaBlockState};
+use crate::model_backward::{BackwardBlockKind, ModelBackwardTape};
 use crate::rwkv_block::{RwkvBlock, RwkvBlockState};
 use ndarray::{Array1, Array2};
 
@@ -83,12 +84,28 @@ impl RwkvModel {
     }
 
     pub fn forward(&self, token_ids: &[usize], state: Option<&RwkvModelState>) -> (Array2<f32>, RwkvModelState) {
+        let (logits, next_state, _) = self.forward_internal(token_ids, state, None);
+        (logits, next_state)
+    }
+
+    pub fn forward_with_tape(&self, token_ids: &[usize]) -> (Array2<f32>, ModelBackwardTape) {
+        let order = self.order.iter().map(|kind| match *kind {
+            BlockKind::Rwkv(index) => BackwardBlockKind::Rwkv(index),
+            BlockKind::Moba(index) => BackwardBlockKind::Moba(index),
+        }).collect();
+        let mut tape = ModelBackwardTape::new(order);
+        let (logits, _, _) = self.forward_internal(token_ids, None, Some(&mut tape));
+        (logits, tape)
+    }
+
+    fn forward_internal(&self, token_ids: &[usize], state: Option<&RwkvModelState>, mut tape: Option<&mut ModelBackwardTape>) -> (Array2<f32>, RwkvModelState, Array2<f32>) {
         assert!(!token_ids.is_empty());
         let mut x = self.embedding.forward(token_ids);
         let mut next_rwkv = Vec::with_capacity(self.rwkv_blocks.len());
         let mut next_moba = Vec::with_capacity(self.moba_blocks.len());
         let mut v_first = state.and_then(|s| s.v_first.clone());
         for kind in &self.order {
+            let input = x.clone();
             match *kind {
                 BlockKind::Rwkv(index) => {
                     let block_state = state.and_then(|s| s.rwkv_blocks.get(index));
@@ -104,6 +121,7 @@ impl RwkvModel {
                     next_moba.push((index, next_state));
                 }
             }
+            if let Some(ref mut tape) = tape { tape.record_block(input, x.clone()); }
         }
         let mut rwkv_states: Vec<Option<RwkvBlockState>> = (0..self.rwkv_blocks.len()).map(|_| None).collect();
         for (index, block_state) in next_rwkv { rwkv_states[index] = Some(block_state); }
@@ -112,8 +130,10 @@ impl RwkvModel {
         for (index, block_state) in next_moba { moba_states[index] = Some(block_state); }
         let moba_states = moba_states.into_iter().map(Option::unwrap).collect();
         x = self.ln_out.forward(&x);
+        let normalized = x.clone();
         let logits = self.head.forward(&x);
-        (logits, RwkvModelState { rwkv_blocks: rwkv_states, moba_blocks: moba_states, v_first })
+        if let Some(ref mut tape) = tape { tape.record_head(normalized, logits.clone()); }
+        (logits, RwkvModelState { rwkv_blocks: rwkv_states, moba_blocks: moba_states, v_first }, x)
     }
 
     pub fn parameter_count(&self) -> usize {
@@ -152,6 +172,18 @@ mod tests {
         assert!(state.moba_blocks.is_empty());
         assert_eq!(state.v_first.as_ref().unwrap().dim(), (3, 16));
         assert_eq!(model.head.parameter_count(), 16 * 32);
+    }
+
+    #[test]
+    fn forward_tape_records_every_block() {
+        let config = RwkvModelConfig::new(32, 16, 5, 4).with_moba(2, 2, 1);
+        let model = RwkvModel::new(config, 1234);
+        let (logits, tape) = model.forward_with_tape(&[1, 2, 3]);
+        assert_eq!(logits.dim(), (3, 32));
+        assert_eq!(tape.len(), 5);
+        assert_eq!(tape.normalized.as_ref().unwrap().dim(), (3, 16));
+        assert_eq!(tape.logits.as_ref().unwrap().dim(), (3, 32));
+        assert_eq!(tape.reverse_blocks().count(), 5);
     }
 
     #[test]
