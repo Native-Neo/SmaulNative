@@ -5,6 +5,8 @@
 
 namespace {
 
+constexpr int kThreads = 256;
+
 __device__ __forceinline__ float fp2_level(int code) {
     return code == 0 ? -1.0f : code == 2 ? 1.0f : 0.0f;
 }
@@ -36,21 +38,38 @@ __global__ void packed_linear_kernel(
     const float* x, const uint8_t* packed, const float* scale, float* out,
     int64_t batch, int64_t out_features, int64_t in_features, int bits
 ) {
-    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t total = batch * out_features;
-    if (index >= total) return;
+    const int64_t block = static_cast<int64_t>(blockIdx.x);
+    const int64_t outputs_per_batch = (out_features + kThreads - 1) / kThreads;
+    const int64_t n = block / outputs_per_batch;
+    const int64_t output_base = (block - n * outputs_per_batch) * kThreads;
+    const int o = output_base + threadIdx.x;
+    if (n >= batch) return;
 
-    const int64_t n = index / out_features;
-    const int64_t o = index - n * out_features;
     const int per_byte = 8 / bits;
     const int64_t row_bytes = (in_features + per_byte - 1) / per_byte;
-    const uint8_t* row = packed + o * row_bytes;
     const float* xr = x + n * in_features;
+    const uint8_t* packed_rows = packed + output_base * row_bytes;
+    float* out_row = out + n * out_features;
+    const uint8_t* row = packed_rows + static_cast<int64_t>(threadIdx.x) * row_bytes;
 
     float sum = 0.0f;
-    for (int64_t k = 0; k < in_features; ++k)
-        sum += xr[k] * scale[k] * decode_level(row, k, bits);
-    out[index] = sum;
+    __shared__ float xscaled[kThreads];
+
+    for (int64_t base = 0; base < in_features; base += kThreads) {
+        const int64_t k = base + threadIdx.x;
+        xscaled[threadIdx.x] = k < in_features ? xr[k] * scale[k] : 0.0f;
+        __syncthreads();
+
+        if (o < out_features) {
+            const int64_t limit = min<int64_t>(kThreads, in_features - base);
+            for (int64_t j = 0; j < limit; ++j)
+                sum += xscaled[j] * decode_level(row, base + j, bits);
+        }
+        __syncthreads();
+    }
+
+    if (o < out_features)
+        out_row[o] = sum;
 }
 
 __global__ void packed_linear_transpose_kernel(
@@ -98,11 +117,12 @@ torch::Tensor packed_linear(
     TORCH_CHECK(packed.numel() >= out_features * row_bytes, "packed weight is too small");
 
     auto out = torch::empty({x.size(0), out_features}, x.options());
-    const int64_t total = x.size(0) * out_features;
-    const int threads = 256;
-    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    const int64_t output_tiles = (out_features + kThreads - 1) / kThreads;
+    const int64_t blocks64 = x.size(0) * output_tiles;
+    TORCH_CHECK(blocks64 <= static_cast<int64_t>(2147483647), "tensor too large for HIP grid");
+    const int blocks = static_cast<int>(blocks64);
     auto stream = at::cuda::getCurrentCUDAStream();
-    packed_linear_kernel<<<blocks, threads, 0, stream>>>(
+    packed_linear_kernel<<<blocks, kThreads, 0, stream>>>(
         x.data_ptr<float>(), packed.data_ptr<uint8_t>(), scale.data_ptr<float>(),
         out.data_ptr<float>(), x.size(0), out_features, in_features, static_cast<int>(bits)
     );
