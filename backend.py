@@ -17,8 +17,25 @@ def _torch_gpu_backend(torch):
     return None
 
 
-def _aocl_available():
-    return _library_available("amdblis", "amdlibm")
+def _gpu_supported(torch, backend):
+    if backend == "cuda":
+        try:
+            major, minor = torch.cuda.get_device_capability(0)
+            return (major, minor) >= (6, 0)
+        except Exception:
+            return False
+    if backend == "hip":
+        try:
+            arch = str(torch.cuda.get_device_properties(0).gcnArchName).lower()
+        except Exception:
+            return True
+        if arch.startswith("gfx"):
+            try:
+                return int(arch[3:5]) >= 8
+            except ValueError:
+                return False
+        return True
+    return False
 
 
 def _mkl_available(torch):
@@ -29,10 +46,14 @@ def _mkl_available(torch):
     return "mkl" in config or _library_available("mkl_rt", "mkl_core")
 
 
+def _aocl_available():
+    return _library_available("amdblis", "amdlibm")
+
+
 def detect_backend(torch, force_cpu=False):
     if not force_cpu:
         gpu_backend = _torch_gpu_backend(torch)
-        if gpu_backend:
+        if gpu_backend and _gpu_supported(torch, gpu_backend):
             return gpu_backend
     if _aocl_available():
         return "aocl"
