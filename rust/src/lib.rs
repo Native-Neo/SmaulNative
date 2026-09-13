@@ -14,6 +14,7 @@ pub mod moba_attention;
 pub mod moba_block;
 pub mod model_loader;
 pub mod optimizer;
+pub mod params;
 pub mod rwkv_block;
 pub mod rwkv_cmix;
 pub mod rwkv_model;
