@@ -13,38 +13,39 @@ from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
 _CMIX_LINEAR_NAMES = ("key", "value")
 _SUPPORTED_BITS = (2, 4, 8)
-_LOWBIT_EXT = None
+_LOWBIT_EXT = {}
 
 
-def _load_lowbit():
-    global _LOWBIT_EXT
-    if _LOWBIT_EXT is None:
+def _load_lowbit(device=None):
+    device = device or torch.device("cpu")
+    key = device.type
+    if key not in _LOWBIT_EXT:
         from torch.utils.cpp_extension import load
         root = Path(__file__).resolve().parent
-        backend = detect_backend(torch)
+        backend = detect_backend(torch, force_cpu=device.type == "cpu")
         if backend == "hip":
             source = root / "gpu" / "hip" / "lowbit_kernel.hip"
             name = "smaulnative_lowbit_hip"
-            _LOWBIT_EXT = load(name=name, sources=[str(source)], with_cuda=True, verbose=False)
+            _LOWBIT_EXT[key] = load(name=name, sources=[str(source)], with_cuda=True, verbose=False)
         elif backend == "cuda":
             source = root / "gpu" / "cuda" / "lowbit_kernel.cu"
             name = "smaulnative_lowbit_cuda"
-            _LOWBIT_EXT = load(name=name, sources=[str(source)], with_cuda=True, verbose=False)
+            _LOWBIT_EXT[key] = load(name=name, sources=[str(source)], with_cuda=True, verbose=False)
         else:
             source = root / "cpu" / "lowbit_kernel.cpp"
-            _LOWBIT_EXT = load(
+            _LOWBIT_EXT[key] = load(
                 name="smaulnative_lowbit",
                 sources=[str(source)],
                 extra_cflags=["-O3", "-march=native", "-mtune=native"],
                 verbose=False,
             )
-    return _LOWBIT_EXT
+    return _LOWBIT_EXT[key]
 
 
 def packed_linear_transpose(grad_output, packed, scale, bits, out_features, in_features):
     if grad_output.device.type != "cuda":
         raise ValueError("packed GPU backward requires CUDA/HIP")
-    return _load_lowbit().packed_linear_transpose(
+    return _load_lowbit(grad_output.device).packed_linear_transpose(
         grad_output.reshape(-1, out_features).contiguous(),
         packed.to(grad_output.device),
         scale.reshape(-1).float().to(grad_output.device),
@@ -144,14 +145,14 @@ class QuantizedLinear(nn.Module):
                 raise ValueError(f"input features {x.shape[-1]} != {in_features}")
             x2 = x.reshape(-1, in_features).contiguous()
             if x.device.type == "cpu":
-                y = _load_lowbit().packed_linear(
+                y = _load_lowbit(x.device).packed_linear(
                     x2, self.packed, self.scale.reshape(-1).float().contiguous(),
                     self.bits, out_features, in_features,
                 )
             else:
                 packed = self.packed.to(x.device)
                 scale = self.scale.reshape(-1).float().to(x.device)
-                y = _load_lowbit().packed_linear(
+                y = _load_lowbit(x.device).packed_linear(
                     x2, packed, scale, self.bits, out_features, in_features,
                 )
             return y.reshape(*x.shape[:-1], out_features)
