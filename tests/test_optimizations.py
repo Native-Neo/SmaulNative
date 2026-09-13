@@ -9,6 +9,7 @@ if _repo_root not in sys.path:
 
 import torch
 
+from cpu_backend import NativeLion
 from dataset import SFTDataset
 from qt import QuantizedLinear, _pack_codes, _unpack_codes
 from rwkv_x_core import RWKVXConfig, RWKV_CMix_MoE
@@ -61,6 +62,22 @@ def test_sft_dataset_caches_processed_records():
         assert first[1][0].item() == -100
 
 
+def test_native_lion_fallback_matches_lion_update():
+    param = torch.tensor([1.0, -2.0, 3.0])
+    grad = torch.tensor([0.5, -0.25, 0.75])
+    optimizer = NativeLion([param], lr=0.1, betas=(0.9, 0.99), weight_decay=0.01)
+    optimizer._ext = None
+    param.grad = grad.clone()
+
+    old = param.clone()
+    optimizer.step()
+    expected_update = torch.zeros_like(old).mul(0.9).add(grad, alpha=0.1)
+    expected_param = old * (1 - 0.1 * 0.01) - 0.1 * expected_update.sign()
+
+    assert torch.equal(param, expected_param)
+    assert torch.equal(optimizer.state[param]["exp_avg"], grad * 0.01)
+
+
 def test_moe_matches_dense_reference():
     torch.manual_seed(0)
     cfg = RWKVXConfig(vocab_size=32, n_embd=16, n_layer=4, head_size=4, n_moba_layer=1, is_moe=True,
@@ -87,5 +104,6 @@ if __name__ == "__main__":
     test_lowbit_roundtrip()
     test_quantized_linear_forward_is_stable()
     test_sft_dataset_caches_processed_records()
+    test_native_lion_fallback_matches_lion_update()
     test_moe_matches_dense_reference()
     print("optimization tests passed")
