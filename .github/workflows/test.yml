@@ -2,7 +2,7 @@ name: Test
 
 on:
   push:
-    branches: [main, developement]
+    branches: [main, developement, rust]
   pull_request:
   workflow_dispatch:
 
@@ -25,5 +25,9 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pytest
 
-      - name: Run tests
+      - name: Run Python tests
         run: pytest -q
+
+      - name: Run Rust tests
+        working-directory: rust
+        run: cargo test --all-targets
