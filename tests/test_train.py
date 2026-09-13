@@ -74,12 +74,11 @@ def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
 
     monkeypatch.setattr(train, "PretrainStream", lambda *args, **kwargs: Stream())
     monkeypatch.setattr(train, "_train_pretrain_batch", train_batch)
-    monkeypatch.setattr(train, "save_checkpoint", lambda *args, **kwargs: saves.append(args))
+    monkeypatch.setattr(train, "save_checkpoint", lambda *args, **kwargs: saves.append(args[2].global_step))
     resume = train.ResumeState()
     train.STOP_REQUESTED = False
     train.train_pretrain(Args(), DummyModel(), DummyOptimizer(), resume, torch.device("cpu"), object(), None)
-    assert len(saves) == 2
-    assert [save[2].global_step for save in saves] == [1, 2]
+    assert saves == [1, 2]
 
 
 def test_resume_state_round_trip(tmp_path):
