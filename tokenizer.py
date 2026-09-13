@@ -186,7 +186,8 @@ def _build(texts, vocab_size, word_budget, max_records=0):
     if seen == 0 or total_tokens == 0:
         raise RuntimeError("no usable text records found for tokenizer training")
     tokens, seen_tokens = SPECIAL + CASE, set(SPECIAL + CASE)
-    for source in (words.most_common(word_budget), graphemes.most_common(), symbols.most_common(), chars.most_common()):
+    whitespace = [(x, n) for x, n in chars.most_common() if x.isspace()]
+    for source in (whitespace, words.most_common(word_budget), graphemes.most_common(), symbols.most_common(), chars.most_common()):
         for x, _ in source:
             if x not in seen_tokens:
                 tokens.append(x); seen_tokens.add(x)
