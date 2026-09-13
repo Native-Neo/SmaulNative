@@ -4,4 +4,5 @@ pub mod ffn;
 pub mod layer_norm;
 pub mod linear;
 pub mod optimizer;
+pub mod rwkv_time_mix;
 pub mod wkv;
