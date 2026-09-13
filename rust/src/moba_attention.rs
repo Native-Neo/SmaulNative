@@ -24,28 +24,21 @@ impl MobaAttention {
             head_size,
             chunk_size,
             top_k,
-            receptance: Linear::new(channels, channels),
-            key: Linear::new(channels, channels),
-            value: Linear::new(channels, channels),
-            output: Linear::new(channels, channels),
+            receptance: Linear::new_no_bias(channels, channels),
+            key: Linear::new_no_bias(channels, channels),
+            value: Linear::new_no_bias(channels, channels),
+            output: Linear::new_no_bias(channels, channels),
         }
     }
 
-    fn dot(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| x * y).sum()
-    }
+    fn dot(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() }
 
     fn softmax(scores: &mut [f32]) {
         if scores.is_empty() { return; }
         let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0;
-        for x in scores.iter_mut() {
-            *x = (*x - max).exp();
-            sum += *x;
-        }
-        if sum > 0.0 {
-            for x in scores.iter_mut() { *x /= sum; }
-        }
+        for x in scores.iter_mut() { *x = (*x - max).exp(); sum += *x; }
+        if sum > 0.0 { for x in scores.iter_mut() { *x /= sum; } }
     }
 
     fn attention(q: &[f32], keys: &[Vec<f32>], values: &[Vec<f32>], scale: f32) -> Vec<f32> {
@@ -63,28 +56,18 @@ impl MobaAttention {
         let mut result = vec![vec![vec![0.0; self.head_size]; x.nrows()]; self.heads];
         for h in 0..self.heads {
             for t in 0..x.nrows() {
-                for d in 0..self.head_size {
-                    result[h][t][d] = projected[[t, h * self.head_size + d]];
-                }
+                for d in 0..self.head_size { result[h][t][d] = projected[[t, h * self.head_size + d]]; }
             }
         }
         result
     }
 
-    fn full_causal(
-        &self,
-        q: &[Vec<Vec<f32>>],
-        k: &[Vec<Vec<f32>>],
-        v: &[Vec<Vec<f32>>],
-        t: usize,
-    ) -> Array2<f32> {
+    fn full_causal(&self, q: &[Vec<Vec<f32>>], k: &[Vec<Vec<f32>>], v: &[Vec<Vec<f32>>], t: usize) -> Array2<f32> {
         let scale = (self.head_size as f32).sqrt().recip();
         let mut out = Array2::<f32>::zeros((t, self.channels));
         for h in 0..self.heads {
             for row in 0..t {
-                let keys = &k[h][..=row];
-                let values = &v[h][..=row];
-                let y = Self::attention(&q[h][row], keys, values, scale);
+                let y = Self::attention(&q[h][row], &k[h][..=row], &v[h][..=row], scale);
                 for d in 0..self.head_size { out[[row, h * self.head_size + d]] = y[d]; }
             }
         }
@@ -99,31 +82,23 @@ impl MobaAttention {
         let k = self.project_heads(x, &self.key);
         let v = self.project_heads(x, &self.value);
         let n_chunks = (t + self.chunk_size - 1) / self.chunk_size;
-
         if self.top_k == 0 || n_chunks <= self.top_k + 1 {
             return self.output.forward(&self.full_causal(&q, &k, &v, t));
         }
-
         let scale = (self.head_size as f32).sqrt().recip();
         let mut out = Array2::<f32>::zeros((t, self.channels));
-
         for h in 0..self.heads {
             let mut means = vec![vec![0.0; self.head_size]; n_chunks];
             for c in 0..n_chunks {
                 let lo = c * self.chunk_size;
                 let hi = usize::min(lo + self.chunk_size, t);
-                for row in lo..hi {
-                    for d in 0..self.head_size { means[c][d] += k[h][row][d]; }
-                }
+                for row in lo..hi { for d in 0..self.head_size { means[c][d] += k[h][row][d]; } }
                 let n = (hi - lo) as f32;
                 for d in 0..self.head_size { means[c][d] /= n; }
             }
-
             for c in 0..n_chunks {
                 let lo = c * self.chunk_size;
                 let hi = usize::min(lo + self.chunk_size, t);
-                let qlen = hi - lo;
-
                 if c == 0 {
                     for row in lo..hi {
                         let y = Self::attention(&q[h][row], &k[h][lo..=row], &v[h][lo..=row], scale);
@@ -131,19 +106,13 @@ impl MobaAttention {
                     }
                     continue;
                 }
-
+                let qlen = hi - lo;
                 let mut qmean = vec![0.0; self.head_size];
-                for row in lo..hi {
-                    for d in 0..self.head_size { qmean[d] += q[h][row][d]; }
-                }
+                for row in lo..hi { for d in 0..self.head_size { qmean[d] += q[h][row][d]; } }
                 for d in 0..self.head_size { qmean[d] /= qlen as f32; }
-
-                let mut selected: Vec<(f32, usize)> = (0..c)
-                    .map(|old| (Self::dot(&qmean, &means[old]), old))
-                    .collect();
+                let mut selected: Vec<(f32, usize)> = (0..c).map(|old| (Self::dot(&qmean, &means[old]), old)).collect();
                 selected.sort_by(|a, b| b.0.total_cmp(&a.0));
                 selected.truncate(usize::min(self.top_k, selected.len()));
-
                 let mut historical_k = Vec::new();
                 let mut historical_v = Vec::new();
                 for &(_, old) in &selected {
@@ -152,7 +121,6 @@ impl MobaAttention {
                     historical_k.extend_from_slice(&k[h][old_lo..old_hi]);
                     historical_v.extend_from_slice(&v[h][old_lo..old_hi]);
                 }
-
                 for row in lo..hi {
                     let local_end = row - lo + 1;
                     let mut keys = historical_k.clone();
@@ -167,12 +135,7 @@ impl MobaAttention {
         self.output.forward(&out)
     }
 
-    pub fn cache_forward(
-        &self,
-        x: &Array2<f32>,
-        cache_k: &Array4<f32>,
-        cache_v: &Array4<f32>,
-    ) -> (Array2<f32>, Array4<f32>, Array4<f32>) {
+    pub fn cache_forward(&self, x: &Array2<f32>, cache_k: &Array4<f32>, cache_v: &Array4<f32>) -> (Array2<f32>, Array4<f32>, Array4<f32>) {
         assert_eq!(x.nrows(), 1);
         let q = self.receptance.forward(x);
         let k = self.key.forward(x);
@@ -181,16 +144,8 @@ impl MobaAttention {
         let mut all_k = Array4::<f32>::zeros((self.heads, past + 1, 1, self.head_size));
         let mut all_v = Array4::<f32>::zeros((self.heads, past + 1, 1, self.head_size));
         for h in 0..self.heads {
-            for p in 0..past {
-                for d in 0..self.head_size {
-                    all_k[[h, p, 0, d]] = cache_k[[h, p, 0, d]];
-                    all_v[[h, p, 0, d]] = cache_v[[h, p, 0, d]];
-                }
-            }
-            for d in 0..self.head_size {
-                all_k[[h, past, 0, d]] = k[[0, h * self.head_size + d]];
-                all_v[[h, past, 0, d]] = v[[0, h * self.head_size + d]];
-            }
+            for p in 0..past { for d in 0..self.head_size { all_k[[h, p, 0, d]] = cache_k[[h, p, 0, d]]; all_v[[h, p, 0, d]] = cache_v[[h, p, 0, d]]; } }
+            for d in 0..self.head_size { all_k[[h, past, 0, d]] = k[[0, h * self.head_size + d]]; all_v[[h, past, 0, d]] = v[[0, h * self.head_size + d]]; }
         }
         let mut result = Array2::<f32>::zeros((1, self.channels));
         let scale = (self.head_size as f32).sqrt().recip();
