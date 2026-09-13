@@ -78,8 +78,8 @@ def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
     resume = train.ResumeState()
     train.STOP_REQUESTED = False
     train.train_pretrain(Args(), DummyModel(), DummyOptimizer(), resume, torch.device("cpu"), object(), None)
-    assert len(saves) == 1
-    assert saves[0][2].global_step == 2
+    assert len(saves) == 2
+    assert [save[2].global_step for save in saves] == [1, 2]
 
 
 def test_resume_state_round_trip(tmp_path):
