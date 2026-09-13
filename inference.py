@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional
 
 import torch
 
-from rwkv_x_core import RWKVXModel
+from rwkv_x_core import RWKVXConfig, RWKVXModel
 from tokenizer import SmaulTokenizer
 
 
@@ -34,6 +34,77 @@ class _IncrementalDecoder:
         return token
 
 
+def _gguf_field(reader, name, default=None):
+    field = reader.fields.get(name)
+    return default if field is None else field.contents()
+
+
+def _config_from_gguf(reader) -> RWKVXConfig:
+    embedding = int(_gguf_field(reader, "embedding_length"))
+    vocab = int(_gguf_field(reader, "vocab_size"))
+    layers = int(_gguf_field(reader, "block_count"))
+    heads = int(_gguf_field(reader, "attention.head_count"))
+    head_size = int(_gguf_field(reader, "rwkv_x.head_size"))
+    if heads * head_size != embedding:
+        raise ValueError("GGUF attention dimensions do not match embedding_length")
+    return RWKVXConfig(
+        vocab_size=vocab,
+        n_embd=embedding,
+        n_layer=layers,
+        head_size=head_size,
+        n_moba_layer=int(_gguf_field(reader, "rwkv_x.n_moba_layer", 0)),
+        moba_chunk_size=int(_gguf_field(reader, "rwkv_x.moba_chunk_size", 512)),
+        moba_topk=int(_gguf_field(reader, "rwkv_x.moba_topk", 4)),
+        ctx_len_hint=int(_gguf_field(reader, "context_length", 2048)),
+        wkv_chunk_size=int(_gguf_field(reader, "rwkv_x.wkv_chunk_size", 64)),
+        head_size_divisor=int(_gguf_field(reader, "rwkv_x.head_size_divisor", 8)),
+        is_moe=bool(_gguf_field(reader, "rwkv_x.is_moe", False)),
+        num_experts=int(_gguf_field(reader, "rwkv_x.num_experts", 1)),
+        num_experts_per_tok=int(_gguf_field(reader, "rwkv_x.num_experts_per_tok", 1)),
+    )
+
+
+def _tokenizer_from_gguf(reader) -> SmaulTokenizer:
+    tokens = _gguf_field(reader, "tokenizer.ggml.tokens")
+    if not tokens:
+        raise ValueError("GGUF does not contain tokenizer.ggml.tokens")
+    vocab = {str(token): i for i, token in enumerate(tokens)}
+    for token in ("<pad>", "<unk>", "<bos>", "<eos>"):
+        if token not in vocab:
+            raise ValueError(f"GGUF tokenizer is missing {token}")
+    data = {
+        "version": 5,
+        "vocab": vocab,
+        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
+        "case_tokens": ["<cap>", "<upper>"],
+        "case_stats": {},
+        "unk_id": vocab["<unk>"],
+    }
+    return SmaulTokenizer(data)
+
+
+def _load_gguf(path: Path, device: torch.device):
+    try:
+        import gguf
+    except ImportError as exc:
+        raise RuntimeError("GGUF inference requires the 'gguf' Python package") from exc
+
+    reader = gguf.GGUFReader(str(path))
+    cfg = _config_from_gguf(reader)
+    state = {}
+    for tensor in reader.tensors:
+        if tensor.tensor_type.name not in {"F32", "F16", "F64"}:
+            raise ValueError(f"unsupported GGUF tensor type for {tensor.name}: {tensor.tensor_type.name}")
+        state[tensor.name] = torch.from_numpy(tensor.data.copy())
+
+    model = RWKVXModel(cfg)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise ValueError(f"GGUF tensor mismatch: missing={missing}, unexpected={unexpected}")
+    tokenizer = _tokenizer_from_gguf(reader)
+    return model.to(device), tokenizer
+
+
 class RWKVXInference:
     def __init__(self, model_dir: str = "./SmaulNative", device: str = "auto", dtype: str = "auto"):
         self.model_dir = Path(model_dir)
@@ -44,8 +115,17 @@ class RWKVXInference:
         if device not in {"cpu", "cuda"}:
             raise ValueError(f"unsupported device: {device}")
         self.device = torch.device(device)
-        self.model = RWKVXModel.from_pretrained(self.model_dir).to(self.device)
-        self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
+
+        if self.model_dir.is_file() and self.model_dir.suffix.lower() == ".gguf":
+            self.model, self.tokenizer = _load_gguf(self.model_dir, self.device)
+        else:
+            ggufs = sorted(self.model_dir.glob("*.gguf")) if self.model_dir.is_dir() else []
+            if ggufs:
+                self.model, self.tokenizer = _load_gguf(ggufs[0], self.device)
+            else:
+                self.model = RWKVXModel.from_pretrained(self.model_dir).to(self.device)
+                self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
+
         self.eos_id = self.tokenizer.eos_token_id
         self.bos_id = self.tokenizer.bos_token_id
         self.last_prompt_tokens = 0
