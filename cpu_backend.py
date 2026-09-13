@@ -30,10 +30,20 @@ def configure(threads=None):
     return threads
 
 
+def _has_avx():
+    try:
+        flags = Path("/proc/cpuinfo").read_text(errors="ignore").lower()
+        return any(line.startswith("flags") and " avx" in f" {line}" for line in flags.splitlines())
+    except OSError:
+        return False
+
+
 def _load():
     global _EXT
     if _EXT is not None:
         return _EXT
+    if not _has_avx():
+        return None
     from torch.utils.cpp_extension import load
     root = Path(__file__).resolve().parent
     _EXT = load(
@@ -52,6 +62,8 @@ class NativeLion(Optimizer):
             raise ValueError("lr must be > 0")
         super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
         self._ext = _load()
+        if self._ext is None:
+            print("[OPTIMIZER] AVX unavailable; using PyTorch Lion fallback")
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -61,7 +73,7 @@ class NativeLion(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                if p.dtype != torch.float32 or not p.is_contiguous() or not p.grad.is_contiguous():
+                if self._ext is None or p.dtype != torch.float32 or not p.is_contiguous() or not p.grad.is_contiguous():
                     self._fallback(p, p.grad, lr, b1, b2, wd)
                     continue
                 state = self.state[p]
