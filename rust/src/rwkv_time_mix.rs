@@ -42,17 +42,18 @@ impl RwkvTimeMix {
         let mut x_k = Array1::zeros(channels); let mut x_v = Array1::zeros(channels);
         let mut x_a = Array1::zeros(channels); let mut x_g = Array1::zeros(channels); let mut w0 = Array1::zeros(channels);
         for c in 0..channels {
-            let d = c as f32 / channels as f32;
-            x_r[c] = 1.0 - d.powf(0.2 * r1); x_w[c] = 1.0 - d.powf(0.9 * r1);
-            x_k[c] = 1.0 - (d.powf(0.9 * r1) + 0.4 * r0); x_v[c] = 1.0 - (d.powf(0.4 * r1) + 0.6 * r0);
-            x_a[c] = 1.0 - d.powf(0.9 * r1); x_g[c] = 1.0 - d.powf(0.2 * r1);
+            let d = if channels > 1 { c as f32 / (channels - 1) as f32 } else { 0.0 };
+            let dc = c as f32 / channels as f32;
+            x_r[c] = 1.0 - dc.powf(0.2 * r1); x_w[c] = 1.0 - dc.powf(0.9 * r1);
+            x_k[c] = 1.0 - (dc.powf(0.9 * r1) + 0.4 * r0); x_v[c] = 1.0 - (dc.powf(0.4 * r1) + 0.6 * r0);
+            x_a[c] = 1.0 - dc.powf(0.9 * r1); x_g[c] = 1.0 - dc.powf(0.2 * r1);
             w0[c] = -7.0 + 5.0 * d.powf(0.85 + r0.sqrt()) + 0.5;
         }
         let w1 = Array2::zeros((channels, dd));
         let a1 = Array2::zeros((channels, dd));
         let g1 = Array2::zeros((channels, dg));
         let v1 = (layer_id > 0).then(|| Array2::zeros((channels, dm)));
-        let w2_gain = (channels as f32 / dd as f32).sqrt().max(1.0) * 0.1;
+        let w2_gain = (dd as f32 / channels as f32).sqrt().max(1.0) * 0.1;
         let a2_gain = w2_gain;
         let g2_gain = (dg as f32 / channels as f32).sqrt().max(1.0) * 0.1;
         let v2_gain = (dm as f32 / channels as f32).sqrt().max(1.0) * 0.1;
