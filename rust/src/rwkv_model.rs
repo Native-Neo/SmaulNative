@@ -15,6 +15,7 @@ pub struct RwkvModelConfig {
 
 impl RwkvModelConfig {
     pub fn new(vocab_size: usize, n_embd: usize, n_layer: usize, head_size: usize) -> Self {
+        assert!(vocab_size > 0);
         assert!(n_layer > 0);
         assert!(head_size > 0);
         assert_eq!(n_embd % head_size, 0);
@@ -25,6 +26,10 @@ impl RwkvModelConfig {
             head_size,
             head_size_divisor: 8,
         }
+    }
+
+    pub fn n_head(&self) -> usize {
+        self.n_embd / self.head_size
     }
 }
 
@@ -45,17 +50,11 @@ impl RwkvModel {
     pub fn new(config: RwkvModelConfig, seed: u64) -> Self {
         let embedding = Embedding::new(config.vocab_size, config.n_embd, seed ^ 0x454d_4245_4444_494e);
         let blocks = (0..config.n_layer)
-            .map(|layer_id| RwkvBlock::new(config.n_embd, config.n_layer, config.head_size, layer_id, seed ^ (layer_id as u64 + 1)))
+            .map(|layer_id| RwkvBlock::new(config.n_embd, config.n_head(), layer_id, config.n_layer))
             .collect();
         let ln_out = LayerNorm::new(config.n_embd, 1e-5);
-        let head = Linear::new(config.n_embd, config.vocab_size, seed ^ 0x4845_4144);
-        Self {
-            config,
-            embedding,
-            blocks,
-            ln_out,
-            head,
-        }
+        let head = Linear::new(config.n_embd, config.vocab_size);
+        Self { config, embedding, blocks, ln_out, head }
     }
 
     pub fn forward(
@@ -78,30 +77,14 @@ impl RwkvModel {
 
         x = self.ln_out.forward(&x);
         let logits = self.head.forward(&x);
-
-        (
-            logits,
-            RwkvModelState {
-                blocks: next_blocks,
-                v_first,
-            },
-        )
+        (logits, RwkvModelState { blocks: next_blocks, v_first })
     }
 
     pub fn parameter_count(&self) -> usize {
-        let mut total = self.embedding.parameter_count();
-        total += self.blocks.iter().map(RwkvBlock::parameter_count).sum::<usize>();
-        total += self.ln_out.weight.len() + self.ln_out.bias.len();
-        total += self.head.parameter_count();
-        total
-    }
-
-    pub fn zero_grad(&mut self) {
-        self.embedding.zero_grad();
-        for block in &mut self.blocks {
-            block.zero_grad();
-        }
-        self.head.zero_grad();
+        self.embedding.parameter_count()
+            + self.blocks.iter().map(RwkvBlock::parameter_count).sum::<usize>()
+            + self.ln_out.weight.len() + self.ln_out.bias.len()
+            + self.head.parameter_count()
     }
 
     pub fn argmax(logits: &Array2<f32>) -> Array1<usize> {
@@ -134,6 +117,16 @@ mod tests {
         assert_eq!(logits.dim(), (3, 32));
         assert_eq!(state.blocks.len(), 2);
         assert_eq!(state.v_first.as_ref().unwrap().dim(), (3, 16));
+    }
+
+    #[test]
+    fn state_can_be_reused_for_decode() {
+        let config = RwkvModelConfig::new(32, 16, 2, 4);
+        let model = RwkvModel::new(config, 1234);
+        let (_, state) = model.forward(&[1, 2, 3], None);
+        let (logits, next_state) = model.forward(&[4], Some(&state));
+        assert_eq!(logits.dim(), (1, 32));
+        assert_eq!(next_state.blocks.len(), 2);
     }
 
     #[test]
