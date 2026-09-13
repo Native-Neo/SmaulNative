@@ -207,7 +207,8 @@ class RWKV_CMix_MoE(nn.Module):
             weight = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(-1, keepdim=True)
             mask = weight.squeeze(-1) > 0
             if mask.any():
-                out[mask] += expert.forward_selected(x[mask], prev[mask]) * weight[mask]
+                expert_weight = weight[mask].reshape(-1, 1)
+                out[mask] += expert.forward_selected(x[mask], prev[mask]) * expert_weight
         return out, x[:, -1]
 
 
