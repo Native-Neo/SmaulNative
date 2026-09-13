@@ -196,8 +196,6 @@ def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokeni
         shutil.copy2(tokenizer_path, bundled)
     if save_optimizer:
         _save_optimizer_checkpoint(optimizer, resume, checkpoint_dir)
-    else:
-        resume.save(checkpoint_dir / "resume_state.json")
     print(f"[SAVE COMPLETE] {output_dir}")
 
 
