@@ -60,7 +60,8 @@ def _pack_codes(codes, bits):
         codes = torch.cat((codes, torch.zeros((rows, pad), dtype=torch.uint8, device=codes.device)), dim=1)
     grouped = codes.reshape(rows, -1, per_byte)
     shifts = torch.arange(per_byte - 1, -1, -1, device=codes.device, dtype=torch.uint8) * bits
-    return (grouped << shifts).sum(dim=-1)
+    packed = (grouped << shifts).sum(dim=-1)
+    return packed.to(torch.uint8)
 
 
 def _unpack_codes(packed, bits, numel):
