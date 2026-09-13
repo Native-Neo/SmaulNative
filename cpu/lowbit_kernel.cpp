@@ -127,59 +127,39 @@ torch::Tensor packed_linear(
 
                     int64_t k = 0;
 
-                    for (
-                        int64_t b = 0;
-                    b < full_bytes;
-                    ++b, k += 4
-                    ) {
+                    for (int64_t b = 0; b < full_bytes; ++b, k += 4) {
+                        const float p0 = xr[k] * sp[k];
+                        const float p1 = xr[k + 1] * sp[k + 1];
+                        const float p2 = xr[k + 2] * sp[k + 2];
+                        const float p3 = xr[k + 3] * sp[k + 3];
+
                         for (int64_t j = 0; j < count; ++j) {
                             const uint8_t byte = wr[j][b];
-
                             const int c0 = byte >> 6;
                             const int c1 = (byte >> 4) & 3;
                             const int c2 = (byte >> 2) & 3;
                             const int c3 = byte & 3;
 
-                            sums[j] +=
-                            xr[k] *
-                            sp[k] *
-                            fp2_levels[c0];
-
-                            sums[j] +=
-                            xr[k + 1] *
-                            sp[k + 1] *
-                            fp2_levels[c1];
-
-                            sums[j] +=
-                            xr[k + 2] *
-                            sp[k + 2] *
-                            fp2_levels[c2];
-
-                            sums[j] +=
-                            xr[k + 3] *
-                            sp[k + 3] *
-                            fp2_levels[c3];
+                            sums[j] += p0 * fp2_levels[c0];
+                            sums[j] += p1 * fp2_levels[c1];
+                            sums[j] += p2 * fp2_levels[c2];
+                            sums[j] += p3 * fp2_levels[c3];
                         }
                     }
 
                     for (; k < in_features; ++k) {
-                        const int shift =
-                        6 - (k & 3) * 2;
+                        const float p = xr[k] * sp[k];
+                        const int shift = 6 - (k & 3) * 2;
 
                         for (int64_t j = 0; j < count; ++j) {
                             const int code =
                             (wr[j][k >> 2] >> shift) & 3;
-
-                            sums[j] +=
-                            xr[k] *
-                            sp[k] *
-                            fp2_levels[code];
+                            sums[j] += p * fp2_levels[code];
                         }
                     }
 
                     for (int64_t j = 0; j < count; ++j)
-                        yp[n * out_features + ob + j] =
-                        sums[j];
+                        yp[n * out_features + ob + j] = sums[j];
                 }
             }
         );
@@ -214,45 +194,30 @@ torch::Tensor packed_linear(
 
                     int64_t k = 0;
 
-                    for (
-                        int64_t b = 0;
-                    b < full_bytes;
-                    ++b, k += 2
-                    ) {
+                    for (int64_t b = 0; b < full_bytes; ++b, k += 2) {
+                        const float p0 = xr[k] * sp[k];
+                        const float p1 = xr[k + 1] * sp[k + 1];
+
                         for (int64_t j = 0; j < count; ++j) {
-                            const uint8_t byte =
-                            wr[j][b];
-
-                            sums[j] +=
-                            xr[k] *
-                            sp[k] *
-                            fp4_levels[byte >> 4];
-
-                            sums[j] +=
-                            xr[k + 1] *
-                            sp[k + 1] *
-                            fp4_levels[byte & 15];
+                            const uint8_t byte = wr[j][b];
+                            sums[j] += p0 * fp4_levels[byte >> 4];
+                            sums[j] += p1 * fp4_levels[byte & 15];
                         }
                     }
 
                     for (; k < in_features; ++k) {
-                        const int shift =
-                        4 - (k & 1) * 4;
+                        const float p = xr[k] * sp[k];
+                        const int shift = 4 - (k & 1) * 4;
 
                         for (int64_t j = 0; j < count; ++j) {
                             const int code =
                             (wr[j][k >> 1] >> shift) & 15;
-
-                            sums[j] +=
-                            xr[k] *
-                            sp[k] *
-                            fp4_levels[code];
+                            sums[j] += p * fp4_levels[code];
                         }
                     }
 
                     for (int64_t j = 0; j < count; ++j)
-                        yp[n * out_features + ob + j] =
-                        sums[j];
+                        yp[n * out_features + ob + j] = sums[j];
                 }
             }
         );
@@ -268,26 +233,11 @@ torch::Tensor qat_linear(
 ) {
     TORCH_CHECK(x.device().is_cpu(), "x must be on CPU");
     TORCH_CHECK(weight.device().is_cpu(), "weight must be on CPU");
-    TORCH_CHECK(
-        x.scalar_type() == torch::kFloat32,
-                "x must be float32"
-    );
-    TORCH_CHECK(
-        weight.scalar_type() == torch::kFloat32,
-                "weight must be float32"
-    );
-    TORCH_CHECK(
-        bits == 2 || bits == 4,
-        "bits must be 2 or 4"
-    );
-    TORCH_CHECK(
-        x.dim() == 2 && weight.dim() == 2,
-                "x and weight must be 2D"
-    );
-    TORCH_CHECK(
-        x.size(1) == weight.size(1),
-                "input feature mismatch"
-    );
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
+    TORCH_CHECK(bits == 2 || bits == 4, "bits must be 2 or 4");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2, "x and weight must be 2D");
+    TORCH_CHECK(x.size(1) == weight.size(1), "input feature mismatch");
 
     x = x.contiguous();
     weight = weight.contiguous();
@@ -295,12 +245,8 @@ torch::Tensor qat_linear(
     const int64_t batch = x.size(0);
     const int64_t out_features = weight.size(0);
     const int64_t in_features = weight.size(1);
-
-    const float eps =
-    std::numeric_limits<float>::epsilon();
-
+    const float eps = std::numeric_limits<float>::epsilon();
     std::vector<float> scale(in_features, eps);
-
     const float* wp = weight.data_ptr<float>();
 
     constexpr int64_t block = 32;
@@ -310,57 +256,31 @@ torch::Tensor qat_linear(
         in_features,
         block,
         [&](int64_t begin, int64_t end) {
-            for (
-                int64_t k0 = begin;
-            k0 < end;
-            k0 += block
-            ) {
-                const int64_t k1 =
-                std::min(k0 + block, end);
-
+            for (int64_t k0 = begin; k0 < end; k0 += block) {
+                const int64_t k1 = std::min(k0 + block, end);
                 float local[32];
 
                 for (int64_t k = k0; k < k1; ++k)
                     local[k - k0] = eps;
 
-                for (
-                    int64_t o = 0;
-                o < out_features;
-                ++o
-                ) {
-                    const float* wr =
-                    wp + o * in_features + k0;
+                for (int64_t o = 0; o < out_features; ++o) {
+                    const float* wr = wp + o * in_features + k0;
 
-                    for (
-                        int64_t k = k0;
-                    k < k1;
-                    ++k
-                    ) {
-                        local[k - k0] =
-                        std::max(
+                    for (int64_t k = k0; k < k1; ++k) {
+                        local[k - k0] = std::max(
                             local[k - k0],
                             std::abs(wr[k - k0])
                         );
                     }
                 }
 
-                for (
-                    int64_t k = k0;
-                k < k1;
-                ++k
-                ) {
-                    scale[k] =
-                    local[k - k0];
-                }
+                for (int64_t k = k0; k < k1; ++k)
+                    scale[k] = local[k - k0];
             }
         }
     );
 
-    auto out = torch::empty(
-        {batch, out_features},
-        x.options()
-    );
-
+    auto out = torch::empty({batch, out_features}, x.options());
     const float* xp = x.data_ptr<float>();
     float* yp = out.data_ptr<float>();
 
@@ -370,124 +290,38 @@ torch::Tensor qat_linear(
             out_features,
             64,
             [&](int64_t begin, int64_t end) {
-                std::vector<float> sums(
-                    batch,
-                    0.0f
-                );
+                std::vector<float> sums(batch, 0.0f);
 
-                for (
-                    int64_t o = begin;
-                o < end;
-                ++o
-                ) {
-                    const float* wr =
-                    wp + o * in_features;
-
-                    std::fill(
-                        sums.begin(),
-                              sums.end(),
-                              0.0f
-                    );
-
+                for (int64_t o = begin; o < end; ++o) {
+                    const float* wr = wp + o * in_features;
+                    std::fill(sums.begin(), sums.end(), 0.0f);
                     int64_t k = 0;
 
-                    for (
-                        ;
-                    k + 7 < in_features;
-                    k += 8
-                    ) {
-                        const float q0 =
-                        quantize2(
-                            wr[k],
-                            scale[k]
-                        );
-                        const float q1 =
-                        quantize2(
-                            wr[k + 1],
-                            scale[k + 1]
-                        );
-                        const float q2 =
-                        quantize2(
-                            wr[k + 2],
-                            scale[k + 2]
-                        );
-                        const float q3 =
-                        quantize2(
-                            wr[k + 3],
-                            scale[k + 3]
-                        );
-                        const float q4 =
-                        quantize2(
-                            wr[k + 4],
-                            scale[k + 4]
-                        );
-                        const float q5 =
-                        quantize2(
-                            wr[k + 5],
-                            scale[k + 5]
-                        );
-                        const float q6 =
-                        quantize2(
-                            wr[k + 6],
-                            scale[k + 6]
-                        );
-                        const float q7 =
-                        quantize2(
-                            wr[k + 7],
-                            scale[k + 7]
-                        );
+                    for (; k + 7 < in_features; k += 8) {
+                        const float q0 = quantize2(wr[k], scale[k]);
+                        const float q1 = quantize2(wr[k + 1], scale[k + 1]);
+                        const float q2 = quantize2(wr[k + 2], scale[k + 2]);
+                        const float q3 = quantize2(wr[k + 3], scale[k + 3]);
+                        const float q4 = quantize2(wr[k + 4], scale[k + 4]);
+                        const float q5 = quantize2(wr[k + 5], scale[k + 5]);
+                        const float q6 = quantize2(wr[k + 6], scale[k + 6]);
+                        const float q7 = quantize2(wr[k + 7], scale[k + 7]);
 
-                        for (
-                            int64_t n = 0;
-                        n < batch;
-                        ++n
-                        ) {
-                            const float* xr =
-                            xp +
-                            n * in_features +
-                            k;
-
-                            sums[n] +=
-                            xr[0] * q0 +
-                            xr[1] * q1 +
-                            xr[2] * q2 +
-                            xr[3] * q3;
-
-                            sums[n] +=
-                            xr[4] * q4 +
-                            xr[5] * q5 +
-                            xr[6] * q6 +
-                            xr[7] * q7;
+                        for (int64_t n = 0; n < batch; ++n) {
+                            const float* xr = xp + n * in_features + k;
+                            sums[n] += xr[0] * q0 + xr[1] * q1 + xr[2] * q2 + xr[3] * q3;
+                            sums[n] += xr[4] * q4 + xr[5] * q5 + xr[6] * q6 + xr[7] * q7;
                         }
                     }
 
                     for (; k < in_features; ++k) {
-                        const float q =
-                        quantize2(
-                            wr[k],
-                            scale[k]
-                        );
-
-                        for (
-                            int64_t n = 0;
-                        n < batch;
-                        ++n
-                        ) {
-                            sums[n] +=
-                            xp[n * in_features + k] *
-                            q;
-                        }
+                        const float q = quantize2(wr[k], scale[k]);
+                        for (int64_t n = 0; n < batch; ++n)
+                            sums[n] += xp[n * in_features + k] * q;
                     }
 
-                    for (
-                        int64_t n = 0;
-                    n < batch;
-                    ++n
-                    ) {
-                        yp[
-                            n * out_features + o
-                        ] = sums[n];
-                    }
+                    for (int64_t n = 0; n < batch; ++n)
+                        yp[n * out_features + o] = sums[n];
                 }
             }
         );
@@ -497,124 +331,38 @@ torch::Tensor qat_linear(
             out_features,
             64,
             [&](int64_t begin, int64_t end) {
-                std::vector<float> sums(
-                    batch,
-                    0.0f
-                );
+                std::vector<float> sums(batch, 0.0f);
 
-                for (
-                    int64_t o = begin;
-                o < end;
-                ++o
-                ) {
-                    const float* wr =
-                    wp + o * in_features;
-
-                    std::fill(
-                        sums.begin(),
-                              sums.end(),
-                              0.0f
-                    );
-
+                for (int64_t o = begin; o < end; ++o) {
+                    const float* wr = wp + o * in_features;
+                    std::fill(sums.begin(), sums.end(), 0.0f);
                     int64_t k = 0;
 
-                    for (
-                        ;
-                    k + 7 < in_features;
-                    k += 8
-                    ) {
-                        const float q0 =
-                        quantize4(
-                            wr[k],
-                            scale[k]
-                        );
-                        const float q1 =
-                        quantize4(
-                            wr[k + 1],
-                            scale[k + 1]
-                        );
-                        const float q2 =
-                        quantize4(
-                            wr[k + 2],
-                            scale[k + 2]
-                        );
-                        const float q3 =
-                        quantize4(
-                            wr[k + 3],
-                            scale[k + 3]
-                        );
-                        const float q4 =
-                        quantize4(
-                            wr[k + 4],
-                            scale[k + 4]
-                        );
-                        const float q5 =
-                        quantize4(
-                            wr[k + 5],
-                            scale[k + 5]
-                        );
-                        const float q6 =
-                        quantize4(
-                            wr[k + 6],
-                            scale[k + 6]
-                        );
-                        const float q7 =
-                        quantize4(
-                            wr[k + 7],
-                            scale[k + 7]
-                        );
+                    for (; k + 7 < in_features; k += 8) {
+                        const float q0 = quantize4(wr[k], scale[k]);
+                        const float q1 = quantize4(wr[k + 1], scale[k + 1]);
+                        const float q2 = quantize4(wr[k + 2], scale[k + 2]);
+                        const float q3 = quantize4(wr[k + 3], scale[k + 3]);
+                        const float q4 = quantize4(wr[k + 4], scale[k + 4]);
+                        const float q5 = quantize4(wr[k + 5], scale[k + 5]);
+                        const float q6 = quantize4(wr[k + 6], scale[k + 6]);
+                        const float q7 = quantize4(wr[k + 7], scale[k + 7]);
 
-                        for (
-                            int64_t n = 0;
-                        n < batch;
-                        ++n
-                        ) {
-                            const float* xr =
-                            xp +
-                            n * in_features +
-                            k;
-
-                            sums[n] +=
-                            xr[0] * q0 +
-                            xr[1] * q1 +
-                            xr[2] * q2 +
-                            xr[3] * q3;
-
-                            sums[n] +=
-                            xr[4] * q4 +
-                            xr[5] * q5 +
-                            xr[6] * q6 +
-                            xr[7] * q7;
+                        for (int64_t n = 0; n < batch; ++n) {
+                            const float* xr = xp + n * in_features + k;
+                            sums[n] += xr[0] * q0 + xr[1] * q1 + xr[2] * q2 + xr[3] * q3;
+                            sums[n] += xr[4] * q4 + xr[5] * q5 + xr[6] * q6 + xr[7] * q7;
                         }
                     }
 
                     for (; k < in_features; ++k) {
-                        const float q =
-                        quantize4(
-                            wr[k],
-                            scale[k]
-                        );
-
-                        for (
-                            int64_t n = 0;
-                        n < batch;
-                        ++n
-                        ) {
-                            sums[n] +=
-                            xp[n * in_features + k] *
-                            q;
-                        }
+                        const float q = quantize4(wr[k], scale[k]);
+                        for (int64_t n = 0; n < batch; ++n)
+                            sums[n] += xp[n * in_features + k] * q;
                     }
 
-                    for (
-                        int64_t n = 0;
-                    n < batch;
-                    ++n
-                    ) {
-                        yp[
-                            n * out_features + o
-                        ] = sums[n];
-                    }
+                    for (int64_t n = 0; n < batch; ++n)
+                        yp[n * out_features + o] = sums[n];
                 }
             }
         );
@@ -624,15 +372,6 @@ torch::Tensor qat_linear(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(
-        "packed_linear",
-        &packed_linear,
-        "Packed FP2/FP4 linear"
-    );
-
-    m.def(
-        "qat_linear",
-        &qat_linear,
-        "Fused FP2/FP4 QAT linear"
-    );
+    m.def("packed_linear", &packed_linear, "Packed FP2/FP4 linear");
+    m.def("qat_linear", &qat_linear, "Fused FP2/FP4 QAT linear");
 }
