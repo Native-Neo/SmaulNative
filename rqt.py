@@ -31,7 +31,7 @@ class _RQTFunction(torch.autograd.Function):
         out_features, in_features = quant._shape
         if x.device.type == "cuda" and x.dtype == torch.float32 and quant.bits < 8:
             grad_x = packed_linear_transpose(
-                grad_output, quant.packed, quant.scale,
+                grad_output.float(), quant.packed, quant.scale,
                 quant.bits, out_features, in_features,
             ).reshape_as(x)
         else:
@@ -103,7 +103,10 @@ class RealQuantLinear(nn.Module):
     def forward(self, x):
         if self.weight.device != x.device:
             self.quant = self.quant.to(x.device)
-        out = _RQTFunction.apply(x, self.weight, self.quant)
+        if x.device.type == "cuda" and x.dtype != torch.float32 and self.bits < 8:
+            out = _RQTFunction.apply(x.float(), self.weight, self.quant).to(x.dtype)
+        else:
+            out = _RQTFunction.apply(x, self.weight, self.quant)
         if self.bias is not None:
             out = out + self.bias
         return out
