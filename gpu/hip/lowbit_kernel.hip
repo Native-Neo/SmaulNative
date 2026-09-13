@@ -23,15 +23,18 @@ __device__ __forceinline__ float fp4_level(int code) {
     }
 }
 
+__device__ __forceinline__ float decode_level(const uint8_t* row, int64_t k, int bits) {
+    if (bits == 2) {
+        const int shift = 6 - static_cast<int>(k & 3) * 2;
+        return fp2_level((row[k >> 2] >> shift) & 3);
+    }
+    const int shift = 4 - static_cast<int>(k & 1) * 4;
+    return fp4_level((row[k >> 1] >> shift) & 15);
+}
+
 __global__ void packed_linear_kernel(
-    const float* x,
-    const uint8_t* packed,
-    const float* scale,
-    float* out,
-    int64_t batch,
-    int64_t out_features,
-    int64_t in_features,
-    int bits
+    const float* x, const uint8_t* packed, const float* scale, float* out,
+    int64_t batch, int64_t out_features, int64_t in_features, int bits
 ) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t total = batch * out_features;
@@ -45,31 +48,37 @@ __global__ void packed_linear_kernel(
     const float* xr = x + n * in_features;
 
     float sum = 0.0f;
-    if (bits == 2) {
-        for (int64_t k = 0; k < in_features; ++k) {
-            const int shift = 6 - static_cast<int>(k & 3) * 2;
-            const int code = (row[k >> 2] >> shift) & 3;
-            sum += xr[k] * scale[k] * fp2_level(code);
-        }
-    } else {
-        for (int64_t k = 0; k < in_features; ++k) {
-            const int shift = 4 - static_cast<int>(k & 1) * 4;
-            const int code = (row[k >> 1] >> shift) & 15;
-            sum += xr[k] * scale[k] * fp4_level(code);
-        }
-    }
+    for (int64_t k = 0; k < in_features; ++k)
+        sum += xr[k] * scale[k] * decode_level(row, k, bits);
     out[index] = sum;
 }
 
-} // namespace
+__global__ void packed_linear_transpose_kernel(
+    const float* go, const uint8_t* packed, const float* scale, float* grad_x,
+    int64_t batch, int64_t out_features, int64_t in_features, int bits
+) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = batch * in_features;
+    if (index >= total) return;
+
+    const int64_t n = index / in_features;
+    const int64_t k = index - n * in_features;
+    const int per_byte = 8 / bits;
+    const int64_t row_bytes = (in_features + per_byte - 1) / per_byte;
+    float sum = 0.0f;
+    const float s = scale[k];
+    for (int64_t o = 0; o < out_features; ++o) {
+        const uint8_t* row = packed + o * row_bytes;
+        sum += go[n * out_features + o] * s * decode_level(row, k, bits);
+    }
+    grad_x[index] = sum;
+}
+
+}
 
 torch::Tensor packed_linear(
-    torch::Tensor x,
-    torch::Tensor packed,
-    torch::Tensor scale,
-    int64_t bits,
-    int64_t out_features,
-    int64_t in_features
+    torch::Tensor x, torch::Tensor packed, torch::Tensor scale,
+    int64_t bits, int64_t out_features, int64_t in_features
 ) {
     TORCH_CHECK(x.is_cuda(), "x must be CUDA/HIP");
     TORCH_CHECK(packed.is_cuda(), "packed must be CUDA/HIP");
@@ -77,15 +86,13 @@ torch::Tensor packed_linear(
     TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
     TORCH_CHECK(packed.scalar_type() == torch::kUInt8, "packed must be uint8");
     TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "scale must be float32");
-    TORCH_CHECK(x.dim() == 2, "x must be 2D");
-    TORCH_CHECK(x.size(1) == in_features, "input feature mismatch");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == in_features, "input shape mismatch");
     TORCH_CHECK(scale.numel() == in_features, "scale size mismatch");
     TORCH_CHECK(bits == 2 || bits == 4, "bits must be 2 or 4");
 
     x = x.contiguous();
     packed = packed.contiguous();
     scale = scale.reshape({-1}).contiguous();
-
     const int per_byte = 8 / bits;
     const int64_t row_bytes = (in_features + per_byte - 1) / per_byte;
     TORCH_CHECK(packed.numel() >= out_features * row_bytes, "packed weight is too small");
@@ -103,18 +110,47 @@ torch::Tensor packed_linear(
     return out;
 }
 
-torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
-    TORCH_CHECK(x.is_cuda(), "x must be CUDA/HIP");
-    TORCH_CHECK(weight.is_cuda(), "weight must be CUDA/HIP");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
-    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
+torch::Tensor packed_linear_transpose(
+    torch::Tensor go, torch::Tensor packed, torch::Tensor scale,
+    int64_t bits, int64_t out_features, int64_t in_features
+) {
+    TORCH_CHECK(go.is_cuda() && packed.is_cuda() && scale.is_cuda(), "tensors must be CUDA/HIP");
+    TORCH_CHECK(go.scalar_type() == torch::kFloat32, "grad_output must be float32");
+    TORCH_CHECK(packed.scalar_type() == torch::kUInt8 && scale.scalar_type() == torch::kFloat32, "invalid weight types");
+    TORCH_CHECK(go.dim() == 2 && go.size(1) == out_features, "grad_output shape mismatch");
+    TORCH_CHECK(scale.numel() == in_features, "scale size mismatch");
     TORCH_CHECK(bits == 2 || bits == 4, "bits must be 2 or 4");
-    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2, "x and weight must be 2D");
-    TORCH_CHECK(x.size(1) == weight.size(1), "input feature mismatch");
+
+    go = go.contiguous();
+    packed = packed.contiguous();
+    scale = scale.reshape({-1}).contiguous();
+    const int per_byte = 8 / bits;
+    const int64_t row_bytes = (in_features + per_byte - 1) / per_byte;
+    TORCH_CHECK(packed.numel() >= out_features * row_bytes, "packed weight is too small");
+
+    auto grad_x = torch::empty({go.size(0), in_features}, go.options());
+    const int64_t total = go.size(0) * in_features;
+    const int threads = 256;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    auto stream = at::cuda::getDefaultCUDAStream();
+    packed_linear_transpose_kernel<<<blocks, threads, 0, stream>>>(
+        go.data_ptr<float>(), packed.data_ptr<uint8_t>(), scale.data_ptr<float>(),
+        grad_x.data_ptr<float>(), go.size(0), out_features, in_features, static_cast<int>(bits)
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return grad_x;
+}
+
+torch::Tensor qat_linear(torch::Tensor x, torch::Tensor weight, int64_t bits) {
+    TORCH_CHECK(x.is_cuda() && weight.is_cuda(), "tensors must be CUDA/HIP");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 && weight.scalar_type() == torch::kFloat32, "tensors must be float32");
+    TORCH_CHECK(bits == 2 || bits == 4, "bits must be 2 or 4");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && x.size(1) == weight.size(1), "shape mismatch");
     return torch::matmul(x, weight.transpose(0, 1));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("packed_linear", &packed_linear, "Packed FP2/FP4 linear");
+    m.def("packed_linear_transpose", &packed_linear_transpose, "Packed FP2/FP4 transpose linear");
     m.def("qat_linear", &qat_linear, "QAT linear fallback");
 }
