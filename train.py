@@ -387,14 +387,37 @@ def parse_args():
     return args
 
 
+def _requested_config(args, tokenizer):
+    from rwkv_x_core import RWKVXConfig
+    return RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd, n_layer=args.n_layer, n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len)
+
+
+def _checkpoint_matches(config, requested):
+    fields = ("vocab_size", "n_embd", "n_layer", "n_moba_layer", "head_size", "ctx_len_hint")
+    return all(getattr(config, field) == getattr(requested, field) for field in fields)
+
+
 def build_model(args, tokenizer):
     output_dir = Path(args.output_dir)
-    if (output_dir / "config.json").exists() and (output_dir / "model.safetensors").exists():
-        return RWKVXModel.from_pretrained(output_dir)
-    from rwkv_x_core import RWKVXConfig
-    config = RWKVXConfig(vocab_size=tokenizer_vocab_size(tokenizer), n_embd=args.n_embd, n_layer=args.n_layer, n_moba_layer=args.n_moba_layer, head_size=args.head_size)
-    config.ctx_len_hint = args.ctx_len
-    return RWKVXModel(config)
+    requested = _requested_config(args, tokenizer)
+    config_path = output_dir / "config.json"
+    model_path = output_dir / "model.safetensors"
+    if config_path.exists() and model_path.exists():
+        from rwkv_x_core import RWKVXConfig
+        try:
+            existing = RWKVXConfig.load(config_path)
+        except Exception as exc:
+            print(f"[MODEL] ignoring invalid checkpoint config: {exc}")
+        else:
+            if _checkpoint_matches(existing, requested):
+                print("[MODEL] loading compatible checkpoint")
+                return RWKVXModel.from_pretrained(output_dir), True
+            print(
+                "[MODEL] checkpoint architecture mismatch; starting fresh "
+                f"(requested {args.n_embd}/{args.n_layer}/{args.n_moba_layer}/{args.head_size}, "
+                f"checkpoint {existing.n_embd}/{existing.n_layer}/{existing.n_moba_layer}/{existing.head_size})"
+            )
+    return RWKVXModel(requested), False
 
 
 def main():
@@ -406,13 +429,12 @@ def main():
         print(f"[CPU] {configure()} threads, native WKV, compile={args.compile}")
     tokenizer_path = Path(args.tokenizer_path)
     output_dir = Path(args.output_dir)
-    bundled_tokenizer = output_dir / "tokenizer.json"
-    if (output_dir / "config.json").exists() and bundled_tokenizer.exists() and bundled_tokenizer.resolve() != tokenizer_path.resolve():
-        tokenizer_path = bundled_tokenizer
     if not tokenizer_path.exists():
         train_tokenizer(Path(args.dataset_dir), tokenizer_path, args.tokenizer_vocab_size, args.stream_dataset, args.tokenizer_max_records)
     tokenizer = load_tokenizer(tokenizer_path)
-    model = build_model(args, tokenizer).to(device)
+    model, loaded_checkpoint = build_model(args, tokenizer)
+    model = model.to(device)
+    print(f"[MODEL CONFIG] vocab={model.cfg.vocab_size} n_embd={model.cfg.n_embd} n_layer={model.cfg.n_layer} n_moba_layer={model.cfg.n_moba_layer} head_size={model.cfg.head_size} ctx_len={args.ctx_len} batch_size={args.batch_size}")
     _print_model_size(model)
     if args.train_router_only:
         trainable = set_router_only_training(model, True)
@@ -428,10 +450,10 @@ def main():
     if args.compile:
         model = torch.compile(model, mode="max-autotune")
     checkpoint_dir = Path(args.checkpoint_dir)
-    resume = ResumeState.load(checkpoint_dir / "resume_state.json")
+    resume = ResumeState.load(checkpoint_dir / "resume_state.json") if loaded_checkpoint else ResumeState()
     if args.new_data:
         resume = ResumeState()
-    else:
+    elif loaded_checkpoint:
         _load_rng_state(checkpoint_dir / "rng_state.pt")
     optimizer_classes = {"lion": Lion, "adamw": torch.optim.AdamW, "adafactor": torch.optim.Adafactor}
     if args.cpu and args.optimizer == "lion":
@@ -439,7 +461,7 @@ def main():
         optimizer_classes["lion"] = NativeLion
     optimizer = optimizer_classes[args.optimizer](model.parameters(), lr=args.learning_rate)
     optimizer_path = checkpoint_dir / "optimizer.pt"
-    if optimizer_path.exists() and not args.new_data:
+    if optimizer_path.exists() and loaded_checkpoint and not args.new_data:
         try:
             optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
         except Exception as exc:
