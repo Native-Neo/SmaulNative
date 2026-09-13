@@ -129,10 +129,11 @@ impl RwkvModel {
         let mut moba_states: Vec<Option<MobaBlockState>> = (0..self.moba_blocks.len()).map(|_| None).collect();
         for (index, block_state) in next_moba { moba_states[index] = Some(block_state); }
         let moba_states = moba_states.into_iter().map(Option::unwrap).collect();
+        let ln_input = x.clone();
         x = self.ln_out.forward(&x);
         let normalized = x.clone();
         let logits = self.head.forward(&x);
-        if let Some(ref mut tape) = tape { tape.record_head(normalized, logits.clone()); }
+        if let Some(ref mut tape) = tape { tape.record_head(ln_input, normalized, logits.clone()); }
         (logits, RwkvModelState { rwkv_blocks: rwkv_states, moba_blocks: moba_states, v_first }, x)
     }
 
@@ -182,6 +183,7 @@ mod tests {
         assert_eq!(logits.dim(), (3, 32));
         assert_eq!(tape.len(), 5);
         assert_eq!(tape.normalized.as_ref().unwrap().dim(), (3, 16));
+        assert_eq!(tape.ln_input.as_ref().unwrap().dim(), (3, 16));
         assert_eq!(tape.logits.as_ref().unwrap().dim(), (3, 32));
         assert_eq!(tape.reverse_blocks().count(), 5);
     }
