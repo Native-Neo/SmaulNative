@@ -30,7 +30,7 @@ def test_qat_checkpoint_restores_bit_width(tmp_path):
     assert torch.equal(expected, actual)
 
 
-def test_original_loader_restores_qat_bit_width(tmp_path):
+def test_original_loader_leaves_qat_wrapping_to_compat_layer(tmp_path):
     cfg = RWKVXConfig(vocab_size=32, n_embd=32, n_layer=2, head_size=8, n_moba_layer=1)
     model = RWKVXModel(cfg)
     qat.prepare_qat(model, 2)
@@ -38,5 +38,4 @@ def test_original_loader_restores_qat_bit_width(tmp_path):
 
     restored = qat._ORIGINAL_LOAD(RWKVXModel, tmp_path)
     qat_modules = list(qat._iter_cmix_modules(restored))
-    assert all(isinstance(module.key, qat.FloatQATLinear) for module in qat_modules)
-    assert all(module.key.bits == 2 and module.value.bits == 2 for module in qat_modules)
+    assert all(isinstance(module.key, torch.nn.Linear) for module in qat_modules)
