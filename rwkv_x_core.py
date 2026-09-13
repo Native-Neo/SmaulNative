@@ -335,6 +335,8 @@ class RWKVBlock(nn.Module):
 class RWKVXModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        if isinstance(cfg, dict):
+            cfg = RWKVXConfig(**cfg)
         self.cfg = cfg
         self.emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout else None
