@@ -101,7 +101,7 @@ torch::Tensor packed_linear(
     const int64_t total = x.size(0) * out_features;
     const int threads = 256;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
-    auto stream = at::cuda::getDefaultCUDAStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
     packed_linear_kernel<<<blocks, threads, 0, stream>>>(
         x.data_ptr<float>(), packed.data_ptr<uint8_t>(), scale.data_ptr<float>(),
         out.data_ptr<float>(), x.size(0), out_features, in_features, static_cast<int>(bits)
@@ -132,7 +132,7 @@ torch::Tensor packed_linear_transpose(
     const int64_t total = go.size(0) * in_features;
     const int threads = 256;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
-    auto stream = at::cuda::getDefaultCUDAStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
     packed_linear_transpose_kernel<<<blocks, threads, 0, stream>>>(
         go.data_ptr<float>(), packed.data_ptr<uint8_t>(), scale.data_ptr<float>(),
         grad_x.data_ptr<float>(), go.size(0), out_features, in_features, static_cast<int>(bits)
