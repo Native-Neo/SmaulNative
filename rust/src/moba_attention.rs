@@ -48,20 +48,11 @@ impl MobaAttention {
         }
     }
 
-    fn attend(
-        q: &[f32],
-        keys: &[Vec<f32>],
-        values: &[Vec<f32>],
-        scale: f32,
-        causal_len: usize,
-    ) -> Vec<f32> {
-        let mut scores = Vec::with_capacity(keys.len());
-        for key in keys.iter() {
-            scores.push(Self::dot(q, key) * scale);
-        }
+    fn attention(q: &[f32], keys: &[Vec<f32>], values: &[Vec<f32>], scale: f32) -> Vec<f32> {
+        let mut scores: Vec<f32> = keys.iter().map(|k| Self::dot(q, k) * scale).collect();
         Self::softmax(&mut scores);
         let mut out = vec![0.0; q.len()];
-        for (weight, value) in scores.iter().zip(values.iter()).take(causal_len) {
+        for (weight, value) in scores.iter().zip(values.iter()) {
             for d in 0..out.len() { out[d] += weight * value[d]; }
         }
         out
@@ -69,9 +60,7 @@ impl MobaAttention {
 
     fn project_heads(&self, x: &Array2<f32>, projection: &Linear) -> Vec<Vec<Vec<f32>>> {
         let projected = projection.forward(x);
-        let chunks = (x.nrows() + self.chunk_size - 1) / self.chunk_size;
         let mut result = vec![vec![vec![0.0; self.head_size]; x.nrows()]; self.heads];
-        let _ = chunks;
         for h in 0..self.heads {
             for t in 0..x.nrows() {
                 for d in 0..self.head_size {
@@ -82,19 +71,45 @@ impl MobaAttention {
         result
     }
 
+    fn full_causal(
+        &self,
+        q: &[Vec<Vec<f32>>],
+        k: &[Vec<Vec<f32>>],
+        v: &[Vec<Vec<f32>>],
+        t: usize,
+    ) -> Array2<f32> {
+        let scale = (self.head_size as f32).sqrt().recip();
+        let mut out = Array2::<f32>::zeros((t, self.channels));
+        for h in 0..self.heads {
+            for row in 0..t {
+                let keys = &k[h][..=row];
+                let values = &v[h][..=row];
+                let y = Self::attention(&q[h][row], keys, values, scale);
+                for d in 0..self.head_size { out[[row, h * self.head_size + d]] = y[d]; }
+            }
+        }
+        out
+    }
+
     pub fn forward(&self, x: &Array2<f32>) -> Array2<f32> {
         assert_eq!(x.ncols(), self.channels);
         let t = x.nrows();
+        assert!(t > 0);
         let q = self.project_heads(x, &self.receptance);
         let k = self.project_heads(x, &self.key);
         let v = self.project_heads(x, &self.value);
-        let chunks = (t + self.chunk_size - 1) / self.chunk_size;
+        let n_chunks = (t + self.chunk_size - 1) / self.chunk_size;
+
+        if self.top_k == 0 || n_chunks <= self.top_k + 1 {
+            return self.output.forward(&self.full_causal(&q, &k, &v, t));
+        }
+
         let scale = (self.head_size as f32).sqrt().recip();
         let mut out = Array2::<f32>::zeros((t, self.channels));
 
         for h in 0..self.heads {
-            let mut means = vec![vec![0.0; self.head_size]; chunks];
-            for c in 0..chunks {
+            let mut means = vec![vec![0.0; self.head_size]; n_chunks];
+            for c in 0..n_chunks {
                 let lo = c * self.chunk_size;
                 let hi = usize::min(lo + self.chunk_size, t);
                 for row in lo..hi {
@@ -104,35 +119,49 @@ impl MobaAttention {
                 for d in 0..self.head_size { means[c][d] /= n; }
             }
 
-            for row in 0..t {
-                let chunk = row / self.chunk_size;
-                let lo = chunk * self.chunk_size;
+            for c in 0..n_chunks {
+                let lo = c * self.chunk_size;
                 let hi = usize::min(lo + self.chunk_size, t);
-                let mut selected = Vec::new();
-                for c in 0..chunk {
-                    selected.push((Self::dot(&q[h][row], &means[c]), c));
+                let qlen = hi - lo;
+
+                if c == 0 {
+                    for row in lo..hi {
+                        let y = Self::attention(&q[h][row], &k[h][lo..=row], &v[h][lo..=row], scale);
+                        for d in 0..self.head_size { out[[row, h * self.head_size + d]] = y[d]; }
+                    }
+                    continue;
                 }
+
+                let mut qmean = vec![0.0; self.head_size];
+                for row in lo..hi {
+                    for d in 0..self.head_size { qmean[d] += q[h][row][d]; }
+                }
+                for d in 0..self.head_size { qmean[d] /= qlen as f32; }
+
+                let mut selected: Vec<(f32, usize)> = (0..c)
+                    .map(|old| (Self::dot(&qmean, &means[old]), old))
+                    .collect();
                 selected.sort_by(|a, b| b.0.total_cmp(&a.0));
                 selected.truncate(usize::min(self.top_k, selected.len()));
 
-                let mut keys = Vec::new();
-                let mut values = Vec::new();
-                for &(_, c) in &selected {
-                    let clo = c * self.chunk_size;
-                    let chi = usize::min(clo + self.chunk_size, t);
-                    for p in clo..chi {
-                        keys.push(k[h][p].clone());
-                        values.push(v[h][p].clone());
-                    }
-                }
-                for p in lo..=row {
-                    keys.push(k[h][p].clone());
-                    values.push(v[h][p].clone());
+                let mut historical_k = Vec::new();
+                let mut historical_v = Vec::new();
+                for &(_, old) in &selected {
+                    let old_lo = old * self.chunk_size;
+                    let old_hi = usize::min(old_lo + self.chunk_size, t);
+                    historical_k.extend_from_slice(&k[h][old_lo..old_hi]);
+                    historical_v.extend_from_slice(&v[h][old_lo..old_hi]);
                 }
 
-                let y = Self::attend(&q[h][row], &keys, &values, scale, keys.len());
-                for d in 0..self.head_size { out[[row, h * self.head_size + d]] = y[d]; }
-                let _ = hi;
+                for row in lo..hi {
+                    let local_end = row - lo + 1;
+                    let mut keys = historical_k.clone();
+                    let mut values = historical_v.clone();
+                    keys.extend_from_slice(&k[h][lo..lo + local_end]);
+                    values.extend_from_slice(&v[h][lo..lo + local_end]);
+                    let y = Self::attention(&q[h][row], &keys, &values, scale);
+                    for d in 0..self.head_size { out[[row, h * self.head_size + d]] = y[d]; }
+                }
             }
         }
         self.output.forward(&out)
@@ -145,7 +174,6 @@ impl MobaAttention {
         cache_v: &Array4<f32>,
     ) -> (Array2<f32>, Array4<f32>, Array4<f32>) {
         assert_eq!(x.nrows(), 1);
-        assert_eq!(cache_k.shape()[0], self.heads);
         let q = self.receptance.forward(x);
         let k = self.key.forward(x);
         let v = self.value.forward(x);
@@ -168,19 +196,16 @@ impl MobaAttention {
         let scale = (self.head_size as f32).sqrt().recip();
         for h in 0..self.heads {
             let qrow: Vec<f32> = (0..self.head_size).map(|d| q[[0, h * self.head_size + d]]).collect();
-            let keys: Vec<Vec<f32>> = (0..past + 1).map(|p| (0..self.head_size).map(|d| all_k[[h, p, 0, d]]).collect()).collect();
-            let values: Vec<Vec<f32>> = (0..past + 1).map(|p| (0..self.head_size).map(|d| all_v[[h, p, 0, d]]).collect()).collect();
-            let y = Self::attend(&qrow, &keys, &values, scale, keys.len());
+            let keys: Vec<Vec<f32>> = (0..=past).map(|p| (0..self.head_size).map(|d| all_k[[h, p, 0, d]]).collect()).collect();
+            let values: Vec<Vec<f32>> = (0..=past).map(|p| (0..self.head_size).map(|d| all_v[[h, p, 0, d]]).collect()).collect();
+            let y = Self::attention(&qrow, &keys, &values, scale);
             for d in 0..self.head_size { result[[0, h * self.head_size + d]] = y[d]; }
         }
         (self.output.forward(&result), all_k, all_v)
     }
 
     pub fn parameter_count(&self) -> usize {
-        self.receptance.parameter_count()
-            + self.key.parameter_count()
-            + self.value.parameter_count()
-            + self.output.parameter_count()
+        self.receptance.parameter_count() + self.key.parameter_count() + self.value.parameter_count() + self.output.parameter_count()
     }
 }
 
@@ -196,13 +221,15 @@ mod tests {
     }
 
     #[test]
+    fn short_sequence_uses_causal_fallback() {
+        let att = MobaAttention::new(16, 4, 4, 4);
+        assert_eq!(att.forward(&Array2::<f32>::zeros((3, 16))).dim(), (3, 16));
+    }
+
+    #[test]
     fn cache_appends_one_token() {
         let att = MobaAttention::new(16, 4, 2, 1);
-        let (_, k, v) = att.cache_forward(
-            &Array2::<f32>::zeros((1, 16)),
-            &Array4::<f32>::zeros((4, 3, 1, 4)),
-            &Array4::<f32>::zeros((4, 3, 1, 4)),
-        );
+        let (_, k, v) = att.cache_forward(&Array2::<f32>::zeros((1, 16)), &Array4::<f32>::zeros((4, 3, 1, 4)), &Array4::<f32>::zeros((4, 3, 1, 4)));
         assert_eq!(k.shape(), &[4, 4, 1, 4]);
         assert_eq!(v.shape(), &[4, 4, 1, 4]);
     }
