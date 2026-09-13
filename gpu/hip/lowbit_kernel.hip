@@ -50,7 +50,6 @@ __global__ void packed_linear_kernel(
     const float* xr = x + n * in_features;
     const uint8_t* packed_rows = packed + output_base * row_bytes;
     float* out_row = out + n * out_features;
-    const uint8_t* row = packed_rows + static_cast<int64_t>(threadIdx.x) * row_bytes;
 
     float sum = 0.0f;
     __shared__ float xscaled[kThreads];
@@ -61,6 +60,7 @@ __global__ void packed_linear_kernel(
         __syncthreads();
 
         if (o < out_features) {
+            const uint8_t* row = packed_rows + static_cast<int64_t>(threadIdx.x) * row_bytes;
             const int64_t limit = min<int64_t>(kThreads, in_features - base);
             for (int64_t j = 0; j < limit; ++j)
                 sum += xscaled[j] * decode_level(row, base + j, bits);
@@ -76,21 +76,36 @@ __global__ void packed_linear_transpose_kernel(
     const float* go, const uint8_t* packed, const float* scale, float* grad_x,
     int64_t batch, int64_t out_features, int64_t in_features, int bits
 ) {
-    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t total = batch * in_features;
-    if (index >= total) return;
+    const int64_t block = static_cast<int64_t>(blockIdx.x);
+    const int64_t inputs_per_batch = (in_features + kThreads - 1) / kThreads;
+    const int64_t n = block / inputs_per_batch;
+    const int64_t input_base = (block - n * inputs_per_batch) * kThreads;
+    const int64_t k = input_base + threadIdx.x;
+    if (n >= batch) return;
 
-    const int64_t n = index / in_features;
-    const int64_t k = index - n * in_features;
     const int per_byte = 8 / bits;
     const int64_t row_bytes = (in_features + per_byte - 1) / per_byte;
+    const float s = k < in_features ? scale[k] : 0.0f;
     float sum = 0.0f;
-    const float s = scale[k];
-    for (int64_t o = 0; o < out_features; ++o) {
-        const uint8_t* row = packed + o * row_bytes;
-        sum += go[n * out_features + o] * s * decode_level(row, k, bits);
+    __shared__ float go_tile[kThreads];
+
+    for (int64_t ob = 0; ob < out_features; ob += kThreads) {
+        const int64_t o = ob + threadIdx.x;
+        go_tile[threadIdx.x] = o < out_features ? go[n * out_features + o] : 0.0f;
+        __syncthreads();
+
+        if (k < in_features) {
+            const int64_t count = min<int64_t>(kThreads, out_features - ob);
+            for (int64_t j = 0; j < count; ++j) {
+                const uint8_t* row = packed + (ob + j) * row_bytes;
+                sum += go_tile[j] * s * decode_level(row, k, bits);
+            }
+        }
+        __syncthreads();
     }
-    grad_x[index] = sum;
+
+    if (k < in_features)
+        grad_x[n * in_features + k] = sum;
 }
 
 }
@@ -149,11 +164,12 @@ torch::Tensor packed_linear_transpose(
     TORCH_CHECK(packed.numel() >= out_features * row_bytes, "packed weight is too small");
 
     auto grad_x = torch::empty({go.size(0), in_features}, go.options());
-    const int64_t total = go.size(0) * in_features;
-    const int threads = 256;
-    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    const int64_t input_tiles = (in_features + kThreads - 1) / kThreads;
+    const int64_t blocks64 = go.size(0) * input_tiles;
+    TORCH_CHECK(blocks64 <= static_cast<int64_t>(2147483647), "tensor too large for HIP grid");
+    const int blocks = static_cast<int>(blocks64);
     auto stream = at::cuda::getCurrentCUDAStream();
-    packed_linear_transpose_kernel<<<blocks, threads, 0, stream>>>(
+    packed_linear_transpose_kernel<<<blocks, kThreads, 0, stream>>>(
         go.data_ptr<float>(), packed.data_ptr<uint8_t>(), scale.data_ptr<float>(),
         grad_x.data_ptr<float>(), go.size(0), out_features, in_features, static_cast<int>(bits)
     );
