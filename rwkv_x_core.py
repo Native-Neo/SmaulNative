@@ -272,7 +272,7 @@ class CausalSelfAttention(nn.Module):
                 else:
                     npick = min(kt, i)
                     top = torch.einsum("bhd,bhkd->bhk", qi.mean(2), km[:, :, :i]).topk(npick, -1).indices
-                    idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, cs, N)
+                    idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, cs, N)
                     sk = torch.gather(kc[:, :, :i], 2, idx).reshape(B, H, npick * cs, N)
                     sv = torch.gather(vc[:, :, :i], 2, idx).reshape(B, H, npick * cs, N)
                     hist_mask = torch.ones(hi - lo, npick * cs, dtype=torch.bool, device=x.device)
