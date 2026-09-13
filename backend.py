@@ -18,7 +18,7 @@ def _torch_gpu_backend(torch):
 
 
 def _aocl_available():
-    return _library_available("amdblis", "blis", "amdlibm")
+    return _library_available("amdblis", "amdlibm")
 
 
 def _mkl_available(torch):
