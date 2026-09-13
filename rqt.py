@@ -5,9 +5,10 @@ import torch
 import torch.nn as nn
 
 from rwkv_x_core import RWKVXModel
-from qt import QuantizedLinear
+from qt import QuantizedLinear, _levels, _pack_codes
 
 _SUPPORTED_BITS = (2, 4, 8)
+_REFRESH_ROWS = 64
 
 
 def _bits(bits):
@@ -51,13 +52,42 @@ class RealQuantLinear(nn.Module):
 
     @torch.no_grad()
     def refresh(self):
-        self.quant = QuantizedLinear.from_linear(self._linear_view(), self.bits)
-        self._make_quant_nonpersistent()
+        weight = self.weight.detach()
+        if weight.device.type != "cpu":
+            weight = weight.cpu()
+        if weight.dtype != torch.float32:
+            weight = weight.float()
 
-    def _linear_view(self):
-        linear = nn.Linear(self.weight.shape[1], self.weight.shape[0], bias=False, device=self.weight.device, dtype=self.weight.dtype)
-        linear.weight = self.weight
-        return linear
+        if self.bits == 8:
+            for start in range(0, weight.shape[0], _REFRESH_ROWS):
+                end = min(start + _REFRESH_ROWS, weight.shape[0])
+                self.quant.packed[start:end].copy_(weight[start:end].to(torch.float8_e4m3fn))
+            return
+
+        scale = weight.abs().amax(dim=0, keepdim=True).clamp_min(torch.finfo(weight.dtype).eps)
+        self.quant.scale.copy_(scale)
+        levels = _levels(self.bits, weight.device, weight.dtype)
+        per_byte = 8 // self.bits
+        packed_cols = self.quant.packed.shape[1]
+        cols = weight.shape[1]
+
+        for start in range(0, weight.shape[0], _REFRESH_ROWS):
+            end = min(start + _REFRESH_ROWS, weight.shape[0])
+            codes = (
+                (weight[start:end] / scale).unsqueeze(-1)
+                .sub(levels)
+                .abs()
+                .argmin(dim=-1)
+                .to(torch.uint8)
+            )
+            pad = packed_cols * per_byte - cols
+            if pad:
+                padded = torch.zeros(
+                    (codes.shape[0], cols + pad), dtype=torch.uint8, device=codes.device
+                )
+                padded[:, :cols].copy_(codes)
+                codes = padded
+            self.quant.packed[start:end].copy_(_pack_codes(codes, self.bits))
 
     def forward(self, x):
         if self.weight.device != x.device:
