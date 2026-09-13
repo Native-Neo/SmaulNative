@@ -18,9 +18,7 @@ impl SafetensorsLoader {
     fn tensor(&self, name: &str) -> Result<safetensors::tensor::TensorView<'_>, String> {
         let tensors = SafeTensors::deserialize(&self.data)
             .map_err(|e| format!("invalid safetensors file: {e}"))?;
-        tensors
-            .tensor(name)
-            .map_err(|e| format!("missing tensor '{name}': {e}"))
+        tensors.tensor(name).map_err(|e| format!("missing tensor '{name}': {e}"))
     }
 
     pub fn names(&self) -> Result<Vec<String>, String> {
@@ -51,14 +49,12 @@ impl SafetensorsLoader {
     }
 
     pub fn f32_1d(&self, name: &str) -> Result<Array1<f32>, String> {
-        self.f32(name)?
-            .into_dimensionality::<Ix1>()
+        self.f32(name)?.into_dimensionality::<Ix1>()
             .map_err(|e| format!("tensor '{name}' is not rank 1: {e}"))
     }
 
     pub fn f32_2d(&self, name: &str) -> Result<Array2<f32>, String> {
-        self.f32(name)?
-            .into_dimensionality::<Ix2>()
+        self.f32(name)?.into_dimensionality::<Ix2>()
             .map_err(|e| format!("tensor '{name}' is not rank 2: {e}"))
     }
 
@@ -70,13 +66,15 @@ impl SafetensorsLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use safetensors::tensor::{serialize, TensorView};
+    use safetensors::tensor::{serialize, Dtype, TensorView};
     use std::collections::HashMap;
 
     #[test]
     fn reads_f32_matrix_and_transpose() {
         let values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let view = TensorView::new(Dtype::F32, &[2, 3], bytemuck::cast_slice(&values)).unwrap();
+        let mut raw = Vec::with_capacity(values.len() * 4);
+        for value in values { raw.extend_from_slice(&value.to_le_bytes()); }
+        let view = TensorView::new(Dtype::F32, &[2, 3], &raw).unwrap();
         let mut tensors = HashMap::new();
         tensors.insert("weight", view);
         let bytes = serialize(tensors).unwrap();
