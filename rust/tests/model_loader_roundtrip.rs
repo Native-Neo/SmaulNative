@@ -64,7 +64,7 @@ fn safetensors_loader_preserves_model_outputs() {
         let rk = t.r_k.clone().into_raw_vec();
         tensors.insert(format!("{p}.att.r_k"), tensor_view(&rk, &[4, 4]));
 
-        for (name, a) [
+        for (name, a) in [
             ("w1", &t.w1), ("w2", &t.w2), ("a1", &t.a1), ("a2", &t.a2),
             ("g1", &t.g1), ("g2", &t.g2),
             ("receptance.weight", &t.receptance), ("key.weight", &t.key),
