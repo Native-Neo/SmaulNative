@@ -141,18 +141,70 @@ impl MobaAttention {
         let k = self.key.forward(x);
         let v = self.value.forward(x);
         let past = cache_k.shape()[1];
-        let mut all_k = Array4::<f32>::zeros((self.heads, past + 1, 1, self.head_size));
-        let mut all_v = Array4::<f32>::zeros((self.heads, past + 1, 1, self.head_size));
+        assert_eq!(cache_k.shape(), &[self.heads, past, 1, self.head_size]);
+        assert_eq!(cache_v.shape(), &[self.heads, past, 1, self.head_size]);
+        let total = past + 1;
+        let mut all_k = Array4::<f32>::zeros((self.heads, total, 1, self.head_size));
+        let mut all_v = Array4::<f32>::zeros((self.heads, total, 1, self.head_size));
         for h in 0..self.heads {
-            for p in 0..past { for d in 0..self.head_size { all_k[[h, p, 0, d]] = cache_k[[h, p, 0, d]]; all_v[[h, p, 0, d]] = cache_v[[h, p, 0, d]]; } }
-            for d in 0..self.head_size { all_k[[h, past, 0, d]] = k[[0, h * self.head_size + d]]; all_v[[h, past, 0, d]] = v[[0, h * self.head_size + d]]; }
+            for p in 0..past {
+                for d in 0..self.head_size {
+                    all_k[[h, p, 0, d]] = cache_k[[h, p, 0, d]];
+                    all_v[[h, p, 0, d]] = cache_v[[h, p, 0, d]];
+                }
+            }
+            for d in 0..self.head_size {
+                all_k[[h, past, 0, d]] = k[[0, h * self.head_size + d]];
+                all_v[[h, past, 0, d]] = v[[0, h * self.head_size + d]];
+            }
         }
-        let mut result = Array2::<f32>::zeros((1, self.channels));
+
+        let cur_start = (past / self.chunk_size) * self.chunk_size;
+        let n_prev_chunks = cur_start / self.chunk_size;
+        let npick = usize::min(self.top_k, n_prev_chunks);
+        let use_moba = self.top_k > 0 && n_prev_chunks > self.top_k;
         let scale = (self.head_size as f32).sqrt().recip();
+        let mut result = Array2::<f32>::zeros((1, self.channels));
+
         for h in 0..self.heads {
             let qrow: Vec<f32> = (0..self.head_size).map(|d| q[[0, h * self.head_size + d]]).collect();
-            let keys: Vec<Vec<f32>> = (0..=past).map(|p| (0..self.head_size).map(|d| all_k[[h, p, 0, d]]).collect()).collect();
-            let values: Vec<Vec<f32>> = (0..=past).map(|p| (0..self.head_size).map(|d| all_v[[h, p, 0, d]]).collect()).collect();
+            let mut keys = Vec::<Vec<f32>>::new();
+            let mut values = Vec::<Vec<f32>>::new();
+
+            if use_moba {
+                let mut ranked = Vec::<(f32, usize)>::with_capacity(n_prev_chunks);
+                for chunk in 0..n_prev_chunks {
+                    let lo = chunk * self.chunk_size;
+                    let hi = lo + self.chunk_size;
+                    let mut mean = vec![0.0; self.head_size];
+                    for p in lo..hi {
+                        for d in 0..self.head_size { mean[d] += all_k[[h, p, 0, d]]; }
+                    }
+                    for d in 0..self.head_size { mean[d] /= self.chunk_size as f32; }
+                    ranked.push((Self::dot(&qrow, &mean), chunk));
+                }
+                ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+                ranked.truncate(npick);
+                for &(_, chunk) in &ranked {
+                    let lo = chunk * self.chunk_size;
+                    let hi = lo + self.chunk_size;
+                    for p in lo..hi {
+                        keys.push((0..self.head_size).map(|d| all_k[[h, p, 0, d]]).collect());
+                        values.push((0..self.head_size).map(|d| all_v[[h, p, 0, d]]).collect());
+                    }
+                }
+            } else {
+                for p in 0..cur_start {
+                    keys.push((0..self.head_size).map(|d| all_k[[h, p, 0, d]]).collect());
+                    values.push((0..self.head_size).map(|d| all_v[[h, p, 0, d]]).collect());
+                }
+            }
+
+            for p in cur_start..total {
+                keys.push((0..self.head_size).map(|d| all_k[[h, p, 0, d]]).collect());
+                values.push((0..self.head_size).map(|d| all_v[[h, p, 0, d]]).collect());
+            }
+
             let y = Self::attention(&qrow, &keys, &values, scale);
             for d in 0..self.head_size { result[[0, h * self.head_size + d]] = y[d]; }
         }
