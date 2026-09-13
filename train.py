@@ -16,12 +16,9 @@ if "--cpu" in sys.argv or "--rqt" in sys.argv:
     for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(key, threads)
     if "MKL_ENABLE_INSTRUCTIONS" not in os.environ:
-        try:
-            flags = Path("/proc/cpuinfo").read_text(errors="ignore")
-            if " avx" in flags or "\navx " in flags:
-                os.environ["MKL_ENABLE_INSTRUCTIONS"] = "AVX"
-        except OSError:
-            pass
+        flags = Path("/proc/cpuinfo").read_text(errors="ignore")
+        if " avx" in flags or "\navx " in flags:
+            os.environ["MKL_ENABLE_INSTRUCTIONS"] = "AVX"
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
     os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "ATEN,CPP")
@@ -115,96 +112,139 @@ def set_router_only_training(model, router_only):
         if isinstance(module, RWKV_CMix_MoE)
         for param in module.gate.parameters()
     }
-    trainable_params = set()
+    trainable_params = 0
     for param in model.parameters():
-        param.requires_grad = id(param) in gates if router_only else True
+        param.requires_grad_(id(param) in gates if router_only else True)
         if param.requires_grad:
-            trainable_params.add(id(param))
-    return sum(param.numel() for param in model.parameters() if id(param) in trainable_params)
+            trainable_params += param.numel()
+    return trainable_params
 
 
 class ResumeState:
-    def __init__(self, global_step=0, total_tokens=0, epoch=0, file_path="", record_index=0, buffer_tokens=None):
-        self.global_step = global_step
-        self.total_tokens = total_tokens
-        self.epoch = epoch
-        self.file_path = file_path
-        self.record_index = record_index
-        self.buffer_tokens = buffer_tokens or []
-
-    def save(self, path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.__dict__, indent=2))
+    def __init__(self):
+        self.global_step = 0
+        self.total_tokens = 0
+        self.file_path: Optional[str] = None
+        self.record_index = 0
+        self.epoch = 0
+        self.buffer_tokens = []
 
     @classmethod
     def load(cls, path):
-        if not path.exists():
-            return cls()
-        return cls(**json.loads(path.read_text()))
+        state = cls()
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if not isinstance(data, dict):
+                    raise ValueError("resume state must be a JSON object")
+                state.global_step = data.get("global_step", 0)
+                state.total_tokens = data.get("total_tokens", 0)
+                state.file_path = data.get("file_path")
+                state.record_index = data.get("record_index", 0)
+                state.epoch = data.get("epoch", 0)
+                state.buffer_tokens = data.get("buffer_tokens", [])
+            except Exception as exc:
+                raise RuntimeError(f"could not load resume state {path}: {exc}") from exc
+        return state
+
+    def save(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.__dict__, indent=2))
+        os.replace(tmp, path)
 
 
 def _save_rng_state(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
     state = {"torch": torch.get_rng_state()}
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(state, path)
+    tmp = path.with_suffix(".pt.tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
 
 
 def _load_rng_state(path):
     if not path.exists():
         return
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    if "torch" in state:
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if "torch" not in state:
+            raise ValueError("missing torch RNG state")
         torch.set_rng_state(state["torch"])
-    if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
-
-
-def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path, save_dtype, final):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    model_to_save = getattr(model, "_orig_mod", model)
-    model_to_save.save_pretrained(output_dir, dtype=save_dtype, include_upstream=False)
-    if tokenizer_path.exists():
-        shutil.copy2(tokenizer_path, output_dir / "tokenizer.json")
-    resume.save(checkpoint_dir / "resume_state.json")
-    _save_rng_state(checkpoint_dir / "rng_state.pt")
-    if final:
-        print("[SAVE COMPLETE] SmaulNative")
+        if torch.cuda.is_available() and "cuda" in state:
+            torch.cuda.set_rng_state_all(state["cuda"])
+    except Exception as exc:
+        raise RuntimeError(f"could not restore RNG state {path}: {exc}") from exc
 
 
 def _save_optimizer_checkpoint(optimizer, resume, checkpoint_dir):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
-    resume.save(checkpoint_dir / "resume_state.json")
+    tmp = checkpoint_dir / "optimizer.pt.tmp"
+    torch.save(optimizer.state_dict(), tmp)
+    os.replace(tmp, checkpoint_dir / "optimizer.pt")
     _save_rng_state(checkpoint_dir / "rng_state.pt")
+    resume.save(checkpoint_dir / "resume_state.json")
+
+
+def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path, save_dtype="fp32", save_optimizer=True):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    model = getattr(model, "_orig_mod", model)
+    model.save_pretrained(output_dir, dtype=save_dtype, include_upstream=False)
+    bundled = output_dir / "tokenizer.json"
+    if tokenizer_path.resolve() != bundled.resolve():
+        shutil.copy2(tokenizer_path, bundled)
+    if save_optimizer:
+        _save_optimizer_checkpoint(optimizer, resume, checkpoint_dir)
+    else:
+        resume.save(checkpoint_dir / "resume_state.json")
+    print(f"[SAVE COMPLETE] {output_dir}")
+
+
+def _autocast(args, device):
+    if device.type == "cuda":
+        dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    if args.precision == "bf16":
+        return torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 
 def _optimizer_step(args, model, optimizer, xb, yb, device, scaler):
     optimizer.zero_grad(set_to_none=True)
-    autocast_enabled = args.precision in ("fp16", "bf16") and device.type == "cuda"
-    autocast_dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
-    with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled):
-        logits = model(xb)
-        loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), yb.reshape(-1))
-    if scaler is not None:
+    with _autocast(args, device):
+        _, loss, _ = model(xb, labels=yb)
+    if not torch.isfinite(loss):
+        print(f"[WARN] non-finite loss {loss.item()}, skipping step")
+        return None
+    if scaler:
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+    else:
+        loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
+    if scaler:
         scaler.step(optimizer)
         scaler.update()
     else:
-        loss.backward()
         optimizer.step()
-    return loss.detach()
+    if args.rqt:
+        import rqt
+        rqt.refresh_rqt(model)
+    return loss
 
 
 def _remote_token_stream(name, tokenizer, ctx_len, resume):
-    position = [resume.file_path or "", resume.record_index, 0]
+    dataset = file_path = None
+    record = 0
+    if resume.file_path:
+        if "::" not in resume.file_path:
+            raise ValueError(f"invalid remote resume position: {resume.file_path!r}")
+        dataset, file_path = resume.file_path.split("::", 1)
+        record = resume.record_index
     buffer_tokens = list(resume.buffer_tokens)
-    for text, source, record in stream_dataset(name, resume.file_path, resume.record_index):
-        tokens = tokenizer.encode(text).ids
-        buffer_tokens.extend(tokens)
-        position[:] = [source, record, 0]
+    for text, position in stream_dataset(name, start_dataset=dataset, start_file=file_path, start_record=record, with_position=True):
+        buffer_tokens.extend(tokenizer.encode(text) + [tokenizer.eos_token_id])
         while len(buffer_tokens) >= ctx_len + 1:
             chunk = buffer_tokens[:ctx_len + 1]
             del buffer_tokens[:ctx_len]
