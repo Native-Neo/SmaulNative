@@ -33,7 +33,7 @@ def test_sampled_kl_is_zero_when_policies_match():
 
 def test_autorl_uses_sampled_old_policy_kl():
     old = torch.tensor([-1.0, -2.0, -3.0])
-    new = torch.tensor([-1.2, -1.8, -3.0])
+    new = torch.tensor([-1.3, -2.0, -2.8])
     expected = -(new - old).mean()
     wrong_reverse_kl = (torch.exp(new - old) - (new - old) - 1).mean()
     assert expected > 0
