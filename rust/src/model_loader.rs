@@ -4,7 +4,8 @@ use ndarray::{Array1, Array2};
 
 fn a1(loader: &SafetensorsLoader, name: &str) -> Result<Array1<f32>, String> { loader.f32_1d(name) }
 fn a2(loader: &SafetensorsLoader, name: &str) -> Result<Array2<f32>, String> { loader.f32_2d(name) }
-fn linear(loader: &SafetensorsLoader, name: &str) -> Result<Array2<f32>, String> { loader.f32_2d_transposed(name) }
+fn direct_linear(loader: &SafetensorsLoader, name: &str) -> Result<Array2<f32>, String> { loader.f32_2d_transposed(name) }
+fn module_linear(loader: &SafetensorsLoader, name: &str) -> Result<Array2<f32>, String> { loader.f32_2d(name) }
 
 fn set_norm(loader: &SafetensorsLoader, prefix: &str, weight: &mut Array1<f32>, bias: &mut Array1<f32>) -> Result<(), String> {
     *weight = a1(loader, &format!("{prefix}.weight"))?;
@@ -18,7 +19,6 @@ fn load_rwkv_block(loader: &SafetensorsLoader, model: &mut RwkvModel, i: usize) 
     if let Some(norm) = block.ln0.as_mut() { set_norm(loader, &format!("{p}.ln0"), &mut norm.weight, &mut norm.bias)?; }
     set_norm(loader, &format!("{p}.ln1"), &mut block.ln1.weight, &mut block.ln1.bias)?;
     set_norm(loader, &format!("{p}.ln2"), &mut block.ln2.weight, &mut block.ln2.bias)?;
-
     let t = &mut block.time_mix;
     t.x_r = a1(loader, &format!("{p}.att.x_r"))?;
     t.x_w = a1(loader, &format!("{p}.att.x_w"))?;
@@ -40,16 +40,15 @@ fn load_rwkv_block(loader: &SafetensorsLoader, model: &mut RwkvModel, i: usize) 
     t.k_k = a1(loader, &format!("{p}.att.k_k"))?;
     t.k_a = a1(loader, &format!("{p}.att.k_a"))?;
     t.r_k = a2(loader, &format!("{p}.att.r_k"))?;
-    t.receptance = linear(loader, &format!("{p}.att.receptance.weight"))?;
-    t.key = linear(loader, &format!("{p}.att.key.weight"))?;
-    t.value = linear(loader, &format!("{p}.att.value.weight"))?;
-    t.output = linear(loader, &format!("{p}.att.output.weight"))?;
+    t.receptance = direct_linear(loader, &format!("{p}.att.receptance.weight"))?;
+    t.key = direct_linear(loader, &format!("{p}.att.key.weight"))?;
+    t.value = direct_linear(loader, &format!("{p}.att.value.weight"))?;
+    t.output = direct_linear(loader, &format!("{p}.att.output.weight"))?;
     set_norm(loader, &format!("{p}.att.ln_x"), &mut t.ln_x.weight, &mut t.ln_x.bias)?;
-
     let c = &mut block.cmix;
     c.x_k = a1(loader, &format!("{p}.ffn.x_k"))?;
-    c.key = linear(loader, &format!("{p}.ffn.key.weight"))?;
-    c.value = linear(loader, &format!("{p}.ffn.value.weight"))?;
+    c.key = direct_linear(loader, &format!("{p}.ffn.key.weight"))?;
+    c.value = direct_linear(loader, &format!("{p}.ffn.value.weight"))?;
     Ok(())
 }
 
@@ -58,13 +57,13 @@ fn load_moba_block(loader: &SafetensorsLoader, model: &mut RwkvModel, i: usize) 
     let p = format!("moba_blocks.{i}");
     set_norm(loader, &format!("{p}.ln1"), &mut block.ln1.weight, &mut block.ln1.bias)?;
     set_norm(loader, &format!("{p}.ln2"), &mut block.ln2.weight, &mut block.ln2.bias)?;
-    block.att.receptance.weight = linear(loader, &format!("{p}.att.receptance.weight"))?;
-    block.att.key.weight = linear(loader, &format!("{p}.att.key.weight"))?;
-    block.att.value.weight = linear(loader, &format!("{p}.att.value.weight"))?;
-    block.att.output.weight = linear(loader, &format!("{p}.att.output.weight"))?;
+    block.att.receptance.weight = module_linear(loader, &format!("{p}.att.receptance.weight"))?;
+    block.att.key.weight = module_linear(loader, &format!("{p}.att.key.weight"))?;
+    block.att.value.weight = module_linear(loader, &format!("{p}.att.value.weight"))?;
+    block.att.output.weight = module_linear(loader, &format!("{p}.att.output.weight"))?;
     block.ffn.x_k = a1(loader, &format!("{p}.ffn.x_k"))?;
-    block.ffn.key = linear(loader, &format!("{p}.ffn.key.weight"))?;
-    block.ffn.value = linear(loader, &format!("{p}.ffn.value.weight"))?;
+    block.ffn.key = direct_linear(loader, &format!("{p}.ffn.key.weight"))?;
+    block.ffn.value = direct_linear(loader, &format!("{p}.ffn.value.weight"))?;
     Ok(())
 }
 
@@ -72,7 +71,7 @@ pub fn load_model_safetensors(model: &mut RwkvModel, path: impl AsRef<std::path:
     let loader = SafetensorsLoader::open(path)?;
     model.embedding.weight = loader.f32_2d("emb.weight")?;
     set_norm(&loader, "ln_out", &mut model.ln_out.weight, &mut model.ln_out.bias)?;
-    model.head.weight = linear(&loader, "head.weight")?;
+    model.head.weight = module_linear(&loader, "head.weight")?;
     for i in 0..model.rwkv_blocks.len() { load_rwkv_block(&loader, model, i)?; }
     for i in 0..model.moba_blocks.len() { load_moba_block(&loader, model, i)?; }
     Ok(())
