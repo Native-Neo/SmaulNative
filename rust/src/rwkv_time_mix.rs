@@ -105,7 +105,13 @@ impl RwkvTimeMix {
 
     fn project(x: &Array2<f32>, weight: &Array2<f32>) -> Array2<f32> { x.dot(weight) }
 
-    pub fn forward(&self, x: &Array2<f32>, state: Option<Array4<f32>>, prev: Option<Array1<f32>>) -> (Array2<f32>, Array4<f32>, Array1<f32>) {
+    pub fn forward(
+        &self,
+        x: &Array2<f32>,
+        state: Option<Array4<f32>>,
+        prev: Option<Array1<f32>>,
+        v_first: Option<Array2<f32>>,
+    ) -> (Array2<f32>, Array4<f32>, Array1<f32>, Array2<f32>) {
         assert!(x.nrows() > 0);
         let zero = Array1::zeros(self.channels);
         let prev_ref = prev.as_ref().unwrap_or(&zero);
@@ -122,14 +128,19 @@ impl RwkvTimeMix {
         let mut v = project(&xv, &self.value);
         let a = project(&project(&xa, &self.a1), &self.a2).mapv(sigmoid);
         let g = project(&project(&xg, &self.g1).mapv(sigmoid), &self.g2);
-        let v_first = v.clone();
+
+        let layer_v_first = match v_first {
+            Some(first) => first,
+            None => v.clone(),
+        };
         if let (Some(v1), Some(v2), Some(v0)) = (&self.v1, &self.v2, &self.v0) {
             let correction = project(&project(&xv, v1), v2);
             for t in 0..v.nrows() { for c in 0..self.channels {
                 let gate = sigmoid(v0[c] + correction[[t, c]]);
-                v[[t, c]] += (v_first[[t, c]] - v[[t, c]]) * gate;
+                v[[t, c]] += (layer_v_first[[t, c]] - v[[t, c]]) * gate;
             }}
         }
+
         let mut kk = k.clone();
         for t in 0..kk.nrows() { for h in 0..self.heads {
             let start = h * self.head_size;
@@ -153,7 +164,7 @@ impl RwkvTimeMix {
         }}
         for t in 0..out.nrows() { for c in 0..self.channels { out[[t, c]] *= g[[t, c]]; }}
         out = out.dot(&self.output);
-        (out, next_state, x.row(x.nrows() - 1).to_owned())
+        (out, next_state, x.row(x.nrows() - 1).to_owned(), layer_v_first)
     }
 
     pub fn parameter_count(&self) -> usize {
@@ -173,9 +184,10 @@ mod tests {
     fn x070_shapes() {
         let layer = RwkvTimeMix::new(16, 2, 0, 4);
         let x = Array2::ones((3, 16));
-        let (out, state, last) = layer.forward(&x, None, None);
+        let (out, state, last, first) = layer.forward(&x, None, None, None);
         assert_eq!(out.shape(), &[3, 16]);
         assert_eq!(state.shape(), &[1, 2, 8, 8]);
         assert_eq!(last.len(), 16);
+        assert_eq!(first.shape(), &[3, 16]);
     }
 }
