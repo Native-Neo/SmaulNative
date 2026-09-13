@@ -182,7 +182,7 @@ class RWKV_CMix_x070(nn.Module):
         return self.value(torch.relu(self.key(x + xx * self.x_k))**2), x[:, -1]
 
     def forward_selected(self, x, prev):
-        return self.value(torch.relu(self.key(x + (prev - x) * self.x_k))**2)
+        return self.value(torch.relu(self.key(x + (prev - x) * self.x_k.view(-1)))**2)
 
 
 class RWKV_CMix_MoE(nn.Module):
