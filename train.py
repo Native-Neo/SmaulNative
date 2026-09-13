@@ -418,7 +418,7 @@ def _build_model(args, tokenizer):
     checkpoint = _checkpoint_config(args.output_dir)
     checkpoint_path = Path(args.output_dir) / "model.safetensors"
     if checkpoint_path.exists() and checkpoint == config:
-        model = RWKVXModel.from_pretrained(args.output_dir, load_upstream=False)
+        model = RWKVXModel.from_pretrained(args.output_dir)
         print(f"[MODEL CONFIG] checkpoint={config}")
         return model
     model = RWKVXModel(config)
@@ -430,12 +430,16 @@ def main():
     args = parse_args()
     backend = require_backend(torch, force_cpu=args.cpu)
     device = backend_device(torch, backend)
+    if device.type == "cpu":
+        import cpu
+        cpu.configure()
     print(f"[DEVICE] {device} | precision={args.precision}")
     if backend in ("hip", "cuda"):
         print(f"[GPU] {torch.cuda.get_device_name(0)}")
         print("[LOWBIT] native FP2/FP4 kernels")
     else:
         print(f"[CPU BACKEND] {backend_name(backend)}")
+        print("[WKV] native CPU")
     tokenizer = _load_or_build_tokenizer(args)
     model = _build_model(args, tokenizer).to(device)
     if args.router_only:
