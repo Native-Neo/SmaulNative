@@ -16,7 +16,7 @@ class Engine:
         return text.split()
 
     def chat_prompt(self, messages, system=None):
-        return "prompt"
+        return "prompt exceeds limit"
 
     def stream(self, *args, **kwargs):
         yield "ok"
