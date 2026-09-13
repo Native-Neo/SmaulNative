@@ -29,6 +29,7 @@ pub mod model_backward;
 pub mod model_gradients;
 pub mod model_head_backward;
 pub mod model_loader;
+pub mod model_train_step;
 pub mod optimizer;
 pub mod params;
 pub mod residual;
