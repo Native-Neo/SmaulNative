@@ -1,3 +1,4 @@
+use crate::init::uniform;
 use ndarray::{Array1, Array2};
 
 pub struct RwkvCmix {
@@ -18,15 +19,9 @@ impl RwkvCmix {
             1.0 - d.powf(r.powi(4))
         }));
         let hidden = channels * 4;
-        let mut key = Array2::<f32>::zeros((channels, hidden));
-        let value = Array2::<f32>::zeros((hidden, channels));
         let scale = 0.5 / (channels as f32).sqrt();
-        for i in 0..channels {
-            for j in 0..hidden {
-                let z = ((i * hidden + j + 1) as f32 * 12.9898).sin() * 43758.547;
-                key[[i, j]] = (z - z.floor()) * 2.0 * scale - scale;
-            }
-        }
+        let key = uniform(channels, hidden, -scale, scale, 0x434d_4958_4b4559 ^ layer_id as u64);
+        let value = Array2::zeros((hidden, channels));
         Self { channels, layer_id, n_layer, x_k, key, value }
     }
 
