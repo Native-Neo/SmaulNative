@@ -47,7 +47,7 @@ def _mkl_available(torch):
 
 
 def _aocl_available():
-    return _library_available("amdblis", "amdlibm")
+    return _library_available("amdblis")
 
 
 def detect_backend(torch, force_cpu=False):
@@ -82,5 +82,11 @@ def require_backend(torch, force_cpu=False):
     if backend is None:
         print("ERR: Device NOT supported!")
         raise RuntimeError("Device NOT supported")
+    if backend in ("aocl", "mkl"):
+        try:
+            from cpu import configure
+            configure()
+        except Exception as exc:
+            raise RuntimeError(f"failed to configure native CPU backend: {exc}") from exc
     print(f"[BACKEND] {backend_name(backend)}")
     return backend
