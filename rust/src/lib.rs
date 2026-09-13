@@ -7,5 +7,6 @@ pub mod linear;
 pub mod optimizer;
 pub mod rwkv_block;
 pub mod rwkv_cmix;
+pub mod rwkv_model;
 pub mod rwkv_time_mix;
 pub mod wkv;
