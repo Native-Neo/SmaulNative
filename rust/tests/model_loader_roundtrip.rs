@@ -47,18 +47,26 @@ fn safetensors_loader_preserves_model_outputs() {
             tensors.insert(format!("{p}.{name}.weight"), tensor_view(&w, &[16]));
             tensors.insert(format!("{p}.{name}.bias"), tensor_view(&b, &[16]));
         }
+
         let t = &block.time_mix;
         for (name, data) in [
             ("x_r", t.x_r.to_vec()), ("x_w", t.x_w.to_vec()), ("x_k", t.x_k.to_vec()),
             ("x_v", t.x_v.to_vec()), ("x_a", t.x_a.to_vec()), ("x_g", t.x_g.to_vec()),
-            ("w0", t.w0.to_vec()), ("a0", t.a0.to_vec()), ("v0", t.v0.to_vec()),
-            ("k_k", t.k_k.to_vec()), ("k_a", t.k_a.to_vec()),
+            ("w0", t.w0.to_vec()), ("a0", t.a0.to_vec()), ("k_k", t.k_k.to_vec()),
+            ("k_a", t.k_a.to_vec()),
         ] {
             tensors.insert(format!("{p}.att.{name}"), tensor_view(&data, &[16]));
         }
-        for (name, a) in [
+        if let Some(v0) = &t.v0 {
+            let data = v0.to_vec();
+            tensors.insert(format!("{p}.att.v0"), tensor_view(&data, &[16]));
+        }
+        let rk = t.r_k.clone().into_raw_vec();
+        tensors.insert(format!("{p}.att.r_k"), tensor_view(&rk, &[4, 4]));
+
+        for (name, a) [
             ("w1", &t.w1), ("w2", &t.w2), ("a1", &t.a1), ("a2", &t.a2),
-            ("v2", &t.v2), ("g1", &t.g1), ("g2", &t.g2), ("r_k", &t.r_k),
+            ("g1", &t.g1), ("g2", &t.g2),
             ("receptance.weight", &t.receptance), ("key.weight", &t.key),
             ("value.weight", &t.value), ("output.weight", &t.output),
         ] {
@@ -67,10 +75,22 @@ fn safetensors_loader_preserves_model_outputs() {
             let py_shape = vec![shape[1], shape[0]];
             tensors.insert(format!("{p}.att.{name}"), tensor_view(&data, &py_shape));
         }
+        if let Some(v1) = &t.v1 {
+            let data = v1.t().to_owned().into_raw_vec();
+            let shape = v1.shape();
+            tensors.insert(format!("{p}.att.v1"), tensor_view(&data, &[shape[1], shape[0]]));
+        }
+        if let Some(v2) = &t.v2 {
+            let data = v2.t().to_owned().into_raw_vec();
+            let shape = v2.shape();
+            tensors.insert(format!("{p}.att.v2"), tensor_view(&data, &[shape[1], shape[0]]));
+        }
+
         let ln_x_w = t.ln_x.weight.to_vec();
         let ln_x_b = t.ln_x.bias.to_vec();
         tensors.insert(format!("{p}.att.ln_x.weight"), tensor_view(&ln_x_w, &[16]));
         tensors.insert(format!("{p}.att.ln_x.bias"), tensor_view(&ln_x_b, &[16]));
+
         let c = &block.cmix;
         let x_k = c.x_k.to_vec();
         tensors.insert(format!("{p}.ffn.x_k"), tensor_view(&x_k, &[16]));
