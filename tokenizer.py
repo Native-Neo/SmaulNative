@@ -192,6 +192,10 @@ def _build(texts, vocab_size, word_budget, max_records=0):
                 tokens.append(x); seen_tokens.add(x)
             if len(tokens) >= vocab_size: break
         if len(tokens) >= vocab_size: break
+    while len(tokens) < vocab_size:
+        token = f"<unused_{len(tokens)}>"
+        tokens.append(token)
+        seen_tokens.add(token)
     vocab = {x: i for i, x in enumerate(tokens)}
     return {"version": 5, "vocab": vocab, "special_tokens": SPECIAL, "case_tokens": CASE, "case_stats": {w: dict(c) for w, c in cases.items()}, "unk_id": vocab["<unk>"], "stats": {"vocab_size": len(vocab), "whole_words": min(word_budget, len(words)), "unique_words": len(words), "total_words": total_words, "total_tokens": total_tokens, "devanagari_units": len(graphemes), "characters": len(chars), "symbols": len(symbols)}}
 
@@ -240,14 +244,27 @@ def decode(ids, tok):
         out.append(t); case = None
     return "".join(out)
 
-def train_tokenizer(dataset_dir, output_path, vocab_size=64000, stream_name="none", max_records=0):
-    if stream_name != "none":
+def train_tokenizer(dataset_dir, output_path, vocab_size=64000, stream_name="none", max_records=0, texts=None):
+    if texts is not None:
+        data = _build(texts, vocab_size, 40000, max_records)
+    elif stream_name != "none":
         from stream_data import stream_dataset
         data = _build(stream_dataset(stream_name), vocab_size, 40000, max_records)
     else: data = train(dataset_dir, vocab_size=vocab_size, max_records=max_records)
     tok = SmaulTokenizer(data); tok.save(output_path); return tok
 
 def ensure_tokenizer(dataset_dir, output_path, vocab_size, stream_name="none", max_records=0):
+    if not isinstance(output_path, (str, Path)):
+        path = Path(dataset_dir)
+        texts = output_path
+        if path.exists():
+            tok = load(path)
+            if tok.get_vocab_size() == vocab_size:
+                return tok
+            print(f"[TOKENIZER] vocabulary mismatch: existing={tok.get_vocab_size()} requested={vocab_size}; rebuilding")
+        else:
+            print(f"[TOKENIZER] creating vocabulary={vocab_size}")
+        return train_tokenizer(path, path, vocab_size, max_records=max_records, texts=texts)
     path = Path(output_path)
     if path.exists():
         tok = load(path)
