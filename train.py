@@ -179,6 +179,15 @@ def _load_rng_state(path):
         raise RuntimeError(f"could not restore RNG state {path}: {exc}") from exc
 
 
+def _save_optimizer_checkpoint(optimizer, resume, checkpoint_dir):
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tmp = checkpoint_dir / "optimizer.pt.tmp"
+    torch.save(optimizer.state_dict(), tmp)
+    os.replace(tmp, checkpoint_dir / "optimizer.pt")
+    _save_rng_state(checkpoint_dir / "rng_state.pt")
+    resume.save(checkpoint_dir / "resume_state.json")
+
+
 def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokenizer_path, save_dtype="fp32", save_optimizer=True):
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -188,11 +197,9 @@ def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokeni
     if tokenizer_path.resolve() != bundled.resolve():
         shutil.copy2(tokenizer_path, bundled)
     if save_optimizer:
-        tmp = checkpoint_dir / "optimizer.pt.tmp"
-        torch.save(optimizer.state_dict(), tmp)
-        os.replace(tmp, checkpoint_dir / "optimizer.pt")
-        _save_rng_state(checkpoint_dir / "rng_state.pt")
-    resume.save(checkpoint_dir / "resume_state.json")
+        _save_optimizer_checkpoint(optimizer, resume, checkpoint_dir)
+    else:
+        resume.save(checkpoint_dir / "resume_state.json")
     print(f"[SAVE COMPLETE] {output_dir}")
 
 
@@ -298,8 +305,10 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler):
             print(f"step {resume.global_step} | loss {loss.item():.4f} | {tokens_since_log / max(elapsed, 1e-9):.1f} tok/s | tokens {resume.total_tokens:,}")
             t0 = time.perf_counter()
             tokens_since_log = 0
-        if resume.global_step % args.save_every == 0 and resume.global_step % args.optimizer_save_every == 0:
-            save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), args.save_dtype, True)
+        if resume.global_step % args.save_every == 0:
+            save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), args.save_dtype, False)
+        if resume.global_step % args.optimizer_save_every == 0:
+            _save_optimizer_checkpoint(optimizer, resume, Path(args.checkpoint_dir))
         if STOP_REQUESTED:
             break
     if batch_x and not STOP_REQUESTED:
@@ -329,8 +338,10 @@ def train_sft(args, model, optimizer, resume, device, tokenizer, scaler):
             resume.record_index = consumed
             if resume.global_step % args.log_every == 0:
                 print(f"epoch {epoch} step {resume.global_step} | loss {loss.item():.4f}")
-            if resume.global_step % args.save_every == 0 and resume.global_step % args.optimizer_save_every == 0:
-                save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), args.save_dtype, True)
+            if resume.global_step % args.save_every == 0:
+                save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), args.save_dtype, False)
+            if resume.global_step % args.optimizer_save_every == 0:
+                _save_optimizer_checkpoint(optimizer, resume, Path(args.checkpoint_dir))
             if STOP_REQUESTED:
                 break
         if STOP_REQUESTED:
