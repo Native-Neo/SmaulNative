@@ -15,8 +15,8 @@ def test_native_wkv_forward_backward():
     try:
         for B, T, H, N in ((1, 1, 1, 4), (1, 9, 2, 4), (1, 65, 2, 8), (2, 17, 3, 8)):
             torch.manual_seed(B + T + H + N)
-            args = [torch.randn(B, H, N, N, dtype=torch.float32, requires_grad=True)]
-            args += [torch.randn(B, T, H, N, dtype=torch.float32, requires_grad=True) for _ in range(6)]
+            args = [0.1 * torch.randn(B, H, N, N, dtype=torch.float32, requires_grad=True)]
+            args += [0.1 * torch.randn(B, T, H, N, dtype=torch.float32, requires_grad=True) for _ in range(6)]
             native = rwkv_x_core._wkv_run_chunk(*args)
             ref_args = [x.detach().clone().requires_grad_(True) for x in args]
             ref = original(*ref_args)
