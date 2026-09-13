@@ -29,19 +29,19 @@ class _RQTFunction(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         quant = ctx.quant
         out_features, in_features = quant._shape
-        if x.device.type == "cuda" and x.dtype == torch.float32 and quant.bits < 8:
+        x2 = x.reshape(-1, in_features)
+        go = grad_output.reshape(-1, out_features)
+        if x.device.type == "cuda" and quant.bits < 8:
+            go32 = go.float().contiguous()
             grad_x = packed_linear_transpose(
-                grad_output.float(), quant.packed, quant.scale,
+                go32, quant.packed, quant.scale,
                 quant.bits, out_features, in_features,
             ).reshape_as(x)
+            grad_weight = go32.transpose(0, 1).matmul(x2.float())
         else:
             q = quant.unpack(x.device, x.dtype)
-            x2 = x.reshape(-1, x.shape[-1])
-            go = grad_output.reshape(-1, grad_output.shape[-1])
             grad_x = go.matmul(q).reshape_as(x)
-        x2 = x.reshape(-1, x.shape[-1])
-        go = grad_output.reshape(-1, grad_output.shape[-1])
-        grad_weight = go.transpose(0, 1).matmul(x2)
+            grad_weight = go.transpose(0, 1).matmul(x2)
         return grad_x, grad_weight, None
 
 
