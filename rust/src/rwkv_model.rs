@@ -78,6 +78,10 @@ impl RwkvModel {
         Self { config, embedding, rwkv_blocks, moba_blocks, order, ln_out, head }
     }
 
+    pub fn load_safetensors(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
+        crate::model_loader::load_model_safetensors(self, path)
+    }
+
     pub fn forward(&self, token_ids: &[usize], state: Option<&RwkvModelState>) -> (Array2<f32>, RwkvModelState) {
         assert!(!token_ids.is_empty());
         let mut x = self.embedding.forward(token_ids);
