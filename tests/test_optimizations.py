@@ -100,10 +100,19 @@ def test_moe_matches_dense_reference():
     assert torch.allclose(sparse, dense, rtol=1e-5, atol=1e-6)
 
 
+def test_moe_parameter_estimate_includes_experts():
+    dense = RWKVXConfig(vocab_size=32, n_embd=16, n_layer=4, n_moba_layer=1, head_size=4)
+    moe = RWKVXConfig(vocab_size=32, n_embd=16, n_layer=4, n_moba_layer=1, head_size=4,
+                      is_moe=True, num_experts=4, num_experts_per_tok=2)
+    expected_delta = dense.n_layer * ((moe.num_experts - 1) * 8 * moe.n_embd**2 + moe.n_embd * moe.num_experts)
+    assert moe.approx_param_count() - dense.approx_param_count() == expected_delta
+
+
 if __name__ == "__main__":
     test_lowbit_roundtrip()
     test_quantized_linear_forward_is_stable()
     test_sft_dataset_caches_processed_records()
     test_native_lion_fallback_matches_lion_update()
     test_moe_matches_dense_reference()
+    test_moe_parameter_estimate_includes_experts()
     print("optimization tests passed")
