@@ -6,9 +6,40 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import torch
+import torch.nn as nn
 
 from rwkv_x_core import RWKVXConfig, RWKVXModel
 from tokenizer import SmaulTokenizer
+
+
+class _TokenGroupNorm(nn.Module):
+    """GroupNorm equivalent for token-wise [batch, channels] tensors."""
+
+    def __init__(self, source: nn.GroupNorm):
+        super().__init__()
+        self.num_groups = source.num_groups
+        self.num_channels = source.num_channels
+        self.eps = source.eps
+        self.weight = nn.Parameter(source.weight.detach().clone())
+        self.bias = nn.Parameter(source.bias.detach().clone())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        channels_per_group = self.num_channels // self.num_groups
+        y = x.reshape(-1, self.num_groups, channels_per_group)
+        mean = y.mean(dim=-1, keepdim=True)
+        var = (y - mean).square().mean(dim=-1, keepdim=True)
+        y = (y - mean) * torch.rsqrt(var + self.eps)
+        y = y.reshape(shape)
+        return y * self.weight + self.bias
+
+
+def _patch_degenerate_groupnorm(module: nn.Module):
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.GroupNorm):
+            setattr(module, name, _TokenGroupNorm(child))
+        else:
+            _patch_degenerate_groupnorm(child)
 
 
 class _IncrementalDecoder:
@@ -135,6 +166,7 @@ class RWKVXInference:
             if self.device.type == "cpu" and dtype == "fp16":
                 dtype = "fp32"
             self.model = self.model.to({"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[dtype])
+        _patch_degenerate_groupnorm(self.model)
         self.model.eval()
 
     @property
