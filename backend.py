@@ -28,13 +28,13 @@ def _gpu_supported(torch, backend):
         try:
             arch = str(torch.cuda.get_device_properties(0).gcnArchName).lower()
         except Exception:
-            return True
-        if arch.startswith("gfx"):
-            try:
-                return int(arch[3:5]) >= 8
-            except ValueError:
-                return False
-        return True
+            return False
+        if not arch.startswith("gfx"):
+            return False
+        try:
+            return int(arch[3:5]) >= 8
+        except ValueError:
+            return False
     return False
 
 
