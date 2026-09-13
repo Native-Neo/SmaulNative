@@ -10,6 +10,7 @@ import train
 def test_final_partial_batch_is_flushed(monkeypatch):
     class Args:
         stream_dataset = "none"
+        dataset_dir = "."
         ctx_len = 4
         batch_size = 2
         log_every = 999
@@ -38,6 +39,7 @@ def test_final_partial_batch_is_flushed(monkeypatch):
 def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
     class Args:
         stream_dataset = "none"
+        dataset_dir = "."
         ctx_len = 4
         batch_size = 1
         log_every = 999
