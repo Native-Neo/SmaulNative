@@ -81,6 +81,18 @@ def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
     assert saves == [1, 2]
 
 
+def test_model_save_does_not_write_resume_state(tmp_path):
+    class Model:
+        def save_pretrained(self, output_dir, dtype="fp32", include_upstream=False):
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    tokenizer = tmp_path / "tokenizer.json"
+    tokenizer.write_text("{}")
+    resume = train.ResumeState()
+    train.save_checkpoint(Model(), DummyOptimizer(), resume, tmp_path / "model", tmp_path / "checkpoint", tokenizer, save_optimizer=False)
+    assert not (tmp_path / "checkpoint" / "resume_state.json").exists()
+
+
 def test_resume_state_round_trip(tmp_path):
     state = train.ResumeState()
     state.global_step = 7
