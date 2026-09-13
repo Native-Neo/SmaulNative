@@ -20,4 +20,5 @@ pub mod rwkv_cmix;
 pub mod rwkv_model;
 pub mod rwkv_time_mix;
 pub mod safetensors;
+pub mod training;
 pub mod wkv;
