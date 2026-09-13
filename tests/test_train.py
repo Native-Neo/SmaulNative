@@ -125,3 +125,10 @@ def test_malformed_remote_resume_position_fails_loudly():
     resume.file_path = "local_dataset.txt"
     with pytest.raises(ValueError, match="invalid remote resume position"):
         next(train._remote_token_stream("hindi", object(), 4, resume))
+
+
+def test_parse_args_rejects_nonpositive_checkpoint_intervals(monkeypatch):
+    for flag in ("--save_every", "--optimizer_save_every"):
+        monkeypatch.setattr(sys, "argv", ["train.py", "--mode", "pretrain", flag, "0"])
+        with pytest.raises(SystemExit):
+            train.parse_args()
