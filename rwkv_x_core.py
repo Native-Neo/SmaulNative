@@ -48,6 +48,8 @@ class RWKVXConfig:
         dg = max(32, round(0.6 * C**0.8 / 32) * 32)
         tmix = 4 * C * C + C * (4 * dd + 2 * dm + 2 * dg)
         cmix = 8 * C * C
+        if self.is_moe:
+            cmix = self.num_experts * cmix + C * self.num_experts
         return 2 * V * C + (L - self.n_moba_layer) * (tmix + cmix) + self.n_moba_layer * (4 * C * C + cmix)
 
 
