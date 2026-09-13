@@ -33,12 +33,18 @@ fn load_rwkv_block(loader: &SafetensorsLoader, model: &mut RwkvModel, i: usize) 
     t.a0 = a1(loader, &format!("{p}.att.a0"))?;
     t.a1 = a2(loader, &format!("{p}.att.a1"))?;
     t.a2 = a2(loader, &format!("{p}.att.a2"))?;
-    t.v0 = a1(loader, &format!("{p}.att.v0"))?;
+    t.v0 = match t.v0.as_ref() {
+        Some(_) => Some(a1(loader, &format!("{p}.att.v0"))?),
+        None => None,
+    };
     t.v1 = match t.v1.as_ref() {
         Some(_) => Some(a2(loader, &format!("{p}.att.v1"))?),
         None => None,
     };
-    t.v2 = a2(loader, &format!("{p}.att.v2"))?;
+    t.v2 = match t.v2.as_ref() {
+        Some(_) => Some(a2(loader, &format!("{p}.att.v2"))?),
+        None => None,
+    };
     t.g1 = a2(loader, &format!("{p}.att.g1"))?;
     t.g2 = a2(loader, &format!("{p}.att.g2"))?;
     t.k_k = a1(loader, &format!("{p}.att.k_k"))?;
