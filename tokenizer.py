@@ -247,6 +247,17 @@ def train_tokenizer(dataset_dir, output_path, vocab_size=64000, stream_name="non
     else: data = train(dataset_dir, vocab_size=vocab_size, max_records=max_records)
     tok = SmaulTokenizer(data); tok.save(output_path); return tok
 
+def ensure_tokenizer(dataset_dir, output_path, vocab_size, stream_name="none", max_records=0):
+    path = Path(output_path)
+    if path.exists():
+        tok = load(path)
+        if tok.get_vocab_size() == vocab_size:
+            return tok, False
+        print(f"[TOKENIZER] vocabulary mismatch: existing={tok.get_vocab_size()} requested={vocab_size}; rebuilding")
+    else:
+        print(f"[TOKENIZER] creating vocabulary={vocab_size}")
+    return train_tokenizer(dataset_dir, path, vocab_size, stream_name, max_records), True
+
 def main():
     p = argparse.ArgumentParser(); s = p.add_subparsers(dest="cmd", required=True)
     x = s.add_parser("train"); x.add_argument("--fromdataset", required=True); x.add_argument("--vocab-size", type=int, default=64000); x.add_argument("--word-budget", type=int, default=40000); x.add_argument("--max-records", type=int, default=0); x.add_argument("--output", default="tokenizer.json"); x.set_defaults(f=train_cmd)
