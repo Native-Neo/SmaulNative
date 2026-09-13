@@ -1,12 +1,16 @@
 pub mod activation;
 pub mod attention;
+pub mod attention_backward;
 pub mod autograd;
 pub mod embedding;
 pub mod ffn;
+pub mod ffn_backward;
+pub mod gelu;
 pub mod gradient;
 pub mod group_norm;
 pub mod init;
 pub mod layer_norm;
+pub mod layer_norm_backward;
 pub mod linear;
 pub mod loss;
 pub mod matmul;
