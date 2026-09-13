@@ -7,6 +7,11 @@ import torch
 import train
 
 
+class DummyModel:
+    def train(self):
+        return self
+
+
 def test_final_partial_batch_is_flushed(monkeypatch):
     class Args:
         stream_dataset = "none"
@@ -32,7 +37,7 @@ def test_final_partial_batch_is_flushed(monkeypatch):
     monkeypatch.setattr(train, "save_checkpoint", lambda *args, **kwargs: None)
     resume = train.ResumeState()
     train.STOP_REQUESTED = False
-    train.train_pretrain(Args(), object(), object(), resume, torch.device("cpu"), object(), None)
+    train.train_pretrain(Args(), DummyModel(), object(), resume, torch.device("cpu"), object(), None)
     assert calls == [1]
 
 
@@ -67,7 +72,7 @@ def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
     monkeypatch.setattr(train, "save_checkpoint", lambda *args, **kwargs: saves.append(args))
     resume = train.ResumeState()
     train.STOP_REQUESTED = False
-    train.train_pretrain(Args(), object(), object(), resume, torch.device("cpu"), object(), None)
+    train.train_pretrain(Args(), DummyModel(), object(), resume, torch.device("cpu"), object(), None)
     assert len(saves) == 1
     assert saves[0][2].global_step == 2
 
