@@ -144,10 +144,11 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
             elif suffix == ".jsonl":
                 with open(path, "r", encoding="utf-8") as f:
                     for i, line in enumerate(f):
-                        if i < start_idx:
-                            continue
                         line = line.strip()
                         if not line:
+                            continue
+                        record = i + 1
+                        if record <= start_idx:
                             continue
                         try:
                             obj = json.loads(line)
@@ -155,24 +156,26 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                             continue
                         text = extract_text(obj, str(path)).strip()
                         if text:
-                            yield text, str(path), i + 1
+                            yield text, str(path), record
             elif suffix == ".json":
                 data = json.loads(path.read_text(encoding="utf-8"))
                 records = data.get("data", data) if isinstance(data, dict) else data
                 if not isinstance(records, list):
                     records = [records]
-                for i in range(start_idx, len(records)):
-                    text = extract_text(records[i], str(path)).strip()
+                for i, record_obj in enumerate(records, 1):
+                    if i <= start_idx:
+                        continue
+                    text = extract_text(record_obj, str(path)).strip()
                     if text:
-                        yield text, str(path), i + 1
+                        yield text, str(path), i
             elif suffix == ".csv":
                 with open(path, "r", encoding="utf-8", newline="") as f:
-                    for i, row in enumerate(csv.DictReader(f)):
-                        if i < start_idx:
+                    for i, row in enumerate(csv.DictReader(f), 1):
+                        if i <= start_idx:
                             continue
                         text = extract_text(row, str(path)).strip()
                         if text:
-                            yield text, str(path), i + 1
+                            yield text, str(path), i
             elif suffix == ".parquet":
                 import pyarrow.parquet as pq
                 pf = pq.ParquetFile(path)
@@ -185,7 +188,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                         break
                 prompt_col = schema_names[schema_lower.index("prompt")] if "prompt" in schema_lower else None
                 completion_col = schema_names[schema_lower.index("completion")] if "completion" in schema_lower else None
-                i = -1
+                record = 0
                 columns = [fast_col] if fast_col is not None else None
                 if prompt_col and completion_col and prompt_col != completion_col:
                     columns = [prompt_col, completion_col]
@@ -194,29 +197,29 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                         prompt_data = batch.column(prompt_col).to_pylist()
                         completion_data = batch.column(completion_col).to_pylist()
                         for prompt, completion in zip(prompt_data, completion_data):
-                            i += 1
-                            if i < start_idx:
+                            record += 1
+                            if record <= start_idx:
                                 continue
                             text = extract_text({"prompt": prompt, "completion": completion}, str(path)).strip()
                             if text:
-                                yield text, str(path), i + 1
+                                yield text, str(path), record
                     elif fast_col is not None:
                         col = batch.column(fast_col)
                         for row_idx in range(batch.num_rows):
-                            i += 1
-                            if i < start_idx:
+                            record += 1
+                            if record <= start_idx:
                                 continue
                             val = col[row_idx].as_py()
                             if isinstance(val, str) and val.strip():
-                                yield val.strip(), str(path), i + 1
+                                yield val.strip(), str(path), record
                     else:
                         for row in batch.to_pylist():
-                            i += 1
-                            if i < start_idx:
+                            record += 1
+                            if record <= start_idx:
                                 continue
                             text = extract_text(row, str(path)).strip()
                             if text:
-                                yield text, str(path), i + 1
+                                yield text, str(path), record
         except Exception as e:
             raise RuntimeError(f"failed to read dataset file {path}") from e
 
