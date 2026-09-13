@@ -41,6 +41,17 @@ def _load_lowbit():
     return _LOWBIT_EXT
 
 
+def packed_linear_transpose(grad_output, packed, scale, bits, out_features, in_features):
+    if grad_output.device.type != "cuda":
+        raise ValueError("packed GPU backward requires CUDA/HIP")
+    return _load_lowbit().packed_linear_transpose(
+        grad_output.reshape(-1, out_features).contiguous(),
+        packed.to(grad_output.device),
+        scale.reshape(-1).float().to(grad_output.device),
+        bits, out_features, in_features,
+    )
+
+
 def _bits(bits):
     if bits not in _SUPPORTED_BITS:
         raise ValueError("bits must be 2, 4, or 8")
