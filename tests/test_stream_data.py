@@ -45,13 +45,19 @@ def test_failed_row_group_is_not_silently_skipped(monkeypatch):
         num_row_groups = 1
         schema_arrow = type("Schema", (), {"names": ["text"]})()
 
+    class FakeParquetFile:
+        def __init__(self, handle):
+            self.num_row_groups = FakeFile.num_row_groups
+            self.schema_arrow = FakeFile.schema_arrow
+
     class FakeContext:
         def __enter__(self):
-            return FakeFile()
+            return object()
 
         def __exit__(self, *args):
             return False
 
+    monkeypatch.setattr(stream_data.pq, "ParquetFile", FakeParquetFile)
     monkeypatch.setattr(stream_data.fs, "open", lambda *args, **kwargs: FakeContext())
 
     with pytest.raises(RuntimeError, match="failed to read row group 0"):
