@@ -7,6 +7,7 @@ pub struct RwkvBlockState {
     pub time_state: Array4<f32>,
     pub time_prev: Array1<f32>,
     pub cmix_prev: Array1<f32>,
+    pub v_first: Option<Array2<f32>>,
 }
 
 pub struct RwkvBlock {
@@ -41,16 +42,19 @@ impl RwkvBlock {
         &self,
         x: &Array2<f32>,
         state: Option<&RwkvBlockState>,
+        v_first: Option<&Array2<f32>>,
     ) -> (Array2<f32>, RwkvBlockState) {
         assert_eq!(x.ncols(), self.channels);
         let input = match &self.ln0 { Some(norm) => norm.forward(x), None => x.clone() };
         let time_input = self.ln1.forward(&input);
         let time_state = state.map(|s| s.time_state.clone());
         let time_prev = state.map(|s| s.time_prev.clone());
-        let (time_output, next_time_state, next_time_prev) = self.time_mix.forward(
+        let inherited_v_first = v_first.cloned().or_else(|| state.and_then(|s| s.v_first.clone()));
+        let (time_output, next_time_state, next_time_prev, next_v_first) = self.time_mix.forward(
             &time_input,
             time_state,
             time_prev,
+            inherited_v_first,
         );
         let residual = &input + &time_output;
         let cmix_input = self.ln2.forward(&residual);
@@ -63,6 +67,7 @@ impl RwkvBlock {
                 time_state: next_time_state,
                 time_prev: next_time_prev,
                 cmix_prev: next_cmix_prev,
+                v_first: Some(next_v_first),
             },
         )
     }
@@ -84,11 +89,23 @@ mod tests {
     fn block_runs_and_carries_state() {
         let block = RwkvBlock::new(16, 2, 0, 4);
         let x = Array2::<f32>::zeros((3, 16));
-        let (y, state) = block.forward(&x, None);
+        let (y, state) = block.forward(&x, None, None);
         assert_eq!(y.shape(), &[3, 16]);
         assert_eq!(state.time_prev.len(), 16);
         assert_eq!(state.cmix_prev.len(), 16);
         assert_eq!(state.time_state.shape(), &[1, 2, 8, 8]);
+        assert_eq!(state.v_first.as_ref().unwrap().shape(), &[3, 16]);
+    }
+
+    #[test]
+    fn later_layer_accepts_v_first() {
+        let first = RwkvBlock::new(16, 2, 0, 4);
+        let later = RwkvBlock::new(16, 2, 1, 4);
+        let x = Array2::<f32>::zeros((3, 16));
+        let (_, first_state) = first.forward(&x, None, None);
+        let (y, later_state) = later.forward(&x, None, first_state.v_first.as_ref());
+        assert_eq!(y.shape(), &[3, 16]);
+        assert!(later_state.v_first.is_some());
     }
 
     #[test]
