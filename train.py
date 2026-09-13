@@ -253,13 +253,13 @@ def _train_pretrain_batch(args, model, optimizer, resume, device, scaler, batch_
     xb = torch.stack(batch_x).to(device)
     yb = torch.stack(batch_y).to(device)
     loss = _optimizer_step(args, model, optimizer, xb, yb, device, scaler)
+    resume.file_path = path
+    resume.record_index = record
+    resume.buffer_tokens = buffer_tokens
     if loss is None:
         return None
     resume.global_step += 1
     resume.total_tokens += xb.numel()
-    resume.file_path = path
-    resume.record_index = record
-    resume.buffer_tokens = buffer_tokens
     return loss
 
 
@@ -326,12 +326,12 @@ def train_sft(args, model, optimizer, resume, device, tokenizer, scaler):
             xb, yb = xb.to(device), yb.to(device)
             loss = _optimizer_step(args, model, optimizer, xb, yb, device, scaler)
             consumed += len(xb)
+            resume.epoch = epoch
+            resume.record_index = consumed
             if loss is None:
                 continue
             resume.global_step += 1
             resume.total_tokens += xb.numel()
-            resume.epoch = epoch
-            resume.record_index = consumed
             if resume.global_step % args.log_every == 0:
                 print(f"epoch {epoch} step {resume.global_step} | loss {loss.item():.4f}")
             if resume.global_step % args.save_every == 0:
@@ -383,6 +383,10 @@ def parse_args():
         parser.error("--n_layer must be >= 1")
     if args.n_moba_layer < 0 or args.n_moba_layer >= args.n_layer:
         parser.error("--n_moba_layer must satisfy 0 <= n_moba_layer < n_layer")
+    if args.save_every < 1:
+        parser.error("--save_every must be >= 1")
+    if args.optimizer_save_every < 1:
+        parser.error("--optimizer_save_every must be >= 1")
     if args.precision is None:
         args.precision = "fp16" if torch.cuda.is_available() and not args.cpu else "fp32"
     return args
@@ -438,45 +442,3 @@ def main():
         import cpu
         cpu.configure()
     print(f"[DEVICE] {device} | precision={args.precision}")
-    if backend in ("hip", "cuda"):
-        print(f"[GPU] {torch.cuda.get_device_name(0)}")
-        print("[LOWBIT] native FP2/FP4 kernels")
-    else:
-        print(f"[CPU BACKEND] {backend_name(backend)}")
-        print("[WKV] native CPU")
-    tokenizer = _load_or_build_tokenizer(args)
-    model = _build_model(args, tokenizer).to(device)
-    if args.router_only:
-        trainable = set_router_only_training(model, True)
-        print(f"[ROUTER ONLY] trainable={trainable:,}")
-    if args.qat:
-        qat.prepare_qat(model, args.qat)
-    if args.rqt:
-        import rqt
-        rqt.prepare_rqt(model, args.rqt)
-        _print_rqt_storage(model)
-    _print_model_size(model)
-    if args.compile:
-        model = torch.compile(model, mode="max-autotune")
-    if device.type == "cpu":
-        from cpu_backend import NativeLion
-        optimizer = NativeLion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        print("[OPTIMIZER] native CPU Lion")
-    else:
-        optimizer = Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json") if args.resume else ResumeState()
-    if args.resume:
-        optimizer_path = Path(args.checkpoint_dir) / "optimizer.pt"
-        if optimizer_path.exists():
-            optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
-        _load_rng_state(Path(args.checkpoint_dir) / "rng_state.pt")
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and args.precision == "fp16" else None
-    if args.mode == "pretrain":
-        train_pretrain(args, model, optimizer, resume, device, tokenizer, scaler)
-    else:
-        train_sft(args, model, optimizer, resume, device, tokenizer, scaler)
-    save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), _tokenizer_path(args), args.save_dtype, True)
-
-
-if __name__ == "__main__":
-    main()
