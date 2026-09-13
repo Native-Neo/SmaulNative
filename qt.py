@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from backend import detect_backend
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE, RWKV_CMix_x070
 
 _CMIX_LINEAR_NAMES = ("key", "value")
@@ -19,13 +20,24 @@ def _load_lowbit():
     global _LOWBIT_EXT
     if _LOWBIT_EXT is None:
         from torch.utils.cpp_extension import load
-        root = Path(__file__).resolve().parent / "cpu"
-        _LOWBIT_EXT = load(
-            name="smaulnative_lowbit",
-            sources=[str(root / "lowbit_kernel.cpp")],
-            extra_cflags=["-O3", "-march=native", "-mtune=native"],
-            verbose=False,
-        )
+        root = Path(__file__).resolve().parent
+        backend = detect_backend(torch)
+        if backend == "hip":
+            source = root / "gpu" / "hip" / "lowbit_kernel.hip"
+            name = "smaulnative_lowbit_hip"
+            _LOWBIT_EXT = load(name=name, sources=[str(source)], with_cuda=True, verbose=False)
+        elif backend == "cuda":
+            source = root / "gpu" / "cuda" / "lowbit_kernel.cu"
+            name = "smaulnative_lowbit_cuda"
+            _LOWBIT_EXT = load(name=name, sources=[str(source)], with_cuda=True, verbose=False)
+        else:
+            source = root / "cpu" / "lowbit_kernel.cpp"
+            _LOWBIT_EXT = load(
+                name="smaulnative_lowbit",
+                sources=[str(source)],
+                extra_cflags=["-O3", "-march=native", "-mtune=native"],
+                verbose=False,
+            )
     return _LOWBIT_EXT
 
 
@@ -115,15 +127,22 @@ class QuantizedLinear(nn.Module):
         return levels * self.scale.to(device=device, dtype=dtype)
 
     def forward(self, x):
-        if self.bits < 8 and x.device.type == "cpu" and x.dtype == torch.float32:
+        if self.bits < 8 and x.dtype == torch.float32:
             out_features, in_features = self._shape
             if x.shape[-1] != in_features:
                 raise ValueError(f"input features {x.shape[-1]} != {in_features}")
             x2 = x.reshape(-1, in_features).contiguous()
-            y = _load_lowbit().packed_linear(
-                x2, self.packed, self.scale.reshape(-1).float().contiguous(),
-                self.bits, out_features, in_features,
-            )
+            if x.device.type == "cpu":
+                y = _load_lowbit().packed_linear(
+                    x2, self.packed, self.scale.reshape(-1).float().contiguous(),
+                    self.bits, out_features, in_features,
+                )
+            else:
+                packed = self.packed.to(x.device)
+                scale = self.scale.reshape(-1).float().to(x.device)
+                y = _load_lowbit().packed_linear(
+                    x2, packed, scale, self.bits, out_features, in_features,
+                )
             return y.reshape(*x.shape[:-1], out_features)
         return F.linear(x, self.unpack(x.device, x.dtype))
 
