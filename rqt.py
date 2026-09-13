@@ -53,8 +53,9 @@ class RealQuantLinear(nn.Module):
     @torch.no_grad()
     def refresh(self):
         weight = self.weight.detach()
-        if weight.device.type != "cpu":
-            weight = weight.cpu()
+        target_device = self.quant.packed.device
+        if weight.device != target_device:
+            weight = weight.to(target_device)
         if weight.dtype != torch.float32:
             weight = weight.float()
 
