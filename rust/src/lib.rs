@@ -4,6 +4,7 @@ pub mod ffn;
 pub mod group_norm;
 pub mod layer_norm;
 pub mod linear;
+pub mod moba_attention;
 pub mod optimizer;
 pub mod rwkv_block;
 pub mod rwkv_cmix;
