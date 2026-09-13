@@ -62,9 +62,9 @@ fn safetensors_loader_preserves_model_outputs() {
             ("receptance.weight", &t.receptance), ("key.weight", &t.key),
             ("value.weight", &t.value), ("output.weight", &t.output),
         ] {
-            let data = a.clone().into_raw_vec();
-            let shape = a.shape().to_vec();
-            let py_shape = if name.ends_with(".weight") { vec![shape[1], shape[0]] } else { shape };
+            let data = a.t().to_owned().into_raw_vec();
+            let shape = a.shape();
+            let py_shape = vec![shape[1], shape[0]];
             tensors.insert(format!("{p}.att.{name}"), tensor_view(&data, &py_shape));
         }
         let ln_x_w = t.ln_x.weight.to_vec();
@@ -74,10 +74,10 @@ fn safetensors_loader_preserves_model_outputs() {
         let c = &block.cmix;
         let x_k = c.x_k.to_vec();
         tensors.insert(format!("{p}.ffn.x_k"), tensor_view(&x_k, &[16]));
-        let key = c.key.clone().into_raw_vec();
-        let value = c.value.clone().into_raw_vec();
-        tensors.insert(format!("{p}.ffn.key.weight"), tensor_view(&key, &[16, 64]));
-        tensors.insert(format!("{p}.ffn.value.weight"), tensor_view(&value, &[64, 16]));
+        let key = c.key.t().to_owned().into_raw_vec();
+        let value = c.value.t().to_owned().into_raw_vec();
+        tensors.insert(format!("{p}.ffn.key.weight"), tensor_view(&key, &[64, 16]));
+        tensors.insert(format!("{p}.ffn.value.weight"), tensor_view(&value, &[16, 64]));
     }
 
     fs::write(&path, serialize(tensors, &None).unwrap()).unwrap();
