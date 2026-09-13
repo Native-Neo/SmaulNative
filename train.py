@@ -416,8 +416,14 @@ def _checkpoint_config(output_dir):
 def _build_model(args, tokenizer):
     config = dict(vocab_size=args.tokenizer_vocab_size, n_embd=args.n_embd, n_layer=args.n_layer, n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len)
     checkpoint = _checkpoint_config(args.output_dir)
+    checkpoint_quant = {}
+    if checkpoint is not None:
+        for name in ("qat_bits", "rqt_bits", "quantization_bits"):
+            checkpoint_quant[name] = int(checkpoint.get(name, 0) or 0)
+        checkpoint = {k: v for k, v in checkpoint.items() if k not in checkpoint_quant}
+    quant_match = checkpoint_quant.get("qat_bits", 0) == args.qat and checkpoint_quant.get("rqt_bits", 0) == args.rqt
     checkpoint_path = Path(args.output_dir) / "model.safetensors"
-    if checkpoint_path.exists() and checkpoint == config:
+    if checkpoint_path.exists() and checkpoint == config and quant_match:
         model = RWKVXModel.from_pretrained(args.output_dir)
         print(f"[MODEL CONFIG] checkpoint={config}")
         return model
