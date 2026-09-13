@@ -30,6 +30,9 @@ class RWKVXConfig:
     is_moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
+    qat_bits: int = 0
+    rqt_bits: int = 0
+    quantization_bits: int = 0
 
     def save(self, path: Path):
         Path(path).write_text(json.dumps(asdict(self), indent=2))
