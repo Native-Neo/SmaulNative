@@ -12,6 +12,10 @@ pub struct RwkvCmix {
 
 impl RwkvCmix {
     pub fn new(channels: usize, layer_id: usize, n_layer: usize) -> Self {
+        Self::new_seeded(channels, layer_id, n_layer, 0x434d_4958_4b4559)
+    }
+
+    pub fn new_seeded(channels: usize, layer_id: usize, n_layer: usize, seed: u64) -> Self {
         assert!(channels > 0 && n_layer > 0 && layer_id < n_layer);
         let r = 1.0 - layer_id as f32 / n_layer as f32;
         let x_k = Array1::from_iter((0..channels).map(|i| {
@@ -20,7 +24,7 @@ impl RwkvCmix {
         }));
         let hidden = channels * 4;
         let scale = 0.5 / (channels as f32).sqrt();
-        let key = uniform(channels, hidden, -scale, scale, 0x434d_4958_4b4559 ^ layer_id as u64);
+        let key = uniform(channels, hidden, -scale, scale, seed ^ layer_id as u64);
         let value = Array2::zeros((hidden, channels));
         Self { channels, layer_id, n_layer, x_k, key, value }
     }
@@ -124,6 +128,15 @@ mod tests {
                 assert!((selected[[i, c]] - full[[row, c]]).abs() < 1e-6);
             }
         }
+    }
+
+    #[test]
+    fn seeded_initialization_changes_expert_weights() {
+        let a = RwkvCmix::new_seeded(8, 0, 4, 1);
+        let b = RwkvCmix::new_seeded(8, 0, 4, 2);
+        assert_ne!(a.key, b.key);
+        assert_eq!(a.value, b.value);
+        assert_eq!(a.x_k, b.x_k);
     }
 
     #[test]
