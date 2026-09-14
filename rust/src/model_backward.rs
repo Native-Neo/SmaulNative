@@ -1,17 +1,16 @@
 use ndarray::Array2;
+use crate::moba_block::MobaBlockTape;
 use crate::rwkv_block_full_tape::RwkvBlockFullTape;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackwardBlockKind {
-    Rwkv(usize),
-    Moba(usize),
-}
+pub enum BackwardBlockKind { Rwkv(usize), Moba(usize) }
 
 pub struct ModelBackwardTape {
     pub block_order: Vec<BackwardBlockKind>,
     pub inputs: Vec<Array2<f32>>,
     pub outputs: Vec<Array2<f32>>,
     pub rwkv_tapes: Vec<Option<RwkvBlockFullTape>>,
+    pub moba_tapes: Vec<Option<MobaBlockTape>>,
     pub ln_input: Option<Array2<f32>>,
     pub normalized: Option<Array2<f32>>,
     pub logits: Option<Array2<f32>>,
@@ -19,9 +18,10 @@ pub struct ModelBackwardTape {
 
 impl ModelBackwardTape {
     pub fn new(block_order: Vec<BackwardBlockKind>) -> Self {
-        let rwkv_tapes = (0..block_order.len()).map(|_| None).collect();
+        let len = block_order.len();
         Self {
-            rwkv_tapes,
+            rwkv_tapes: (0..len).map(|_| None).collect(),
+            moba_tapes: (0..len).map(|_| None).collect(),
             block_order,
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -47,6 +47,15 @@ impl ModelBackwardTape {
         self.rwkv_tapes[slot] = Some(tape);
     }
 
+    pub fn record_moba_tape(&mut self, tape: MobaBlockTape) {
+        let index = self.inputs.len();
+        assert!(index > 0 && index <= self.block_order.len());
+        let slot = index - 1;
+        assert!(matches!(self.block_order[slot], BackwardBlockKind::Moba(_)));
+        assert!(self.moba_tapes[slot].is_none());
+        self.moba_tapes[slot] = Some(tape);
+    }
+
     pub fn record_head(&mut self, ln_input: Array2<f32>, normalized: Array2<f32>, logits: Array2<f32>) {
         assert_eq!(ln_input.dim(), normalized.dim());
         assert_eq!(normalized.nrows(), logits.nrows());
@@ -68,6 +77,7 @@ impl ModelBackwardTape {
         self.inputs.clear();
         self.outputs.clear();
         for tape in &mut self.rwkv_tapes { *tape = None; }
+        for tape in &mut self.moba_tapes { *tape = None; }
         self.ln_input = None;
         self.normalized = None;
         self.logits = None;
