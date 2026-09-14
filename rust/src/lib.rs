@@ -43,6 +43,7 @@ pub mod rwkv_cmix_backward_full;
 pub mod rwkv_model;
 pub mod rwkv_time_mix;
 pub mod rwkv_time_mix_backward;
+pub mod rwkv_time_mix_backward_full;
 pub mod rwkv_time_mix_tape;
 pub mod safetensors;
 pub mod sequence_loss;
