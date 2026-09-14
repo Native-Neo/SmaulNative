@@ -13,7 +13,19 @@ pub struct TrainingRunner { pub optimizer: TrainStep, pub state: TrainingState }
 impl TrainingRunner {
  pub fn new(model:&RwkvModel,learning_rate:f32)->Self{Self{optimizer:TrainStep::new(model,learning_rate),state:TrainingState::new()}}
  pub fn resume_from_checkpoint(&mut self,path:impl AsRef<Path>)->Result<(),String>{let bundle=CheckpointBundle::load(path)?;if let Some(state)=bundle.optimizer_state.get("lion.momentum"){self.optimizer.load_optimizer_state(state)?;}else{return Err("checkpoint has no lion.momentum optimizer state".into());}self.state=bundle.training;Ok(())}
- pub fn resume_checkpoint(&mut self,model:&mut RwkvModel,path:impl AsRef<Path>)->Result<(),String>{let path=path.as_ref();self.resume_from_checkpoint(path)?;let name=path.file_stem().and_then(|x|x.to_str()).ok_or("checkpoint path has no valid filename")?;let step=name.strip_prefix("training-").ok_or("checkpoint filename must be training-<step>.json")?;if step.is_empty()||!step.chars().all(|c|c.is_ascii_digit()){return Err("checkpoint filename must be training-<step>.json".into());}let model_path=path.with_file_name(format!("model-{step}.safetensors"));crate::model_loader::load_model_safetensors(model,&model_path)?;Ok(())}
+ pub fn resume_checkpoint(&mut self,model:&mut RwkvModel,path:impl AsRef<Path>)->Result<(),String>{
+  let path=path.as_ref();
+  let name=path.file_stem().and_then(|x|x.to_str()).ok_or("checkpoint path has no valid filename")?;
+  let step=name.strip_prefix("training-").ok_or("checkpoint filename must be training-<step>.json")?;
+  if step.is_empty()||!step.chars().all(|c|c.is_ascii_digit()){return Err("checkpoint filename must be training-<step>.json".into());}
+  let model_path=path.with_file_name(format!("model-{step}.safetensors"));
+  let bundle=CheckpointBundle::load(path)?;
+  let optimizer_state=bundle.optimizer_state.get("lion.momentum").ok_or("checkpoint has no lion.momentum optimizer state")?;
+  crate::model_loader::load_model_safetensors(model,&model_path)?;
+  self.optimizer.load_optimizer_state(optimizer_state)?;
+  self.state=bundle.training;
+  Ok(())
+ }
  pub fn run_stream(&mut self,model:&mut RwkvModel,stream:&mut TextStream,config:&TrainingConfig)->Result<TrainingState,String>{self.run_batches(model,config,||stream.next_batch())}
  pub fn run_multi_stream(&mut self,model:&mut RwkvModel,stream:&mut MultiFileTextStream,config:&TrainingConfig)->Result<TrainingState,String>{self.run_batches(model,config,||stream.next_batch())}
  pub fn run_dataset_stream(&mut self,model:&mut RwkvModel,stream:&mut MultiFileDatasetStream,config:&TrainingConfig)->Result<TrainingState,String>{self.run_batches(model,config,||stream.next_batch())}
@@ -47,5 +59,5 @@ mod tests{
  #[test]fn parquet_missing_file_is_reported(){let p=std::env::temp_dir().join("smaul-not-parquet.parquet");fs::write(&p,b"not parquet").unwrap();assert!(ParquetTextStream::open(&p,tokenizer(),3).is_err());let _=fs::remove_file(p);}
  #[test]fn checkpoint_contains_lion_state(){let m=RwkvModel::new(RwkvModelConfig::new(9,8,1,4),42);let r=TrainingRunner::new(&m,1e-4);let p=std::env::temp_dir().join("smaul-training-state.json");r.save_state(&p).unwrap();let c=CheckpointBundle::load(&p).unwrap();assert_eq!(c.optimizer_state.get("lion.momentum").unwrap().len(),m.parameter_count());let _=fs::remove_file(p);}
  #[test]fn resume_restores_training_state(){let m=RwkvModel::new(RwkvModelConfig::new(9,8,1,4),42);let r=TrainingRunner::new(&m,1e-4);let p=std::env::temp_dir().join("smaul-training-resume.json");r.save_state(&p).unwrap();let mut resumed=TrainingRunner::new(&m,1e-4);resumed.resume_from_checkpoint(&p).unwrap();assert_eq!(resumed.state,r.state);assert_eq!(resumed.optimizer.optimizer_state(),r.optimizer.optimizer_state());let _=fs::remove_file(p);}
- #[test]fn resume_checkpoint_rejects_wrong_filename(){let m=RwkvModel::new(RwkvModelConfig::new(9,8,1,4),42);let mut r=TrainingRunner::new(&m,1e-4);let p=std::env::temp_dir().join("resume.json");r.save_state(&p).unwrap();let mut loaded=RwkvModel::new(RwkvModelConfig::new(9,8,1,4),42);assert!(r.resume_checkpoint(&mut loaded,&p).is_err());let _=fs::remove_file(p);}
+ #[test]fn resume_checkpoint_rejects_wrong_filename(){let m=RwkvModel::new(RwkvModelConfig::new(9,8,1,4),42);let mut r=TrainingRunner::new(&m,1e-4);let p=std::env::temp_dir().join("resume.json");r.save_state(&p).unwrap();let mut loaded=RwkvModel::new(RwkvModelConfig::new(9,8,1,4),42);assert!(r.resume_checkpoint(&mut loaded,&p).is_err());assert_eq!(r.state.step,0);let _=fs::remove_file(p);}
 }
