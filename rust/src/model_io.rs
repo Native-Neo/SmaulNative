@@ -28,14 +28,12 @@ impl PretrainedModel {
         std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
         self.config.save(directory.join("config.json"))?;
         crate::model_saver::save_model_safetensors(&self.model, directory.join("model.safetensors"))?;
+        self.tokenizer.save_json(directory.join("tokenizer.json"))?;
         Ok(())
     }
 
     pub fn save(&self, directory: impl AsRef<Path>) -> Result<(), String> {
-        let directory = directory.as_ref();
-        self.save_model(directory)?;
-        self.tokenizer.save_json(directory.join("tokenizer.json"))?;
-        Ok(())
+        self.save_model(directory)
     }
 
     pub fn paths(directory: impl AsRef<Path>) -> (PathBuf, PathBuf, PathBuf) {
