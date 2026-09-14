@@ -70,7 +70,7 @@ impl RwkvCmix {
     }
 
     pub fn parameter_count(&self) -> usize {
-        self.key.len() + self.value.len()
+        self.x_k.len() + self.key.len() + self.value.len()
     }
 }
 
@@ -94,5 +94,11 @@ mod tests {
         let (a, _) = layer.forward(&x, Some(&Array1::<f32>::ones(4)));
         let (b, _) = layer.forward(&x, None);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn parameter_count_includes_x_k() {
+        let layer = RwkvCmix::new(8, 0, 4);
+        assert_eq!(layer.parameter_count(), layer.x_k.len() + layer.key.len() + layer.value.len());
     }
 }
