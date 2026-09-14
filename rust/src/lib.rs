@@ -18,6 +18,7 @@ pub mod gguf;
 pub mod gguf_convert;
 pub mod gguf_inference;
 pub mod gguf_model_loader;
+pub mod gguf_writer;
 pub mod gpu;
 pub mod grad_accumulation;
 pub mod grad_accumulator;
