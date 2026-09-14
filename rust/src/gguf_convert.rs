@@ -1,29 +1,13 @@
+use std::fs;
 use std::path::Path;
+use serde_json::Value;
+use safetensors::{SafeTensors,Dtype};
+use crate::gguf_writer::{Writer,Tensor};
 
-/// Native Rust entrypoint for RWKV-X checkpoint conversion.
-/// The actual GGUF serialization lives in the shared GGUF module.
-pub fn convert(input_dir: impl AsRef<Path>, output: impl AsRef<Path>, dtype: &str) -> Result<(), String> {
-    let input = input_dir.as_ref();
-    let output = output.as_ref();
-    if dtype != "f16" && dtype != "f32" {
-        return Err("dtype must be f16 or f32".into());
-    }
-    if !input.join("config.json").is_file() {
-        return Err(format!("missing {}", input.join("config.json").display()));
-    }
-    if !input.join("model.safetensors").is_file() {
-        return Err(format!("missing {}", input.join("model.safetensors").display()));
-    }
-    if !input.join("tokenizer.json").is_file() {
-        return Err(format!("missing {}", input.join("tokenizer.json").display()));
-    }
-    crate::gguf::convert_safetensors_checkpoint(input, output, dtype)
-}
+fn f32_to_f16(x:f32)->u16{let b=x.to_bits();let s=((b>>16)&0x8000)as u16;let e=((b>>23)&255)as i32-127+15;let m=b&0x7fffff;if e<=0{if e< -10{return s}return s|(((m|0x800000)>>(1-e)+0x1000)>>13)as u16}if e>=31{return s|0x7c00}s|((e as u16)<<10)|((m+0x1000)>>13)as u16}
+fn f32_bytes_to_f16(b:&[u8])->Vec<u8>{let mut o=Vec::with_capacity(b.len()/2);for c in b.chunks_exact(4){o.extend(f32_to_f16(f32::from_le_bytes(c.try_into().unwrap())).to_le_bytes())}o}
+fn tokens(path:&Path)->Result<Vec<String>,String>{let v:Value=serde_json::from_slice(&fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;let x=v.get("vocab").or_else(||v.get("model").and_then(|m|m.get("vocab"))).ok_or("tokenizer.json has no vocabulary")?.as_object().ok_or("invalid tokenizer vocabulary")?;let max=x.values().filter_map(|v|v.as_u64()).max().ok_or("empty tokenizer")? as usize;let mut out=vec![String::new();max+1];for(k,id)in x{out[id.as_u64().ok_or("invalid tokenizer id")? as usize]=k.clone()}if out.iter().any(|s|s.is_empty()){return Err("tokenizer vocabulary contains gaps or empty tokens".into())}Ok(out)}
 
-pub fn convert_cli(args: &[String]) -> Result<(), String> {
-    if args.len() < 3 {
-        return Err("usage: smaul-convert-gguf <input_dir> <output.gguf> [--dtype f16|f32]".into());
-    }
-    let dtype = if args.len() >= 5 && args[3] == "--dtype" { args[4].as_str() } else { "f16" };
-    convert(&args[1], &args[2], dtype)
-}
+pub fn convert(input_dir:impl AsRef<Path>,output:impl AsRef<Path>,dtype:&str)->Result<(),String>{if dtype!="f16"&&dtype!="f32"{return Err("dtype must be f16 or f32".into())}let dir=input_dir.as_ref();let cfg:Value=serde_json::from_slice(&fs::read(dir.join("config.json")).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;let toks=tokens(&dir.join("tokenizer.json"))?;let bytes=fs::read(dir.join("model.safetensors")).map_err(|e|e.to_string())?;let st=SafeTensors::deserialize(&bytes).map_err(|e|e.to_string())?;let mut w=Writer::new();w.add_meta_str("general.name","SmaulNative RWKV-X");w.add_meta_str("general.description","RWKV-X checkpoint exported from SmaulNative");w.add_meta_u32("general.alignment",32);w.add_meta_str("general.architecture","rwkv_x");let u32v=|k:&str,d:&Value|if let Some(v)=d.as_u64(){w.add_meta_u32(k,v as u32)};u32v("rwkv_x.vocab_size",cfg.get("vocab_size").unwrap());u32v("rwkv_x.embedding_length",cfg.get("n_embd").unwrap());u32v("rwkv_x.block_count",cfg.get("n_layer").unwrap());u32v("rwkv_x.head_size",cfg.get("head_size").unwrap());w.add_tokens("tokenizer.ggml.tokens",&toks);for name in st.names(){let t=st.tensor(name).map_err(|e|e.to_string())?;let data=if dtype=="f16"&&t.dtype()==Dtype::F32{f32_bytes_to_f16(t.data())}else{t.data().to_vec()};let ty=if t.dtype()==Dtype::F16||dtype=="f16"{1}else{0};let shape=t.shape().iter().map(|&x|x as u64).collect::<Vec<_>>();w.tensor(Tensor{name,shape:&shape,dtype:ty,data:&data});}w.finish(output.as_ref().to_str().ok_or("invalid output path")?)?;Ok(())}
+
+pub fn convert_cli(args:&[String])->Result<(),String>{if args.len()<3{return Err("usage: smaul-convert-gguf <input_dir> <output.gguf> [--dtype f16|f32]".into())}let dtype=if args.len()>=5&&args[3]=="--dtype"{&args[4]}else{"f16"};convert(&args[1],&args[2],dtype)}
