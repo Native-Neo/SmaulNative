@@ -33,13 +33,7 @@ pub fn backward(
         layer_norm_backward::backward(ln_input, &grad_normalized, ln_weight, ln_eps);
     let grad_embedding = embedding_backward::backward(token_ids, &grad_input, vocab_size);
 
-    HeadBackward {
-        grad_input,
-        grad_weight,
-        grad_ln_weight,
-        grad_ln_bias,
-        grad_embedding,
-    }
+    HeadBackward { grad_input, grad_weight, grad_ln_weight, grad_ln_bias, grad_embedding }
 }
 
 pub fn accumulate_parameter_gradient(target: &mut Array2<f32>, source: &Array2<f32>) {
@@ -61,11 +55,10 @@ mod tests {
     fn computes_head_and_embedding_gradients() {
         let tokens = [1usize, 2, 1];
         let normalized = array![[1.0, 2.0], [2.0, 1.0], [0.5, 1.5]];
-        let ln_input = normalized.clone();
         let logits_grad = array![[1.0, 0.0, -1.0], [0.5, -0.5, 0.0], [0.0, 1.0, -1.0]];
         let head = array![[0.2, 0.3], [0.4, -0.1], [0.5, 0.6]];
         let gamma = Array1::ones(2);
-        let grads = backward(&tokens, &normalized, &logits_grad, &head, &ln_input, &gamma, 1e-5, 4);
+        let grads = backward(&tokens, &normalized, &logits_grad, &head, &normalized, &gamma, 1e-5, 4);
         assert_eq!(grads.grad_weight.dim(), (3, 2));
         assert_eq!(grads.grad_input.dim(), (3, 2));
         assert_eq!(grads.grad_embedding.dim(), (4, 2));
