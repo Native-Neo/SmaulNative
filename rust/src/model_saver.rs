@@ -4,173 +4,43 @@ use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use std::collections::HashMap;
 use std::path::Path;
 
-fn bytes_1d(array: &Array1<f32>) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(array.len() * 4);
-    for &value in array {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    bytes
-}
-
-fn bytes_2d(array: &Array2<f32>) -> Vec<u8> {
-    let array = array.as_standard_layout();
-    let mut bytes = Vec::with_capacity(array.len() * 4);
-    for &value in array.iter() {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    bytes
-}
-
-struct OwnedTensor {
-    name: String,
-    shape: Vec<usize>,
-    bytes: Vec<u8>,
-}
-
+fn bytes_1d(array: &Array1<f32>) -> Vec<u8> { let mut bytes = Vec::with_capacity(array.len() * 4); for &value in array { bytes.extend_from_slice(&value.to_le_bytes()); } bytes }
+fn bytes_2d(array: &Array2<f32>) -> Vec<u8> { let array = array.as_standard_layout(); let mut bytes = Vec::with_capacity(array.len() * 4); for &value in array.iter() { bytes.extend_from_slice(&value.to_le_bytes()); } bytes }
+struct OwnedTensor { name: String, shape: Vec<usize>, bytes: Vec<u8> }
 impl OwnedTensor {
-    fn one(name: impl Into<String>, array: &Array1<f32>) -> Self {
-        Self { name: name.into(), shape: vec![array.len()], bytes: bytes_1d(array) }
-    }
-
-    fn two(name: impl Into<String>, array: &Array2<f32>) -> Self {
-        Self { name: name.into(), shape: vec![array.nrows(), array.ncols()], bytes: bytes_2d(array) }
-    }
-
-    fn two_transposed(name: impl Into<String>, array: &Array2<f32>) -> Self {
-        let transposed = array.t().to_owned();
-        Self::two(name, &transposed)
-    }
+    fn one(name: impl Into<String>, array: &Array1<f32>) -> Self { Self { name: name.into(), shape: vec![array.len()], bytes: bytes_1d(array) } }
+    fn two(name: impl Into<String>, array: &Array2<f32>) -> Self { Self { name: name.into(), shape: vec![array.nrows(), array.ncols()], bytes: bytes_2d(array) } }
+    fn two_transposed(name: impl Into<String>, array: &Array2<f32>) -> Self { let transposed = array.t().to_owned(); Self::two(name, &transposed) }
 }
-
-fn add_norm(tensors: &mut Vec<OwnedTensor>, prefix: &str, weight: &Array1<f32>, bias: &Array1<f32>) {
-    tensors.push(OwnedTensor::one(format!("{prefix}.weight"), weight));
-    tensors.push(OwnedTensor::one(format!("{prefix}.bias"), bias));
-}
-
-fn add_linear(tensors: &mut Vec<OwnedTensor>, name: &str, weight: &Array2<f32>, transpose: bool) {
-    if transpose {
-        tensors.push(OwnedTensor::two_transposed(name, weight));
-    } else {
-        tensors.push(OwnedTensor::two(name, weight));
-    }
-}
-
+fn add_norm(tensors: &mut Vec<OwnedTensor>, prefix: &str, weight: &Array1<f32>, bias: &Array1<f32>) { tensors.push(OwnedTensor::one(format!("{prefix}.weight"), weight)); tensors.push(OwnedTensor::one(format!("{prefix}.bias"), bias)); }
+fn add_linear(tensors: &mut Vec<OwnedTensor>, name: &str, weight: &Array2<f32>, transpose: bool) { tensors.push(if transpose { OwnedTensor::two_transposed(name, weight) } else { OwnedTensor::two(name, weight) }); }
 fn add_rwkv_block(tensors: &mut Vec<OwnedTensor>, model: &RwkvModel, index: usize) {
-    let block = &model.rwkv_blocks[index];
-    let prefix = format!("rwkv_blocks.{index}");
-
-    if let Some(norm) = &block.ln0 {
-        add_norm(tensors, &format!("{prefix}.ln0"), &norm.weight, &norm.bias);
-    }
-    add_norm(tensors, &format!("{prefix}.ln1"), &block.ln1.weight, &block.ln1.bias);
-    add_norm(tensors, &format!("{prefix}.ln2"), &block.ln2.weight, &block.ln2.bias);
-
+    let block = &model.rwkv_blocks[index]; let prefix = format!("rwkv_blocks.{index}");
+    if let Some(norm) = &block.ln0 { add_norm(tensors, &format!("{prefix}.ln0"), &norm.weight, &norm.bias); }
+    add_norm(tensors, &format!("{prefix}.ln1"), &block.ln1.weight, &block.ln1.bias); add_norm(tensors, &format!("{prefix}.ln2"), &block.ln2.weight, &block.ln2.bias);
     let t = &block.time_mix;
-    for (name, value) in [
-        ("x_r", &t.x_r),
-        ("x_w", &t.x_w),
-        ("x_k", &t.x_k),
-        ("x_v", &t.x_v),
-        ("x_a", &t.x_a),
-        ("x_g", &t.x_g),
-        ("w0", &t.w0),
-        ("a0", &t.a0),
-        ("k_k", &t.k_k),
-        ("k_a", &t.k_a),
-    ] {
-        tensors.push(OwnedTensor::one(format!("{prefix}.att.{name}"), value));
-    }
-
-    for (name, value) in [
-        ("w1", &t.w1),
-        ("w2", &t.w2),
-        ("a1", &t.a1),
-        ("a2", &t.a2),
-        ("g1", &t.g1),
-        ("g2", &t.g2),
-        ("r_k", &t.r_k),
-    ] {
-        tensors.push(OwnedTensor::two(format!("{prefix}.att.{name}"), value));
-    }
-
-    if let Some(value) = &t.v1 {
-        tensors.push(OwnedTensor::two(format!("{prefix}.att.v1"), value));
-    }
-    if let Some(value) = &t.v2 {
-        tensors.push(OwnedTensor::two(format!("{prefix}.att.v2"), value));
-    }
-    if let Some(value) = &t.v0 {
-        tensors.push(OwnedTensor::one(format!("{prefix}.att.v0"), value));
-    }
-
-    add_linear(tensors, &format!("{prefix}.att.receptance.weight"), &t.receptance, true);
-    add_linear(tensors, &format!("{prefix}.att.key.weight"), &t.key, true);
-    add_linear(tensors, &format!("{prefix}.att.value.weight"), &t.value, true);
-    add_linear(tensors, &format!("{prefix}.att.output.weight"), &t.output, true);
-    add_norm(tensors, &format!("{prefix}.att.ln_x"), &t.ln_x.weight, &t.ln_x.bias);
-
-    let c = &block.cmix;
-    tensors.push(OwnedTensor::one(format!("{prefix}.ffn.x_k"), &c.x_k));
-    add_linear(tensors, &format!("{prefix}.ffn.key.weight"), &c.key, true);
-    add_linear(tensors, &format!("{prefix}.ffn.value.weight"), &c.value, true);
+    for (name, value) in [("x_r", &t.x_r), ("x_w", &t.x_w), ("x_k", &t.x_k), ("x_v", &t.x_v), ("x_a", &t.x_a), ("x_g", &t.x_g), ("w0", &t.w0), ("a0", &t.a0), ("k_k", &t.k_k), ("k_a", &t.k_a)] { tensors.push(OwnedTensor::one(format!("{prefix}.att.{name}"), value)); }
+    for (name, value) in [("w1", &t.w1), ("w2", &t.w2), ("a1", &t.a1), ("a2", &t.a2), ("g1", &t.g1), ("g2", &t.g2), ("r_k", &t.r_k)] { tensors.push(OwnedTensor::two(format!("{prefix}.att.{name}"), value)); }
+    if let Some(value) = &t.v1 { tensors.push(OwnedTensor::two(format!("{prefix}.att.v1"), value)); }
+    if let Some(value) = &t.v2 { tensors.push(OwnedTensor::two(format!("{prefix}.att.v2"), value)); }
+    if let Some(value) = &t.v0 { tensors.push(OwnedTensor::one(format!("{prefix}.att.v0"), value)); }
+    add_linear(tensors, &format!("{prefix}.att.receptance.weight"), &t.receptance, true); add_linear(tensors, &format!("{prefix}.att.key.weight"), &t.key, true); add_linear(tensors, &format!("{prefix}.att.value.weight"), &t.value, true); add_linear(tensors, &format!("{prefix}.att.output.weight"), &t.output, true); add_norm(tensors, &format!("{prefix}.att.ln_x"), &t.ln_x.weight, &t.ln_x.bias);
+    let c = &block.cmix; tensors.push(OwnedTensor::one(format!("{prefix}.ffn.x_k"), &c.x_k)); add_linear(tensors, &format!("{prefix}.ffn.key.weight"), &c.key, true); add_linear(tensors, &format!("{prefix}.ffn.value.weight"), &c.value, true);
 }
-
 fn add_moba_block(tensors: &mut Vec<OwnedTensor>, model: &RwkvModel, index: usize) {
-    let block = &model.moba_blocks[index];
-    let prefix = format!("moba_blocks.{index}");
-
-    add_norm(tensors, &format!("{prefix}.ln1"), &block.ln1.weight, &block.ln1.bias);
-    add_norm(tensors, &format!("{prefix}.ln2"), &block.ln2.weight, &block.ln2.bias);
-    add_linear(tensors, &format!("{prefix}.att.receptance.weight"), &block.att.receptance.weight, false);
-    add_linear(tensors, &format!("{prefix}.att.key.weight"), &block.att.key.weight, false);
-    add_linear(tensors, &format!("{prefix}.att.value.weight"), &block.att.value.weight, false);
-    add_linear(tensors, &format!("{prefix}.att.output.weight"), &block.att.output.weight, false);
-    tensors.push(OwnedTensor::one(format!("{prefix}.ffn.x_k"), &block.ffn.x_k));
-    add_linear(tensors, &format!("{prefix}.ffn.key.weight"), &block.ffn.key, true);
-    add_linear(tensors, &format!("{prefix}.ffn.value.weight"), &block.ffn.value, true);
+    let block = &model.moba_blocks[index]; let prefix = format!("moba_blocks.{index}"); add_norm(tensors, &format!("{prefix}.ln1"), &block.ln1.weight, &block.ln1.bias); add_norm(tensors, &format!("{prefix}.ln2"), &block.ln2.weight, &block.ln2.bias);
+    add_linear(tensors, &format!("{prefix}.att.receptance.weight"), &block.att.receptance.weight, false); add_linear(tensors, &format!("{prefix}.att.key.weight"), &block.att.key.weight, false); add_linear(tensors, &format!("{prefix}.att.value.weight"), &block.att.value.weight, false); add_linear(tensors, &format!("{prefix}.att.output.weight"), &block.att.output.weight, false);
+    tensors.push(OwnedTensor::one(format!("{prefix}.ffn.x_k"), &block.ffn.x_k)); add_linear(tensors, &format!("{prefix}.ffn.key.weight"), &block.ffn.key, true); add_linear(tensors, &format!("{prefix}.ffn.value.weight"), &block.ffn.value, true);
 }
-
 pub fn save_model_safetensors(model: &RwkvModel, path: impl AsRef<Path>) -> Result<(), String> {
-    let mut owned = Vec::new();
-    owned.push(OwnedTensor::two("emb.weight", &model.embedding.weight));
-    add_norm(&mut owned, "ln_out", &model.ln_out.weight, &model.ln_out.bias);
-    add_linear(&mut owned, "head.weight", &model.head.weight, false);
-
-    for index in 0..model.rwkv_blocks.len() {
-        add_rwkv_block(&mut owned, model, index);
-    }
-    for index in 0..model.moba_blocks.len() {
-        add_moba_block(&mut owned, model, index);
-    }
-
-    let mut tensors = HashMap::with_capacity(owned.len());
-    for tensor in &owned {
-        let view = TensorView::new(Dtype::F32, &tensor.shape, &tensor.bytes)
-            .map_err(|error| format!("failed to build tensor '{}': {error}", tensor.name))?;
-        tensors.insert(tensor.name.as_str(), view);
-    }
-
-    serialize_to_file(tensors, None, path.as_ref())
-        .map_err(|error| format!("failed to write {}: {error}", path.as_ref().display()))
+    let mut owned = Vec::new(); owned.push(OwnedTensor::two("emb.weight", &model.embedding.weight)); add_norm(&mut owned, "ln_out", &model.ln_out.weight, &model.ln_out.bias); add_linear(&mut owned, "head.weight", &model.head.weight, false);
+    for index in 0..model.rwkv_blocks.len() { add_rwkv_block(&mut owned, model, index); } for index in 0..model.moba_blocks.len() { add_moba_block(&mut owned, model, index); }
+    let mut tensors = HashMap::with_capacity(owned.len()); for tensor in &owned { let view = TensorView::new(Dtype::F32, tensor.shape.clone(), &tensor.bytes).map_err(|error| format!("failed to build tensor '{}': {error}", tensor.name))?; tensors.insert(tensor.name.as_str(), view); }
+    serialize_to_file(tensors, &None, path.as_ref()).map_err(|error| format!("failed to write {}: {error}", path.as_ref().display()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::rwkv_model::{RwkvModel, RwkvModelConfig};
-    use crate::safetensors::SafetensorsLoader;
-
-    #[test]
-    fn saved_model_contains_loader_tensors() {
-        let model = RwkvModel::new(RwkvModelConfig::new(32, 16, 2, 4), 7);
-        let path = std::env::temp_dir().join("smaul-native-model.safetensors");
-        save_model_safetensors(&model, &path).unwrap();
-        let loader = SafetensorsLoader::open(&path).unwrap();
-        let names = loader.names().unwrap();
-        assert!(names.contains(&"emb.weight".to_owned()));
-        assert!(names.contains(&"ln_out.weight".to_owned()));
-        assert!(names.contains(&"head.weight".to_owned()));
-        assert!(names.contains(&"rwkv_blocks.0.att.key.weight".to_owned()));
-        let _ = std::fs::remove_file(path);
-    }
+    use super::*; use crate::rwkv_model::{RwkvModel, RwkvModelConfig}; use crate::safetensors::SafetensorsLoader;
+    #[test] fn saved_model_contains_loader_tensors() { let model = RwkvModel::new(RwkvModelConfig::new(32, 16, 2, 4), 7); let path = std::env::temp_dir().join("smaul-native-model.safetensors"); save_model_safetensors(&model, &path).unwrap(); let loader = SafetensorsLoader::open(&path).unwrap(); let names = loader.names().unwrap(); assert!(names.contains(&"emb.weight".to_owned())); assert!(names.contains(&"ln_out.weight".to_owned())); assert!(names.contains(&"head.weight".to_owned())); assert!(names.contains(&"rwkv_blocks.0.att.key.weight".to_owned())); let _ = std::fs::remove_file(path); }
 }
