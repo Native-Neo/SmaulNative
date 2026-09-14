@@ -15,6 +15,17 @@ impl Lion {
     pub fn new(parameter_count: usize, lr: f32, beta1: f32, beta2: f32, weight_decay: f32) -> Self {
         Self { lr, beta1, beta2, weight_decay, momentum: vec![0.0; parameter_count] }
     }
+
+    pub fn parameter_count(&self) -> usize { self.momentum.len() }
+    pub fn state(&self) -> &[f32] { &self.momentum }
+
+    pub fn load_state(&mut self, state: &[f32]) -> Result<(), String> {
+        if state.len() != self.momentum.len() {
+            return Err(format!("Lion state has {} values, expected {}", state.len(), self.momentum.len()));
+        }
+        self.momentum.copy_from_slice(state);
+        Ok(())
+    }
 }
 
 impl Optimizer for Lion {
@@ -84,6 +95,23 @@ mod tests {
         let mut parameter = vec![1.0, -1.0];
         optimizer.step(&mut parameter, &[1.0, -1.0]);
         assert!(parameter[0] < 1.0 && parameter[1] > -1.0);
+    }
+
+    #[test]
+    fn lion_state_round_trip() {
+        let mut first = Lion::new(2, 0.01, 0.9, 0.99, 0.0);
+        let mut parameter = vec![1.0, -1.0];
+        first.step(&mut parameter, &[2.0, -3.0]);
+        let state = first.state().to_vec();
+        let mut second = Lion::new(2, 0.01, 0.9, 0.99, 0.0);
+        second.load_state(&state).unwrap();
+        assert_eq!(second.state(), state.as_slice());
+    }
+
+    #[test]
+    fn lion_rejects_wrong_state_size() {
+        let mut optimizer = Lion::new(2, 0.01, 0.9, 0.99, 0.0);
+        assert!(optimizer.load_state(&[0.0]).is_err());
     }
 
     #[test]
