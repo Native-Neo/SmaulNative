@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod checkpoint_state;
 pub mod checkpoint_version;
 pub mod config;
+pub mod data_filter;
 pub mod dataset;
 pub mod dataset_multi;
 pub mod embedding;
