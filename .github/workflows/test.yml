@@ -29,5 +29,6 @@ jobs:
         run: pytest -q
 
       - name: Run Rust tests
+        if: always()
         working-directory: rust
         run: cargo test --all-targets
