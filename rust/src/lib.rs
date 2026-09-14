@@ -33,6 +33,7 @@ pub mod model_loader;
 pub mod model_train_step;
 pub mod optimizer;
 pub mod params;
+pub mod qat;
 pub mod residual;
 pub mod rwkv_block;
 pub mod rwkv_block_backward;
