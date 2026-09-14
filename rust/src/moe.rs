@@ -58,7 +58,7 @@ pub struct MoeCmix {
 impl MoeCmix {
     pub fn new(channels: usize, layer_id: usize, n_layer: usize, num_experts: usize, top_k: usize, seed: u64) -> Self {
         let experts = (0..num_experts)
-            .map(|_| RwkvCmix::new(channels, layer_id, n_layer))
+            .map(|i| RwkvCmix::new_seeded(channels, layer_id, n_layer, seed ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)))
             .collect();
         let router = MoeRouter::new(channels, num_experts, top_k, seed);
         Self { experts, router }
@@ -121,6 +121,13 @@ mod tests {
         assert_eq!(y.dim(), (4, 8));
         assert_eq!(last.len(), 8);
         assert_eq!(moe.parameter_count(), moe.router.parameter_count() + moe.experts.iter().map(RwkvCmix::parameter_count).sum::<usize>());
+    }
+
+    #[test]
+    fn experts_have_distinct_initialization() {
+        let moe = MoeCmix::new(8, 0, 4, 3, 2, 7);
+        assert_ne!(moe.experts[0].key, moe.experts[1].key);
+        assert_ne!(moe.experts[1].key, moe.experts[2].key);
     }
 
     #[test]
