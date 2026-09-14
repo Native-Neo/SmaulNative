@@ -13,6 +13,7 @@ pub mod ffn;
 pub mod ffn_backward;
 pub mod gelu;
 pub mod gguf;
+pub mod gguf_model_loader;
 pub mod grad_accumulation;
 pub mod grad_accumulator;
 pub mod gradient;
