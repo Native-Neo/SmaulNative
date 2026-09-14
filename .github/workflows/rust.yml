@@ -1,0 +1,22 @@
+name: Rust SmaulNative
+
+on:
+  push:
+    branches: [rust]
+  pull_request:
+    branches: [main, developement]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and test
+        working-directory: rust
+        run: cargo test --all-targets
