@@ -30,7 +30,8 @@ impl RwkvModel{
  pub fn load_safetensors(&mut self,path:impl AsRef<std::path::Path>)->Result<(),String>{crate::model_loader::load_model_safetensors(self,path)}
  pub fn forward(&self,token_ids:&[usize],state:Option<&RwkvModelState>)->(Array2<f32>,RwkvModelState){let(logits,next_state,_)=self.forward_internal(token_ids,state,None);(logits,next_state)}
  pub fn forward_with_tape(&self,token_ids:&[usize])->(Array2<f32>,ModelBackwardTape){self.forward_with_state_and_tape(token_ids,None)}
- pub fn forward_with_state_and_tape(&self,token_ids:&[usize],state:Option<&RwkvModelState>)->(Array2<f32>,ModelBackwardTape){let order=self.order.iter().map(|kind|match *kind{BlockKind::Rwkv(index)=>BackwardBlockKind::Rwkv(index),BlockKind::Moba(index)=>BackwardBlockKind::Moba(index)}).collect();let mut tape=ModelBackwardTape::new(order);let(logits,_,_)=self.forward_internal(token_ids,state,Some(&mut tape));(logits,tape)}
+ pub fn forward_with_state_and_tape(&self,token_ids:&[usize],state:Option<&RwkvModelState>)->(Array2<f32>,ModelBackwardTape){let(logits,tape,_)=self.forward_with_tape_and_state(token_ids,state);(logits,tape)}
+ pub fn forward_with_tape_and_state(&self,token_ids:&[usize],state:Option<&RwkvModelState>)->(Array2<f32>,ModelBackwardTape,RwkvModelState){let order=self.order.iter().map(|kind|match *kind{BlockKind::Rwkv(index)=>BackwardBlockKind::Rwkv(index),BlockKind::Moba(index)=>BackwardBlockKind::Moba(index)}).collect();let mut tape=ModelBackwardTape::new(order);let(logits,next_state,_)=self.forward_internal(token_ids,state,Some(&mut tape));(logits,tape,next_state)}
  fn forward_internal(&self,token_ids:&[usize],state:Option<&RwkvModelState>,mut tape:Option<&mut ModelBackwardTape>)->(Array2<f32>,RwkvModelState,Array2<f32>){assert!(!token_ids.is_empty());let mut x=self.embedding.forward(token_ids);let mut next_rwkv=Vec::with_capacity(self.rwkv_blocks.len());let mut next_moba=Vec::with_capacity(self.moba_blocks.len());let mut v_first=state.and_then(|s|s.v_first.clone());for kind in &self.order{let input=x.clone();match *kind{BlockKind::Rwkv(index)=>{let block_state=state.and_then(|s|s.rwkv_blocks.get(index));if let Some(ref mut model_tape)=tape{let(next_x,next_state,block_tape)=self.rwkv_blocks[index].forward_with_full_tape(&x,block_state,v_first.as_ref());v_first=next_state.v_first.clone();x=next_x;next_rwkv.push((index,next_state));model_tape.record_block(input,x.clone());model_tape.record_rwkv_tape(block_tape);}else{let(next_x,next_state)=self.rwkv_blocks[index].forward(&x,block_state,v_first.as_ref());v_first=next_state.v_first.clone();x=next_x;next_rwkv.push((index,next_state));}}BlockKind::Moba(index)=>{let block_state=state.and_then(|s|s.moba_blocks.get(index));if let Some(ref mut model_tape)=tape{let(next_x,next_state,block_tape)=self.moba_blocks[index].forward_with_tape(&x,block_state);x=next_x;next_moba.push((index,next_state));model_tape.record_block(input,x.clone());model_tape.record_moba_tape(block_tape);}else{let(next_x,next_state)=self.moba_blocks[index].forward(&x,block_state);x=next_x;next_moba.push((index,next_state));}}}}
  let mut rwkv_states:Vec<Option<RwkvBlockState>>=(0..self.rwkv_blocks.len()).map(|_|None).collect();for(index,block_state)in next_rwkv{rwkv_states[index]=Some(block_state);}let rwkv_states=rwkv_states.into_iter().map(Option::unwrap).collect();let mut moba_states:Vec<Option<MobaBlockState>>=(0..self.moba_blocks.len()).map(|_|None).collect();for(index,block_state)in next_moba{moba_states[index]=Some(block_state);}let moba_states=moba_states.into_iter().map(Option::unwrap).collect();let ln_input=x.clone();x=self.ln_out.forward(&x);let normalized=x.clone();let logits=self.head.forward(&x);if let Some(ref mut tape)=tape{tape.record_head(ln_input,normalized,logits.clone());}(logits,RwkvModelState{rwkv_blocks:rwkv_states,moba_blocks:moba_states,v_first},x)}
  pub fn parameter_count(&self)->usize{self.embedding.parameter_count()+self.rwkv_blocks.iter().map(RwkvBlock::parameter_count).sum::<usize>()+self.moba_blocks.iter().map(MobaBlock::parameter_count).sum::<usize>()+self.ln_out.weight.len()+self.ln_out.bias.len()+self.head.parameter_count()}
@@ -42,6 +43,24 @@ mod tests {
     use super::*;
 
     fn max_abs_diff(a:&Array2<f32>,b:&Array2<f32>)->f32 {
+        a.iter().zip(b.iter()).map(|(x,y)|(x-y).abs()).fold(0.0,f32::max)
+    }
+
+    fn state_max_abs_diff(a:&RwkvModelState,b:&RwkvModelState)->f32 {
+        let mut diff=0.0;
+        for (x,y) in a.rwkv_blocks.iter().zip(b.rwkv_blocks.iter()) {
+            diff=diff.max(max_abs_diff_4(&x.time_state,&y.time_state));
+            diff=diff.max(max_abs_diff_1(&x.time_prev,&y.time_prev));
+            diff=diff.max(max_abs_diff_1(&x.cmix_prev,&y.cmix_prev));
+        }
+        diff
+    }
+
+    fn max_abs_diff_1(a:&Array1<f32>,b:&Array1<f32>)->f32 {
+        a.iter().zip(b.iter()).map(|(x,y)|(x-y).abs()).fold(0.0,f32::max)
+    }
+
+    fn max_abs_diff_4(a:&ndarray::Array4<f32>,b:&ndarray::Array4<f32>)->f32 {
         a.iter().zip(b.iter()).map(|(x,y)|(x-y).abs()).fold(0.0,f32::max)
     }
 
@@ -58,5 +77,17 @@ mod tests {
         for tape in tape.rwkv_tapes.iter().flatten() {
             assert!(tape.initial_state.is_some());
         }
+    }
+
+    #[test]
+    fn taped_forward_returns_the_same_next_state() {
+        let model=RwkvModel::new(RwkvModelConfig::new(32,16,2,4),456);
+        let prefix=[7usize,8,9];
+        let suffix=[10usize,11,12];
+        let (_,state)=model.forward(&prefix,None);
+        let (plain,next_plain)=model.forward(&suffix,Some(&state));
+        let (taped,_,next_taped)=model.forward_with_tape_and_state(&suffix,Some(&state));
+        assert!(max_abs_diff(&plain,&taped)<1e-6);
+        assert!(state_max_abs_diff(&next_plain,&next_taped)<1e-6);
     }
 }
