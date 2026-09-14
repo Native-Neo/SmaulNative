@@ -5,6 +5,7 @@ pub mod autograd;
 pub mod checkpoint;
 pub mod checkpoint_state;
 pub mod checkpoint_version;
+pub mod config;
 pub mod dataset;
 pub mod embedding;
 pub mod embedding_backward;
