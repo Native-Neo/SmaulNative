@@ -14,6 +14,9 @@ impl PretrainedModel {
     pub fn load(directory: impl AsRef<Path>) -> Result<Self, String> {
         let directory = directory.as_ref();
         let config = RwkvXConfig::load(directory.join("config.json"))?;
+        if config.is_moe {
+            return Err("MoE checkpoints are not yet supported by the native model loader".into());
+        }
         let tokenizer = Tokenizer::from_json_file(directory.join("tokenizer.json"))?;
         if tokenizer.vocab_size() != config.vocab_size {
             return Err(format!("tokenizer vocabulary is {}, config expects {}", tokenizer.vocab_size(), config.vocab_size));
