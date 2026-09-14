@@ -40,14 +40,17 @@ pub fn backward(model: &RwkvTimeMix, tape: &RwkvTimeMixTape, grad_output: &Array
     for row in 0..steps {
         for h in 0..model.heads {
             let start = h * model.head_size;
-            let mut scalar = 0.0;
-            for i in 0..model.head_size { scalar += grad_correction[[row, start+i]] * tape.v[[row, start+i]]; }
+            let mut grad_scalar = 0.0;
             for i in 0..model.head_size {
                 let col = start + i;
-                grad_v[[row,col]] += grad_correction[[row,col]] * scalar;
-                grad_r[[row,col]] += scalar * tape.k_mod[[row,col]] * model.r_k[[h,i]];
-                grad_k_mod[[row,col]] += scalar * tape.r[[row,col]] * model.r_k[[h,i]];
-                grad_r_k[[h,i]] += scalar * tape.r[[row,col]] * tape.k_mod[[row,col]];
+                grad_v[[row, col]] += grad_correction[[row, col]] * tape.correction[[row, col]] / tape.v[[row, col]].abs().max(1e-12);
+                grad_scalar += grad_correction[[row, col]] * tape.v[[row, col]];
+            }
+            for i in 0..model.head_size {
+                let col = start + i;
+                grad_r[[row, col]] += grad_scalar * tape.k_mod[[row, col]] * model.r_k[[h, i]];
+                grad_k_mod[[row, col]] += grad_scalar * tape.r[[row, col]] * model.r_k[[h, i]];
+                grad_r_k[[h, i]] += grad_scalar * tape.r[[row, col]] * tape.k_mod[[row, col]];
             }
         }
     }
@@ -87,7 +90,7 @@ pub fn backward(model: &RwkvTimeMix, tape: &RwkvTimeMixTape, grad_output: &Array
     let (grad_v0,grad_v1,grad_v2);
     if let (Some(v1),Some(v2),Some(v0),Some(correction),Some(gate))=(&model.v1,&model.v2,&model.v0,&tape.v_correction,&tape.v_gate) {
         let mut gv_base=Array2::zeros((steps,channels)); let mut gv_corr=Array2::zeros((steps,channels)); let mut gv0=Array1::zeros(channels);
-        for row in 0..steps { for col in 0..channels { let gv=grad_v[[row,col]]; gv_base[[row,col]]=gv*(1.0-gate[[row,col]]); grad_v_first[[row,col]]=gv*gate[[row,col]]; let gg=gv*(tape.v_first[[row,col]]-tape.v_base[[row,col]])*gate[[row,col]]*(1.0-gate[[row,col]]); gv_corr[[row,col]]=gg; gv0[col]+=gg; }}
+        for row in 0..steps { for col in 0..channels { let gv=grad_v[[row,col]; gv_base[[row,col]]=gv*(1.0-gate[[row,col]]); grad_v_first[[row,col]]=gv*gate[[row,col]]; let gg=gv*(tape.v_first[[row,col]]-tape.v_base[[row,col]])*gate[[row,col]]*(1.0-gate[[row,col]]); gv_corr[[row,col]]=gg; gv0[col]+=gg; }}
         grad_value=tape.xv.t().dot(&gv_base); grad_xv+=&gv_base.dot(&model.value.t());
         let gv2=correction.t().dot(&gv_corr); let gh=gv_corr.dot(&v2.t()); let gv1=tape.xv.t().dot(&gh); grad_xv+=&gh.dot(&v1.t());
         grad_v0=Some(gv0); grad_v1=Some(gv1); grad_v2=Some(gv2);
