@@ -32,6 +32,17 @@ fn compile(kind: &str, filename: &str, compiler: &str, runtime: &str) {
     if !status.success() { panic!("ar failed while building SmaulNative {kind} low-bit backend"); }
     println!("cargo:rustc-link-search=native={out}");
     println!("cargo:rustc-link-lib=static=smaul_{kind}_lowbit");
+    if kind == "cuda" {
+        if let Some(cuda_home) = env::var_os("CUDA_HOME") {
+            println!("cargo:rustc-link-search=native={}/lib64", cuda_home.to_string_lossy());
+        } else {
+            println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+        }
+    } else if let Some(rocm_path) = env::var_os("ROCM_PATH") {
+        println!("cargo:rustc-link-search=native={}/lib", rocm_path.to_string_lossy());
+    } else {
+        println!("cargo:rustc-link-search=native=/opt/rocm/lib");
+    }
     println!("cargo:rustc-link-lib=dylib={runtime}");
     println!("cargo:rerun-if-changed={source}");
 }
