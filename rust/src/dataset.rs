@@ -24,10 +24,16 @@ impl TextStream {
         Ok(Self { reader: BufReader::new(file), tokenizer, ctx_len, record: 0, buffer: Vec::new(), path, jsonl_text_field: text_field.map(Into::into), eof: false })
     }
     fn read_text(&self, line: &str) -> Result<String, String> {
-        if self.jsonl_text_field.is_none() { return Ok(line.trim_end_matches(['\n', '\r']).to_owned()); }
+        let field = match &self.jsonl_text_field {
+            Some(field) => field,
+            None => return Ok(line.trim_end_matches(['\n', '\r']).to_owned()),
+        };
         let value: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("invalid JSONL record {}: {e}", self.record))?;
-        let field = self.jsonl_text_field.as_ref().unwrap();
         value.get(field).and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| format!("JSONL record {} has no string field '{field}'", self.record))
+    }
+    fn read_jsonl_record(&self, line: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        json_value_text(&value)
     }
     pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> {
         loop {
@@ -40,14 +46,58 @@ impl TextStream {
             if self.eof { return Ok(None); }
             let mut line = String::new();
             if self.reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 { self.eof = true; continue; }
-            let text = self.read_text(&line)?;
-            self.buffer.extend(self.tokenizer.encode(&text));
-            self.buffer.push(self.tokenizer.eos_id());
+            let text = if self.jsonl_text_field.is_some() {
+                self.read_text(&line)?
+            } else if self.path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("jsonl")) {
+                self.read_jsonl_record(&line).unwrap_or_default()
+            } else {
+                self.read_text(&line)?
+            };
+            if !text.is_empty() {
+                self.buffer.extend(self.tokenizer.encode(&text));
+                self.buffer.push(self.tokenizer.eos_id());
+            }
             self.record += 1;
         }
     }
     pub fn position(&self) -> DatasetPosition { DatasetPosition { file: self.path.clone(), record: self.record } }
     pub fn buffered_tokens(&self) -> &[usize] { &self.buffer }
+}
+
+fn json_value_text(value: &serde_json::Value) -> Option<String> {
+    const TEXT_KEYS: &[&str] = &["text", "content", "document", "body", "code", "prompt", "completion"];
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Object(object) => {
+            let lower: std::collections::HashMap<String, &serde_json::Value> = object.iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect();
+            if let (Some(prompt), Some(completion)) = (lower.get("prompt").and_then(|v| v.as_str()), lower.get("completion").and_then(|v| v.as_str())) {
+                return Some(format!("{prompt}\n{completion}"));
+            }
+            for key in TEXT_KEYS {
+                if let Some(text) = lower.get(*key).and_then(|v| v.as_str()).filter(|text| !text.trim().is_empty()) {
+                    return Some(text.to_owned());
+                }
+            }
+            object.values()
+                .filter_map(|v| v.as_str())
+                .filter(|text| !text.trim().is_empty() && !looks_numeric(text))
+                .max_by_key(|text| text.len())
+                .map(str::to_owned)
+        }
+        serde_json::Value::Array(values) => {
+            let texts = values.iter().filter_map(json_value_text).collect::<Vec<_>>();
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn looks_numeric(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() { return true; }
+    let mut core = text.to_owned();
+    for ch in ['.', '-', ':', '/'] { core = core.replacen(ch, "", 1); }
+    core.chars().all(|c| c.is_ascii_digit())
 }
 
 pub struct ParquetTextStream {
@@ -142,6 +192,8 @@ mod tests {
     #[test] fn stops_at_eof() { let path=std::env::temp_dir().join("smaul-eof.txt"); fs::write(&path,"a b").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_none()); let _=fs::remove_file(path); }
     #[test] fn drops_incomplete_tail() { let path=std::env::temp_dir().join("smaul-tail.txt"); fs::write(&path,"a").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_none()); let _=fs::remove_file(path); }
     #[test] fn reads_jsonl_text_field() { let path=std::env::temp_dir().join("smaul-dataset.jsonl"); fs::write(&path,"{\"text\":\"a b a\"}\n{\"text\":\"b a\"}\n").unwrap(); let mut stream=TextStream::open_jsonl(&path,tokenizer(),2,Some("text")).unwrap(); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_file(path); }
+    #[test] fn reads_jsonl_default_text_field() { let path=std::env::temp_dir().join("smaul-default.jsonl"); fs::write(&path,"{\"content\":\"a b a\"}\n").unwrap(); let mut stream=TextStream::open_jsonl(&path,tokenizer(),2,None::<String>).unwrap(); let batch=stream.next_batch().unwrap(); assert!(batch.is_some()); let _=fs::remove_file(path); }
+    #[test] fn reads_jsonl_prompt_and_completion() { let path=std::env::temp_dir().join("smaul-prompt.jsonl"); fs::write(&path,"{\"prompt\":\"a\",\"completion\":\"b a\"}\n").unwrap(); let mut stream=TextStream::open_jsonl(&path,tokenizer(),2,None::<String>).unwrap(); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_file(path); }
     #[test] fn discovers_parquet_files() { let dir=std::env::temp_dir().join("smaul-discover"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("data.parquet"),b"not parquet").unwrap(); assert_eq!(discover_files(&dir).unwrap().len(),1); let _=fs::remove_dir_all(dir); }
     #[test] fn discovers_source_files() { let dir=std::env::temp_dir().join("smaul-source-discover"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("model.rs"),"fn main() {}").unwrap(); fs::write(dir.join("ignore.bin"),b"x").unwrap(); assert_eq!(discover_files(&dir).unwrap(), vec![dir.join("model.rs")]); let _=fs::remove_dir_all(dir); }
     #[test] fn streams_multiple_files() { let dir=std::env::temp_dir().join("smaul-multi"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("a.txt"),"a b a b").unwrap(); fs::write(dir.join("b.txt"),"b a b a").unwrap(); let mut stream=MultiFileTextStream::open_discovered(&dir,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_dir_all(dir); }
