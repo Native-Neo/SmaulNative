@@ -47,9 +47,7 @@ impl<'a> Reader<'a> {
 }
 
 fn align(value:u64,alignment:u64)->Result<u64,String>{if alignment==0||!alignment.is_power_of_two(){return Err(format!("invalid GGUF alignment {alignment}"));}value.checked_add(alignment-1).map(|x|x/alignment*alignment).ok_or("GGUF offset overflow".into())}
-
 fn element_count(shape:&[u64])->Result<u64,String>{shape.iter().try_fold(1u64,|a,&b|a.checked_mul(b)).ok_or_else(||"tensor element count overflow".into())}
-
 fn block_size(dtype:u32)->Option<(u64,u64)>{match dtype{2=>Some((32,18)),3=>Some((32,20)),6=>Some((32,22)),7=>Some((32,24)),8=>Some((32,34)),_=>None}}
 
 impl GgufReader {
@@ -65,7 +63,13 @@ impl GgufReader {
     pub fn tensor(&self,name:&str)->Option<&GgufTensorInfo>{self.tensors.iter().find(|t|t.name==name)}
     fn tensor_size(info:&GgufTensorInfo)->Result<usize,String>{
         let elements=element_count(&info.shape)?;
-        let bytes=match info.dtype{0=>elements.checked_mul(4),1|30=>elements.checked_mul(2),24=>elements,25=>elements.checked_mul(2),26=>elements.checked_mul(4),27=>elements.checked_mul(8),28=>elements.checked_mul(8),2|3|6|7|8=>{let (block,bytes)=block_size(info.dtype).unwrap();if elements%block!=0{return Err(format!("tensor '{}' has {} elements, not divisible by quant block size {}",info.name,elements,block));}elements/block*bytes}.into(),_=>None}.ok_or_else(||format!("unsupported GGML type {} ({})",info.dtype,gguf_dtype_name(info.dtype)))?;
+        let bytes=match info.dtype {
+            0=>elements.checked_mul(4), 1|30=>elements.checked_mul(2),
+            24=>Some(elements), 25=>elements.checked_mul(2), 26=>elements.checked_mul(4),
+            27=>elements.checked_mul(8), 28=>elements.checked_mul(8),
+            2|3|6|7|8=>{let(block,bytes)=block_size(info.dtype).unwrap();if elements%block!=0{return Err(format!("tensor '{}' has {} elements, not divisible by quant block size {}",info.name,elements,block));}Some(elements/block*bytes)},
+            _=>None,
+        }.ok_or_else(||format!("unsupported GGML type {} ({})",info.dtype,gguf_dtype_name(info.dtype)))?;
         usize::try_from(bytes).map_err(|_|"tensor is too large for memory".into())
     }
     pub fn tensor_bytes(&mut self,name:&str)->Result<Vec<u8>,String>{let info=self.tensor(name).cloned().ok_or_else(||format!("GGUF tensor '{name}' not found"))?;let size=Self::tensor_size(&info)?;self.file.seek(SeekFrom::Start(self.data_start.checked_add(info.offset).ok_or("tensor offset overflow")?)).map_err(|e|e.to_string())?;let mut bytes=vec![0u8;size];self.file.read_exact(&mut bytes).map_err(|e|e.to_string())?;Ok(bytes)}
