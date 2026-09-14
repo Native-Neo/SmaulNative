@@ -112,4 +112,41 @@ fn finish(model:&RwkvTimeMix,tape:&RwkvTimeMixTape,grad_xr:Array2<f32>,grad_xw:A
 }
 
 #[cfg(test)]
-mod tests { use super::*; use ndarray::Array2; #[test] fn backward_produces_finite_gradients(){ let model=RwkvTimeMix::new(16,2,1,4); let x=Array2::from_shape_fn((3,16),|(r,c)|0.01*(r+c) as f32); let (_,_,_,_,tape)=model.forward_with_tape(&x,None,None,None); let b=backward(&model,&tape,&Array2::ones((3,16))); assert!(b.grad_input.iter().all(|v|v.is_finite())); assert!(b.grad_state.iter().all(|v|v.is_finite())); assert!(b.grad_value.iter().all(|v|v.is_finite())); }}
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn loss(model: &RwkvTimeMix, x: &Array2<f32>) -> f32 {
+        model.forward(x, None, None, None).0.sum()
+    }
+
+    #[test]
+    fn backward_produces_finite_gradients() {
+        let model=RwkvTimeMix::new(16,2,1,4);
+        let x=Array2::from_shape_fn((3,16),|(r,c)|0.01*(r+c) as f32);
+        let (_,_,_,_,tape)=model.forward_with_tape(&x,None,None,None);
+        let b=backward(&model,&tape,&Array2::ones((3,16)));
+        assert!(b.grad_input.iter().all(|v|v.is_finite()));
+        assert!(b.grad_state.iter().all(|v|v.is_finite()));
+        assert!(b.grad_value.iter().all(|v|v.is_finite()));
+    }
+
+    #[test]
+    fn input_gradient_matches_finite_difference() {
+        let model=RwkvTimeMix::new(16,2,1,4);
+        let x=Array2::from_shape_fn((2,16),|(r,c)|0.03*(r as f32)+0.002*(c as f32)+0.01);
+        let (_,_,_,_,tape)=model.forward_with_tape(&x,None,None,None);
+        let analytic=backward(&model,&tape,&Array2::ones((2,16))).grad_input;
+        let eps=1e-3_f32;
+        for &(row,col) in &[(0usize,0usize),(0,7),(1,3),(1,15)] {
+            let mut plus=x.clone();
+            let mut minus=x.clone();
+            plus[[row,col]]+=eps;
+            minus[[row,col]]-=eps;
+            let numeric=(loss(&model,&plus)-loss(&model,&minus))/(2.0*eps);
+            let a=analytic[[row,col]];
+            let tolerance=2e-2_f32.max(2e-2*a.abs());
+            assert!((numeric-a).abs()<=tolerance,"gradient mismatch at ({row},{col}): analytic={a}, numeric={numeric}");
+        }
+    }
+}
