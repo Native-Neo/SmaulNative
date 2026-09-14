@@ -1,4 +1,6 @@
 use crate::tokenizer::Tokenizer;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::{Field, Row};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -15,7 +17,7 @@ pub struct TextStream {
 }
 
 impl TextStream {
-    pub fn open(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> { Self::open_jsonl(path, tokenizer, ctx_len, None) }
+    pub fn open(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> { Self::open_jsonl(path, tokenizer, ctx_len, None::<String>) }
     pub fn open_jsonl(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize, text_field: Option<impl Into<String>>) -> Result<Self, String> {
         if ctx_len == 0 { return Err("ctx_len must be greater than zero".into()); }
         let path = path.as_ref().to_path_buf();
@@ -53,6 +55,94 @@ impl TextStream {
     pub fn buffered_tokens(&self) -> &[usize] { &self.buffer }
 }
 
+pub struct ParquetTextStream {
+    tokenizer: Tokenizer,
+    ctx_len: usize,
+    path: PathBuf,
+    rows: std::vec::IntoIter<Row>,
+    record: usize,
+    buffer: Vec<usize>,
+    eof: bool,
+    text_field: Option<String>,
+}
+
+impl ParquetTextStream {
+    pub fn open(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> {
+        Self::open_with_field(path, tokenizer, ctx_len, None::<String>)
+    }
+
+    pub fn open_with_field(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize, text_field: Option<impl Into<String>>) -> Result<Self, String> {
+        if ctx_len == 0 { return Err("ctx_len must be greater than zero".into()); }
+        let path = path.as_ref().to_path_buf();
+        let file = File::open(&path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        let reader = SerializedFileReader::new(file).map_err(|e| format!("failed to read parquet {}: {e}", path.display()))?;
+        let rows = reader.get_row_iter(None).map_err(|e| format!("failed to read parquet rows {}: {e}", path.display()))?.collect::<Result<Vec<_>, _>>().map_err(|e| format!("failed to decode parquet {}: {e}", path.display()))?.into_iter();
+        Ok(Self { tokenizer, ctx_len, path, rows, record: 0, buffer: Vec::new(), eof: false, text_field: text_field.map(Into::into) })
+    }
+
+    fn field_text(&self, row: &Row) -> Option<String> {
+        if let Some(field) = &self.text_field {
+            return row.get_column_iter().find_map(|(name, value)| if name == field { field_to_text(value) } else { None });
+        }
+        for name in ["text", "content", "document", "body", "code", "prompt", "completion"] {
+            if let Some(value) = row.get_column_iter().find_map(|(column, value)| if column == name { Some(value) } else { None }) {
+                if let Some(text) = field_to_text(value) { return Some(text); }
+            }
+        }
+        row.get_column_iter().filter_map(|(_, value)| field_to_text(value)).max_by_key(|text| text.len())
+    }
+
+    pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> {
+        loop {
+            if self.buffer.len() >= self.ctx_len + 1 {
+                let input = self.buffer[..self.ctx_len].to_vec();
+                let target = self.buffer[1..self.ctx_len + 1].to_vec();
+                self.buffer.drain(..self.ctx_len);
+                return Ok(Some(TokenBatch { input, target, position: DatasetPosition { file: self.path.clone(), record: self.record } }));
+            }
+            if self.eof {
+                if self.buffer.len() < 2 { return Ok(None); }
+                self.buffer.resize(self.ctx_len + 1, self.tokenizer.eos_id());
+                continue;
+            }
+            match self.rows.next() {
+                Some(row) => {
+                    let text = self.field_text(&row).ok_or_else(|| format!("Parquet record {} in {} has no usable text field", self.record, self.path.display()))?;
+                    self.buffer.extend(self.tokenizer.encode(&text));
+                    self.buffer.push(self.tokenizer.eos_id());
+                    self.record += 1;
+                }
+                None => self.eof = true,
+            }
+        }
+    }
+
+    pub fn position(&self) -> DatasetPosition { DatasetPosition { file: self.path.clone(), record: self.record } }
+}
+
+fn field_to_text(field: &Field) -> Option<String> {
+    match field {
+        Field::Str(value) => Some(value.clone()),
+        Field::Bytes(value) => String::from_utf8(value.data().to_vec()).ok(),
+        Field::List(values) => {
+            let parts = values.elements().iter().filter_map(field_to_text).collect::<Vec<_>>();
+            if parts.is_empty() { None } else { Some(parts.join(" ")) }
+        }
+        _ => None,
+    }
+}
+
+pub enum DatasetStream {
+    Text(TextStream),
+    Parquet(ParquetTextStream),
+}
+
+impl DatasetStream {
+    pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> {
+        match self { Self::Text(stream) => stream.next_batch(), Self::Parquet(stream) => stream.next_batch() }
+    }
+}
+
 pub struct MultiFileTextStream {
     streams: Vec<TextStream>, current: usize,
 }
@@ -87,7 +177,7 @@ pub fn discover_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir.as_ref()).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
-        if path.is_file() && matches!(path.extension().and_then(|x| x.to_str()), Some("txt" | "text" | "jsonl")) { files.push(path); }
+        if path.is_file() && matches!(path.extension().and_then(|x| x.to_str()), Some("txt" | "text" | "jsonl" | "parquet")) { files.push(path); }
     }
     files.sort();
     Ok(files)
@@ -106,5 +196,6 @@ mod tests {
     #[test] fn streams_fixed_length_training_pairs() { let path=std::env::temp_dir().join("smaul-dataset.txt"); fs::write(&path,"a b a b a b").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),3).unwrap(); let batch=stream.next_batch().unwrap().unwrap(); assert_eq!(batch.input.len(),3); assert_eq!(batch.target.len(),3); assert_eq!(batch.position.record,1); let _=fs::remove_file(path); }
     #[test] fn stops_at_eof() { let path=std::env::temp_dir().join("smaul-eof.txt"); fs::write(&path,"a b").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_none()); let _=fs::remove_file(path); }
     #[test] fn reads_jsonl_text_field() { let path=std::env::temp_dir().join("smaul-dataset.jsonl"); fs::write(&path,"{\"text\":\"a b a\"}\n{\"text\":\"b a\"}\n").unwrap(); let mut stream=TextStream::open_jsonl(&path,tokenizer(),2,Some("text")).unwrap(); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_file(path); }
+    #[test] fn discovers_parquet_files() { let dir=std::env::temp_dir().join("smaul-discover"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("data.parquet"),b"not parquet").unwrap(); assert_eq!(discover_files(&dir).unwrap().len(),1); let _=fs::remove_dir_all(dir); }
     #[test] fn streams_multiple_files() { let dir=std::env::temp_dir().join("smaul-multi"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("a.txt"),"a b a b").unwrap(); fs::write(dir.join("b.txt"),"b a b a").unwrap(); let mut stream=MultiFileTextStream::open_discovered(&dir,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_dir_all(dir); }
 }
