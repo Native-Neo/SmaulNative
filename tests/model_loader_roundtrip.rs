@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use smaul_native::rwkv_model::{RwkvModel,RwkvModelConfig};
 
-fn tensor_view(data:&[f32],shape:&[usize])->TensorView<'_>{let bytes=unsafe{std::slice::from_raw_parts(data.as_ptr()as*const u8,data.len()*std::mem::size_of::<f32>())};TensorView::new(Dtype::F32,shape.to_vec(),bytes).unwrap()}
+fn tensor_view<'a>(data:&'a [f32],shape:&[usize])->TensorView<'a>{let bytes=unsafe{std::slice::from_raw_parts(data.as_ptr()as*const u8,data.len()*std::mem::size_of::<f32>())};TensorView::new(Dtype::F32,shape.to_vec(),bytes).unwrap()}
 fn tensor_view_owned(data:Vec<f32>,shape:&[usize])->TensorView<'static>{tensor_view(Box::leak(data.into_boxed_slice()),shape)}
 fn temp_checkpoint_path()->PathBuf{std::env::temp_dir().join(format!("smaulnative-loader-{}.safetensors",std::process::id()))}
 
