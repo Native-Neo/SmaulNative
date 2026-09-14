@@ -38,6 +38,7 @@ pub mod linear_loss_backward;
 pub mod loss;
 pub mod lr_scheduler;
 pub mod matmul;
+pub mod merge_moe;
 pub mod moe;
 pub mod moe_backward;
 pub mod moba_attention;
