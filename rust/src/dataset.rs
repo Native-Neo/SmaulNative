@@ -39,11 +39,7 @@ impl TextStream {
                 self.buffer.drain(..self.ctx_len);
                 return Ok(Some(TokenBatch { input, target, position: DatasetPosition { file: self.path.clone(), record: self.record } }));
             }
-            if self.eof {
-                if self.buffer.len() < 2 { return Ok(None); }
-                self.buffer.resize(self.ctx_len + 1, self.tokenizer.eos_id());
-                continue;
-            }
+            if self.eof { return Ok(None); }
             let mut line = String::new();
             if self.reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 { self.eof = true; continue; }
             let text = self.read_text(&line)?;
@@ -71,10 +67,7 @@ pub struct ParquetTextStream {
 }
 
 impl ParquetTextStream {
-    pub fn open(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> {
-        Self::open_with_field(path, tokenizer, ctx_len, None::<String>)
-    }
-
+    pub fn open(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> { Self::open_with_field(path, tokenizer, ctx_len, None::<String>) }
     pub fn open_with_field(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize, text_field: Option<impl Into<String>>) -> Result<Self, String> {
         if ctx_len == 0 { return Err("ctx_len must be greater than zero".into()); }
         let path = path.as_ref().to_path_buf();
@@ -83,7 +76,6 @@ impl ParquetTextStream {
         let row_group_count = reader.num_row_groups();
         Ok(Self { tokenizer, ctx_len, path, reader, rows: VecDeque::new(), row_group: 0, row_group_count, record: 0, buffer: Vec::new(), eof: false, text_field: text_field.map(Into::into) })
     }
-
     fn load_next_row_group(&mut self) -> Result<bool, String> {
         if self.row_group >= self.row_group_count { return Ok(false); }
         let group = self.reader.get_row_group(self.row_group).map_err(|e| format!("failed to read parquet row group {} in {}: {e}", self.row_group, self.path.display()))?;
@@ -92,11 +84,8 @@ impl ParquetTextStream {
         self.rows.extend(rows);
         Ok(true)
     }
-
     fn field_text(&self, row: &Row) -> Option<String> {
-        if let Some(field) = &self.text_field {
-            return row.get_column_iter().find_map(|(name, value)| if name == field { field_to_text(value) } else { None });
-        }
+        if let Some(field) = &self.text_field { return row.get_column_iter().find_map(|(name, value)| if name == field { field_to_text(value) } else { None }); }
         for name in ["text", "content", "document", "body", "code", "prompt", "completion"] {
             if let Some(value) = row.get_column_iter().find_map(|(column, value)| if column == name { Some(value) } else { None }) {
                 if let Some(text) = field_to_text(value) { return Some(text); }
@@ -104,7 +93,6 @@ impl ParquetTextStream {
         }
         row.get_column_iter().filter_map(|(_, value)| field_to_text(value)).max_by_key(|text| text.len())
     }
-
     pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> {
         loop {
             if self.buffer.len() >= self.ctx_len + 1 {
@@ -113,15 +101,8 @@ impl ParquetTextStream {
                 self.buffer.drain(..self.ctx_len);
                 return Ok(Some(TokenBatch { input, target, position: DatasetPosition { file: self.path.clone(), record: self.record } }));
             }
-            if self.eof {
-                if self.buffer.len() < 2 { return Ok(None); }
-                self.buffer.resize(self.ctx_len + 1, self.tokenizer.eos_id());
-                continue;
-            }
-            if self.rows.is_empty() && !self.load_next_row_group()? {
-                self.eof = true;
-                continue;
-            }
+            if self.eof { return Ok(None); }
+            if self.rows.is_empty() && !self.load_next_row_group()? { self.eof = true; continue; }
             if let Some(row) = self.rows.pop_front() {
                 let text = self.field_text(&row).ok_or_else(|| format!("Parquet record {} in {} has no usable text field", self.record, self.path.display()))?;
                 self.buffer.extend(self.tokenizer.encode(&text));
@@ -130,7 +111,6 @@ impl ParquetTextStream {
             }
         }
     }
-
     pub fn position(&self) -> DatasetPosition { DatasetPosition { file: self.path.clone(), record: self.record } }
 }
 
@@ -138,52 +118,19 @@ fn field_to_text(field: &Field) -> Option<String> {
     match field {
         Field::Str(value) => Some(value.clone()),
         Field::Bytes(value) => String::from_utf8(value.data().to_vec()).ok(),
-        Field::List(values) => {
-            let parts = values.elements().iter().filter_map(field_to_text).collect::<Vec<_>>();
-            if parts.is_empty() { None } else { Some(parts.join(" ")) }
-        }
+        Field::List(values) => { let parts = values.elements().iter().filter_map(field_to_text).collect::<Vec<_>>(); if parts.is_empty() { None } else { Some(parts.join(" ")) } }
         _ => None,
     }
 }
 
-pub enum DatasetStream {
-    Text(TextStream),
-    Parquet(ParquetTextStream),
-}
+pub enum DatasetStream { Text(TextStream), Parquet(ParquetTextStream) }
+impl DatasetStream { pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> { match self { Self::Text(stream) => stream.next_batch(), Self::Parquet(stream) => stream.next_batch() } } }
 
-impl DatasetStream {
-    pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> {
-        match self { Self::Text(stream) => stream.next_batch(), Self::Parquet(stream) => stream.next_batch() }
-    }
-}
-
-pub struct MultiFileTextStream {
-    streams: Vec<TextStream>, current: usize,
-}
-
+pub struct MultiFileTextStream { streams: Vec<TextStream>, current: usize }
 impl MultiFileTextStream {
-    pub fn open(paths: &[PathBuf], tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> {
-        if paths.is_empty() { return Err("dataset contains no files".into()); }
-        let streams = paths.iter().map(|path| TextStream::open(path, tokenizer.clone(), ctx_len)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { streams, current: 0 })
-    }
-
-    pub fn open_discovered(dir: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> {
-        let paths = discover_files(dir)?;
-        Self::open(&paths, tokenizer, ctx_len)
-    }
-
-    pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> {
-        while !self.streams.is_empty() {
-            if self.current >= self.streams.len() { self.current = 0; }
-            match self.streams[self.current].next_batch()? {
-                Some(batch) => { self.current = (self.current + 1) % self.streams.len(); return Ok(Some(batch)); }
-                None => { self.streams.remove(self.current); if self.current >= self.streams.len() && !self.streams.is_empty() { self.current = 0; } }
-            }
-        }
-        Ok(None)
-    }
-
+    pub fn open(paths: &[PathBuf], tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> { if paths.is_empty() { return Err("dataset contains no files".into()); } let streams = paths.iter().map(|path| TextStream::open(path, tokenizer.clone(), ctx_len)).collect::<Result<Vec<_>, _>>()?; Ok(Self { streams, current: 0 }) }
+    pub fn open_discovered(dir: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> { Self::open(&discover_files(dir)?, tokenizer, ctx_len) }
+    pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> { while !self.streams.is_empty() { if self.current >= self.streams.len() { self.current = 0; } match self.streams[self.current].next_batch()? { Some(batch) => { self.current = (self.current + 1) % self.streams.len(); return Ok(Some(batch)); } None => { self.streams.remove(self.current); if self.current >= self.streams.len() && !self.streams.is_empty() { self.current = 0; } } } } Ok(None) }
     pub fn file_count(&self) -> usize { self.streams.len() }
 }
 
@@ -197,10 +144,7 @@ pub fn discover_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-pub fn load_texts(path: impl AsRef<Path>) -> Result<Vec<String>, String> {
-    let file = File::open(path.as_ref()).map_err(|e| e.to_string())?;
-    BufReader::new(file).lines().collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
-}
+pub fn load_texts(path: impl AsRef<Path>) -> Result<Vec<String>, String> { let file = File::open(path.as_ref()).map_err(|e| e.to_string())?; BufReader::new(file).lines().collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string()) }
 
 #[cfg(test)]
 mod tests {
@@ -209,6 +153,7 @@ mod tests {
     fn tokenizer() -> Tokenizer { Tokenizer::from_vocab(vec!["<pad>".into(), "<unk>".into(), "<bos>".into(), "<eos>".into(), "<cap>".into(), "<upper>".into(), "a".into(), "b".into(), " ".into()]) }
     #[test] fn streams_fixed_length_training_pairs() { let path=std::env::temp_dir().join("smaul-dataset.txt"); fs::write(&path,"a b a b a b").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),3).unwrap(); let batch=stream.next_batch().unwrap().unwrap(); assert_eq!(batch.input.len(),3); assert_eq!(batch.target.len(),3); assert_eq!(batch.position.record,1); let _=fs::remove_file(path); }
     #[test] fn stops_at_eof() { let path=std::env::temp_dir().join("smaul-eof.txt"); fs::write(&path,"a b").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_none()); let _=fs::remove_file(path); }
+    #[test] fn drops_incomplete_tail() { let path=std::env::temp_dir().join("smaul-tail.txt"); fs::write(&path,"a").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_none()); let _=fs::remove_file(path); }
     #[test] fn reads_jsonl_text_field() { let path=std::env::temp_dir().join("smaul-dataset.jsonl"); fs::write(&path,"{\"text\":\"a b a\"}\n{\"text\":\"b a\"}\n").unwrap(); let mut stream=TextStream::open_jsonl(&path,tokenizer(),2,Some("text")).unwrap(); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_file(path); }
     #[test] fn discovers_parquet_files() { let dir=std::env::temp_dir().join("smaul-discover"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("data.parquet"),b"not parquet").unwrap(); assert_eq!(discover_files(&dir).unwrap().len(),1); let _=fs::remove_dir_all(dir); }
     #[test] fn streams_multiple_files() { let dir=std::env::temp_dir().join("smaul-multi"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("a.txt"),"a b a b").unwrap(); fs::write(dir.join("b.txt"),"b a b a").unwrap(); let mut stream=MultiFileTextStream::open_discovered(&dir,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_dir_all(dir); }
