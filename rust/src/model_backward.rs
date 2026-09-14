@@ -19,8 +19,9 @@ pub struct ModelBackwardTape {
 
 impl ModelBackwardTape {
     pub fn new(block_order: Vec<BackwardBlockKind>) -> Self {
+        let rwkv_tapes = (0..block_order.len()).map(|_| None).collect();
         Self {
-            rwkv_tapes: vec![None; block_order.len()],
+            rwkv_tapes,
             block_order,
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -34,13 +35,16 @@ impl ModelBackwardTape {
         assert_eq!(input.dim(), output.dim());
         self.inputs.push(input);
         self.outputs.push(output);
-        assert_eq!(self.inputs.len(), self.outputs.len());
         assert!(self.inputs.len() <= self.block_order.len());
     }
 
     pub fn record_rwkv_tape(&mut self, tape: RwkvBlockFullTape) {
-        let index = self.rwkv_tapes.iter().position(Option::is_none).expect("too many RWKV tapes");
-        self.rwkv_tapes[index] = Some(tape);
+        let index = self.inputs.len();
+        assert!(index > 0 && index <= self.block_order.len());
+        let slot = index - 1;
+        assert!(matches!(self.block_order[slot], BackwardBlockKind::Rwkv(_)));
+        assert!(self.rwkv_tapes[slot].is_none());
+        self.rwkv_tapes[slot] = Some(tape);
     }
 
     pub fn record_head(&mut self, ln_input: Array2<f32>, normalized: Array2<f32>, logits: Array2<f32>) {
