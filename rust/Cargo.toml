@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Native Rust runtime and training toolkit for SmaulNative"
 license = "MIT"
+build = "build.rs"
+
+[features]
+default = []
+cuda = []
+hip = []
 
 [dependencies]
 ndarray = "0.16"
