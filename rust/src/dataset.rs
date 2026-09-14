@@ -172,12 +172,23 @@ impl MultiFileTextStream {
 
 pub fn discover_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, String> {
     const PLAIN: &[&str] = &["txt", "text", "py", "cpp", "c", "h", "hpp", "cc", "cxx", "rs", "js", "ts", "tsx", "jsx", "java", "go", "cs", "php", "rb", "swift", "kt", "kts", "scala", "sh", "bash", "zsh", "html", "css", "scss", "sql", "md", "rst", "yaml", "yml", "toml", "xml"];
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir.as_ref()).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        let ext = path.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
-        if path.is_file() && matches!(ext.as_deref(), Some("jsonl") | Some("parquet")) || path.is_file() && ext.as_deref().is_some_and(|x| PLAIN.contains(&x)) { files.push(path); }
+    fn visit(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in std::fs::read_dir(path).map_err(|e| format!("failed to read {}: {e}", path.display()))? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.is_dir() {
+                visit(&path, files)?;
+                continue;
+            }
+            if !path.is_file() { continue; }
+            let ext = path.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
+            if matches!(ext.as_deref(), Some("jsonl") | Some("parquet")) || ext.as_deref().is_some_and(|x| PLAIN.contains(&x)) {
+                files.push(path);
+            }
+        }
+        Ok(())
     }
+    let mut files = Vec::new();
+    visit(dir.as_ref(), &mut files)?;
     files.sort();
     Ok(files)
 }
@@ -196,5 +207,6 @@ mod tests {
     #[test] fn reads_jsonl_prompt_and_completion() { let path=std::env::temp_dir().join("smaul-prompt.jsonl"); fs::write(&path,"{\"prompt\":\"a\",\"completion\":\"b a\"}\n").unwrap(); let mut stream=TextStream::open_jsonl(&path,tokenizer(),2,None::<String>).unwrap(); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_file(path); }
     #[test] fn discovers_parquet_files() { let dir=std::env::temp_dir().join("smaul-discover"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("data.parquet"),b"not parquet").unwrap(); assert_eq!(discover_files(&dir).unwrap().len(),1); let _=fs::remove_dir_all(dir); }
     #[test] fn discovers_source_files() { let dir=std::env::temp_dir().join("smaul-source-discover"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("model.rs"),"fn main() {}").unwrap(); fs::write(dir.join("ignore.bin"),b"x").unwrap(); assert_eq!(discover_files(&dir).unwrap(), vec![dir.join("model.rs")]); let _=fs::remove_dir_all(dir); }
+    #[test] fn discovers_nested_source_files() { let dir=std::env::temp_dir().join("smaul-nested-discover"); let nested=dir.join("nested"); fs::create_dir_all(&nested).unwrap(); fs::write(nested.join("model.rs"),"fn main() {}").unwrap(); fs::write(nested.join("ignore.bin"),b"x").unwrap(); assert_eq!(discover_files(&dir).unwrap(), vec![nested.join("model.rs")]); let _=fs::remove_dir_all(dir); }
     #[test] fn streams_multiple_files() { let dir=std::env::temp_dir().join("smaul-multi"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("a.txt"),"a b a b").unwrap(); fs::write(dir.join("b.txt"),"b a b a").unwrap(); let mut stream=MultiFileTextStream::open_discovered(&dir,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_dir_all(dir); }
 }
