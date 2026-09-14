@@ -37,7 +37,7 @@ os.environ.setdefault("MKL_NUM_THREADS", _default_threads)
 os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX")
 
 import torch
-from cpu_backend import NativeLion, configure
+from cpu import NativeLion, configure
 from rwkv_x_core import RWKVXConfig, RWKVXModel
 
 threads = configure(args.threads)
@@ -63,7 +63,6 @@ print(f"SmaulNative CPU Benchmark  |  threads={threads}  ctx_len={args.ctx_len}"
 print(f"Model: {model.num_parameters()/1e6:.1f}M params  |  compile={args.compile}")
 print(f"{'='*60}")
 
-# Warm-up
 print("Warming up (1 step)...")
 optimizer.zero_grad(set_to_none=True)
 _, loss, _ = model(x, labels=y)
@@ -91,13 +90,9 @@ for step in range(args.steps):
     tps = tok_per_step / total
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     results.append((t_fwd, t_bwd, t_opt, total, tps, rss))
-    print(
-        f"  step {step+1}/{args.steps}: fwd={t_fwd:.2f}s  bwd={t_bwd:.2f}s  opt={t_opt:.3f}s  total={total:.2f}s  {tps:.1f} tok/s  RAM={rss:.0f}MB"
-    )
+    print(f"  step {step+1}/{args.steps}: fwd={t_fwd:.2f}s  bwd={t_bwd:.2f}s  opt={t_opt:.3f}s  total={total:.2f}s  {tps:.1f} tok/s  RAM={rss:.0f}MB")
 
 if results:
     avg = [sum(r[i] for r in results) / len(results) for i in range(6)]
     print(f"\nAverage over {args.steps} steps:")
-    print(
-        f"  fwd={avg[0]:.2f}s  bwd={avg[1]:.2f}s  opt={avg[2]:.3f}s  total={avg[3]:.2f}s  {avg[4]:.1f} tok/s  peak_RAM={avg[5]:.0f}MB"
-    )
+    print(f"  fwd={avg[0]:.2f}s  bwd={avg[1]:.2f}s  opt={avg[2]:.3f}s  total={avg[3]:.2f}s  {avg[4]:.1f} tok/s  peak_RAM={avg[5]:.0f}MB")

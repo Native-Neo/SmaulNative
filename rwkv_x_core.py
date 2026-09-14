@@ -30,6 +30,9 @@ class RWKVXConfig:
     is_moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
+    qat_bits: int = 0
+    rqt_bits: int = 0
+    quantization_bits: int = 0
 
     def save(self, path: Path):
         Path(path).write_text(json.dumps(asdict(self), indent=2))
@@ -45,6 +48,8 @@ class RWKVXConfig:
         dg = max(32, round(0.6 * C**0.8 / 32) * 32)
         tmix = 4 * C * C + C * (4 * dd + 2 * dm + 2 * dg)
         cmix = 8 * C * C
+        if self.is_moe:
+            cmix = self.num_experts * cmix + C * self.num_experts
         return 2 * V * C + (L - self.n_moba_layer) * (tmix + cmix) + self.n_moba_layer * (4 * C * C + cmix)
 
 
@@ -155,7 +160,7 @@ class RWKV_Tmix_x070(nn.Module):
             state, y = (torch.utils.checkpoint.checkpoint(_wkv_run_chunk, state, *args, use_reentrant=False)
                         if checkpoint else _wkv_run_chunk(state, *args))
             ys.append(y)
-        out = torch.cat(ys, 1).reshape(B, T, C)
+        out = ys[0].reshape(B, T, C) if len(ys) == 1 else torch.cat(ys, 1).reshape(B, T, C)
         out = self.ln_x(out.reshape(B * T, C)).reshape(B, T, C)
         out = out + ((r_ * k_ * self.r_k).sum(-1, keepdim=True) * v_).reshape(B, T, C)
         return self.output(out * g), v_first, (state, x[:, -1])
@@ -178,6 +183,9 @@ class RWKV_CMix_x070(nn.Module):
         xx = torch.cat([prev, x[:, :-1]], 1) - x
         return self.value(torch.relu(self.key(x + xx * self.x_k))**2), x[:, -1]
 
+    def forward_selected(self, x, prev):
+        return self.value(torch.relu(self.key(x + (prev - x) * self.x_k.view(-1)))**2)
+
 
 class RWKV_CMix_MoE(nn.Module):
     def __init__(self, cfg, layer_id):
@@ -193,11 +201,16 @@ class RWKV_CMix_MoE(nn.Module):
         topv, topi = torch.topk(probs, self.top_k, -1)
         topv = topv / topv.sum(-1, keepdim=True).clamp_min(1e-9)
         out = torch.zeros_like(x)
+        prev = torch.cat([
+            x_prev_last.unsqueeze(1) if x_prev_last is not None else torch.zeros_like(x[:, :1]),
+            x[:, :-1],
+        ], 1)
         for e, expert in enumerate(self.experts):
-            weight = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(-1)
-            mask = weight > 0
+            weight = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(-1, keepdim=True)
+            mask = weight.squeeze(-1) > 0
             if mask.any():
-                out[mask] += expert(x, x_prev_last)[0][mask] * weight[mask].unsqueeze(-1)
+                expert_weight = weight[mask].reshape(-1, 1)
+                out[mask] += expert.forward_selected(x[mask], prev[mask]) * expert_weight
         return out, x[:, -1]
 
 
@@ -265,20 +278,13 @@ class CausalSelfAttention(nn.Module):
                 else:
                     npick = min(kt, i)
                     top = torch.einsum("bhd,bhkd->bhk", qi.mean(2), km[:, :, :i]).topk(npick, -1).indices
-                    idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, -1, cs, N)
-                    hist_k = kc[:, :, :i].unsqueeze(2).expand(-1, -1, hi - lo, -1, -1, -1)
-                    hist_v = vc[:, :, :i].unsqueeze(2).expand(-1, -1, hi - lo, -1, -1, -1)
-                    sk = torch.gather(hist_k, 3, idx).reshape(B * H * (hi - lo), npick * cs, N)
-                    sv = torch.gather(hist_v, 3, idx).reshape(B * H * (hi - lo), npick * cs, N)
-                    qflat = qi.reshape(B * H * (hi - lo), 1, N)
-                    ownk_flat = ownk.unsqueeze(2).expand(-1, -1, hi - lo, -1, -1).reshape(B * H * (hi - lo), hi - lo, N)
-                    ownv_flat = ownv.unsqueeze(2).expand(-1, -1, hi - lo, -1, -1).reshape(B * H * (hi - lo), hi - lo, N)
+                    idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, cs, N)
+                    sk = torch.gather(kc[:, :, :i], 2, idx).reshape(B, H, npick * cs, N)
+                    sv = torch.gather(vc[:, :, :i], 2, idx).reshape(B, H, npick * cs, N)
                     hist_mask = torch.ones(hi - lo, npick * cs, dtype=torch.bool, device=x.device)
                     causal = torch.tril(torch.ones(hi - lo, hi - lo, dtype=torch.bool, device=x.device))
                     base_mask = torch.cat((hist_mask, causal), 1)
-                    mask = base_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1).reshape(B * H * (hi - lo), 1, npick * cs + hi - lo)
-                    yi = F.scaled_dot_product_attention(qflat, torch.cat((sk, ownk_flat), 1), torch.cat((sv, ownv_flat), 1), attn_mask=mask)
-                    yi = yi.reshape(B, H, hi - lo, N)
+                    yi = F.scaled_dot_product_attention(qi, torch.cat((sk, ownk), 2), torch.cat((sv, ownv), 2), attn_mask=base_mask)
                 out[:, :, lo:hi] = yi
             y = out
         return self.output(y.transpose(1, 2).contiguous().view(B, T, C)), (k, v) if use_cache else None
@@ -335,6 +341,8 @@ class RWKVBlock(nn.Module):
 class RWKVXModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        if isinstance(cfg, dict):
+            cfg = RWKVXConfig(**cfg)
         self.cfg = cfg
         self.emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout else None
@@ -357,7 +365,7 @@ class RWKVXModel(nn.Module):
         B, T = idx.shape
         x = self.emb(idx)
         x = self.dropout(x) if self.dropout else x
-        v_first = None
+        v_first = state.get("v_first") if state is not None else None
         if state is None:
             tmix_state, cmix_state, att_state = [None] * len(self.rwkv_blocks), [None] * len(self._order), [None] * len(self.moba_blocks)
         else:
@@ -374,7 +382,7 @@ class RWKVXModel(nn.Module):
         logits = self.head(x)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100) if labels is not None else None
         logits = logits if return_logits else None
-        new_state = {"tmix": nts, "cmix": ncs, "moba_att": nas} if use_cache else None
+        new_state = {"tmix": nts, "cmix": ncs, "moba_att": nas, "v_first": v_first} if use_cache else None
         return logits, loss, new_state
 
     def num_parameters(self):
@@ -424,5 +432,10 @@ class RWKVXModel(nn.Module):
                 parent_path, name = path.rsplit(".", 1) if "." in path else ("", path)
                 parent = model.get_submodule(parent_path) if parent_path else model
                 setattr(parent, name, QuantizedLinear(sd[pk], sd[sk], sd[shape].tolist()))
+        else:
+            qat_keys = [k for k in sd if k.endswith(".weight_fq.scale") or k.endswith(".act_fq.scale")]
+            if qat_keys:
+                from qat import prepare_qat
+                prepare_qat(model)
         model.load_state_dict(sd, strict=True)
         return model

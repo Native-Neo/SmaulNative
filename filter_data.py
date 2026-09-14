@@ -47,7 +47,19 @@ def filter_text(text: Any, dataset: str = "auto", min_chars: int = 20, max_chars
 
 def filter_record(record: dict[str, Any], dataset: str = "auto", min_chars: int = 20,
                   max_chars: int = 1_000_000) -> Optional[str]:
-    value = record.get("text") if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        return None
+    lower = {str(key).lower(): value for key, value in record.items()}
+    prompt = lower.get("prompt")
+    completion = lower.get("completion")
+    if isinstance(prompt, str) and isinstance(completion, str):
+        value = prompt + "\n" + completion
+    elif isinstance(prompt, str):
+        value = prompt
+    elif isinstance(completion, str):
+        value = completion
+    else:
+        value = lower.get("text")
     return filter_text(value, dataset, min_chars, max_chars)
 
 

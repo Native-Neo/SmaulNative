@@ -37,7 +37,9 @@ def load_tokenizer(path: Path) -> TokenizerWrapper:
     return TokenizerWrapper(SmaulTokenizer.from_file(path))
 
 
-def tokenizer_vocab_size(tok: TokenizerWrapper) -> int:
+def tokenizer_vocab_size(tok) -> int:
+    if isinstance(tok, (str, Path)):
+        tok = load_tokenizer(Path(tok))
     return tok.get_vocab_size()
 
 
@@ -98,18 +100,25 @@ def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
 
 
 def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_record: int = 0) -> Iterator[Tuple[str, str, int]]:
+    if resume_record < 0:
+        raise ValueError("resume_record must be non-negative")
+    if resume_file is not None:
+        resume_file = str(Path(resume_file).resolve())
+        resolved_files = {str(path.resolve()) for path in files}
+        if resume_file not in resolved_files:
+            raise FileNotFoundError(f"resume file not found in discovered dataset files: {resume_file}")
     started = resume_file is None
     for path in files:
         if not started:
-            if str(path) == resume_file:
+            if str(path.resolve()) == resume_file:
                 started = True
             else:
                 continue
-        start_idx = resume_record if str(path) == resume_file else 0
+        start_idx = resume_record if str(path.resolve()) == resume_file else 0
         suffix = path.suffix.lower()
         try:
             if suffix in (".txt", ".text"):
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     doc = []
                     record = -1
                     for line in f:
@@ -128,17 +137,18 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                         if record >= start_idx:
                             yield "\n".join(doc), str(path), record + 1
             elif suffix in PLAIN_TEXT_SUFFIXES:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     content = f.read().strip()
                 if content and start_idx == 0:
                     yield content, str(path), 1
             elif suffix == ".jsonl":
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     for i, line in enumerate(f):
-                        if i < start_idx:
-                            continue
                         line = line.strip()
                         if not line:
+                            continue
+                        record = i + 1
+                        if record <= start_idx:
                             continue
                         try:
                             obj = json.loads(line)
@@ -146,24 +156,26 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                             continue
                         text = extract_text(obj, str(path)).strip()
                         if text:
-                            yield text, str(path), i + 1
+                            yield text, str(path), record
             elif suffix == ".json":
-                data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+                data = json.loads(path.read_text(encoding="utf-8"))
                 records = data.get("data", data) if isinstance(data, dict) else data
                 if not isinstance(records, list):
                     records = [records]
-                for i in range(start_idx, len(records)):
-                    text = extract_text(records[i], str(path)).strip()
+                for i, record_obj in enumerate(records, 1):
+                    if i <= start_idx:
+                        continue
+                    text = extract_text(record_obj, str(path)).strip()
                     if text:
-                        yield text, str(path), i + 1
+                        yield text, str(path), i
             elif suffix == ".csv":
-                with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
-                    for i, row in enumerate(csv.DictReader(f)):
-                        if i < start_idx:
+                with open(path, "r", encoding="utf-8", newline="") as f:
+                    for i, row in enumerate(csv.DictReader(f), 1):
+                        if i <= start_idx:
                             continue
                         text = extract_text(row, str(path)).strip()
                         if text:
-                            yield text, str(path), i + 1
+                            yield text, str(path), i
             elif suffix == ".parquet":
                 import pyarrow.parquet as pq
                 pf = pq.ParquetFile(path)
@@ -174,27 +186,42 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                     if cand in schema_lower:
                         fast_col = schema_names[schema_lower.index(cand)]
                         break
-                i = -1
-                for batch in pf.iter_batches(batch_size=1024):
-                    if fast_col is not None:
+                prompt_col = schema_names[schema_lower.index("prompt")] if "prompt" in schema_lower else None
+                completion_col = schema_names[schema_lower.index("completion")] if "completion" in schema_lower else None
+                record = 0
+                columns = [fast_col] if fast_col is not None else None
+                if prompt_col and completion_col and prompt_col != completion_col:
+                    columns = [prompt_col, completion_col]
+                for batch in pf.iter_batches(batch_size=1024, columns=columns):
+                    if prompt_col and completion_col and prompt_col != completion_col:
+                        prompt_data = batch.column(prompt_col).to_pylist()
+                        completion_data = batch.column(completion_col).to_pylist()
+                        for prompt, completion in zip(prompt_data, completion_data):
+                            record += 1
+                            if record <= start_idx:
+                                continue
+                            text = extract_text({"prompt": prompt, "completion": completion}, str(path)).strip()
+                            if text:
+                                yield text, str(path), record
+                    elif fast_col is not None:
                         col = batch.column(fast_col)
                         for row_idx in range(batch.num_rows):
-                            i += 1
-                            if i < start_idx:
+                            record += 1
+                            if record <= start_idx:
                                 continue
                             val = col[row_idx].as_py()
                             if isinstance(val, str) and val.strip():
-                                yield val.strip(), str(path), i + 1
+                                yield val.strip(), str(path), record
                     else:
                         for row in batch.to_pylist():
-                            i += 1
-                            if i < start_idx:
+                            record += 1
+                            if record <= start_idx:
                                 continue
                             text = extract_text(row, str(path)).strip()
                             if text:
-                                yield text, str(path), i + 1
+                                yield text, str(path), record
         except Exception as e:
-            print(f"[WARN] skipping {path}: {e}")
+            raise RuntimeError(f"failed to read dataset file {path}") from e
 
 
 class PretrainStream(IterableDataset):
@@ -260,14 +287,21 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
         tokenized_lens.append(len(ids))
         speakers.append(c["from"])
         prefix_lens.append(len(tokenizer.encode(c["from"] + ": ")))
+    if not input_ids:
+        raise ValueError("SFT record contains no valid conversation turns")
     targets = [IGNORE_INDEX] * len(input_ids)
     cur = 0
     for length, speaker, prefix_len in zip(tokenized_lens, speakers, prefix_lens):
         if speaker.lower() == "assistant":
-            targets[cur + min(prefix_len, length):cur + length] = input_ids[cur + min(prefix_len, length):cur + length]
+            start = cur + min(prefix_len, length)
+            targets[start:cur + length] = input_ids[start:cur + length]
         cur += length
-    input_ids = input_ids[:ctx_len]
-    targets = targets[:ctx_len]
+    input_ids = input_ids[:ctx_len + 1]
+    targets = targets[:ctx_len + 1]
+    if not any(x != IGNORE_INDEX for x in targets[1:]):
+        raise ValueError("SFT record contains no assistant targets within ctx_len")
+    input_ids = input_ids[:-1]
+    targets = targets[1:]
     pad_len = ctx_len - len(input_ids)
     if pad_len:
         input_ids.extend([pad_token_id] * pad_len)
@@ -282,7 +316,7 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
             continue
         try:
             if path.suffix.lower() == ".jsonl":
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -292,10 +326,10 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
                         except json.JSONDecodeError:
                             print(f"[WARN] skipping malformed SFT record in {path}")
             else:
-                data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+                data = json.loads(path.read_text(encoding="utf-8"))
                 records.extend(data if isinstance(data, list) else [data])
         except Exception as e:
-            print(f"[WARN] skipping SFT file {path}: {e}")
+            raise RuntimeError(f"failed to read SFT file {path}") from e
     records = [r for r in records if isinstance(r, dict) and isinstance(r.get("conversations"), list)]
     if not records:
         raise RuntimeError(f"No valid SFT conversation records found under {dataset_dir}")

@@ -66,20 +66,25 @@ class SmaulRL:
         if seed is not None:
             torch.manual_seed(seed)
             random.seed(seed)
-        prompt_ids = self._encode(prompt)
-        if not prompt_ids:
-            prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
-        ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-        logits, _, state = self.model(ids, state=None, use_cache=True, return_logits=True)
-        response, old_logprobs = [], []
-        for _ in range(max_new_tokens):
-            token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
-            if token == self.eos_id:
-                break
-            response.append(token)
-            old_logprobs.append(logprob)
-            logits, _, state = self.model(torch.tensor([[token]], device=self.device), state=state, use_cache=True, return_logits=True)
-        return self._decode(response), response, old_logprobs
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            prompt_ids = self._encode(prompt)
+            if not prompt_ids:
+                prompt_ids = [self.bos_id if self.bos_id is not None else self.eos_id]
+            ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+            logits, _, state = self.model(ids, state=None, use_cache=True, return_logits=True)
+            response, old_logprobs = [], []
+            for _ in range(max_new_tokens):
+                token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
+                if token == self.eos_id:
+                    break
+                response.append(token)
+                old_logprobs.append(logprob)
+                logits, _, state = self.model(torch.tensor([[token]], device=self.device), state=state, use_cache=True, return_logits=True)
+            return self._decode(response), response, old_logprobs
+        finally:
+            self.model.train(was_training)
 
     def candidates(self, prompt: str, count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float) -> List[Dict]:
         result = []
@@ -146,7 +151,7 @@ class SmaulRL:
             clipped_ratio = ratio.clamp(1 - clip, 1 + clip)
             token_advantage = advantage.detach().expand_as(ratio)
             policy_loss = -torch.minimum(ratio * token_advantage, clipped_ratio * token_advantage).mean()
-            sampled_kl = (torch.exp(log_ratio.clamp(-20, 20)) - log_ratio - 1).mean()
+            sampled_kl = -log_ratio.mean()
             losses.append(policy_loss + kl_coef * sampled_kl)
         if not losses:
             return 0.0

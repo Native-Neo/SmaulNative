@@ -82,7 +82,12 @@ def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str, min_c
     with fs.open(remote, "rb") as handle:
         pf = pq.ParquetFile(handle)
         column, conversation = _text_column(pf)
-        columns = [column] if column else None
+        schema_names = pf.schema_arrow.names
+        lower = {name.lower(): name for name in schema_names}
+        prompt_col = lower.get("prompt")
+        completion_col = lower.get("completion")
+        pair_columns = prompt_col is not None and completion_col is not None and prompt_col != completion_col
+        columns = [prompt_col, completion_col] if pair_columns else ([column] if column else None)
         row_groups = pf.num_row_groups
 
     record = 0
@@ -98,16 +103,23 @@ def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str, min_c
                 try:
                     rows = future.result()
                 except Exception as exc:
-                    print(
-                        f"[WARN] skipping row group {group_index} in {rel_path}: {exc}",
-                        file=sys.stderr,
-                    )
-                    continue
+                    raise RuntimeError(f"failed to read row group {group_index} in {rel_path}") from exc
                 for value in rows:
                     if record < skip:
                         record += 1
                         continue
-                    if column:
+                    if pair_columns and isinstance(value, dict):
+                        prompt = value.get(prompt_col)
+                        completion = value.get(completion_col)
+                        if isinstance(prompt, str) and isinstance(completion, str):
+                            text = prompt + "\n" + completion
+                        elif isinstance(prompt, str):
+                            text = prompt
+                        elif isinstance(completion, str):
+                            text = completion
+                        else:
+                            text = ""
+                    elif column:
                         text = _conversation(value) if conversation else value
                     else:
                         text = (max(
@@ -135,12 +147,17 @@ def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
     names = list(DATASETS) if name == "all" else [name]
     if name != "all" and name not in DATASETS:
         raise ValueError(f"unknown dataset: {name}")
+    if start_dataset is not None and start_dataset not in names:
+        raise ValueError(f"start_dataset {start_dataset!r} is not part of selected dataset {name!r}")
+    if start_file is not None and start_dataset is None:
+        raise ValueError("start_file requires start_dataset")
 
     workers = workers if workers is not None else int(os.environ.get("SMAUL_STREAM_WORKERS", "0"))
     if workers <= 0:
         workers = min(4, max(1, os.cpu_count() or 1))
 
     active_dataset = start_dataset is None
+    found_start_file = start_file is None
     for dataset_name in names:
         if not active_dataset:
             if dataset_name != start_dataset:
@@ -157,12 +174,15 @@ def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
                 if rel_path != start_file:
                     continue
                 active_file = True
+                found_start_file = True
             skip = start_record if dataset_name == start_dataset and rel_path == start_file else 0
             print(
                 f"[STREAM] {dataset_name}/{rel_path}" + (f" from row {skip:,}" if skip else ""),
                 file=sys.stderr,
             )
             yield from _stream_file(config, dataset_name, rel_path, min_chars, max_chars, skip, with_position, workers)
+    if not found_start_file:
+        raise FileNotFoundError(f"resume file not found: {start_dataset}/{start_file}")
 
 
 def main() -> None:

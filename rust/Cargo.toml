@@ -1,0 +1,9 @@
+[package]
+name = "smaul-native"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust runtime and training toolkit for SmaulNative"
+license = "MIT"
+
+[dependencies]
+ndarray = "0.16"
