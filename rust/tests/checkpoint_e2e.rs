@@ -17,8 +17,8 @@ fn checkpoint_load_inference_and_training_roundtrip(){
     let loaded=PretrainedModel::load(&dir).unwrap();
     assert_eq!(loaded.model.parameter_count(),pretrained.model.parameter_count());
     let engine=Inference{model:&loaded.model,tokenizer:&loaded.tokenizer,eos_id:loaded.tokenizer.eos_id()};
-    let text=engine.generate("a",4,1.0,0,1.0,1.0,&[],1);
-    assert!(text.is_some());
+    let text=engine.generate("a",4,1.0,0,1.0,1.0,1);
+    assert!(text.len()<=4);
     let tokens=loaded.tokenizer.encode("ab");
     let step=ModelTrainStep::run(&loaded.model,&tokens,&Array1::from_vec(vec![6,7]));
     assert!(step.loss.is_finite());
