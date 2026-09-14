@@ -2,9 +2,9 @@ name: Rust SmaulNative
 
 on:
   push:
-    branches: [rust]
+    branches: [Development/Unstable]
   pull_request:
-    branches: [main, developement]
+    branches: [Stable, Development/Unstable]
   workflow_dispatch:
 
 jobs:
@@ -18,5 +18,4 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build and test
-        working-directory: rust
         run: cargo test --all-targets
