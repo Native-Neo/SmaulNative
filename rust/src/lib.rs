@@ -62,6 +62,7 @@ pub mod rwkv_time_mix_backward_full;
 pub mod rwkv_time_mix_tape;
 pub mod safetensors;
 pub mod sequence_loss;
+pub mod sft_dataset;
 pub mod tokenizer;
 pub mod train_loop;
 pub mod training;
