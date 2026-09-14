@@ -96,6 +96,7 @@ mod tests {
     use super::*;
     use crate::rwkv_model::RwkvModelConfig;
     #[test] fn greedy_sampling_selects_maximum() { let mut rng=rand::rngs::StdRng::seed_from_u64(1); assert_eq!(sample(&[1.0,4.0,2.0],0.0,0,1.0,1.0,&[],&mut rng),1); }
+    #[test] fn invalid_generation_arguments_are_rejected(){assert!(Inference::validate(0,-1.0,0,1.0,1.0).is_err());assert!(Inference::validate(0,0.7,0,0.0,1.0).is_err());assert!(Inference::validate(0,0.7,0,1.0,0.0).is_err());}
     #[test] fn inference_can_generate() { let tokenizer=Tokenizer::from_vocab(vec!["<pad>".into(),"<unk>".into(),"<bos>".into(),"<eos>".into(),"<cap>".into(),"<upper>".into(),"a".into()]); let model=RwkvModel::new(RwkvModelConfig::new(7,8,1,4),1); let engine=Inference{model:&model,tokenizer:&tokenizer,eos_id:tokenizer.eos_id()}; let _=engine.generate("a",1,0.0,0,1.0,1.0,1); }
     #[test] fn chat_prompt_matches_format() { let tokenizer=Tokenizer::from_vocab(vec!["<pad>".into(),"<unk>".into(),"<bos>".into(),"<eos>".into(),"<cap>".into(),"<upper>".into(),"a".into()]); let model=RwkvModel::new(RwkvModelConfig::new(7,8,1,4),1); let engine=Inference{model:&model,tokenizer:&tokenizer,eos_id:3}; assert_eq!(engine.chat_prompt(&[("user","hello")],Some("sys")),"System:\nsys\n\nUser:\nhello\n\nAssistant:\n"); }
 }
