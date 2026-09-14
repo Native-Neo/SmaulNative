@@ -13,16 +13,26 @@ impl Bits {
 }
 
 fn fp8_e4m3_code(value: f32) -> u8 {
+    const MAX_FINITE: f32 = 448.0;
     if value.is_nan() { return 0x7f; }
     if value == 0.0 { return if value.is_sign_negative() { 0x80 } else { 0 }; }
     let sign = if value.is_sign_negative() { 0x80 } else { 0 };
     let x = value.abs();
-    if !x.is_finite() { return sign | 0x7f; }
-    let mut exponent = x.log2().floor().clamp(-6.0, 7.0) as i32;
+    if x.is_infinite() || x >= MAX_FINITE { return sign | 0x7e; }
+
+    let mut exponent = x.log2().floor() as i32;
+    if exponent < -6 { exponent = -6; }
+    if exponent > 8 { exponent = 8; }
     let base = 2.0_f32.powi(exponent);
     let mut mantissa = ((x / base - 1.0) * 8.0).round() as i32;
-    if mantissa >= 8 { mantissa = 0; exponent += 1; }
-    exponent = exponent.clamp(-6, 7);
+
+    if mantissa >= 8 {
+        mantissa = 0;
+        exponent += 1;
+    }
+    if exponent > 8 { return sign | 0x7e; }
+    if exponent == 8 && mantissa > 6 { return sign | 0x7e; }
+
     sign | (((exponent + 7) as u8) << 3) | (mantissa.clamp(0, 7) as u8)
 }
 
@@ -36,7 +46,7 @@ fn fp8_e4m3(code: u8) -> f32 {
 }
 
 fn fp8_e4m3_value(value: f32) -> f32 {
-    if value == 0.0 || !value.is_finite() { return value; }
+    if value == 0.0 { return value; }
     fp8_e4m3(fp8_e4m3_code(value))
 }
 
@@ -73,4 +83,8 @@ impl QatLinear3Bit{pub fn new(weight:Array2<f32>,signed_activation:bool)->Self{a
 #[derive(Clone,Debug)]pub struct QuantizedLinear3Bit{pub packed:Vec<u8>,pub scales:Vec<f32>,pub shape:(usize,usize)}
 impl QuantizedLinear3Bit{pub fn forward(&self,input:&Array2<f32>)->Array2<f32>{input.dot(&dequantize_weight_3bit(&self.packed,&self.scales,self.shape).t())}}
 
-#[cfg(test)]mod tests{use super::*;use ndarray::array;#[test]fn bit_modes_are_supported(){assert_eq!(Bits::from_bits(2).unwrap().bits(),2);assert_eq!(Bits::from_bits(4).unwrap().bits(),4);assert_eq!(Bits::from_bits(8).unwrap().bits(),8);assert!(Bits::from_bits(3).is_err());}#[test]fn fp2_round_trip_uses_three_levels(){let x=array![[-2.0,0.0],[0.5,2.0]];let q=fake_quantize(&x,Bits::Fp2);assert_eq!(q[[0,0]],-2.0);assert_eq!(q[[0,1]],0.0);assert_eq!(q[[1,0]],1.0);assert_eq!(q[[1,1]],2.0);}#[test]fn fp4_quantization_has_expected_shape(){let x=array![[1.0,-0.5,0.2]];assert_eq!(fake_quantize(&x,Bits::Fp4).dim(),x.dim());}#[test]fn fp8_quantization_is_finite(){let x=array![[1.0,-0.5,0.2]];let q=fake_quantize(&x,Bits::Fp8);assert!(q.iter().all(|v|v.is_finite()));assert!((q[[0,0]]-1.0).abs()<0.01);}#[test]fn fp8_packed_storage_is_one_byte_per_value(){let x=array![[1.0,-0.5,0.2],[2.0,-1.0,0.0]];let(packed,scales)=quantize_weight(&x,Bits::Fp8);assert_eq!(packed.len(),x.len());assert_eq!(scales,vec![1.0]);let restored=dequantize_weight(&packed,&scales,x.dim(),Bits::Fp8);for(v,r)in x.iter().zip(restored.iter()){if *v!=0.0{assert!((v-r).abs()<0.2);}}assert_eq!(restored[[1,2]],0.0);}#[test]fn quantized_linear_has_expected_shape(){let x=array![[1.0,2.0,3.0]];let w=array![[1.0,0.0,0.0],[0.0,1.0,0.0]];assert_eq!(quantized_linear(&x,&w,Bits::Fp4).shape(),&[1,2]);}#[test]fn packed_lowbit_round_trips(){let codes=vec![0,1,2,3,0,1,2,3,2,1,0];for bits in[Bits::Fp2,Bits::Fp4]{let packed=pack_lowbit(&codes,bits);let expected=codes.iter().map(|c|if bits==Bits::Fp2{c&3}else{c&15}).collect::<Vec<_>>();assert_eq!(unpack_lowbit(&packed,codes.len(),bits),expected);}}#[test]fn pack_3bit_round_trips(){let codes=vec![0,1,2,3,4,5,6,7,3,1,6];assert_eq!(unpack_3bit(&pack_3bit(&codes),codes.len()),codes);}#[test]fn qat_3bit_weight_preserves_shape(){let weight=array![[0.2,-0.4,0.7],[1.0,-0.5,0.25]];let(packed,scales)=quantize_weight_3bit(&weight);let quantized=dequantize_weight_3bit(&packed,&scales,weight.dim());assert_eq!(quantized.dim(),weight.dim());assert!(quantized.iter().all(|value|value.is_finite()));assert!(quantized[[0,2]]>0.6);}#[test]fn qat_linear_observes_and_converts(){let weight=array![[1.0,0.0],[0.0,1.0]];let mut qat=QatLinear3Bit::new(weight,true);let input=array![[1.0,-0.5]];let output=qat.forward(&input);assert_eq!(output.dim(),(1,2));assert!(qat.activation_min<=-0.5);assert!(qat.activation_max>=1.0);assert_eq!(qat.convert().shape,(2,2));}#[test]fn fp4_packed_linear_round_trip(){let weight=array![[1.0,-0.5],[0.25,2.0]];let qat=QatLinear::new(weight,Bits::Fp4);let packed=qat.convert();let x=array![[1.0,2.0]];assert_eq!(packed.forward(&x).dim(),(1,2));}#[test]fn fp8_packed_linear_round_trip(){let weight=array![[1.0,-0.5],[0.25,2.0]];let qat=QatLinear::new(weight,Bits::Fp8);let packed=qat.convert();let x=array![[1.0,2.0]];let y=packed.forward(&x);assert_eq!(y.dim(),(1,2));assert!(y.iter().all(|v|v.is_finite()));}}
+#[cfg(test)]mod tests{use super::*;use ndarray::array;#[test]fn bit_modes_are_supported(){assert_eq!(Bits::from_bits(2).unwrap().bits(),2);assert_eq!(Bits::from_bits(4).unwrap().bits(),4);assert_eq!(Bits::from_bits(8).unwrap().bits(),8);assert!(Bits::from_bits(3).is_err());}#[test]fn fp2_round_trip_uses_three_levels(){let x=array![[-2.0,0.0],[0.5,2.0]];let q=fake_quantize(&x,Bits::Fp2);assert_eq!(q[[0,0]],-2.0);assert_eq!(q[[0,1]],0.0);assert_eq!(q[[1,0]],1.0);assert_eq!(q[[1,1]],2.0);}#[test]fn fp4_quantization_has_expected_shape(){let x=array![[1.0,-0.5,0.2]];assert_eq!(fake_quantize(&x,Bits::Fp4).dim(),x.dim());}#[test]fn fp8_quantization_is_finite(){let x=array![[1.0,-0.5,0.2]];let q=fake_quantize(&x,Bits::Fp8);assert!(q.iter().all(|v|v.is_finite()));assert!((q[[0,0]]-1.0).abs()<0.01);}#[test]fn fp8_packed_storage_is_one_byte_per_value(){let x=array![[1.0,-0.5,0.2],[2.0,-1.0,0.0]];let(packed,scales)=quantize_weight(&x,Bits::Fp8);assert_eq!(packed.len(),x.len());assert_eq!(scales,vec![1.0]);let restored=dequantize_weight(&packed,&scales,x.dim(),Bits::Fp8);for(v,r)in x.iter().zip(restored.iter()){if *v!=0.0{assert!((v-r).abs()<0.2);}}assert_eq!(restored[[1,2]],0.0);}#[test]fn quantized_linear_has_expected_shape(){let x=array![[1.0,2.0,3.0]];let w=array![[1.0,0.0,0.0],[0.0,1.0,0.0]];assert_eq!(quantized_linear(&x,&w,Bits::Fp4).shape(),&[1,2]);}#[test]fn packed_lowbit_round_trips(){let codes=vec![0,1,2,3,0,1,2,3,2,1,0];for bits in[Bits::Fp2,Bits::Fp4]{let packed=pack_lowbit(&codes,bits);let expected=codes.iter().map(|c|if bits==Bits::Fp2{c&3}else{c&15}).collect::<Vec<_>>();assert_eq!(unpack_lowbit(&packed,codes.len(),bits),expected);}}#[test]fn pack_3bit_round_trips(){let codes=vec![0,1,2,3,4,5,6,7,3,1,6];assert_eq!(unpack_3bit(&pack_3bit(&codes),codes.len()),codes);}#[test]fn qat_3bit_weight_preserves_shape(){let weight=array![[0.2,-0.4,0.7],[1.0,-0.5,0.25]];let(packed,scales)=quantize_weight_3bit(&weight);let quantized=dequantize_weight_3bit(&packed,&scales,weight.dim());assert_eq!(quantized.dim(),weight.dim());assert!(quantized.iter().all(|value|value.is_finite()));assert!(quantized[[0,2]]>0.6);}#[test]fn qat_linear_observes_and_converts(){let weight=array![[1.0,0.0],[0.0,1.0]];let mut qat=QatLinear3Bit::new(weight,true);let input=array![[1.0,-0.5]];let output=qat.forward(&input);assert_eq!(output.dim(),(1,2));assert!(qat.activation_min<=-0.5);assert!(qat.activation_max>=1.0);assert_eq!(qat.convert().shape,(2,2));}#[test]fn fp4_packed_linear_round_trip(){let weight=array![[1.0,-0.5],[0.25,2.0]];let qat=QatLinear::new(weight,Bits::Fp4);let packed=qat.convert();let x=array![[1.0,2.0]];assert_eq!(packed.forward(&x).dim(),(1,2));}#[test]fn fp8_packed_linear_round_trip(){let weight=array![[1.0,-0.5],[0.25,2.0]];let qat=QatLinear::new(weight,Bits::Fp8);let packed=qat.convert();let x=array![[1.0,2.0]];let y=packed.forward(&x);assert_eq!(y.dim(),(1,2));assert!(y.iter().all(|v|v.is_finite()));}
+#[test]fn fp8_saturates_to_max_finite(){assert_eq!(fp8_e4m3( fp8_e4m3_code(448.0)),448.0);assert_eq!(fp8_e4m3(fp8_e4m3_code(1000.0)),448.0);assert_eq!(fp8_e4m3(fp8_e4m3_code(-1000.0)),-448.0);}
+#[test]fn fp8_rounding_does_not_create_nan_code(){for value in [240.0,250.0,300.0,400.0,447.0]{let code=fp8_e4m3_code(value);assert_ne!(code,0x7f);assert!(fp8_e4m3(code).is_finite());}}
+#[test]fn fp8_special_values_are_consistent(){assert!(fp8_e4m3_value(f32::NAN).is_nan());assert_eq!(fp8_e4m3_value(f32::INFINITY),448.0);assert_eq!(fp8_e4m3_value(f32::NEG_INFINITY),-448.0);assert_eq!(fp8_e4m3_value(-0.0).to_bits(),(-0.0f32).to_bits());}
+}
