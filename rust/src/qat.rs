@@ -112,11 +112,10 @@ pub fn unpack_3bit(packed: &[u8], numel: usize) -> Vec<u8> {
 pub fn quantize_weight_3bit(weight: &Array2<f32>) -> (Vec<u8>, Vec<f32>) {
     let mut codes = Vec::with_capacity(weight.len());
     let mut scales = Vec::with_capacity(weight.nrows());
+
     for row in weight.rows() {
-        let mut scale = row.iter().map(|v| v.abs()).fold(0.0, f32::max);
-        if scale < f32::EPSILON {
-            scale = 1.0;
-        }
+        let max_abs = row.iter().map(|v| v.abs()).fold(0.0, f32::max);
+        let scale = (max_abs / QAT_3BIT_MAX as f32).max(f32::EPSILON);
         scales.push(scale);
         for &value in row {
             let quantized = (value / scale)
@@ -179,38 +178,30 @@ impl QatLinear3Bit {
 
     pub fn fake_quantize_activation(&self, input: &Array2<f32>) -> Array2<f32> {
         if self.signed_activation {
-            let scale = self.activation_min.abs().max(self.activation_max.abs()).max(f32::EPSILON);
-            let step = scale / QAT_3BIT_MAX as f32;
+            let max_abs = self.activation_min.abs().max(self.activation_max.abs());
+            let scale = (max_abs / QAT_3BIT_MAX as f32).max(f32::EPSILON);
             return Array2::from_shape_fn(input.raw_dim(), |index| {
-                (input[index] / step)
+                (input[index] / scale)
                     .round()
                     .clamp(QAT_3BIT_MIN as f32, QAT_3BIT_MAX as f32)
-                    * step
+                    * scale
             });
         }
-        let scale = (self.activation_max - self.activation_min).max(f32::EPSILON);
+
+        let range = (self.activation_max - self.activation_min).max(f32::EPSILON);
         Array2::from_shape_fn(input.raw_dim(), |index| {
-            let normalized = ((input[index] - self.activation_min) / scale).clamp(0.0, 1.0);
+            let normalized = ((input[index] - self.activation_min) / range).clamp(0.0, 1.0);
             let q = (normalized * 7.0).round();
-            self.activation_min + q * scale / 7.0
+            self.activation_min + q * range / 7.0
         })
     }
 
     pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.observe(input);
         let activation = self.fake_quantize_activation(input);
-        quantized_linear(&activation, &self.weight, Bits::Fp4)
-    }
-
-    pub fn forward_3bit(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        self.observe(input);
-        let activation = self.fake_quantize_activation(input);
-        let quantized = dequantize_weight_3bit(
-            &quantize_weight_3bit(&self.weight).0,
-            &quantize_weight_3bit(&self.weight).1,
-            self.weight.dim(),
-        );
-        activation.dot(&quantized.t())
+        let (packed, scales) = quantize_weight_3bit(&self.weight);
+        let weight = dequantize_weight_3bit(&packed, &scales, self.weight.dim());
+        activation.dot(&weight.t())
     }
 
     pub fn convert(&self) -> QuantizedLinear3Bit {
@@ -268,6 +259,7 @@ mod tests {
         let quantized = dequantize_weight_3bit(&packed, &scales, weight.dim());
         assert_eq!(quantized.dim(), weight.dim());
         assert!(quantized.iter().all(|value| value.is_finite()));
+        assert!(quantized[[0, 2]] > 0.6);
     }
 
     #[test]
@@ -275,7 +267,7 @@ mod tests {
         let weight = array![[1.0, 0.0], [0.0, 1.0]];
         let mut qat = QatLinear3Bit::new(weight, true);
         let input = array![[1.0, -0.5]];
-        let output = qat.forward_3bit(&input);
+        let output = qat.forward(&input);
         assert_eq!(output.dim(), (1, 2));
         assert!(qat.activation_min <= -0.5);
         assert!(qat.activation_max >= 1.0);
