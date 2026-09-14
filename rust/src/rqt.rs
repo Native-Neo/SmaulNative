@@ -8,8 +8,9 @@ pub struct RealQuantLinear { pub weight:Array2<f32>, pub bias:Option<Vec<f32>>, 
 impl RealQuantLinear {
  pub fn new(weight:Array2<f32>,bias:Option<Vec<f32>>,bits:u8)->Result<Self,String>{let bits=Bits::from_bits(bits)?;let quant=QatLinear::new(weight.clone(),bits).convert();Ok(Self{weight,bias,bits,quant})}
  pub fn refresh(&mut self){self.quant=QatLinear::new(self.weight.clone(),self.bits).convert();}
+ pub fn dequantized(&self)->Array2<f32>{crate::qat::dequantize_weight(&self.quant.packed,&self.quant.scales,self.quant.shape,self.bits)}
  pub fn forward(&self,input:&Array2<f32>)->Array2<f32>{let mut out=self.quant.forward(input);if let Some(b)=&self.bias{for r in 0..out.nrows(){for c in 0..out.ncols(){out[[r,c]]+=b[c];}}}out}
- pub fn backward(&self,input:&Array2<f32>,grad:&Array2<f32>)->(Array2<f32>,Array2<f32>){let q=crate::qat::dequantize_weight(&self.quant.packed,&self.quant.scales,self.quant.shape,self.bits);(grad.dot(&q),grad.t().dot(input))}
+ pub fn backward(&self,input:&Array2<f32>,grad:&Array2<f32>)->(Array2<f32>,Array2<f32>){(grad.dot(&self.dequantized()),grad.t().dot(input))}
 }
 
 #[derive(Clone,Debug)]
@@ -20,4 +21,4 @@ pub fn prepare_linear(weight:Array2<f32>,bias:Option<Vec<f32>>,bits:u8)->Result<
 pub fn refresh(linear:&mut RealQuantLinear){linear.refresh()}
 
 #[cfg(test)]
-mod tests{use super::*;use ndarray::array;#[test]fn packed_training_roundtrip(){let l=RealQuantLinear::new(array![[1.0,0.0],[0.0,1.0]],None,4).unwrap();let y=l.forward(&array![[2.0,3.0]]);assert_eq!(y.shape(),&[1,2]);}#[test]fn supported_bits(){for b in [2,4,8]{assert!(RqtConfig::new(b).is_ok())}}}
+mod tests{use super::*;use ndarray::array;#[test]fn packed_training_roundtrip(){let l=RealQuantLinear::new(array![[1.0,0.0],[0.0,1.0]],None,4).unwrap();let y=l.forward(&array![[2.0,3.0]]);assert_eq!(y.shape(),&[1,2]);assert_eq!(l.dequantized().shape(),&[2,2]);}#[test]fn supported_bits(){for b in [2,4,8]{assert!(RqtConfig::new(b).is_ok())}}}
