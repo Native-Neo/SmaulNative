@@ -74,7 +74,7 @@ impl MobaAttention {
         out
     }
 
-    pub fn forward(&self, x: &Array2<f32>) -> Array2<f32> {
+    pub fn forward_core(&self, x: &Array2<f32>) -> Array2<f32> {
         assert_eq!(x.ncols(), self.channels);
         let t = x.nrows();
         assert!(t > 0);
@@ -83,7 +83,7 @@ impl MobaAttention {
         let v = self.project_heads(x, &self.value);
         let n_chunks = (t + self.chunk_size - 1) / self.chunk_size;
         if self.top_k == 0 || n_chunks <= self.top_k + 1 {
-            return self.output.forward(&self.full_causal(&q, &k, &v, t));
+            return self.full_causal(&q, &k, &v, t);
         }
         let scale = (self.head_size as f32).sqrt().recip();
         let mut out = Array2::<f32>::zeros((t, self.channels));
@@ -132,7 +132,11 @@ impl MobaAttention {
                 }
             }
         }
-        self.output.forward(&out)
+        out
+    }
+
+    pub fn forward(&self, x: &Array2<f32>) -> Array2<f32> {
+        self.output.forward(&self.forward_core(x))
     }
 
     pub fn cache_forward(&self, x: &Array2<f32>, cache_k: &Array4<f32>, cache_v: &Array4<f32>) -> (Array2<f32>, Array4<f32>, Array4<f32>) {
@@ -190,7 +194,7 @@ impl MobaAttention {
                     let hi = lo + self.chunk_size;
                     for p in lo..hi {
                         keys.push((0..self.head_size).map(|d| all_k[[h, p, 0, d]]).collect());
-                        values.push((0..self.head_size).map(|d| all_v[[h, p, 0, d]]).collect());
+                        values.push((0..self.head_size).map(|d| all_v[[h, p, 0, d]).collect());
                     }
                 }
             } else {
@@ -231,6 +235,16 @@ mod tests {
     fn short_sequence_uses_causal_fallback() {
         let att = MobaAttention::new(16, 4, 4, 4);
         assert_eq!(att.forward(&Array2::<f32>::zeros((3, 16))).dim(), (3, 16));
+    }
+
+    #[test]
+    fn core_is_before_output_projection() {
+        let att = MobaAttention::new(16, 4, 2, 1);
+        let x = Array2::from_shape_fn((5, 16), |(r, c)| 0.01 * (r + c) as f32);
+        let core = att.forward_core(&x);
+        let projected = att.forward(&x);
+        assert_eq!(core.dim(), projected.dim());
+        assert!(core.iter().zip(projected.iter()).any(|(a, b)| (a - b).abs() > 1e-7));
     }
 
     #[test]
