@@ -117,3 +117,32 @@ pub fn backward(
         cmix,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn loss(block: &RwkvBlock, x: &Array2<f32>) -> f32 {
+        block.forward(x, None, None).0.sum()
+    }
+
+    #[test]
+    fn input_gradient_matches_finite_difference() {
+        let block=RwkvBlock::new(16,2,0,4);
+        let x=Array2::from_shape_fn((2,16),|(r,c)|0.02*(r as f32)+0.003*(c as f32)+0.01);
+        let (_,_,tape)=block.forward_with_full_tape(&x,None,None);
+        let analytic=backward(&block,&tape,&Array2::ones((2,16)),None,None,None,None).grad_input;
+        let eps=1e-3_f32;
+        for &(row,col) in &[(0usize,0usize),(0,7),(1,3),(1,15)] {
+            let mut plus=x.clone();
+            let mut minus=x.clone();
+            plus[[row,col]]+=eps;
+            minus[[row,col]]-=eps;
+            let numeric=(loss(&block,&plus)-loss(&block,&minus))/(2.0*eps);
+            let a=analytic[[row,col]];
+            let tolerance=3e-2_f32.max(3e-2*a.abs());
+            assert!((numeric-a).abs()<=tolerance,"gradient mismatch at ({row},{col}): analytic={a}, numeric={numeric}");
+        }
+    }
+}
