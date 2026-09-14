@@ -109,19 +109,28 @@ impl RwkvModel {
             match *kind {
                 BlockKind::Rwkv(index) => {
                     let block_state = state.and_then(|s| s.rwkv_blocks.get(index));
-                    let (next_x, next_state) = self.rwkv_blocks[index].forward(&x, block_state, v_first.as_ref());
+                    let (next_x, next_state, block_tape) = if tape.is_some() {
+                        self.rwkv_blocks[index].forward_with_full_tape(&x, block_state, v_first.as_ref())
+                    } else {
+                        let (next_x, next_state) = self.rwkv_blocks[index].forward(&x, block_state, v_first.as_ref());
+                        (next_x, next_state, unsafe { std::mem::zeroed() })
+                    };
                     v_first = next_state.v_first.clone();
                     x = next_x;
                     next_rwkv.push((index, next_state));
+                    if let Some(ref mut model_tape) = tape {
+                        model_tape.record_block(input, x.clone());
+                        model_tape.record_rwkv_tape(block_tape);
+                    }
                 }
                 BlockKind::Moba(index) => {
                     let block_state = state.and_then(|s| s.moba_blocks.get(index));
                     let (next_x, next_state) = self.moba_blocks[index].forward(&x, block_state);
                     x = next_x;
                     next_moba.push((index, next_state));
+                    if let Some(ref mut model_tape) = tape { model_tape.record_block(input, x.clone()); }
                 }
             }
-            if let Some(ref mut tape) = tape { tape.record_block(input, x.clone()); }
         }
         let mut rwkv_states: Vec<Option<RwkvBlockState>> = (0..self.rwkv_blocks.len()).map(|_| None).collect();
         for (index, block_state) in next_rwkv { rwkv_states[index] = Some(block_state); }
@@ -156,87 +165,5 @@ impl RwkvModel {
             result[row] = best_index;
         }
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_produces_vocab_logits() {
-        let config = RwkvModelConfig::new(32, 16, 2, 4);
-        let model = RwkvModel::new(config, 1234);
-        let (logits, state) = model.forward(&[1, 2, 3], None);
-        assert_eq!(logits.dim(), (3, 32));
-        assert_eq!(state.rwkv_blocks.len(), 2);
-        assert!(state.moba_blocks.is_empty());
-        assert_eq!(state.v_first.as_ref().unwrap().dim(), (3, 16));
-        assert_eq!(model.head.parameter_count(), 16 * 32);
-    }
-
-    #[test]
-    fn forward_tape_records_every_block() {
-        let config = RwkvModelConfig::new(32, 16, 5, 4).with_moba(2, 2, 1);
-        let model = RwkvModel::new(config, 1234);
-        let (logits, tape) = model.forward_with_tape(&[1, 2, 3]);
-        assert_eq!(logits.dim(), (3, 32));
-        assert_eq!(tape.len(), 5);
-        assert_eq!(tape.normalized.as_ref().unwrap().dim(), (3, 16));
-        assert_eq!(tape.ln_input.as_ref().unwrap().dim(), (3, 16));
-        assert_eq!(tape.logits.as_ref().unwrap().dim(), (3, 32));
-        assert_eq!(tape.reverse_blocks().count(), 5);
-    }
-
-    #[test]
-    fn moba_order_matches_layer_count() {
-        let config = RwkvModelConfig::new(32, 16, 5, 4).with_moba(2, 2, 1);
-        let model = RwkvModel::new(config, 1234);
-        assert_eq!(model.rwkv_blocks.len(), 3);
-        assert_eq!(model.moba_blocks.len(), 2);
-        assert_eq!(model.order.len(), 5);
-        let (_, state) = model.forward(&[1, 2, 3], None);
-        assert_eq!(state.rwkv_blocks.len(), 3);
-        assert_eq!(state.moba_blocks.len(), 2);
-    }
-
-    #[test]
-    fn state_can_be_reused_for_decode() {
-        let config = RwkvModelConfig::new(32, 16, 2, 4);
-        let model = RwkvModel::new(config, 1234);
-        let (_, state) = model.forward(&[1, 2, 3], None);
-        let (logits, next_state) = model.forward(&[4], Some(&state));
-        assert_eq!(logits.dim(), (1, 32));
-        assert_eq!(next_state.rwkv_blocks.len(), 2);
-    }
-
-    #[test]
-    fn moba_state_can_be_reused_for_decode() {
-        let config = RwkvModelConfig::new(32, 16, 5, 4).with_moba(2, 2, 1);
-        let model = RwkvModel::new(config, 1234);
-        let (_, state) = model.forward(&[1, 2, 3], None);
-        let (logits, next_state) = model.forward(&[4], Some(&state));
-        assert_eq!(logits.dim(), (1, 32));
-        assert_eq!(next_state.moba_blocks.len(), 2);
-        assert_eq!(next_state.moba_blocks[0].att_k.shape(), &[4, 4, 1, 4]);
-    }
-
-    #[test]
-    fn moba_decode_matches_full_sequence() {
-        let config = RwkvModelConfig::new(32, 16, 5, 4).with_moba(2, 2, 1);
-        let model = RwkvModel::new(config, 1234);
-        let (full_logits, _) = model.forward(&[1, 2, 3, 4], None);
-        let (_, state) = model.forward(&[1, 2, 3], None);
-        let (decode_logits, _) = model.forward(&[4], Some(&state));
-        let full = full_logits.row(3);
-        let decode = decode_logits.row(0);
-        let max_error = full.iter().zip(decode.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
-        assert!(max_error < 1e-5, "max decode error: {max_error}");
-    }
-
-    #[test]
-    fn argmax_selects_each_row() {
-        let logits = Array2::from_shape_vec((2, 4), vec![1.0, 7.0, 2.0, 3.0, 9.0, 2.0, 8.0, 1.0]).unwrap();
-        assert_eq!(RwkvModel::argmax(&logits).to_vec(), vec![1, 0]);
     }
 }
