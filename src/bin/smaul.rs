@@ -49,32 +49,32 @@ fn main() -> Result<(), String> {
 
     let prompt = required(&args, "--prompt");
     let max_new = value(&args, "--max-new")
-        .map(|v| v.parse())
+        .map(|v| v.parse::<usize>())
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or(256);
     let temperature = value(&args, "--temperature")
-        .map(|v| v.parse())
+        .map(|v| v.parse::<f32>())
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or(0.7);
     let top_k = value(&args, "--top-k")
-        .map(|v| v.parse())
+        .map(|v| v.parse::<usize>())
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or(50);
     let top_p = value(&args, "--top-p")
-        .map(|v| v.parse())
+        .map(|v| v.parse::<f32>())
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or(0.95);
     let repeat = value(&args, "--repeat")
-        .map(|v| v.parse())
+        .map(|v| v.parse::<f32>())
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or(1.05);
     let seed = value(&args, "--seed")
-        .map(|v| v.parse())
+        .map(|v| v.parse::<u64>())
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or(0);
