@@ -22,8 +22,8 @@ pub fn cross_entropy(logits: &Array2<f32>, targets: &Array1<usize>) -> (f32, Arr
 }
 
 pub fn cross_entropy_backward(logits: &Array2<f32>, targets: &[usize]) -> Array2<f32> {
-    let targets = Array1::from_vec(targets.to_vec());
-    cross_entropy(logits, &targets).1
+    assert_eq!(logits.nrows(), targets.len());
+    cross_entropy(logits, &Array1::from_vec(targets.to_vec())).1
 }
 
 #[cfg(test)]
