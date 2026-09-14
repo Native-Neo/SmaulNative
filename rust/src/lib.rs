@@ -56,6 +56,7 @@ pub mod qat;
 pub mod residual;
 pub mod rl;
 pub mod rqt;
+pub mod rqt_model;
 pub mod rwkv_block;
 pub mod rwkv_block_backward;
 pub mod rwkv_block_backward_full;
