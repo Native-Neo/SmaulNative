@@ -36,6 +36,7 @@ pub mod params;
 pub mod residual;
 pub mod rwkv_block;
 pub mod rwkv_block_backward;
+pub mod rwkv_block_backward_full;
 pub mod rwkv_block_tape;
 pub mod rwkv_block_full_tape;
 pub mod rwkv_cmix;
