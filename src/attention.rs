@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, Array3, Axis};
+use ndarray::{Array2, Array3, Axis};
 
 pub struct MultiHeadAttention {
     pub d_model: usize,
