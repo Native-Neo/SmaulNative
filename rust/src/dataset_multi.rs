@@ -31,13 +31,22 @@ impl MultiFileDatasetStream {
     }
 
     pub fn open_discovered(dir: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> {
-        let mut paths = Vec::new();
-        for entry in std::fs::read_dir(dir.as_ref()).map_err(|e| e.to_string())? {
-            let path = entry.map_err(|e| e.to_string())?.path();
-            let extension = path.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase());
-            let supported = extension.as_deref() == Some("jsonl") || extension.as_deref() == Some("parquet") || extension.as_deref().is_some_and(|x| PLAIN_SUFFIXES.contains(&x));
-            if path.is_file() && supported { paths.push(path); }
+        fn visit(path: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+            for entry in std::fs::read_dir(path).map_err(|e| format!("failed to read {}: {e}", path.display()))? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path.is_dir() {
+                    visit(&path, paths)?;
+                    continue;
+                }
+                if !path.is_file() { continue; }
+                let extension = path.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase());
+                let supported = extension.as_deref() == Some("jsonl") || extension.as_deref() == Some("parquet") || extension.as_deref().is_some_and(|x| PLAIN_SUFFIXES.contains(&x));
+                if supported { paths.push(path); }
+            }
+            Ok(())
         }
+        let mut paths = Vec::new();
+        visit(dir.as_ref(), &mut paths)?;
         paths.sort();
         Self::open(&paths, tokenizer, ctx_len)
     }
@@ -73,6 +82,20 @@ mod tests {
         fs::write(dir.join("c.rs"), "a b a b").unwrap();
         let stream = MultiFileDatasetStream::open_discovered(&dir, tokenizer(), 2).unwrap();
         assert_eq!(stream.file_count(), 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn discovers_nested_files() {
+        let dir = std::env::temp_dir().join("smaul-mixed-nested-dataset");
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("a.txt"), "a b a b").unwrap();
+        fs::write(nested.join("b.rs"), "a b a b").unwrap();
+        fs::write(nested.join("ignore.bin"), b"x").unwrap();
+        let stream = MultiFileDatasetStream::open_discovered(&dir, tokenizer(), 2).unwrap();
+        assert_eq!(stream.file_count(), 2);
+        assert_eq!(stream.paths(), &[nested.join("a.txt"), nested.join("b.rs")]);
         let _ = fs::remove_dir_all(dir);
     }
 
