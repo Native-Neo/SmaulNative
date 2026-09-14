@@ -29,17 +29,14 @@ fn tensor2_transposed(reader: &mut GgufReader, name: &str, rows: usize, cols: us
 }
 
 fn set_norm(reader: &mut GgufReader, prefix: &str, weight: &mut Array1<f32>, bias: &mut Array1<f32>) -> Result<(), String> {
-    let w = tensor1(reader, &format!("{prefix}.weight"), weight.len())?;
-    let b = tensor1(reader, &format!("{prefix}.bias"), bias.len())?;
-    *weight = w;
-    *bias = b;
+    *weight = tensor1(reader, &format!("{prefix}.weight"), weight.len())?;
+    *bias = tensor1(reader, &format!("{prefix}.bias"), bias.len())?;
     Ok(())
 }
 
 fn set_linear(reader: &mut GgufReader, name: &str, target: &mut Array2<f32>, transposed: bool) -> Result<(), String> {
     let shape = target.raw_dim();
-    let loaded = if transposed { tensor2_transposed(reader, name, shape[0], shape[1])? } else { tensor2(reader, name, shape[0], shape[1])? };
-    *target = loaded;
+    *target = if transposed { tensor2_transposed(reader, name, shape[0], shape[1])? } else { tensor2(reader, name, shape[0], shape[1])? };
     Ok(())
 }
 
@@ -55,7 +52,8 @@ fn load_rwkv_block(reader: &mut GgufReader, model: &mut RwkvModel, i: usize) -> 
         ("x_v", &mut t.x_v), ("x_a", &mut t.x_a), ("x_g", &mut t.x_g),
         ("w0", &mut t.w0), ("a0", &mut t.a0), ("k_k", &mut t.k_k), ("k_a", &mut t.k_a),
     ] {
-        *target = tensor1(reader, &format!("{p}.att.{name}"), target.len())?;
+        let len = target.len();
+        *target = tensor1(reader, &format!("{p}.att.{name}"), len)?;
     }
     for (name, target) in [
         ("w1", &mut t.w1), ("w2", &mut t.w2), ("a1", &mut t.a1),
@@ -70,14 +68,18 @@ fn load_rwkv_block(reader: &mut GgufReader, model: &mut RwkvModel, i: usize) -> 
             *target = tensor2(reader, &format!("{p}.att.{name}"), shape[0], shape[1])?;
         }
     }
-    if let Some(target) = t.v0.as_mut() { *target = tensor1(reader, &format!("{p}.att.v0"), target.len())?; }
+    if let Some(target) = t.v0.as_mut() {
+        let len = target.len();
+        *target = tensor1(reader, &format!("{p}.att.v0"), len)?;
+    }
     set_linear(reader, &format!("{p}.att.receptance.weight"), &mut t.receptance, true)?;
     set_linear(reader, &format!("{p}.att.key.weight"), &mut t.key, true)?;
     set_linear(reader, &format!("{p}.att.value.weight"), &mut t.value, true)?;
     set_linear(reader, &format!("{p}.att.output.weight"), &mut t.output, true)?;
     set_norm(reader, &format!("{p}.att.ln_x"), &mut t.ln_x.weight, &mut t.ln_x.bias)?;
     let c = &mut block.cmix;
-    c.x_k = tensor1(reader, &format!("{p}.ffn.x_k"), c.x_k.len())?;
+    let len = c.x_k.len();
+    c.x_k = tensor1(reader, &format!("{p}.ffn.x_k"), len)?;
     set_linear(reader, &format!("{p}.ffn.key.weight"), &mut c.key, true)?;
     set_linear(reader, &format!("{p}.ffn.value.weight"), &mut c.value, true)?;
     Ok(())
@@ -94,7 +96,8 @@ fn load_moba_block(reader: &mut GgufReader, model: &mut RwkvModel, i: usize) -> 
         ("value.weight", &mut block.att.value.weight),
         ("output.weight", &mut block.att.output.weight),
     ] { set_linear(reader, &format!("{p}.att.{name}"), target, false)?; }
-    block.ffn.x_k = tensor1(reader, &format!("{p}.ffn.x_k"), block.ffn.x_k.len())?;
+    let len = block.ffn.x_k.len();
+    block.ffn.x_k = tensor1(reader, &format!("{p}.ffn.x_k"), len)?;
     set_linear(reader, &format!("{p}.ffn.key.weight"), &mut block.ffn.key, true)?;
     set_linear(reader, &format!("{p}.ffn.value.weight"), &mut block.ffn.value, true)?;
     Ok(())
@@ -129,17 +132,5 @@ pub fn load_gguf_tokenizer(path: impl AsRef<std::path::Path>) -> Result<Tokenize
         None => return Err("missing GGUF metadata 'tokenizer.ggml.tokens'".into()),
     };
     if tokens.is_empty() { return Err("GGUF tokenizer vocabulary is empty".into()); }
-    Tokenizer::from_vocab(tokens);
     Ok(Tokenizer::from_vocab(tokens))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tokenizer_metadata_requires_tokens() {
-        let path = std::env::temp_dir().join("smaul-missing.gguf");
-        let _ = path;
-    }
 }
