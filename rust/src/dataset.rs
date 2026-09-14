@@ -1,6 +1,7 @@
 use crate::tokenizer::Tokenizer;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::{Field, Row};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -59,7 +60,10 @@ pub struct ParquetTextStream {
     tokenizer: Tokenizer,
     ctx_len: usize,
     path: PathBuf,
-    rows: std::vec::IntoIter<Row>,
+    reader: SerializedFileReader<File>,
+    rows: VecDeque<Row>,
+    row_group: usize,
+    row_group_count: usize,
     record: usize,
     buffer: Vec<usize>,
     eof: bool,
@@ -76,8 +80,17 @@ impl ParquetTextStream {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
         let reader = SerializedFileReader::new(file).map_err(|e| format!("failed to read parquet {}: {e}", path.display()))?;
-        let rows = reader.get_row_iter(None).map_err(|e| format!("failed to read parquet rows {}: {e}", path.display()))?.collect::<Result<Vec<_>, _>>().map_err(|e| format!("failed to decode parquet {}: {e}", path.display()))?.into_iter();
-        Ok(Self { tokenizer, ctx_len, path, rows, record: 0, buffer: Vec::new(), eof: false, text_field: text_field.map(Into::into) })
+        let row_group_count = reader.num_row_groups();
+        Ok(Self { tokenizer, ctx_len, path, reader, rows: VecDeque::new(), row_group: 0, row_group_count, record: 0, buffer: Vec::new(), eof: false, text_field: text_field.map(Into::into) })
+    }
+
+    fn load_next_row_group(&mut self) -> Result<bool, String> {
+        if self.row_group >= self.row_group_count { return Ok(false); }
+        let group = self.reader.get_row_group(self.row_group).map_err(|e| format!("failed to read parquet row group {} in {}: {e}", self.row_group, self.path.display()))?;
+        let rows = group.get_row_iter(None).map_err(|e| format!("failed to decode parquet row group {} in {}: {e}", self.row_group, self.path.display()))?.collect::<Result<Vec<_>, _>>().map_err(|e| format!("failed to decode parquet row group {} in {}: {e}", self.row_group, self.path.display()))?;
+        self.row_group += 1;
+        self.rows.extend(rows);
+        Ok(true)
     }
 
     fn field_text(&self, row: &Row) -> Option<String> {
@@ -105,14 +118,15 @@ impl ParquetTextStream {
                 self.buffer.resize(self.ctx_len + 1, self.tokenizer.eos_id());
                 continue;
             }
-            match self.rows.next() {
-                Some(row) => {
-                    let text = self.field_text(&row).ok_or_else(|| format!("Parquet record {} in {} has no usable text field", self.record, self.path.display()))?;
-                    self.buffer.extend(self.tokenizer.encode(&text));
-                    self.buffer.push(self.tokenizer.eos_id());
-                    self.record += 1;
-                }
-                None => self.eof = true,
+            if self.rows.is_empty() && !self.load_next_row_group()? {
+                self.eof = true;
+                continue;
+            }
+            if let Some(row) = self.rows.pop_front() {
+                let text = self.field_text(&row).ok_or_else(|| format!("Parquet record {} in {} has no usable text field", self.record, self.path.display()))?;
+                self.buffer.extend(self.tokenizer.encode(&text));
+                self.buffer.push(self.tokenizer.eos_id());
+                self.record += 1;
             }
         }
     }
