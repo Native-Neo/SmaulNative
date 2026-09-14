@@ -61,6 +61,7 @@ mod tests {
     use super::*;
     use crate::moe::MoeCmix;
     use ndarray::Array2;
+
     #[test]
     fn backward_shapes() {
         let moe = MoeCmix::new(8, 0, 4, 3, 2, 7);
@@ -69,5 +70,23 @@ mod tests {
         assert_eq!(result.grad_input.dim(), x.dim());
         assert_eq!(result.grad_router.dim(), (3, 8));
         assert_eq!(result.grad_key.len(), 3);
+    }
+
+    #[test]
+    fn input_gradient_matches_finite_difference_away_from_route_ties() {
+        let moe = MoeCmix::new(4, 0, 2, 2, 1, 19);
+        let x = Array2::from_shape_fn((2, 4), |(r, c)| 0.13 + r as f32 * 0.41 + c as f32 * 0.17);
+        let grad = backward(&moe, &x, None, &Array2::ones((2, 4))).grad_input;
+        let eps = 1e-3_f32;
+        for &(row, col) in &[(0usize, 0usize), (0, 2), (1, 1)] {
+            let mut plus = x.clone();
+            let mut minus = x.clone();
+            plus[[row, col]] += eps;
+            minus[[row, col]] -= eps;
+            let (yp, _) = moe.forward(&plus, None);
+            let (ym, _) = moe.forward(&minus, None);
+            let numeric = (yp.sum() - ym.sum()) / (2.0 * eps);
+            assert!((numeric - grad[[row, col]]).abs() < 0.2, "gradient mismatch at ({row},{col}): analytic={} numeric={numeric}", grad[[row, col]]);
+        }
     }
 }
