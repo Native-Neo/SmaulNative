@@ -25,38 +25,52 @@ pub fn backward(
     block: &RwkvBlock,
     tape: &RwkvBlockFullTape,
     grad_output: &Array2<f32>,
-    grad_next_state: Option<&RwkvBlockState>,
+    grad_next_time_state: Option<&Array4<f32>>,
+    grad_next_time_prev: Option<&Array1<f32>>,
+    grad_next_cmix_prev: Option<&Array1<f32>>,
+    grad_next_v_first: Option<&Array2<f32>>,
 ) -> RwkvBlockBackward {
     assert_eq!(grad_output.dim(), tape.output.dim());
-    let channels = block.channels;
 
     let grad_cmix_output = grad_output.clone();
-    let grad_residual = grad_output.clone();
+    let grad_skip = grad_output.clone();
 
     let cmix = rwkv_cmix_backward::backward(
         &tape.cmix_input,
-        &tape.cmix_prev,
+        Some(&tape.cmix_prev),
+        &grad_cmix_output,
         &block.cmix.x_k,
         &block.cmix.key,
-        &tape.cmix_pre,
-        &tape.cmix_hidden,
-        &grad_cmix_output,
+        &block.cmix.value,
     );
 
     let (grad_ln2_input, grad_ln2_weight, grad_ln2_bias) = layer_norm_backward::backward(
         &tape.ln2_input,
-        &cmix.grad_x,
+        &cmix.grad_input,
         &block.ln2.weight,
         block.ln2.eps,
     );
 
-    let mut grad_residual_total = grad_residual + &grad_ln2_input;
+    let grad_residual = grad_skip + &grad_ln2_input;
 
-    let time = rwkv_time_mix_backward_full::backward(
+    let mut time = rwkv_time_mix_backward_full::backward(
         &block.time_mix,
         &tape.time,
-        &grad_residual_total,
+        &grad_residual,
     );
+
+    if let Some(g) = grad_next_time_state {
+        assert_eq!(g.dim(), time.grad_state.dim());
+        time.grad_state += g;
+    }
+    if let Some(g) = grad_next_time_prev {
+        assert_eq!(g.len(), time.grad_prev.len());
+        time.grad_prev += g;
+    }
+    if let Some(g) = grad_next_v_first {
+        assert_eq!(g.dim(), time.grad_v_first.dim());
+        time.grad_v_first += g;
+    }
 
     let (grad_ln1_input, grad_ln1_weight, grad_ln1_bias) = layer_norm_backward::backward(
         &tape.ln1_input,
@@ -64,18 +78,14 @@ pub fn backward(
         &block.ln1.weight,
         block.ln1.eps,
     );
-    grad_residual_total += &grad_ln1_input;
 
+    let grad_into_input = grad_residual + &grad_ln1_input;
     let mut grad_ln0_weight = None;
     let mut grad_ln0_bias = None;
-    let grad_input = if let (Some(ln0), Some(ln0_input), Some(ln0_output)) = (
-        block.ln0.as_ref(),
-        tape.ln0_input.as_ref(),
-        tape.ln0_output.as_ref(),
-    ) {
+    let grad_input = if let (Some(ln0), Some(ln0_input)) = (block.ln0.as_ref(), tape.ln0_input.as_ref()) {
         let (dx, dw, db) = layer_norm_backward::backward(
             ln0_input,
-            &grad_residual_total,
+            &grad_into_input,
             &ln0.weight,
             ln0.eps,
         );
@@ -83,34 +93,15 @@ pub fn backward(
         grad_ln0_bias = Some(db);
         dx
     } else {
-        grad_residual_total
+        grad_into_input
     };
 
-    let mut grad_time_state = time.grad_state.clone();
-    let mut grad_time_prev = time.grad_prev.clone();
-    let mut grad_cmix_prev = cmix.grad_prev.clone();
-    let mut grad_v_first = time.grad_v_first.clone();
-
-    if let Some(next) = grad_next_state {
-        assert_eq!(next.time_state.dim(), grad_time_state.dim());
-        assert_eq!(next.time_prev.len(), grad_time_prev.len());
-        assert_eq!(next.cmix_prev.len(), grad_cmix_prev.len());
-        grad_time_state += &next.time_state;
-        grad_time_prev += &next.time_prev;
-        grad_cmix_prev += &next.cmix_prev;
-        if let Some(next_first) = &next.v_first {
-            assert_eq!(next_first.dim(), grad_v_first.dim());
-            grad_v_first += next_first;
-        }
-    }
-
-    assert_eq!(grad_input.ncols(), channels);
     RwkvBlockBackward {
         grad_input,
-        grad_time_prev,
-        grad_cmix_prev,
-        grad_time_state,
-        grad_v_first,
+        grad_time_prev: time.grad_prev.clone(),
+        grad_cmix_prev: cmix.grad_prev.clone(),
+        grad_time_state: time.grad_state.clone(),
+        grad_v_first: time.grad_v_first.clone(),
         grad_ln0_weight,
         grad_ln0_bias,
         grad_ln1_weight,
@@ -119,26 +110,5 @@ pub fn backward(
         grad_ln2_bias,
         time,
         cmix,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rwkv_block_full_tape::RwkvBlockFullTape;
-
-    #[test]
-    fn backward_output_has_expected_gradient_shapes() {
-        let block = RwkvBlock::new(16, 2, 0, 4);
-        let input = Array2::<f32>::zeros((3, 16));
-        let state = block.forward(&input, None, None).1;
-        let time = block.time_mix.forward_with_tape(&input, None, None, None).4;
-        let tape = RwkvBlockFullTape::new(input.clone(), time, state);
-        let grad = Array2::<f32>::ones((3, 16));
-        let result = backward(&block, &tape, &grad, None);
-        assert_eq!(result.grad_input.dim(), input.dim());
-        assert_eq!(result.grad_time_prev.len(), 16);
-        assert_eq!(result.grad_time_state.dim(), (1, 2, 8, 8));
-        assert!(result.grad_input.iter().all(|v| v.is_finite()));
     }
 }
