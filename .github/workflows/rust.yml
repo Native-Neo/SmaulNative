@@ -25,6 +25,8 @@ jobs:
         uses: actions/checkout@v4
       - name: Compile CUDA kernel
         run: docker run --rm -v "$PWD:/workspace" -w /workspace nvidia/cuda:12.6.3-devel-ubuntu22.04 nvcc -O3 -c gpu/cuda/rust_lowbit.cu -o /tmp/rust_lowbit_cuda.o
+      - name: Build Rust CUDA feature
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace nvidia/cuda:12.6.3-devel-ubuntu22.04 bash -lc 'apt-get update >/dev/null && apt-get install -y --no-install-recommends curl build-essential >/dev/null && curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && . "$HOME/.cargo/env" && cargo test --all-targets --features cuda'
 
   hip-kernel:
     runs-on: ubuntu-latest
