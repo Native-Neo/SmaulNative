@@ -35,9 +35,17 @@ pub struct RwkvTimeMixTape {
 }
 
 impl RwkvTimeMixTape {
-    pub fn new(input: Array2<f32>, prev: Array1<f32>, state_initial: Array4<f32>) -> Self {
+    pub fn new(
+        input: Array2<f32>,
+        prev: Array1<f32>,
+        state_initial: Array4<f32>,
+        w_hidden: usize,
+        v_hidden: Option<usize>,
+        g_hidden: usize,
+    ) -> Self {
         let shape = input.raw_dim();
         let channels = input.ncols();
+        let rows = input.nrows();
         let state_shape = state_initial.raw_dim();
         Self {
             input,
@@ -49,16 +57,16 @@ impl RwkvTimeMixTape {
             xa: Array2::zeros(shape.clone()),
             xg: Array2::zeros(shape.clone()),
             r: Array2::zeros(shape.clone()),
-            w_hidden: Array2::zeros((shape.0, channels)),
+            w_hidden: Array2::zeros((rows, w_hidden)),
             g_decay: Array2::zeros(shape.clone()),
             k: Array2::zeros(shape.clone()),
             v_base: Array2::zeros(shape.clone()),
-            v_correction: None,
-            v_gate: None,
+            v_correction: v_hidden.map(|n| Array2::zeros((rows, n))),
+            v_gate: v_hidden.map(|_| Array2::zeros(shape.clone())),
             v: Array2::zeros(shape.clone()),
-            a_hidden: Array2::zeros((shape.0, channels)),
+            a_hidden: Array2::zeros((rows, w_hidden)),
             a: Array2::zeros(shape.clone()),
-            g_hidden: Array2::zeros((shape.0, channels)),
+            g_hidden: Array2::zeros((rows, g_hidden)),
             g: Array2::zeros(shape.clone()),
             kk_pre_norm: Array2::zeros(shape.clone()),
             kk: Array2::zeros(shape.clone()),
@@ -86,8 +94,13 @@ mod tests {
             Array2::zeros((3, 8)),
             Array1::zeros(8),
             Array4::zeros((1, 2, 4, 4)),
+            5,
+            Some(6),
+            7,
         );
         assert_eq!(tape.xr.dim(), (3, 8));
+        assert_eq!(tape.w_hidden.dim(), (3, 5));
+        assert_eq!(tape.v_correction.as_ref().unwrap().dim(), (3, 6));
         assert_eq!(tape.state_initial.dim(), (1, 2, 4, 4));
         assert_eq!(tape.output.dim(), (3, 8));
     }
