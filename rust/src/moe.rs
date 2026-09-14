@@ -49,6 +49,7 @@ impl MoeRouter {
     pub fn parameter_count(&self) -> usize { self.weight.len() }
 }
 
+#[derive(Clone, Debug)]
 pub struct MoeCmix {
     pub experts: Vec<RwkvCmix>,
     pub router: MoeRouter,
@@ -57,7 +58,7 @@ pub struct MoeCmix {
 impl MoeCmix {
     pub fn new(channels: usize, layer_id: usize, n_layer: usize, num_experts: usize, top_k: usize, seed: u64) -> Self {
         let experts = (0..num_experts)
-            .map(|i| RwkvCmix::new(channels, layer_id, n_layer))
+            .map(|_| RwkvCmix::new(channels, layer_id, n_layer))
             .collect();
         let router = MoeRouter::new(channels, num_experts, top_k, seed);
         Self { experts, router }
@@ -74,23 +75,23 @@ impl MoeCmix {
 
     pub fn forward(&self, x: &Array2<f32>, prev: Option<&Array1<f32>>) -> (Array2<f32>, Array1<f32>) {
         assert_eq!(x.ncols(), self.router.input_size);
+        assert!(x.nrows() > 0);
         let gates = self.router.route(x);
         let mut output = Array2::zeros(x.raw_dim());
-        let mut last = Array1::zeros(x.ncols());
-        for (expert_id, expert) in self.experts.iter().enumerate() {
-            let expert_output = expert.forward_selected(x, prev);
-            for row in 0..x.nrows() {
+        for expert_id in 0..self.experts.len() {
+            let rows: Vec<usize> = (0..x.nrows()).filter(|&row| gates[[row, expert_id]] != 0.0).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let expert_output = self.experts[expert_id].forward_rows(x, prev, &rows);
+            for (local_row, &row) in rows.iter().enumerate() {
                 let gate = gates[[row, expert_id]];
-                if gate != 0.0 {
-                    for col in 0..x.ncols() {
-                        output[[row, col]] += gate * expert_output[[row, col]];
-                    }
+                for col in 0..x.ncols() {
+                    output[[row, col]] += gate * expert_output[[local_row, col]];
                 }
             }
-            if expert_id == 0 {
-                last = x.row(x.nrows() - 1).to_owned();
-            }
         }
+        let last = x.row(x.nrows() - 1).to_owned();
         (output, last)
     }
 
