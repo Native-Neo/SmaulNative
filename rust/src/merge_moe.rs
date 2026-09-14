@@ -5,17 +5,14 @@ use crate::rwkv_cmix::RwkvCmix;
 use crate::rwkv_model::RwkvModel;
 use crate::tokenizer::Tokenizer;
 use ndarray::Array2;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 fn compatible(a: &RwkvXConfig, b: &RwkvXConfig, path: &Path) -> Result<(), String> {
-    for (name, x, y) in [
-        ("n_embd", a.n_embd, b.n_embd), ("n_layer", a.n_layer, b.n_layer),
-        ("n_moba_layer", a.n_moba_layer, b.n_moba_layer), ("head_size", a.head_size, b.head_size),
-        ("moba_chunk_size", a.moba_chunk_size, b.moba_chunk_size), ("moba_topk", a.moba_topk, b.moba_topk),
-        ("qat_bits", a.effective_qat_bits(), b.effective_qat_bits()),
-    ] { if x != y { return Err(format!("{}: {name}={y} does not match base {x}", path.display())); } }
+    for (name, x, y) in [("n_embd", a.n_embd, b.n_embd), ("n_layer", a.n_layer, b.n_layer), ("n_moba_layer", a.n_moba_layer, b.n_moba_layer), ("head_size", a.head_size, b.head_size), ("moba_chunk_size", a.moba_chunk_size, b.moba_chunk_size), ("moba_topk", a.moba_topk, b.moba_topk), ("qat_bits", a.effective_qat_bits(), b.effective_qat_bits())] {
+        if x != y { return Err(format!("{}: {name}={y} does not match base {x}", path.display())); }
+    }
     Ok(())
 }
 
@@ -72,7 +69,6 @@ pub fn merge(base_dir: impl AsRef<Path>, branch_dirs: &[PathBuf], out_dir: impl 
     let counts = branches.iter().map(|m| if m.config.is_moe { m.config.num_experts } else { 1 }).collect::<Vec<_>>();
     let num_experts: usize = counts.iter().sum();
     if top_k > num_experts { return Err(format!("top_k ({top_k}) cannot exceed merged expert count ({num_experts})")); }
-
     let vocab = merged_vocab(&base.tokenizer, &tokenizers[1..]);
     let mut config = base.config.clone();
     config.vocab_size = vocab.len();
@@ -94,18 +90,12 @@ pub fn merge(base_dir: impl AsRef<Path>, branch_dirs: &[PathBuf], out_dir: impl 
         merged.rwkv_blocks[i].moe = Some(MoeCmix::from_experts(experts, router)?);
     }
     merged.moba_blocks = base.model.moba_blocks.iter().map(Clone::clone).collect();
-
     let tokenizer = Tokenizer::from_vocab(vocab);
     let output = out_dir.as_ref();
     fs::create_dir_all(output).map_err(|e| e.to_string())?;
     let result = PretrainedModel { config, model: merged, tokenizer };
     result.save(output)?;
-    let meta = serde_json::json!({
-        "engine": "smaul-native merge-moe", "base_model": base_dir, "branches": branch_dirs,
-        "branch_expert_counts": counts, "num_experts": num_experts, "top_k": top_k,
-        "tokenizer": {"base_vocab_size": base.tokenizer.vocab_size(), "merged_vocab_size": result.tokenizer.vocab_size()},
-        "note": "Channel-Mix experts are concatenated and routers are freshly initialized."
-    });
+    let meta = serde_json::json!({"engine":"smaul-native merge-moe","base_model":base_dir,"branches":branch_dirs,"branch_expert_counts":counts,"num_experts":num_experts,"top_k":top_k,"tokenizer":{"base_vocab_size":base.tokenizer.vocab_size(),"merged_vocab_size":result.tokenizer.vocab_size()},"note":"Channel-Mix experts are concatenated and routers are freshly initialized."});
     fs::write(output.join("merge_config.json"), serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     println!("[DONE] merged model -> {} ({} experts, vocab_size={})", output.display(), num_experts, result.tokenizer.vocab_size());
     Ok(())
