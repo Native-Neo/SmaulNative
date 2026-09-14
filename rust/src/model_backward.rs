@@ -20,10 +20,10 @@ pub struct ModelBackwardTape {
 impl ModelBackwardTape {
     pub fn new(block_order: Vec<BackwardBlockKind>) -> Self {
         Self {
+            rwkv_tapes: vec![None; block_order.len()],
             block_order,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            rwkv_tapes: Vec::new(),
             ln_input: None,
             normalized: None,
             logits: None,
@@ -34,19 +34,13 @@ impl ModelBackwardTape {
         assert_eq!(input.dim(), output.dim());
         self.inputs.push(input);
         self.outputs.push(output);
-        self.rwkv_tapes.push(None);
         assert_eq!(self.inputs.len(), self.outputs.len());
-        assert_eq!(self.inputs.len(), self.rwkv_tapes.len());
+        assert!(self.inputs.len() <= self.block_order.len());
     }
 
-    pub fn record_rwkv_block(&mut self, index: usize, tape: RwkvBlockFullTape) {
-        assert!(index < self.rwkv_tapes.len());
-        assert!(matches!(self.block_order[index], BackwardBlockKind::Rwkv(_)));
+    pub fn record_rwkv_tape(&mut self, tape: RwkvBlockFullTape) {
+        let index = self.rwkv_tapes.iter().position(Option::is_none).expect("too many RWKV tapes");
         self.rwkv_tapes[index] = Some(tape);
-    }
-
-    pub fn rwkv_block_tape(&self, index: usize) -> &RwkvBlockFullTape {
-        self.rwkv_tapes[index].as_ref().expect("missing RWKV block tape")
     }
 
     pub fn record_head(&mut self, ln_input: Array2<f32>, normalized: Array2<f32>, logits: Array2<f32>) {
@@ -60,7 +54,6 @@ impl ModelBackwardTape {
     pub fn reverse_blocks(&self) -> impl DoubleEndedIterator<Item = (BackwardBlockKind, &Array2<f32>, &Array2<f32>)> {
         assert_eq!(self.block_order.len(), self.inputs.len());
         assert_eq!(self.inputs.len(), self.outputs.len());
-        assert_eq!(self.inputs.len(), self.rwkv_tapes.len());
         self.block_order.iter().copied().zip(self.inputs.iter()).zip(self.outputs.iter()).map(|((kind, input), output)| (kind, input, output)).rev()
     }
 
@@ -70,7 +63,7 @@ impl ModelBackwardTape {
     pub fn clear(&mut self) {
         self.inputs.clear();
         self.outputs.clear();
-        self.rwkv_tapes.clear();
+        for tape in &mut self.rwkv_tapes { *tape = None; }
         self.ln_input = None;
         self.normalized = None;
         self.logits = None;
