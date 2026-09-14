@@ -1,6 +1,6 @@
 use crate::rwkv_model::{RwkvModel, RwkvModelState};
 use crate::tokenizer::Tokenizer;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 
 pub fn sample(logits: &[f32], temperature: f32, top_k: usize, top_p: f32, repetition_penalty: f32, recent: &[usize], rng: &mut impl Rng) -> usize {
     assert!(temperature >= 0.0 && top_p > 0.0 && top_p <= 1.0 && repetition_penalty > 0.0);
@@ -39,7 +39,7 @@ impl<'a> Inference<'a> {
         let mut tokens = self.tokenizer.encode(prompt);
         if tokens.is_empty() { tokens.push(self.tokenizer.bos_id()); }
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let (mut logits, mut state): (ndarray::Array2<f32>, RwkvModelState) = self.model.forward(&tokens, None);
+        let (mut logits, mut state) = self.model.forward(&tokens, None);
         let mut recent = tokens.iter().copied().rev().take(128).collect::<Vec<_>>();
         recent.reverse();
         let mut generated = Vec::new();
@@ -49,9 +49,7 @@ impl<'a> Inference<'a> {
             generated.push(token);
             recent.push(token);
             if recent.len() > 128 { recent.remove(0); }
-            let next = self.model.forward(&[token], Some(&state));
-            logits = next.0;
-            state = next.1;
+            (logits, state) = self.model.forward(&[token], Some(&state));
         }
         self.tokenizer.decode(&generated)
     }
@@ -61,7 +59,6 @@ impl<'a> Inference<'a> {
 mod tests {
     use super::*;
     use crate::rwkv_model::RwkvModelConfig;
-    use rand::SeedableRng;
 
     #[test]
     fn greedy_sampling_selects_maximum() {
