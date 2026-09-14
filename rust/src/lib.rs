@@ -53,6 +53,7 @@ pub mod rwkv_time_mix_tape;
 pub mod safetensors;
 pub mod sequence_loss;
 pub mod tokenizer;
+pub mod train_loop;
 pub mod training;
 pub mod training_state;
 pub mod inference;
