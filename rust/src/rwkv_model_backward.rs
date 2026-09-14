@@ -1,7 +1,7 @@
 use ndarray::{Array1, Array2};
 use crate::model_backward::{BackwardBlockKind, ModelBackwardTape};
 use crate::model_head_backward::HeadBackward;
-use crate::moba_block::{MobaBlockBackward, MobaBlockState};
+use crate::moba_block::MobaBlockBackward;
 use crate::rwkv_block::RwkvBlockState;
 use crate::rwkv_block_backward_full::{self, RwkvBlockBackward};
 use crate::rwkv_model::RwkvModel;
@@ -10,7 +10,7 @@ pub struct RwkvModelBackward {
     pub grad_input: Array2<f32>, pub grad_embedding: Array2<f32>,
     pub grad_ln_out_weight: Array1<f32>, pub grad_ln_out_bias: Array1<f32>, pub grad_head: Array2<f32>,
     pub head: HeadBackward, pub blocks: Vec<(usize, RwkvBlockBackward)>, pub moba_blocks: Vec<(usize, MobaBlockBackward)>,
-    pub grad_initial_states: Vec<Option<RwkvBlockState>>, pub grad_initial_moba_states: Vec<Option<MobaBlockState>>, pub grad_v_first: Option<Array2<f32>>,
+    pub grad_initial_states: Vec<Option<RwkvBlockState>>, pub grad_v_first: Option<Array2<f32>>,
 }
 
 pub fn backward(model: &RwkvModel, token_ids: &[usize], tape: &ModelBackwardTape, logits_grad: &Array2<f32>) -> RwkvModelBackward {
@@ -26,7 +26,7 @@ pub fn backward_with_state_grads(model: &RwkvModel, token_ids: &[usize], tape: &
     if let Some(grads)=grad_next_states { assert_eq!(grads.len(),model.rwkv_blocks.len()); }
     let head=HeadBackward::backward(token_ids,normalized,logits_grad,&model.head.weight,ln_input,&model.ln_out.weight,model.ln_out.eps,model.config.vocab_size);
     let mut grad=head.grad_input.clone(); let mut grad_v_first=None; let mut blocks=Vec::with_capacity(model.rwkv_blocks.len()); let mut moba_blocks=Vec::with_capacity(model.moba_blocks.len());
-    let mut grad_initial_states=(0..model.rwkv_blocks.len()).map(|_|None).collect::<Vec<_>>(); let mut grad_initial_moba_states=(0..model.moba_blocks.len()).map(|_|None).collect::<Vec<_>>();
+    let mut grad_initial_states=(0..model.rwkv_blocks.len()).map(|_|None).collect::<Vec<_>>();
     for slot in (0..model.config.n_layer).rev() {
         match tape.block_order[slot] {
             BackwardBlockKind::Rwkv(index)=>{
@@ -36,13 +36,12 @@ pub fn backward_with_state_grads(model: &RwkvModel, token_ids: &[usize], tape: &
                 grad_v_first=Some(match grad_v_first{Some(mut total)=>{total+=&block_grad.grad_v_first;total},None=>block_grad.grad_v_first.clone()}); blocks.push((index,block_grad));
             }
             BackwardBlockKind::Moba(index)=>{
-                let block_tape=tape.moba_tapes[slot].as_ref().expect("missing MOBA block tape"); let block_grad=model.moba_blocks[index].backward(block_tape,&grad); grad=block_grad.grad_input.clone();
-                grad_initial_moba_states[index]=Some(MobaBlockState{cmix_prev:block_grad.grad_cmix_prev.clone(),att_k:ndarray::Array4::zeros((model.moba_blocks[index].att.heads,block_tape.input.nrows(),1,model.moba_blocks[index].att.head_size)),att_v:ndarray::Array4::zeros((model.moba_blocks[index].att.heads,block_tape.input.nrows(),1,model.moba_blocks[index].att.head_size))}); moba_blocks.push((index,block_grad));
+                let block_tape=tape.moba_tapes[slot].as_ref().expect("missing MOBA block tape"); let block_grad=model.moba_blocks[index].backward(block_tape,&grad); grad=block_grad.grad_input.clone(); moba_blocks.push((index,block_grad));
             }
         }
     }
     blocks.reverse(); moba_blocks.reverse();
-    RwkvModelBackward{grad_input:grad,grad_embedding:head.grad_embedding.clone(),grad_ln_out_weight:head.grad_ln_weight.clone(),grad_ln_out_bias:head.grad_ln_bias.clone(),grad_head:head.grad_weight.clone(),head,blocks,moba_blocks,grad_initial_states,grad_initial_moba_states,grad_v_first}
+    RwkvModelBackward{grad_input:grad,grad_embedding:head.grad_embedding.clone(),grad_ln_out_weight:head.grad_ln_weight.clone(),grad_ln_out_bias:head.grad_ln_bias.clone(),grad_head:head.grad_weight.clone(),head,blocks,moba_blocks,grad_initial_states,grad_v_first}
 }
 
 #[cfg(test)]
