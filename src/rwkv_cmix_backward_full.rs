@@ -8,8 +8,7 @@ pub fn backward(x:&Array2<f32>,prev:&Array1<f32>,x_k:&Array1<f32>,key_weight:&Ar
  for i in 0..t{
   let current=x.row(i).to_owned();let previous=if i==0{prev.clone()}else{x.row(i-1).to_owned()};let mut mixed=Array1::zeros(c);for k in 0..c{mixed[k]=current[k]+(previous[k]-current[k])*x_k[k];}
   let upstream=grad_output.row(i);let hidden=key_output.row(i);
-  for j in 0..h{for k in 0..c{grad_key[[k,j]]+=mixed[k]*(if hidden[j]>0.0{2.0*hidden[j]}else{0.0})*(0.0+upstream.dot(&value_input.row(j)));}}
-  for j in 0..h{let mut gh=0.0;for o in 0..c{gh+=upstream[o]*value_input[[j,o]];}gh*=if hidden[j]>0.0{2.0*hidden[j]}else{0.0};for k in 0..c{let gm=gh*key_weight[[k,j]];grad_x[[i,k]]+=gm*(1.0-x_k[k]);if i==0{grad_prev[k]+=gm*x_k[k];}else{grad_x[[i-1,k]]+=gm*x_k[k];}grad_key[[k,j]]+=mixed[k]*gh;}}
+  for j in 0..h{let mut gh=0.0;for o in 0..c{gh+=upstream[o]*value_input[[j,o]];}gh*=if hidden[j]>0.0{2.0*hidden[j]}else{0.0};for k in 0..c{grad_key[[k,j]]+=mixed[k]*gh;let gm=gh*key_weight[[k,j]];grad_x[[i,k]]+=gm*(1.0-x_k[k]);if i==0{grad_prev[k]+=gm*x_k[k];}else{grad_x[[i-1,k]]+=gm*x_k[k];}}}
   for j in 0..h{for o in 0..c{grad_value[[j,o]]+=hidden[j]*upstream[o];}}
  }
  CmixBackward{grad_x,grad_prev,grad_key,grad_value}
