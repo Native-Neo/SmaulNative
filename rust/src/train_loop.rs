@@ -1,4 +1,5 @@
 use crate::dataset::{MultiFileTextStream, ParquetTextStream, TextStream};
+use crate::dataset_multi::MultiFileDatasetStream;
 use crate::model_train_step::ModelTrainStep;
 use crate::rwkv_model::RwkvModel;
 use crate::training::TrainStep;
@@ -15,6 +16,7 @@ impl TrainingRunner {
  pub fn resume_checkpoint(&mut self,model:&mut RwkvModel,path:impl AsRef<Path>)->Result<(),String>{let path=path.as_ref();self.resume_from_checkpoint(path)?;let name=path.file_stem().and_then(|x|x.to_str()).ok_or("checkpoint path has no valid filename")?;let step=name.strip_prefix("training-").ok_or("checkpoint filename must be training-<step>.json")?;if step.is_empty()||!step.chars().all(|c|c.is_ascii_digit()){return Err("checkpoint filename must be training-<step>.json".into());}let model_path=path.with_file_name(format!("model-{step}.safetensors"));crate::model_loader::load_model_safetensors(model,&model_path)?;Ok(())}
  pub fn run_stream(&mut self,model:&mut RwkvModel,stream:&mut TextStream,config:&TrainingConfig)->Result<TrainingState,String>{self.run_batches(model,config,||stream.next_batch())}
  pub fn run_multi_stream(&mut self,model:&mut RwkvModel,stream:&mut MultiFileTextStream,config:&TrainingConfig)->Result<TrainingState,String>{self.run_batches(model,config,||stream.next_batch())}
+ pub fn run_dataset_stream(&mut self,model:&mut RwkvModel,stream:&mut MultiFileDatasetStream,config:&TrainingConfig)->Result<TrainingState,String>{self.run_batches(model,config,||stream.next_batch())}
  pub fn run_parquet_stream(&mut self,model:&mut RwkvModel,stream:&mut ParquetTextStream,config:&TrainingConfig)->Result<TrainingState,String>{self.run_batches(model,config,||stream.next_batch())}
  fn run_batches<F>(&mut self,model:&mut RwkvModel,config:&TrainingConfig,mut next:F)->Result<TrainingState,String> where F:FnMut()->Result<Option<crate::dataset::TokenBatch>,String>{
   if config.log_every==0{return Err("log_every must be greater than zero".into());}
