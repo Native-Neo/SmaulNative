@@ -1,5 +1,8 @@
 use ndarray::Array2;
 
+pub const QAT_3BIT_MIN: i8 = -4;
+pub const QAT_3BIT_MAX: i8 = 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bits {
     Fp2,
@@ -70,9 +73,6 @@ pub fn quantized_linear(input: &Array2<f32>, weight: &Array2<f32>, bits: Bits) -
     assert_eq!(input.ncols(), weight.ncols());
     input.dot(&fake_quantize(weight, bits).t())
 }
-
-pub const QAT_3BIT_MIN: i8 = -4;
-pub const QAT_3BIT_MAX: i8 = 3;
 
 pub fn pack_3bit(codes: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity((codes.len() * 3 + 7) / 8);
@@ -152,10 +152,89 @@ pub fn dequantize_weight_3bit(
     })
 }
 
-pub fn quantized_linear_3bit(input: &Array2<f32>, weight: &Array2<f32>) -> Array2<f32> {
-    let (packed, scales) = quantize_weight_3bit(weight);
-    let quantized = dequantize_weight_3bit(&packed, &scales, weight.dim());
-    input.dot(&quantized.t())
+#[derive(Clone, Debug)]
+pub struct QatLinear3Bit {
+    pub weight: Array2<f32>,
+    pub signed_activation: bool,
+    pub activation_min: f32,
+    pub activation_max: f32,
+    pub momentum: f32,
+}
+
+impl QatLinear3Bit {
+    pub fn new(weight: Array2<f32>, signed_activation: bool) -> Self {
+        assert!(weight.nrows() > 0 && weight.ncols() > 0);
+        Self {
+            weight,
+            signed_activation,
+            activation_min: 0.0,
+            activation_max: 0.0,
+            momentum: 0.1,
+        }
+    }
+
+    pub fn observe(&mut self, input: &Array2<f32>) {
+        if input.is_empty() {
+            return;
+        }
+        let min = input.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = input.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if self.activation_min == 0.0 && self.activation_max == 0.0 {
+            self.activation_min = min;
+            self.activation_max = max;
+        } else {
+            self.activation_min = (1.0 - self.momentum) * self.activation_min + self.momentum * min;
+            self.activation_max = (1.0 - self.momentum) * self.activation_max + self.momentum * max;
+        }
+    }
+
+    pub fn fake_quantize_activation(&self, input: &Array2<f32>) -> Array2<f32> {
+        if self.signed_activation {
+            fake_quantize_range(input, self.activation_min, self.activation_max, true)
+        } else {
+            fake_quantize_range(input, self.activation_min, self.activation_max, false)
+        }
+    }
+
+    pub fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        self.observe(input);
+        let activation = self.fake_quantize_activation(input);
+        quantized_linear(&activation, &self.weight, Bits::Fp4)
+    }
+
+    pub fn convert(&self) -> QuantizedLinear3Bit {
+        let (packed, scales) = quantize_weight_3bit(&self.weight);
+        QuantizedLinear3Bit {
+            packed,
+            scales,
+            shape: self.weight.dim(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QuantizedLinear3Bit {
+    pub packed: Vec<u8>,
+    pub scales: Vec<f32>,
+    pub shape: (usize, usize),
+}
+
+impl QuantizedLinear3Bit {
+    pub fn forward(&self, input: &Array2<f32>) -> Array2<f32> {
+        let weight = dequantize_weight_3bit(&self.packed, &self.scales, self.shape);
+        input.dot(&weight.t())
+    }
+}
+
+fn fake_quantize_range(input: &Array2<f32>, min: f32, max: f32, signed: bool) -> Array2<f32> {
+    let (qmin, qmax) = if signed { (-4.0, 3.0) } else { (0.0, 7.0) };
+    let span = (max - min).max(f32::EPSILON);
+    Array2::from_shape_fn(input.raw_dim(), |index| {
+        let value = input[index];
+        let normalized = ((value - min) / span).clamp(0.0, 1.0);
+        let q = (qmin + normalized * (qmax - qmin)).round();
+        min + (q - qmin) * span / (qmax - qmin)
+    })
 }
 
 #[cfg(test)]
@@ -193,5 +272,17 @@ mod tests {
         let quantized = dequantize_weight_3bit(&packed, &scales, weight.dim());
         assert_eq!(quantized.dim(), weight.dim());
         assert!(quantized.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn qat_linear_observes_and_converts() {
+        let weight = array![[1.0, 0.0], [0.0, 1.0]];
+        let mut qat = QatLinear3Bit::new(weight, true);
+        let input = array![[1.0, -0.5]];
+        let output = qat.forward(&input);
+        assert_eq!(output.dim(), (1, 2));
+        assert!(qat.activation_min <= -0.5);
+        assert!(qat.activation_max >= 1.0);
+        assert_eq!(qat.convert().shape, (2, 2));
     }
 }
