@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub const IGNORE_INDEX: i32 = -100;
+const DEFAULT_STOP_TOKEN: &str = "\n\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SftRecord {
@@ -99,36 +100,47 @@ fn parse_record(line: &str) -> Result<SftRecord, String> {
 }
 
 fn normalize_role(role: &str) -> String {
-    match role.to_ascii_lowercase().as_str() {
-        "human" | "user" => "user".into(),
-        "gpt" | "assistant" | "bot" => "assistant".into(),
-        "system" => "system".into(),
-        other => other.to_owned(),
+    match role.trim().to_ascii_lowercase().as_str() {
+        "human" | "user" => "User".into(),
+        "gpt" | "assistant" | "bot" => "Assistant".into(),
+        _ => "Other".into(),
     }
 }
 
 fn preprocess_record(record: &SftRecord, tokenizer: &Tokenizer, ctx_len: usize) -> Result<Option<SftExample>, String> {
     let mut input = Vec::new();
     let mut labels = Vec::new();
+
     for message in &record.messages {
-        let role_tokens = tokenizer.encode(&format!("{}: ", message.role));
-        let content_tokens = tokenizer.encode(&message.content);
-        if input.len() + role_tokens.len() + content_tokens.len() + 1 > ctx_len {
-            break;
-        }
-        input.extend_from_slice(&role_tokens);
-        labels.extend(std::iter::repeat_n(IGNORE_INDEX, role_tokens.len()));
-        let assistant = message.role == "assistant";
-        input.extend_from_slice(&content_tokens);
-        if assistant {
-            labels.extend(content_tokens.iter().map(|&id| id as i32));
+        let role_prefix = format!("{}: ", message.role);
+        let formatted = format!("{}{}{}", role_prefix, message.content, DEFAULT_STOP_TOKEN);
+        let ids = tokenizer.encode(&formatted);
+        let prefix_len = tokenizer.encode(&role_prefix).len();
+
+        if input.len() + ids.len() > ctx_len { break; }
+
+        input.extend_from_slice(&ids);
+        if message.role == "Assistant" {
+            labels.extend(ids.iter().enumerate().map(|(i, &id)| {
+                if i < prefix_len { IGNORE_INDEX } else { id as i32 }
+            }));
         } else {
-            labels.extend(std::iter::repeat_n(IGNORE_INDEX, content_tokens.len()));
+            labels.extend(std::iter::repeat_n(IGNORE_INDEX, ids.len()));
         }
-        input.push(tokenizer.eos_id());
-        labels.push(if assistant { tokenizer.eos_id() as i32 } else { IGNORE_INDEX });
     }
-    if input.is_empty() || !labels.iter().any(|&label| label != IGNORE_INDEX) { return Ok(None); }
+
+    if input.is_empty() || !labels.iter().any(|&label| label != IGNORE_INDEX) {
+        return Ok(None);
+    }
+
+    let pad_id = tokenizer.token_to_id("<pad>")
+        .ok_or("tokenizer is missing <pad> token")?;
+    let pad_len = ctx_len - input.len();
+    if pad_len > 0 {
+        input.extend(std::iter::repeat_n(pad_id, pad_len));
+        labels.extend(std::iter::repeat_n(IGNORE_INDEX, pad_len));
+    }
+
     Ok(Some(SftExample { input, labels }))
 }
 
@@ -136,7 +148,9 @@ pub fn discover_sft_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, String>
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir.as_ref()).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
-        if path.is_file() && path.extension().and_then(|x| x.to_str()) == Some("jsonl") { files.push(path); }
+        if path.is_file() && path.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("jsonl")).unwrap_or(false) {
+            files.push(path);
+        }
     }
     files.sort();
     Ok(files)
@@ -147,29 +161,56 @@ mod tests {
     use super::*;
 
     fn tokenizer() -> Tokenizer {
-        Tokenizer::from_vocab(vec!["<pad>".into(), "<unk>".into(), "<bos>".into(), "<eos>".into(), "<cap>".into(), "<upper>".into(), "user".into(), "assistant".into(), ":".into(), " ".into(), "hello".into(), "world".into()])
+        Tokenizer::from_vocab(vec![
+            "<pad>".into(), "<unk>".into(), "<bos>".into(), "<eos>".into(),
+            "<cap>".into(), "<upper>".into(), "User".into(), "Assistant".into(),
+            ":".into(), " ".into(), "hello".into(), "world".into(), "\n".into(),
+        ])
     }
 
     #[test]
     fn parses_chat_roles() {
         let record = parse_record(r#"{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"world"}]}"#).unwrap();
-        assert_eq!(record.messages[1].role, "assistant");
+        assert_eq!(record.messages[0].role, "User");
+        assert_eq!(record.messages[1].role, "Assistant");
     }
 
     #[test]
     fn labels_only_assistant_content() {
+        let tok = tokenizer();
         let record = SftRecord { messages: vec![
-            SftMessage { role: "user".into(), content: "hello".into() },
-            SftMessage { role: "assistant".into(), content: "world".into() },
+            SftMessage { role: "User".into(), content: "hello".into() },
+            SftMessage { role: "Assistant".into(), content: "world".into() },
         ]};
-        let example = preprocess_record(&record, &tokenizer(), 64).unwrap().unwrap();
-        assert!(example.labels.iter().any(|&x| x == tokenizer().token_to_id("world").unwrap() as i32));
+        let example = preprocess_record(&record, &tok, 64).unwrap().unwrap();
+        let world = tok.token_to_id("world").unwrap() as i32;
+        assert!(example.labels.iter().any(|&x| x == world));
         assert!(example.labels.iter().any(|&x| x == IGNORE_INDEX));
     }
 
     #[test]
+    fn masks_assistant_prefix() {
+        let tok = tokenizer();
+        let record = SftRecord { messages: vec![SftMessage { role: "Assistant".into(), content: "world".into() }] };
+        let example = preprocess_record(&record, &tok, 64).unwrap().unwrap();
+        let prefix_len = tok.encode("Assistant: ").len();
+        assert!(example.labels[..prefix_len].iter().all(|&x| x == IGNORE_INDEX));
+        assert_eq!(example.labels[prefix_len], tok.token_to_id("world").unwrap() as i32);
+    }
+
+    #[test]
+    fn pads_to_context_length() {
+        let tok = tokenizer();
+        let record = SftRecord { messages: vec![SftMessage { role: "Assistant".into(), content: "world".into() }] };
+        let example = preprocess_record(&record, &tok, 64).unwrap().unwrap();
+        assert_eq!(example.input.len(), 64);
+        assert_eq!(example.labels.len(), 64);
+        assert_eq!(*example.labels.last().unwrap(), IGNORE_INDEX);
+    }
+
+    #[test]
     fn skips_records_without_assistant_targets() {
-        let record = SftRecord { messages: vec![SftMessage { role: "user".into(), content: "hello".into() }] };
+        let record = SftRecord { messages: vec![SftMessage { role: "User".into(), content: "hello".into() }] };
         assert!(preprocess_record(&record, &tokenizer(), 64).unwrap().is_none());
     }
 }
