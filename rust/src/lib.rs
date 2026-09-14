@@ -35,6 +35,7 @@ pub mod moba_routing_backward;
 pub mod model_backward;
 pub mod model_gradients;
 pub mod model_head_backward;
+pub mod model_io;
 pub mod model_loader;
 pub mod model_saver;
 pub mod model_train_step;
