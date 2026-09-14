@@ -44,18 +44,13 @@ pub fn backward(model: &RwkvTimeMix, tape: &RwkvTimeMixTape, grad_output: &Array
             for i in 0..model.head_size { scalar += grad_correction[[row, start+i]] * tape.v[[row, start+i]]; }
             for i in 0..model.head_size {
                 let col = start + i;
-                grad_v[[row,col]] += grad_correction[[row,col]] * scalar / scalar.max(1e-30) * 0.0;
+                grad_v[[row,col]] += grad_correction[[row,col]] * scalar;
                 grad_r[[row,col]] += scalar * tape.k_mod[[row,col]] * model.r_k[[h,i]];
                 grad_k_mod[[row,col]] += scalar * tape.r[[row,col]] * model.r_k[[h,i]];
                 grad_r_k[[h,i]] += scalar * tape.r[[row,col]] * tape.k_mod[[row,col]];
             }
         }
     }
-    for row in 0..steps { for h in 0..model.heads {
-        let start=h*model.head_size; let mut scalar=0.0;
-        for i in 0..model.head_size { scalar += grad_correction[[row,start+i]] * tape.v[[row,start+i]]; }
-        for i in 0..model.head_size { grad_v[[row,start+i]] += grad_correction[[row,start+i]] * scalar; }
-    }}
 
     let wk = wkv_backward::backward(&tape.state_initial, &tape.w, &tape.k_mod, &tape.v, &tape.kk, &tape.a, &tape.r, &grad_y, model.heads, model.head_size);
     grad_v += &wk.v; grad_r += &wk.r; grad_k_mod += &wk.k;
@@ -102,8 +97,9 @@ pub fn backward(model: &RwkvTimeMix, tape: &RwkvTimeMixTape, grad_output: &Array
 }
 
 fn finish(model:&RwkvTimeMix,tape:&RwkvTimeMixTape,grad_xr:Array2<f32>,grad_xw:Array2<f32>,grad_xk:Array2<f32>,grad_xv:Array2<f32>,grad_xa:Array2<f32>,grad_xg:Array2<f32>,grad_v_first:Array2<f32>,grad_state:Array4<f32>,grad_receptance:Array2<f32>,grad_key:Array2<f32>,grad_value:Array2<f32>,grad_w0:Array1<f32>,grad_w1:Array2<f32>,grad_w2:Array2<f32>,grad_a0:Array1<f32>,grad_a1:Array2<f32>,grad_a2:Array2<f32>,grad_v0:Option<Array1<f32>>,grad_v1:Option<Array2<f32>>,grad_v2:Option<Array2<f32>>,grad_g1:Array2<f32>,grad_g2:Array2<f32>,grad_k_k:Array1<f32>,grad_k_a:Array1<f32>,grad_r_k:Array2<f32>,grad_ln_weight:Array1<f32>,grad_ln_bias:Array1<f32>,grad_output:Array2<f32>)->RwkvTimeMixBackward {
-    let mut grad_input=Array2::zeros(tape.input.raw_dim()); let mut grad_prev=Array1::zeros(tape.prev.raw_dim()); let branches=[(&tape.xr,&model.x_r,&grad_xr),(&tape.xw,&model.x_w,&grad_xw),(&tape.xk,&model.x_k,&grad_xk),(&tape.xv,&model.x_v,&grad_xv),(&tape.xa,&model.x_a,&grad_xa),(&tape.xg,&model.x_g,&grad_xg)]; let mut factors=[Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels)];
-    for i in 0..6 { let b=mix_backward(&tape.input,&tape.prev,branches[i].1,branches[i].2); grad_input+=&b.grad_input; grad_prev+=&b.grad_prev; factors[i]=b.grad_factor; }
+    let mut grad_input=Array2::zeros(tape.input.raw_dim()); let mut grad_prev=Array1::zeros(tape.prev.raw_dim()); let branches=[(&model.x_r,&grad_xr),(&model.x_w,&grad_xw),(&model.x_k,&grad_xk),(&model.x_v,&grad_xv),(&model.x_a,&grad_xa),(&model.x_g,&grad_xg)]; let mut factors=[Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels)];
+    let mixed=[&tape.xr,&tape.xw,&tape.xk,&tape.xv,&tape.xa,&tape.xg];
+    for i in 0..6 { let b=mix_backward(&tape.input,&tape.prev,branches[i].0,branches[i].1); let _=mixed[i]; grad_input+=&b.grad_input; grad_prev+=&b.grad_prev; factors[i]=b.grad_factor; }
     RwkvTimeMixBackward{grad_input,grad_prev,grad_state,grad_v_first,grad_x_r:factors[0].clone(),grad_x_w:factors[1].clone(),grad_x_k:factors[2].clone(),grad_x_v:factors[3].clone(),grad_x_a:factors[4].clone(),grad_x_g:factors[5].clone(),grad_w0,grad_w1,grad_w2,grad_a0,grad_a1,grad_a2,grad_v0,grad_v1,grad_v2,grad_g1,grad_g2,grad_k_k,grad_k_a,grad_r_k,grad_receptance,grad_key,grad_value,grad_output,grad_ln_weight,grad_ln_bias}
 }
 
