@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "Native Rust runtime and training toolkit for SmaulNative"
 license = "MIT"
+build = "build.rs"
+
+[features]
+default = []
+cuda = []
+hip = []
 
 [dependencies]
 ndarray = "0.16"
+rand = "0.9"
+safetensors = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+parquet = { version = "59.3", default-features = false, features = ["brotli", "flate2-zlib-rs", "lz4", "snap", "zstd", "simdutf8"] }

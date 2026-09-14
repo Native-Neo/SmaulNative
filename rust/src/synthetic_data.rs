@@ -1,0 +1,15 @@
+use rand::Rng;
+use serde::{Deserialize,Serialize};
+
+#[derive(Clone,Debug,Serialize,Deserialize)]
+pub struct SyntheticRecord{pub instruction:String,pub response:String,pub think:String,pub domain:String}
+
+pub fn linear_equation<R:Rng+?Sized>(rng:&mut R)->SyntheticRecord{let hindi=rng.random_bool(0.5);let a=rng.random_range(2..=500);let b=rng.random_range(10..=5000);let c=rng.random_range(5000..=500000);let x=(c-b)as f64/a as f64;if hindi{SyntheticRecord{instruction:format!("समीकरण {a}x + {b} = {c} के लिए x का मान ज्ञात कीजिए।"),response:format!("**उत्तर:** x = {x:.4}"),think:format!("दोनों पक्षों से {b} घटाएं, फिर {a} से विभाजित करें।"),domain:"math_algebra_hi".into()}}else{SyntheticRecord{instruction:format!("Solve for x in the linear equation: {a}x + {b} = {c}"),response:format!("Subtract {b}, then divide by {a}. **Final Answer:** x = {x:.4}"),think:format!("Subtract {b} from both sides, then divide by {a}."),domain:"math_algebra_en".into()}}}
+
+pub fn quadratic<R:Rng+?Sized>(rng:&mut R)->SyntheticRecord{let a=rng.random_range(1..=50);let r1=rng.random_range(-100..=100);let r2=rng.random_range(-100..=100);let b=-a*(r1+r2);let c=a*r1*r2;SyntheticRecord{instruction:format!("Solve the quadratic equation: {a}x^2 + {b}x + {c} = 0"),response:format!("The roots are x = {r1} and x = {r2}."),think:format!("The polynomial factors as {a}(x - {r1})(x - {r2}) = 0."),domain:"math_quadratic".into()}}
+
+pub fn linear_system<R:Rng+?Sized>(rng:&mut R)->SyntheticRecord{let x=rng.random_range(-50..=50);let y=rng.random_range(-50..=50);let(a,b,c,d)=(loop{let a=rng.random_range(1..=20);let b=rng.random_range(1..=20);let c=rng.random_range(1..=20);let d=rng.random_range(1..=20);if a*d!=b*c{break(a,b,c,d)}});let e=a*x+b*y;let f=c*x+d*y;SyntheticRecord{instruction:format!("Solve: {a}x + {b}y = {e}; {c}x + {d}y = {f}"),response:format!("x = {x}, y = {y}"),think:"Use elimination or substitution and verify both equations.".into(),domain:"math_system_linear".into()}}
+
+pub fn quicksort<R:Rng+?Sized>(rng:&mut R)->SyntheticRecord{let langs=[("Python","python","def quick_sort(a):\n    if len(a) <= 1: return a\n    p=a[len(a)//2]\n    return quick_sort([x for x in a if x<p])+[x for x in a if x==p]+quick_sort([x for x in a if x>p])"),("JavaScript","javascript","function quickSort(a) { if (a.length <= 1) return a; const p=a[Math.floor(a.length/2)]; return [...quickSort(a.filter(x=>x<p)),...a.filter(x=>x===p),...quickSort(a.filter(x=>x>p))]; }"),("Rust","rust","fn quick_sort(a: &mut [i32]) { a.sort_unstable(); }")];let(i,(lang,fence,code))=langs.iter().enumerate().nth(rng.random_range(0..langs.len())).unwrap_or((0,&langs[0]));let _=i;SyntheticRecord{instruction:format!("Write a clean quick sort implementation in {lang}."),response:format!("```{fence}\n{code}\n```\nAverage time: O(n log n)."),think:format!("Use the standard partitioning strategy for {lang}."),domain:"code_algorithms".into()}}
+
+pub fn generate<R:Rng+?Sized>(rng:&mut R)->SyntheticRecord{match rng.random_range(0..4){0=>linear_equation(rng),1=>quadratic(rng),2=>linear_system(rng),_=>quicksort(rng)}}

@@ -1,0 +1,3 @@
+# Keep the native Rust implementation visible to GitHub Linguist.
+rust/**/*.rs linguist-language=Rust
+rust/*.rs linguist-language=Rust
