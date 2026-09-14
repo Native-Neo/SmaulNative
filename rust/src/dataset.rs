@@ -78,11 +78,7 @@ fn json_value_text(value: &serde_json::Value) -> Option<String> {
                     return Some(text.to_owned());
                 }
             }
-            object.values()
-                .filter_map(|v| v.as_str())
-                .filter(|text| !text.trim().is_empty() && !looks_numeric(text))
-                .max_by_key(|text| text.len())
-                .map(str::to_owned)
+            object.values().filter_map(|v| v.as_str()).filter(|text| !text.trim().is_empty() && !looks_numeric(text)).max_by_key(|text| text.len()).map(str::to_owned)
         }
         serde_json::Value::Array(values) => {
             let texts = values.iter().filter_map(json_value_text).collect::<Vec<_>>();
@@ -165,7 +161,10 @@ impl DatasetStream { pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, 
 pub struct MultiFileTextStream { streams: Vec<TextStream>, current: usize }
 impl MultiFileTextStream {
     pub fn open(paths: &[PathBuf], tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> { if paths.is_empty() { return Err("dataset contains no files".into()); } let streams = paths.iter().map(|path| TextStream::open(path, tokenizer.clone(), ctx_len)).collect::<Result<Vec<_>, _>>()?; Ok(Self { streams, current: 0 }) }
-    pub fn open_discovered(dir: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> { Self::open(&discover_files(dir)?, tokenizer, ctx_len) }
+    pub fn open_discovered(dir: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> {
+        let paths = discover_files(dir)?.into_iter().filter(|path| path.extension().and_then(|e| e.to_str()).is_some_and(|e| !e.eq_ignore_ascii_case("parquet"))).collect::<Vec<_>>();
+        Self::open(&paths, tokenizer, ctx_len)
+    }
     pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> { while !self.streams.is_empty() { if self.current >= self.streams.len() { self.current = 0; } match self.streams[self.current].next_batch()? { Some(batch) => { self.current = (self.current + 1) % self.streams.len(); return Ok(Some(batch)); } None => { self.streams.remove(self.current); if self.current >= self.streams.len() && !self.streams.is_empty() { self.current = 0; } } } } Ok(None) }
     pub fn file_count(&self) -> usize { self.streams.len() }
 }
@@ -175,15 +174,10 @@ pub fn discover_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, String> {
     fn visit(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
         for entry in std::fs::read_dir(path).map_err(|e| format!("failed to read {}: {e}", path.display()))? {
             let path = entry.map_err(|e| e.to_string())?.path();
-            if path.is_dir() {
-                visit(&path, files)?;
-                continue;
-            }
+            if path.is_dir() { visit(&path, files)?; continue; }
             if !path.is_file() { continue; }
             let ext = path.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
-            if matches!(ext.as_deref(), Some("jsonl") | Some("parquet")) || ext.as_deref().is_some_and(|x| PLAIN.contains(&x)) {
-                files.push(path);
-            }
+            if matches!(ext.as_deref(), Some("jsonl") | Some("parquet")) || ext.as_deref().is_some_and(|x| PLAIN.contains(&x)) { files.push(path); }
         }
         Ok(())
     }
@@ -209,4 +203,5 @@ mod tests {
     #[test] fn discovers_source_files() { let dir=std::env::temp_dir().join("smaul-source-discover"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("model.rs"),"fn main() {}").unwrap(); fs::write(dir.join("ignore.bin"),b"x").unwrap(); assert_eq!(discover_files(&dir).unwrap(), vec![dir.join("model.rs")]); let _=fs::remove_dir_all(dir); }
     #[test] fn discovers_nested_source_files() { let dir=std::env::temp_dir().join("smaul-nested-discover"); let nested=dir.join("nested"); fs::create_dir_all(&nested).unwrap(); fs::write(nested.join("model.rs"),"fn main() {}").unwrap(); fs::write(nested.join("ignore.bin"),b"x").unwrap(); assert_eq!(discover_files(&dir).unwrap(), vec![nested.join("model.rs")]); let _=fs::remove_dir_all(dir); }
     #[test] fn streams_multiple_files() { let dir=std::env::temp_dir().join("smaul-multi"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("a.txt"),"a b a b").unwrap(); fs::write(dir.join("b.txt"),"b a b a").unwrap(); let mut stream=MultiFileTextStream::open_discovered(&dir,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_dir_all(dir); }
+    #[test] fn multi_file_text_stream_ignores_parquet() { let dir=std::env::temp_dir().join("smaul-multi-parquet"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("a.txt"),"a b a b").unwrap(); fs::write(dir.join("broken.parquet"),b"not parquet").unwrap(); let stream=MultiFileTextStream::open_discovered(&dir,tokenizer(),2).unwrap(); assert_eq!(stream.file_count(),1); let _=fs::remove_dir_all(dir); }
 }
