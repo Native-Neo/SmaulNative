@@ -134,3 +134,10 @@ pub fn load_gguf_tokenizer(path: impl AsRef<std::path::Path>) -> Result<Tokenize
     if tokens.is_empty() { return Err("GGUF tokenizer vocabulary is empty".into()); }
     Ok(Tokenizer::from_vocab(tokens))
 }
+
+pub fn load_gguf(path: impl AsRef<std::path::Path>) -> Result<(RwkvModel, Tokenizer), String> {
+    let path = path.as_ref();
+    let model = load_gguf_model(path)?;
+    let tokenizer = load_gguf_tokenizer(path)?;
+    Ok((model, tokenizer))
+}
