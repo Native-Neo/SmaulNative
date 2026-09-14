@@ -69,6 +69,21 @@ impl RwkvCmix {
         hidden.dot(&self.value)
     }
 
+    pub fn forward_rows(&self, x: &Array2<f32>, prev: Option<&Array1<f32>>, rows: &[usize]) -> Array2<f32> {
+        assert_eq!(x.ncols(), self.channels);
+        let mut mixed = Array2::zeros((rows.len(), self.channels));
+        for (out_row, &t) in rows.iter().enumerate() {
+            assert!(t < x.nrows());
+            for c in 0..self.channels {
+                let previous = if t == 0 { prev.map_or(0.0, |p| p[c]) } else { x[[t - 1, c]] };
+                mixed[[out_row, c]] = x[[t, c]] + (previous - x[[t, c]]) * self.x_k[c];
+            }
+        }
+        let mut hidden = mixed.dot(&self.key);
+        hidden.mapv_inplace(Self::relu_squared);
+        hidden.dot(&self.value)
+    }
+
     pub fn parameter_count(&self) -> usize {
         self.x_k.len() + self.key.len() + self.value.len()
     }
@@ -94,6 +109,21 @@ mod tests {
         let (a, _) = layer.forward(&x, Some(&Array1::<f32>::ones(4)));
         let (b, _) = layer.forward(&x, None);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn selected_rows_match_full_forward() {
+        let layer = RwkvCmix::new(4, 0, 2);
+        let x = Array2::from_shape_fn((5, 4), |(r, c)| (r * 4 + c) as f32 * 0.1);
+        let prev = Array1::from_elem(4, 0.25);
+        let (full, _) = layer.forward(&x, Some(&prev));
+        let rows = [0, 2, 4];
+        let selected = layer.forward_rows(&x, Some(&prev), &rows);
+        for (i, &row) in rows.iter().enumerate() {
+            for c in 0..4 {
+                assert!((selected[[i, c]] - full[[row, c]]).abs() < 1e-6);
+            }
+        }
     }
 
     #[test]
