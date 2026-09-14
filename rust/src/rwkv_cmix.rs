@@ -1,4 +1,5 @@
 use crate::init::uniform;
+use crate::qat::{dequantize_weight_3bit, quantize_weight_3bit};
 use ndarray::{Array1, Array2};
 
 pub struct RwkvCmix {
@@ -8,6 +9,7 @@ pub struct RwkvCmix {
     pub x_k: Array1<f32>,
     pub key: Array2<f32>,
     pub value: Array2<f32>,
+    pub qat_3bit: bool,
 }
 
 impl RwkvCmix {
@@ -26,7 +28,7 @@ impl RwkvCmix {
         let scale = 0.5 / (channels as f32).sqrt();
         let key = uniform(channels, hidden, -scale, scale, seed ^ layer_id as u64);
         let value = Array2::zeros((hidden, channels));
-        Self { channels, layer_id, n_layer, x_k, key, value }
+        Self { channels, layer_id, n_layer, x_k, key, value, qat_3bit: false }
     }
 
     pub fn from_weights(x_k: Array1<f32>, key: Array2<f32>, value: Array2<f32>, layer_id: usize, n_layer: usize) -> Self {
@@ -34,7 +36,24 @@ impl RwkvCmix {
         assert_eq!(key.dim(), (channels, value.nrows()));
         assert_eq!(value.ncols(), channels);
         assert!(n_layer > 0 && layer_id < n_layer);
-        Self { channels, layer_id, n_layer, x_k, key, value }
+        Self { channels, layer_id, n_layer, x_k, key, value, qat_3bit: false }
+    }
+
+    pub fn with_qat_3bit(mut self, enabled: bool) -> Self {
+        self.qat_3bit = enabled;
+        self
+    }
+
+    fn effective_weights(&self) -> (Array2<f32>, Array2<f32>) {
+        if !self.qat_3bit {
+            return (self.key.clone(), self.value.clone());
+        }
+        let (key_packed, key_scales) = quantize_weight_3bit(&self.key);
+        let (value_packed, value_scales) = quantize_weight_3bit(&self.value);
+        (
+            dequantize_weight_3bit(&key_packed, &key_scales, self.key.dim()),
+            dequantize_weight_3bit(&value_packed, &value_scales, self.value.dim()),
+        )
     }
 
     fn relu_squared(x: f32) -> f32 {
@@ -52,9 +71,10 @@ impl RwkvCmix {
                 mixed[[t, c]] = x[[t, c]] + (previous - x[[t, c]]) * self.x_k[c];
             }
         }
-        let mut hidden = mixed.dot(&self.key);
+        let (key, value) = self.effective_weights();
+        let mut hidden = mixed.dot(&key);
         hidden.mapv_inplace(Self::relu_squared);
-        let output = hidden.dot(&self.value);
+        let output = hidden.dot(&value);
         let last = x.row(x.nrows() - 1).to_owned();
         (output, last)
     }
@@ -68,9 +88,10 @@ impl RwkvCmix {
                 mixed[[t, c]] = x[[t, c]] + (previous - x[[t, c]]) * self.x_k[c];
             }
         }
-        let mut hidden = mixed.dot(&self.key);
+        let (key, value) = self.effective_weights();
+        let mut hidden = mixed.dot(&key);
         hidden.mapv_inplace(Self::relu_squared);
-        hidden.dot(&self.value)
+        hidden.dot(&value)
     }
 
     pub fn forward_rows(&self, x: &Array2<f32>, prev: Option<&Array1<f32>>, rows: &[usize]) -> Array2<f32> {
@@ -83,9 +104,10 @@ impl RwkvCmix {
                 mixed[[out_row, c]] = x[[t, c]] + (previous - x[[t, c]]) * self.x_k[c];
             }
         }
-        let mut hidden = mixed.dot(&self.key);
+        let (key, value) = self.effective_weights();
+        let mut hidden = mixed.dot(&key);
         hidden.mapv_inplace(Self::relu_squared);
-        hidden.dot(&self.value)
+        hidden.dot(&value)
     }
 
     pub fn parameter_count(&self) -> usize {
@@ -143,5 +165,17 @@ mod tests {
     fn parameter_count_includes_x_k() {
         let layer = RwkvCmix::new(8, 0, 4);
         assert_eq!(layer.parameter_count(), layer.x_k.len() + layer.key.len() + layer.value.len());
+    }
+
+    #[test]
+    fn qat_3bit_executes_real_cmix_path() {
+        let plain = RwkvCmix::new(8, 0, 4);
+        let qat = RwkvCmix::new(8, 0, 4).with_qat_3bit(true);
+        let x = Array2::from_shape_fn((3, 8), |(r, c)| (r * 8 + c) as f32 * 0.01);
+        let (plain_y, _) = plain.forward(&x, None);
+        let (qat_y, _) = qat.forward(&x, None);
+        assert_eq!(plain_y.dim(), qat_y.dim());
+        assert!(qat_y.iter().all(|v| v.is_finite()));
+        assert!(plain_y.iter().zip(qat_y.iter()).any(|(a, b)| (a - b).abs() > 1e-8));
     }
 }
