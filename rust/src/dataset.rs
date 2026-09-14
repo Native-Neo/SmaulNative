@@ -10,33 +10,24 @@ pub struct DatasetPosition { pub file: PathBuf, pub record: usize }
 pub struct TokenBatch { pub input: Vec<usize>, pub target: Vec<usize>, pub position: DatasetPosition }
 
 pub struct TextStream {
-    reader: BufReader<File>,
-    tokenizer: Tokenizer,
-    ctx_len: usize,
-    record: usize,
-    buffer: Vec<usize>,
-    path: PathBuf,
-    jsonl_text_field: Option<String>,
-    eof: bool,
+    reader: BufReader<File>, tokenizer: Tokenizer, ctx_len: usize, record: usize,
+    buffer: Vec<usize>, path: PathBuf, jsonl_text_field: Option<String>, eof: bool,
 }
 
 impl TextStream {
     pub fn open(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> { Self::open_jsonl(path, tokenizer, ctx_len, None) }
-
     pub fn open_jsonl(path: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize, text_field: Option<impl Into<String>>) -> Result<Self, String> {
         if ctx_len == 0 { return Err("ctx_len must be greater than zero".into()); }
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
         Ok(Self { reader: BufReader::new(file), tokenizer, ctx_len, record: 0, buffer: Vec::new(), path, jsonl_text_field: text_field.map(Into::into), eof: false })
     }
-
     fn read_text(&self, line: &str) -> Result<String, String> {
         if self.jsonl_text_field.is_none() { return Ok(line.trim_end_matches(['\n', '\r']).to_owned()); }
         let value: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("invalid JSONL record {}: {e}", self.record))?;
         let field = self.jsonl_text_field.as_ref().unwrap();
         value.get(field).and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| format!("JSONL record {} has no string field '{field}'", self.record))
     }
-
     pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> {
         loop {
             if self.buffer.len() >= self.ctx_len + 1 {
@@ -58,9 +49,38 @@ impl TextStream {
             self.record += 1;
         }
     }
-
     pub fn position(&self) -> DatasetPosition { DatasetPosition { file: self.path.clone(), record: self.record } }
     pub fn buffered_tokens(&self) -> &[usize] { &self.buffer }
+}
+
+pub struct MultiFileTextStream {
+    streams: Vec<TextStream>, current: usize,
+}
+
+impl MultiFileTextStream {
+    pub fn open(paths: &[PathBuf], tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> {
+        if paths.is_empty() { return Err("dataset contains no files".into()); }
+        let streams = paths.iter().map(|path| TextStream::open(path, tokenizer.clone(), ctx_len)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { streams, current: 0 })
+    }
+
+    pub fn open_discovered(dir: impl AsRef<Path>, tokenizer: Tokenizer, ctx_len: usize) -> Result<Self, String> {
+        let paths = discover_files(dir)?;
+        Self::open(&paths, tokenizer, ctx_len)
+    }
+
+    pub fn next_batch(&mut self) -> Result<Option<TokenBatch>, String> {
+        while !self.streams.is_empty() {
+            if self.current >= self.streams.len() { self.current = 0; }
+            match self.streams[self.current].next_batch()? {
+                Some(batch) => { self.current = (self.current + 1) % self.streams.len(); return Ok(Some(batch)); }
+                None => { self.streams.remove(self.current); if self.current >= self.streams.len() && !self.streams.is_empty() { self.current = 0; } }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn file_count(&self) -> usize { self.streams.len() }
 }
 
 pub fn discover_files(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, String> {
@@ -86,4 +106,5 @@ mod tests {
     #[test] fn streams_fixed_length_training_pairs() { let path=std::env::temp_dir().join("smaul-dataset.txt"); fs::write(&path,"a b a b a b").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),3).unwrap(); let batch=stream.next_batch().unwrap().unwrap(); assert_eq!(batch.input.len(),3); assert_eq!(batch.target.len(),3); assert_eq!(batch.position.record,1); let _=fs::remove_file(path); }
     #[test] fn stops_at_eof() { let path=std::env::temp_dir().join("smaul-eof.txt"); fs::write(&path,"a b").unwrap(); let mut stream=TextStream::open(&path,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_none()); let _=fs::remove_file(path); }
     #[test] fn reads_jsonl_text_field() { let path=std::env::temp_dir().join("smaul-dataset.jsonl"); fs::write(&path,"{\"text\":\"a b a\"}\n{\"text\":\"b a\"}\n").unwrap(); let mut stream=TextStream::open_jsonl(&path,tokenizer(),2,Some("text")).unwrap(); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_file(path); }
+    #[test] fn streams_multiple_files() { let dir=std::env::temp_dir().join("smaul-multi"); fs::create_dir_all(&dir).unwrap(); fs::write(dir.join("a.txt"),"a b a b").unwrap(); fs::write(dir.join("b.txt"),"b a b a").unwrap(); let mut stream=MultiFileTextStream::open_discovered(&dir,tokenizer(),2).unwrap(); assert!(stream.next_batch().unwrap().is_some()); assert!(stream.next_batch().unwrap().is_some()); let _=fs::remove_dir_all(dir); }
 }
