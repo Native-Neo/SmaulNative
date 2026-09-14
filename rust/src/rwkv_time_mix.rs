@@ -1,5 +1,6 @@
 use crate::group_norm::GroupNorm;
 use crate::init::{orthogonal, uniform};
+use crate::rwkv_time_mix_tape::RwkvTimeMixTape;
 use crate::wkv;
 use ndarray::{Array1, Array2, Array4};
 
@@ -74,41 +75,79 @@ impl RwkvTimeMix {
 
     fn project(x: &Array2<f32>, weight: &Array2<f32>) -> Array2<f32> { x.dot(weight) }
 
-    pub fn forward(&self, x: &Array2<f32>, state: Option<Array4<f32>>, prev: Option<Array1<f32>>, v_first: Option<Array2<f32>>) -> (Array2<f32>, Array4<f32>, Array1<f32>, Array2<f32>) {
+    pub fn forward_with_tape(
+        &self,
+        x: &Array2<f32>,
+        state: Option<Array4<f32>>,
+        prev: Option<Array1<f32>>,
+        v_first: Option<Array2<f32>>,
+    ) -> (Array2<f32>, Array4<f32>, Array1<f32>, Array2<f32>, RwkvTimeMixTape) {
         assert!(x.nrows() > 0);
-        let zero = Array1::zeros(self.channels); let prev_ref = prev.as_ref().unwrap_or(&zero);
-        let xr = mix(x, prev_ref, &self.x_r); let xw = mix(x, prev_ref, &self.x_w); let xk = mix(x, prev_ref, &self.x_k);
-        let xv = mix(x, prev_ref, &self.x_v); let xa = mix(x, prev_ref, &self.x_a); let xg = mix(x, prev_ref, &self.x_g);
-        let r = Self::project(&xr, &self.receptance); let g_decay = Self::project(&Self::project(&xw, &self.w1).mapv(|v| v.tanh()), &self.w2);
-        let k = Self::project(&xk, &self.key); let mut v = Self::project(&xv, &self.value);
-        let a = Self::project(&Self::project(&xa, &self.a1), &self.a2).mapv(sigmoid);
-        let g = Self::project(&Self::project(&xg, &self.g1).mapv(sigmoid), &self.g2);
-        let layer_v_first = v_first.unwrap_or_else(|| v.clone());
+        let zero = Array1::zeros(self.channels);
+        let prev_ref = prev.as_ref().unwrap_or(&zero);
+        let initial = state.unwrap_or_else(|| Array4::zeros((1, self.heads, self.head_size, self.head_size)));
+        let w_hidden = self.w1.ncols();
+        let v_hidden = self.v1.as_ref().map(|v| v.ncols());
+        let g_hidden = self.g1.ncols();
+        let mut tape = RwkvTimeMixTape::new(x.clone(), prev_ref.clone(), initial.clone(), w_hidden, v_hidden, g_hidden);
+
+        tape.xr = mix(x, prev_ref, &self.x_r);
+        tape.xw = mix(x, prev_ref, &self.x_w);
+        tape.xk = mix(x, prev_ref, &self.x_k);
+        tape.xv = mix(x, prev_ref, &self.x_v);
+        tape.xa = mix(x, prev_ref, &self.x_a);
+        tape.xg = mix(x, prev_ref, &self.x_g);
+        tape.r = Self::project(&tape.xr, &self.receptance);
+        tape.w_hidden = Self::project(&tape.xw, &self.w1).mapv(|v| v.tanh());
+        tape.g_decay = Self::project(&tape.w_hidden, &self.w2);
+        tape.k = Self::project(&tape.xk, &self.key);
+        tape.v_base = Self::project(&tape.xv, &self.value);
+        tape.v = tape.v_base.clone();
+        tape.a_hidden = Self::project(&tape.xa, &self.a1);
+        tape.a = Self::project(&tape.a_hidden, &self.a2).mapv(sigmoid);
+        tape.g_hidden = Self::project(&tape.xg, &self.g1).mapv(sigmoid);
+        tape.g = Self::project(&tape.g_hidden, &self.g2);
+        tape.v_first = v_first.unwrap_or_else(|| tape.v.clone());
+
         if let (Some(v1), Some(v2), Some(v0)) = (&self.v1, &self.v2, &self.v0) {
-            let correction = Self::project(&Self::project(&xv, v1), v2);
-            for t in 0..v.nrows() { for c in 0..self.channels {
-                v[[t, c]] += (layer_v_first[[t, c]] - v[[t, c]]) * sigmoid(v0[c] + correction[[t, c]]);
-            }}
+            let correction = Self::project(&Self::project(&tape.xv, v1), v2);
+            let mut gate = Array2::zeros(tape.v.dim());
+            for t in 0..tape.v.nrows() { for c in 0..self.channels { gate[[t, c]] = sigmoid(v0[c] + correction[[t, c]]); tape.v[[t, c]] += (tape.v_first[[t, c]] - tape.v[[t, c]]) * gate[[t, c]]; }}
+            tape.v_correction = Some(correction);
+            tape.v_gate = Some(gate);
         }
-        let mut kk = k.clone();
-        for t in 0..kk.nrows() { for h in 0..self.heads {
+
+        tape.kk_pre_norm = tape.k.clone();
+        tape.kk = tape.k.clone();
+        for t in 0..tape.kk.nrows() { for h in 0..self.heads {
             let start = h * self.head_size; let mut norm = 0.0;
-            for i in 0..self.head_size { let z = kk[[t, start+i]] * self.k_k[start+i]; norm += z*z; }
+            for i in 0..self.head_size { let z = tape.kk[[t, start+i]] * self.k_k[start+i]; norm += z*z; }
             let inv = (norm + 1e-12).sqrt().recip();
-            for i in 0..self.head_size { kk[[t,start+i]] *= self.k_k[start+i] * inv; }
+            for i in 0..self.head_size { tape.kk[[t,start+i]] *= self.k_k[start+i] * inv; }
         }}
-        let mut k_mod = k.clone(); for t in 0..k_mod.nrows() { for c in 0..self.channels { k_mod[[t,c]] *= 1.0 + (a[[t,c]]-1.0)*self.k_a[c]; }}
-        let mut w = Array2::zeros(x.raw_dim()); for t in 0..x.nrows() { for c in 0..self.channels { w[[t,c]] = (-0.606531*sigmoid(self.w0[c]+g_decay[[t,c]])).exp(); }}
-        let initial = state.unwrap_or_else(|| Array4::zeros((1,self.heads,self.head_size,self.head_size)));
-        let (next_state,y) = wkv::run(initial,&w,&k_mod,&v,&kk,&a,&r,self.heads,self.head_size);
-        let mut out = self.ln_x.forward(&y);
-        for t in 0..out.nrows() { for h in 0..self.heads { let start=h*self.head_size; let mut correction=0.0;
-            for i in 0..self.head_size { let c=start+i; correction += r[[t,c]]*k_mod[[t,c]]*self.r_k[[h,i]]; }
-            for i in 0..self.head_size { out[[t,start+i]] += correction*v[[t,start+i]]; }
+        tape.k_mod = tape.k.clone();
+        for t in 0..tape.k_mod.nrows() { for c in 0..self.channels { tape.k_mod[[t,c]] *= 1.0 + (tape.a[[t,c]]-1.0)*self.k_a[c]; }}
+        tape.w = Array2::zeros(x.raw_dim());
+        for t in 0..x.nrows() { for c in 0..self.channels { tape.w[[t,c]] = (-0.606531*sigmoid(self.w0[c]+tape.g_decay[[t,c]])).exp(); }}
+        let (next_state, y) = wkv::run(initial, &tape.w, &tape.k_mod, &tape.v, &tape.kk, &tape.a, &tape.r, self.heads, self.head_size);
+        tape.y = y;
+        tape.normalized = self.ln_x.forward(&tape.y);
+        tape.correction = Array2::zeros(tape.y.raw_dim());
+        for t in 0..tape.normalized.nrows() { for h in 0..self.heads {
+            let start=h*self.head_size; let mut corr=0.0;
+            for i in 0..self.head_size { let c=start+i; corr += tape.r[[t,c]]*tape.k_mod[[t,c]]*self.r_k[[h,i]]; }
+            for i in 0..self.head_size { tape.correction[[t,start+i]] = corr*tape.v[[t,start+i]]; }
         }}
-        for t in 0..out.nrows() { for c in 0..self.channels { out[[t,c]] *= g[[t,c]]; }}
-        out = out.dot(&self.output);
-        (out,next_state,x.row(x.nrows()-1).to_owned(),layer_v_first)
+        tape.gated = &tape.normalized + &tape.correction;
+        for t in 0..tape.gated.nrows() { for c in 0..self.channels { tape.gated[[t,c]] *= tape.g[[t,c]]; }}
+        tape.output = tape.gated.dot(&self.output);
+        let last = x.row(x.nrows()-1).to_owned();
+        (tape.output.clone(), next_state, last, tape.v_first.clone(), tape)
+    }
+
+    pub fn forward(&self, x: &Array2<f32>, state: Option<Array4<f32>>, prev: Option<Array1<f32>>, v_first: Option<Array2<f32>>) -> (Array2<f32>, Array4<f32>, Array1<f32>, Array2<f32>) {
+        let (out, next_state, last, first, _) = self.forward_with_tape(x, state, prev, v_first);
+        (out, next_state, last, first)
     }
 
     pub fn parameter_count(&self) -> usize {
@@ -123,5 +162,16 @@ mod tests {
     fn x070_shapes() {
         let layer=RwkvTimeMix::new(16,2,0,4); let x=Array2::ones((3,16)); let (out,state,last,first)=layer.forward(&x,None,None,None);
         assert_eq!(out.shape(),&[3,16]); assert_eq!(state.shape(),&[1,2,8,8]); assert_eq!(last.len(),16); assert_eq!(first.shape(),&[3,16]);
+    }
+
+    #[test]
+    fn tape_matches_forward_output() {
+        let layer=RwkvTimeMix::new(16,2,1,4); let x=Array2::ones((3,16));
+        let (a,_,_,_,tape)=layer.forward_with_tape(&x,None,None,None);
+        let (b,_,_,_)=layer.forward(&x,None,None,None);
+        assert_eq!(a.dim(), b.dim());
+        assert!(a.iter().zip(b.iter()).all(|(x,y)| (x-y).abs() < 1e-6));
+        assert_eq!(tape.output.dim(), (3,16));
+        assert_eq!(tape.w_hidden.ncols(), layer.w1.ncols());
     }
 }
