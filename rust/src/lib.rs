@@ -32,6 +32,7 @@ pub mod linear_loss_backward;
 pub mod loss;
 pub mod lr_scheduler;
 pub mod matmul;
+pub mod moe;
 pub mod moba_attention;
 pub mod moba_block;
 pub mod moba_routed_backward;
