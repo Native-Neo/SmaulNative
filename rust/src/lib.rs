@@ -11,6 +11,7 @@ pub mod grad_accumulation;
 pub mod grad_accumulator;
 pub mod gradient;
 pub mod group_norm;
+pub mod group_norm_backward;
 pub mod group_norm_grad;
 pub mod init;
 pub mod layer_norm;
