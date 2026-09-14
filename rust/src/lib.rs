@@ -54,6 +54,7 @@ pub mod sequence_loss;
 pub mod tokenizer;
 pub mod training;
 pub mod training_state;
+pub mod inference;
 pub mod wkv;
 pub mod wkv_backward;
 pub mod wkv_backward_check;
