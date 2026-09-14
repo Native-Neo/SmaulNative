@@ -1,4 +1,5 @@
 use ndarray::Array2;
+use crate::rwkv_block_full_tape::RwkvBlockFullTape;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackwardBlockKind {
@@ -10,6 +11,7 @@ pub struct ModelBackwardTape {
     pub block_order: Vec<BackwardBlockKind>,
     pub inputs: Vec<Array2<f32>>,
     pub outputs: Vec<Array2<f32>>,
+    pub rwkv_tapes: Vec<Option<RwkvBlockFullTape>>,
     pub ln_input: Option<Array2<f32>>,
     pub normalized: Option<Array2<f32>>,
     pub logits: Option<Array2<f32>>,
@@ -17,14 +19,34 @@ pub struct ModelBackwardTape {
 
 impl ModelBackwardTape {
     pub fn new(block_order: Vec<BackwardBlockKind>) -> Self {
-        Self { block_order, inputs: Vec::new(), outputs: Vec::new(), ln_input: None, normalized: None, logits: None }
+        Self {
+            block_order,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            rwkv_tapes: Vec::new(),
+            ln_input: None,
+            normalized: None,
+            logits: None,
+        }
     }
 
     pub fn record_block(&mut self, input: Array2<f32>, output: Array2<f32>) {
         assert_eq!(input.dim(), output.dim());
         self.inputs.push(input);
         self.outputs.push(output);
+        self.rwkv_tapes.push(None);
         assert_eq!(self.inputs.len(), self.outputs.len());
+        assert_eq!(self.inputs.len(), self.rwkv_tapes.len());
+    }
+
+    pub fn record_rwkv_block(&mut self, index: usize, tape: RwkvBlockFullTape) {
+        assert!(index < self.rwkv_tapes.len());
+        assert!(matches!(self.block_order[index], BackwardBlockKind::Rwkv(_)));
+        self.rwkv_tapes[index] = Some(tape);
+    }
+
+    pub fn rwkv_block_tape(&self, index: usize) -> &RwkvBlockFullTape {
+        self.rwkv_tapes[index].as_ref().expect("missing RWKV block tape")
     }
 
     pub fn record_head(&mut self, ln_input: Array2<f32>, normalized: Array2<f32>, logits: Array2<f32>) {
@@ -38,6 +60,7 @@ impl ModelBackwardTape {
     pub fn reverse_blocks(&self) -> impl DoubleEndedIterator<Item = (BackwardBlockKind, &Array2<f32>, &Array2<f32>)> {
         assert_eq!(self.block_order.len(), self.inputs.len());
         assert_eq!(self.inputs.len(), self.outputs.len());
+        assert_eq!(self.inputs.len(), self.rwkv_tapes.len());
         self.block_order.iter().copied().zip(self.inputs.iter()).zip(self.outputs.iter()).map(|((kind, input), output)| (kind, input, output)).rev()
     }
 
@@ -47,6 +70,7 @@ impl ModelBackwardTape {
     pub fn clear(&mut self) {
         self.inputs.clear();
         self.outputs.clear();
+        self.rwkv_tapes.clear();
         self.ln_input = None;
         self.normalized = None;
         self.logits = None;
