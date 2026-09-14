@@ -27,7 +27,7 @@ pub struct RwkvBlock {
 
 impl RwkvBlock {
     pub fn new(channels: usize, heads: usize, layer_id: usize, n_layer: usize) -> Self {
-        Self::new_with_moe(channels, heads, layer_id, n_layer, false, 1, 1, 0)
+        Self::new_with_moe_and_qat(channels, heads, layer_id, n_layer, false, 1, 1, 0, false)
     }
 
     pub fn new_with_moe(
@@ -40,9 +40,29 @@ impl RwkvBlock {
         num_experts_per_tok: usize,
         seed: u64,
     ) -> Self {
+        Self::new_with_moe_and_qat(channels, heads, layer_id, n_layer, is_moe, num_experts, num_experts_per_tok, seed, false)
+    }
+
+    pub fn new_with_moe_and_qat(
+        channels: usize,
+        heads: usize,
+        layer_id: usize,
+        n_layer: usize,
+        is_moe: bool,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        seed: u64,
+        qat_3bit: bool,
+    ) -> Self {
         assert!(channels > 0);
         assert!(heads > 0);
         assert_eq!(channels % heads, 0);
+        let cmix = RwkvCmix::new_seeded(channels, layer_id, n_layer, seed ^ 0x434d_4958).with_qat_3bit(qat_3bit);
+        let moe = if is_moe {
+            Some(MoeCmix::new(channels, layer_id, n_layer, num_experts, num_experts_per_tok, seed).with_qat_3bit(qat_3bit))
+        } else {
+            None
+        };
         Self {
             channels,
             heads,
@@ -51,8 +71,8 @@ impl RwkvBlock {
             ln1: LayerNorm::new(channels, 1e-5),
             ln2: LayerNorm::new(channels, 1e-5),
             time_mix: RwkvTimeMix::new(channels, heads, layer_id, n_layer),
-            cmix: RwkvCmix::new(channels, layer_id, n_layer),
-            moe: if is_moe { Some(MoeCmix::new(channels, layer_id, n_layer, num_experts, num_experts_per_tok, seed)) } else { None },
+            cmix,
+            moe,
         }
     }
 
@@ -103,9 +123,10 @@ impl RwkvBlock {
             None => {
                 let mut mixed = ln2_output.clone();
                 for t in 0..mixed.nrows() { for c in 0..self.channels { let previous = if t == 0 { cmix_prev[c] } else { ln2_output[[t - 1, c]] }; mixed[[t, c]] = ln2_output[[t, c]] + (previous - ln2_output[[t, c]]) * self.cmix.x_k[c]; } }
-                let pre = mixed.dot(&self.cmix.key);
+                let (key, value) = self.cmix.effective_weights_for_tape();
+                let pre = mixed.dot(&key);
                 let hidden = pre.mapv(|v| v.max(0.0).powi(2));
-                let output = hidden.dot(&self.cmix.value);
+                let output = hidden.dot(&value);
                 (output, ln2_output.row(ln2_output.nrows() - 1).to_owned(), mixed, pre, hidden)
             }
         };
@@ -132,4 +153,5 @@ mod tests {
     #[test] fn moe_block_runs() { let block = RwkvBlock::new_with_moe(16, 2, 0, 4, true, 3, 2, 17); let x = Array2::<f32>::ones((3, 16)); let (y, state) = block.forward(&x, None, None); assert_eq!(y.dim(), x.dim()); assert_eq!(state.cmix_prev.len(), 16); assert!(block.parameter_count() > RwkvBlock::new(16, 2, 0, 4).parameter_count()); }
     #[test] fn later_layer_accepts_v_first() { let first = RwkvBlock::new(16, 2, 0, 4); let later = RwkvBlock::new(16, 2, 1, 4); let x = Array2::<f32>::zeros((3, 16)); let (_, first_state) = first.forward(&x, None, None); let (y, later_state) = later.forward(&x, None, first_state.v_first.as_ref()); assert_eq!(y.shape(), &[3, 16]); assert!(later_state.v_first.is_some()); }
     #[test] fn only_first_layer_has_ln0() { let first = RwkvBlock::new(16, 2, 0, 4); let later = RwkvBlock::new(16, 2, 1, 4); assert!(first.ln0.is_some()); assert!(later.ln0.is_none()); }
+    #[test] fn configured_qat_constructs() { let block = RwkvBlock::new_with_moe_and_qat(16, 2, 0, 4, false, 1, 1, 1, true); assert!(block.cmix.qat_3bit); }
 }
