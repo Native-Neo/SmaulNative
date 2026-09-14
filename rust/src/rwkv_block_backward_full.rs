@@ -1,35 +1,20 @@
-use ndarray::{Array1, Array2, Array4};
+use ndarray::{Array1,Array2,Array4};
 use crate::layer_norm_backward;
-use crate::moe_backward::{self, MoeBackward};
-use crate::rwkv_block::{RwkvBlock, RwkvBlockState};
+use crate::moe_backward::{self,MoeBackward};
+use crate::rwkv_block::{RwkvBlock,RwkvBlockState};
 use crate::rwkv_block_full_tape::RwkvBlockFullTape;
-use crate::rwkv_cmix_backward::{self, CmixBackward};
+use crate::rwkv_cmix_backward::{self,CmixBackward};
 use crate::rwkv_time_mix_backward_full;
 
-pub struct RwkvBlockBackward {
-    pub grad_input: Array2<f32>, pub grad_time_prev: Array1<f32>, pub grad_cmix_prev: Array1<f32>, pub grad_time_state: Array4<f32>, pub grad_v_first: Array2<f32>,
-    pub grad_ln0_weight: Option<Array1<f32>>, pub grad_ln0_bias: Option<Array1<f32>>, pub grad_ln1_weight: Array1<f32>, pub grad_ln1_bias: Array1<f32>, pub grad_ln2_weight: Array1<f32>, pub grad_ln2_bias: Array1<f32>,
-    pub time: rwkv_time_mix_backward_full::RwkvTimeMixBackward, pub cmix: Option<CmixBackward>, pub moe: Option<MoeBackward>,
-}
+pub struct RwkvBlockBackward{pub grad_input:Array2<f32>,pub grad_time_prev:Array1<f32>,pub grad_cmix_prev:Array1<f32>,pub grad_time_state:Array4<f32>,pub grad_v_first:Array2<f32>,pub grad_ln0_weight:Option<Array1<f32>>,pub grad_ln0_bias:Option<Array1<f32>>,pub grad_ln1_weight:Array1<f32>,pub grad_ln1_bias:Array1<f32>,pub grad_ln2_weight:Array1<f32>,pub grad_ln2_bias:Array1<f32>,pub time:rwkv_time_mix_backward_full::RwkvTimeMixBackward,pub cmix:Option<CmixBackward>,pub moe:Option<MoeBackward>}
 
 pub fn backward(block:&RwkvBlock,tape:&RwkvBlockFullTape,grad_output:&Array2<f32>,grad_next_time_state:Option<&Array4<f32>>,grad_next_time_prev:Option<&Array1<f32>>,grad_next_cmix_prev:Option<&Array1<f32>>,grad_next_v_first:Option<&Array2<f32>>)->RwkvBlockBackward{
-    assert_eq!(grad_output.dim(),tape.output.dim());
-    let initial_cmix_prev=tape.initial_state.as_ref().map(|s|&s.cmix_prev);
-    let(grad_cmix_input,grad_cmix_prev,cmix,moe) = match &block.moe {
-        Some(moe_layer)=>{let mut result=moe_backward::backward(moe_layer,&tape.cmix_input,initial_cmix_prev,grad_output);if let Some(g)=grad_next_cmix_prev{result.grad_prev+=g;} (result.grad_input.clone(),result.grad_prev.clone(),None,Some(result))}
-        None=>{let mut result=rwkv_cmix_backward::backward(&tape.cmix_input,initial_cmix_prev,grad_output,&block.cmix.x_k,&block.cmix.key,&block.cmix.value);if let Some(g)=grad_next_cmix_prev{result.grad_prev+=g;}(result.grad_input.clone(),result.grad_prev.clone(),Some(result),None)}
-    };
-    let(grad_ln2_input,grad_ln2_weight,grad_ln2_bias)=layer_norm_backward::backward(&tape.ln2_input,&grad_cmix_input,&block.ln2.weight,block.ln2.eps);
-    let grad_residual=grad_output+&grad_ln2_input;
-    let mut time=rwkv_time_mix_backward_full::backward(&block.time_mix,&tape.time,&grad_residual);
-    if let Some(g)=grad_next_time_state{time.grad_state+=g;}if let Some(g)=grad_next_time_prev{time.grad_prev+=g;}if let Some(g)=grad_next_v_first{time.grad_v_first+=g;}
-    let(grad_ln1_input,grad_ln1_weight,grad_ln1_bias)=layer_norm_backward::backward(&tape.ln1_input,&time.grad_input,&block.ln1.weight,block.ln1.eps);
-    let grad_into_input=grad_residual+&grad_ln1_input;
-    let(mut grad_ln0_weight,mut grad_ln0_bias)=(None,None);
-    let grad_input=if let(Some(ln0),Some(ln0_input))=(block.ln0.as_ref(),tape.ln0_input.as_ref()){let(dx,dw,db)=layer_norm_backward::backward(ln0_input,&grad_into_input,&ln0.weight,ln0.eps);grad_ln0_weight=Some(dw);grad_ln0_bias=Some(db);dx}else{grad_into_input};
-    RwkvBlockBackward{grad_input,grad_time_prev:time.grad_prev.clone(),grad_cmix_prev,grad_time_state:time.grad_state.clone(),grad_v_first:time.grad_v_first.clone(),grad_ln0_weight,grad_ln0_bias,grad_ln1_weight,grad_ln1_bias,grad_ln2_weight,grad_ln2_bias,time,cmix,moe}
+ assert_eq!(grad_output.dim(),tape.output.dim());let initial_cmix_prev=tape.initial_state.as_ref().map(|s|&s.cmix_prev);
+ let(grad_cmix_input,grad_cmix_prev,cmix,moe)=match &block.moe{
+  Some(moe_layer)=>{let mut result=moe_backward::backward(moe_layer,&tape.cmix_input,initial_cmix_prev,grad_output);if let Some(g)=grad_next_cmix_prev{result.grad_prev+=g;}(result.grad_input.clone(),result.grad_prev.clone(),None,Some(result))}
+  None=>{let(key,value)=block.cmix.effective_weights();let mut result=rwkv_cmix_backward::backward(&tape.cmix_input,initial_cmix_prev,grad_output,&block.cmix.x_k,&key,&value);if let Some(g)=grad_next_cmix_prev{result.grad_prev+=g;}(result.grad_input.clone(),result.grad_prev.clone(),Some(result),None)}
+ };
+ let(grad_ln2_input,grad_ln2_weight,grad_ln2_bias)=layer_norm_backward::backward(&tape.ln2_input,&grad_cmix_input,&block.ln2.weight,block.ln2.eps);let grad_residual=grad_output+&grad_ln2_input;let mut time=rwkv_time_mix_backward_full::backward(&block.time_mix,&tape.time,&grad_residual);if let Some(g)=grad_next_time_state{time.grad_state+=g;}if let Some(g)=grad_next_time_prev{time.grad_prev+=g;}if let Some(g)=grad_next_v_first{time.grad_v_first+=g;}let(grad_ln1_input,grad_ln1_weight,grad_ln1_bias)=layer_norm_backward::backward(&tape.ln1_input,&time.grad_input,&block.ln1.weight,block.ln1.eps);let grad_into_input=grad_residual+&grad_ln1_input;let(mut grad_ln0_weight,mut grad_ln0_bias)=(None,None);let grad_input=if let(Some(ln0),Some(ln0_input))=(block.ln0.as_ref(),tape.ln0_input.as_ref()){let(dx,dw,db)=layer_norm_backward::backward(ln0_input,&grad_into_input,&ln0.weight,ln0.eps);grad_ln0_weight=Some(dw);grad_ln0_bias=Some(db);dx}else{grad_into_input};RwkvBlockBackward{grad_input,grad_time_prev:time.grad_prev.clone(),grad_cmix_prev,grad_time_state:time.grad_state.clone(),grad_v_first:time.grad_v_first.clone(),grad_ln0_weight,grad_ln0_bias,grad_ln1_weight,grad_ln1_bias,grad_ln2_weight,grad_ln2_bias,time,cmix,moe}
 }
 
-#[cfg(test)]
-mod tests{use super::*;use ndarray::Array2;fn loss(block:&RwkvBlock,x:&Array2<f32>)->f32{block.forward(x,None,None).0.sum()}#[test]fn input_gradient_matches_finite_difference(){let block=RwkvBlock::new(16,2,0,4);let x=Array2::from_shape_fn((2,16),|(r,c)|0.02*(r as f32)+0.003*(c as f32)+0.01);let(_,_,tape)=block.forward_with_full_tape(&x,None,None);let analytic=backward(&block,&tape,&Array2::ones((2,16)),None,None,None,None).grad_input;let eps=1e-3_f32;for&(row,col)in&[(0usize,0usize),(0,7),(1,3),(1,15)]{let mut plus=x.clone();let mut minus=x.clone();plus[[row,col]]+=eps;minus[[row,col]]-=eps;let numeric=(loss(&block,&plus)-loss(&block,&minus))/(2.0*eps);let a=analytic[[row,col]];let tolerance=3e-2_f32.max(3e-2*a.abs());assert!((numeric-a).abs()<=tolerance,"gradient mismatch at ({row},{col}): analytic={a}, numeric={numeric}");}}
-#[test]fn moe_backward_returns_expert_gradients(){let block=RwkvBlock::new_with_moe(8,2,0,4,true,3,2,17);let x=Array2::<f32>::ones((2,8));let(_,_,tape)=block.forward_with_full_tape(&x,None,None);let result=backward(&block,&tape,&Array2::ones((2,8)),None,None,None,None);assert!(result.moe.is_some());assert_eq!(result.moe.as_ref().unwrap().grad_key.len(),3);}}
+#[cfg(test)]mod tests{use super::*;use ndarray::Array2;fn loss(block:&RwkvBlock,x:&Array2<f32>)->f32{block.forward(x,None,None).0.sum()}#[test]fn input_gradient_matches_finite_difference(){let block=RwkvBlock::new(16,2,0,4);let x=Array2::from_shape_fn((2,16),|(r,c)|0.02*(r as f32)+0.003*(c as f32)+0.01);let(_,_,tape)=block.forward_with_full_tape(&x,None,None);let analytic=backward(&block,&tape,&Array2::ones((2,16)),None,None,None,None).grad_input;let eps=1e-3_f32;for&(row,col)in&[(0usize,0usize),(0,7),(1,3),(1,15)]{let mut plus=x.clone();let mut minus=x.clone();plus[[row,col]]+=eps;minus[[row,col]]-=eps;let numeric=(loss(&block,&plus)-loss(&block,&minus))/(2.0*eps);let a=analytic[[row,col]];let tolerance=3e-2_f32.max(3e-2*a.abs());assert!((numeric-a).abs()<=tolerance,"gradient mismatch at ({row},{col}): analytic={a}, numeric={numeric}");}}#[test]fn moe_backward_returns_expert_gradients(){let block=RwkvBlock::new_with_moe(8,2,0,4,true,3,2,17);let x=Array2::<f32>::ones((2,8));let(_,_,tape)=block.forward_with_full_tape(&x,None,None);let result=backward(&block,&tape,&Array2::ones((2,8)),None,None,None,None);assert!(result.moe.is_some());assert_eq!(result.moe.as_ref().unwrap().grad_key.len(),3);}#[test]fn qat_backward_uses_same_effective_weights_as_forward(){let block=RwkvBlock::new_with_moe_and_qat(8,2,0,4,false,1,1,17,true);let x=Array2::from_shape_fn((2,8),|(r,c)|0.01*(r*8+c)as f32);let(_,_,tape)=block.forward_with_full_tape(&x,None,None);let result=backward(&block,&tape,&Array2::ones((2,8)),None,None,None,None);assert!(result.grad_input.iter().all(|v|v.is_finite()));}}
