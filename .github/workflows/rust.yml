@@ -35,3 +35,5 @@ jobs:
         uses: actions/checkout@v4
       - name: Compile HIP kernel
         run: docker run --rm -v "$PWD:/workspace" -w /workspace rocm/dev-ubuntu-22.04:latest hipcc -O3 -c gpu/hip/rust_lowbit.hip -o /tmp/rust_lowbit_hip.o
+      - name: Build Rust HIP feature
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace rocm/dev-ubuntu-22.04:latest bash -lc 'apt-get update >/dev/null && apt-get install -y --no-install-recommends curl build-essential >/dev/null && curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && . "$HOME/.cargo/env" && cargo test --all-targets --features hip'
