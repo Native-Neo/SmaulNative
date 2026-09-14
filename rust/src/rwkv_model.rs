@@ -109,18 +109,18 @@ impl RwkvModel {
             match *kind {
                 BlockKind::Rwkv(index) => {
                     let block_state = state.and_then(|s| s.rwkv_blocks.get(index));
-                    let (next_x, next_state, block_tape) = if tape.is_some() {
-                        self.rwkv_blocks[index].forward_with_full_tape(&x, block_state, v_first.as_ref())
-                    } else {
-                        let (next_x, next_state) = self.rwkv_blocks[index].forward(&x, block_state, v_first.as_ref());
-                        (next_x, next_state, unsafe { std::mem::zeroed() })
-                    };
-                    v_first = next_state.v_first.clone();
-                    x = next_x;
-                    next_rwkv.push((index, next_state));
                     if let Some(ref mut model_tape) = tape {
+                        let (next_x, next_state, block_tape) = self.rwkv_blocks[index].forward_with_full_tape(&x, block_state, v_first.as_ref());
+                        v_first = next_state.v_first.clone();
+                        x = next_x;
+                        next_rwkv.push((index, next_state));
                         model_tape.record_block(input, x.clone());
                         model_tape.record_rwkv_tape(block_tape);
+                    } else {
+                        let (next_x, next_state) = self.rwkv_blocks[index].forward(&x, block_state, v_first.as_ref());
+                        v_first = next_state.v_first.clone();
+                        x = next_x;
+                        next_rwkv.push((index, next_state));
                     }
                 }
                 BlockKind::Moba(index) => {
