@@ -14,7 +14,7 @@ impl PretrainedModel {
     pub fn load(directory: impl AsRef<Path>) -> Result<Self, String> {
         let directory = directory.as_ref();
         let config = RwkvXConfig::load(directory.join("config.json"))?;
-        let tokenizer = Tokenizer::load_json(directory.join("tokenizer.json"))?;
+        let tokenizer = Tokenizer::from_json_file(directory.join("tokenizer.json"))?;
         if tokenizer.vocab_size() != config.vocab_size {
             return Err(format!("tokenizer vocabulary is {}, config expects {}", tokenizer.vocab_size(), config.vocab_size));
         }
@@ -28,6 +28,13 @@ impl PretrainedModel {
         std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
         self.config.save(directory.join("config.json"))?;
         crate::model_saver::save_model_safetensors(&self.model, directory.join("model.safetensors"))?;
+        Ok(())
+    }
+
+    pub fn save(&self, directory: impl AsRef<Path>) -> Result<(), String> {
+        let directory = directory.as_ref();
+        self.save_model(directory)?;
+        self.tokenizer.save_json(directory.join("tokenizer.json"))?;
         Ok(())
     }
 
