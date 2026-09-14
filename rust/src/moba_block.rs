@@ -32,18 +32,19 @@ mod tests {
     use ndarray::Array2;
 
     fn loss(block: &MobaBlock, x: &Array2<f32>, grad: &Array2<f32>) -> f32 { block.forward_with_tape(x,None).0.iter().zip(grad.iter()).map(|(a,b)| a*b).sum() }
-
-    #[test]
-    fn forward_preserves_shape_and_creates_state() { let block=MobaBlock::new(16,4,2,1,2,4); let x=Array2::<f32>::zeros((4,16)); let(y,state)=block.forward(&x,None); assert_eq!(y.dim(),(4,16)); assert_eq!(state.cmix_prev.len(),16); }
-
-    #[test]
-    fn backward_produces_finite_gradients() { let block=MobaBlock::new(16,4,2,1,2,4); let x=Array2::from_shape_fn((4,16),|(r,c)|0.01*(r+c)as f32); let(_,_,tape)=block.forward_with_tape(&x,None); let g=block.backward(&tape,&Array2::ones((4,16))); assert!(g.grad_input.iter().all(|v|v.is_finite())); assert!(g.grad_output.iter().all(|v|v.is_finite())); }
-
-    #[test]
-    fn output_weight_gradient_matches_finite_difference() {
+    fn relative_error(a: f32, b: f32) -> f32 { (a-b).abs() / a.abs().max(b.abs()).max(1e-5) }
+    fn test_projection_gradient(which: usize) {
         let mut block=MobaBlock::new(16,4,2,1,2,4); let x=Array2::from_shape_fn((4,16),|(r,c)|0.013*(r+1)as f32-0.007*c as f32); let grad=Array2::from_shape_fn((4,16),|(r,c)|0.01*(r+1+c)as f32);
-        let (_,_,tape)=block.forward_with_tape(&x,None); let analytic=block.backward(&tape,&grad).grad_output[[3,5]]; let eps=1e-3; let original=block.att.output.weight[[3,5]];
-        block.att.output.weight[[3,5]]=original+eps; let plus=loss(&block,&x,&grad); block.att.output.weight[[3,5]]=original-eps; let minus=loss(&block,&x,&grad); block.att.output.weight[[3,5]]=original;
-        let numeric=(plus-minus)/(2.0*eps); let scale=analytic.abs().max(numeric.abs()).max(1e-5); assert!((analytic-numeric).abs()/scale < 2e-2, "analytic={analytic} numeric={numeric}");
+        let (_,_,tape)=block.forward_with_tape(&x,None); let analytic=match which { 0=>block.backward(&tape,&grad).grad_receptance[[2,5]], 1=>block.backward(&tape,&grad).grad_key[[2,5]], _=>block.backward(&tape,&grad).grad_value[[2,5]] };
+        let eps=1e-3; let parameter=match which { 0=>&mut block.att.receptance.weight, 1=>&mut block.att.key.weight, _=>&mut block.att.value.weight }; let original=parameter[[2,5]];
+        parameter[[2,5]]=original+eps; let plus=loss(&block,&x,&grad); parameter[[2,5]]=original-eps; let minus=loss(&block,&x,&grad); parameter[[2,5]]=original;
+        let numeric=(plus-minus)/(2.0*eps); assert!(relative_error(analytic,numeric)<3e-2,"which={which} analytic={analytic} numeric={numeric}");
     }
+
+    #[test] fn forward_preserves_shape_and_creates_state() { let block=MobaBlock::new(16,4,2,1,2,4); let x=Array2::<f32>::zeros((4,16)); let(y,state)=block.forward(&x,None); assert_eq!(y.dim(),(4,16)); assert_eq!(state.cmix_prev.len(),16); }
+    #[test] fn backward_produces_finite_gradients() { let block=MobaBlock::new(16,4,2,1,2,4); let x=Array2::from_shape_fn((4,16),|(r,c)|0.01*(r+c)as f32); let(_,_,tape)=block.forward_with_tape(&x,None); let g=block.backward(&tape,&Array2::ones((4,16))); assert!(g.grad_input.iter().all(|v|v.is_finite())); assert!(g.grad_output.iter().all(|v|v.is_finite())); }
+    #[test] fn output_weight_gradient_matches_finite_difference() { let mut block=MobaBlock::new(16,4,2,1,2,4); let x=Array2::from_shape_fn((4,16),|(r,c)|0.013*(r+1)as f32-0.007*c as f32); let grad=Array2::from_shape_fn((4,16),|(r,c)|0.01*(r+1+c)as f32); let (_,_,tape)=block.forward_with_tape(&x,None); let analytic=block.backward(&tape,&grad).grad_output[[3,5]]; let eps=1e-3; let original=block.att.output.weight[[3,5]]; block.att.output.weight[[3,5]]=original+eps; let plus=loss(&block,&x,&grad); block.att.output.weight[[3,5]]=original-eps; let minus=loss(&block,&x,&grad); block.att.output.weight[[3,5]]=original; let numeric=(plus-minus)/(2.0*eps); let scale=analytic.abs().max(numeric.abs()).max(1e-5); assert!((analytic-numeric).abs()/scale < 2e-2, "analytic={analytic} numeric={numeric}"); }
+    #[test] fn receptance_weight_gradient_matches_finite_difference() { test_projection_gradient(0); }
+    #[test] fn key_weight_gradient_matches_finite_difference() { test_projection_gradient(1); }
+    #[test] fn value_weight_gradient_matches_finite_difference() { test_projection_gradient(2); }
 }
