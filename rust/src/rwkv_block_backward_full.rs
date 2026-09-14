@@ -34,15 +34,20 @@ pub fn backward(
 
     let grad_cmix_output = grad_output.clone();
     let grad_skip = grad_output.clone();
+    let initial_cmix_prev = tape.initial_state.as_ref().map(|s| &s.cmix_prev);
 
-    let cmix = rwkv_cmix_backward::backward(
+    let mut cmix = rwkv_cmix_backward::backward(
         &tape.cmix_input,
-        Some(&tape.cmix_prev),
+        initial_cmix_prev,
         &grad_cmix_output,
         &block.cmix.x_k,
         &block.cmix.key,
         &block.cmix.value,
     );
+    if let Some(g) = grad_next_cmix_prev {
+        assert_eq!(g.len(), cmix.grad_prev.len());
+        cmix.grad_prev += g;
+    }
 
     let (grad_ln2_input, grad_ln2_weight, grad_ln2_bias) = layer_norm_backward::backward(
         &tape.ln2_input,
