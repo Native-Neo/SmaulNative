@@ -13,9 +13,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
       - name: Build and test
         run: cargo test --all-targets
+
+  cuda-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Compile CUDA kernel
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace nvidia/cuda:12.6.3-devel-ubuntu22.04 nvcc -O3 -c gpu/cuda/rust_lowbit.cu -o /tmp/rust_lowbit_cuda.o
+
+  hip-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Compile HIP kernel
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace rocm/dev-ubuntu-22.04:latest hipcc -O3 -c gpu/hip/rust_lowbit.hip -o /tmp/rust_lowbit_hip.o
