@@ -2,6 +2,7 @@ pub mod activation;
 pub mod attention;
 pub mod attention_backward;
 pub mod autograd;
+pub mod dataset;
 pub mod embedding;
 pub mod embedding_backward;
 pub mod ffn;
