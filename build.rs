@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
@@ -7,8 +9,13 @@ fn main() {
     if cuda && hip {
         panic!("cuda and hip features are mutually exclusive");
     }
-    if cuda { compile("cuda", "rust_lowbit.cu", "nvcc", "cudart"); }
-    if hip { compile("hip", "rust_lowbit.hip", "hipcc", "amdhip64"); }
+    if cuda {
+        compile("cuda", "rust_lowbit.cu", "nvcc", "cudart");
+    }
+    if hip {
+        compile("hip", "rust_lowbit.hip", "hipcc", "amdhip64");
+    }
+    compile_workflow_libraries();
 }
 
 fn compile(kind: &str, filename: &str, compiler: &str, runtime: &str) {
@@ -29,7 +36,9 @@ fn compile(kind: &str, filename: &str, compiler: &str, runtime: &str) {
         .args(["crus", &lib, &obj])
         .status()
         .expect("failed to execute ar");
-    if !status.success() { panic!("ar failed while building SmaulNative {kind} low-bit backend"); }
+    if !status.success() {
+        panic!("ar failed while building SmaulNative {kind} low-bit backend");
+    }
     println!("cargo:rustc-link-search=native={out}");
     println!("cargo:rustc-link-lib=static=smaul_{kind}_lowbit");
     if kind == "cuda" {
@@ -45,4 +54,53 @@ fn compile(kind: &str, filename: &str, compiler: &str, runtime: &str) {
     }
     println!("cargo:rustc-link-lib=dylib={runtime}");
     println!("cargo:rerun-if-changed={source}");
+}
+
+fn compile_workflow_libraries() {
+    let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let profile_dir = out_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .expect("failed to locate Cargo profile directory")
+        .to_path_buf();
+    fs::create_dir_all(&profile_dir).expect("failed to create workflow library directory");
+
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let target = env::var("TARGET").unwrap();
+    let plugins = [
+        ("finetune", "smaul-finetune"),
+        ("sft", "smaul-sft"),
+        ("pretrain", "smaul-pretrain"),
+        ("quantize-gguf", "smaul-quantize-gguf"),
+        ("safetensors-gguf", "smaul-convert-gguf"),
+        ("export-onnx", "smaul-export-onnx"),
+        ("inference", "smaul-infer"),
+    ];
+
+    for (name, _) in plugins {
+        let source = root.join("workflow_plugins").join(format!("{name}.rs"));
+        let output = profile_dir.join(format!("libsmaul_{name}.so"));
+        let status = Command::new(&rustc)
+            .arg("--crate-name")
+            .arg(format!("smaul_workflow_{name}"))
+            .arg("--crate-type")
+            .arg("cdylib")
+            .arg("--edition")
+            .arg("2021")
+            .arg("--target")
+            .arg(&target)
+            .arg("-C")
+            .arg("debuginfo=2")
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to execute rustc for workflow {name}: {e}"));
+        if !status.success() {
+            panic!("rustc failed while building workflow library {name}");
+        }
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
 }
