@@ -96,8 +96,9 @@ pub fn backward(model: &RwkvTimeMix, tape: &RwkvTimeMixTape, grad_output: &Array
     if let (Some(v1),Some(v2),Some(v0),Some(correction),Some(gate))=(&model.v1,&model.v2,&model.v0,&tape.v_correction,&tape.v_gate) {
         let mut gv_base=Array2::zeros((steps,channels)); let mut gv_corr=Array2::zeros((steps,channels)); let mut gv0=Array1::zeros(channels);
         for row in 0..steps { for col in 0..channels { let gv=grad_v[[row,col]]; gv_base[[row,col]]=gv*(1.0-gate[[row,col]]); grad_v_first[[row,col]]=gv*gate[[row,col]]; let gg=gv*(tape.v_first[[row,col]]-tape.v_base[[row,col]])*gate[[row,col]]*(1.0-gate[[row,col]]); gv_corr[[row,col]]=gg; gv0[col]+=gg; }}
+        let v_hidden= tape.xv.dot(v1);
         grad_value=tape.xv.t().dot(&gv_base); grad_xv+=&gv_base.dot(&model.value.t());
-        let gv2=correction.t().dot(&gv_corr); let gh=gv_corr.dot(&v2.t()); let gv1=tape.xv.t().dot(&gh); grad_xv+=&gh.dot(&v1.t());
+        let gv2=v_hidden.t().dot(&gv_corr); let gh=gv_corr.dot(&v2.t()); let gv1=tape.xv.t().dot(&gh); grad_xv+=&gh.dot(&v1.t());
         grad_v0=Some(gv0); grad_v1=Some(gv1); grad_v2=Some(gv2);
     } else { grad_value=tape.xv.t().dot(&grad_v); grad_xv+=&grad_v.dot(&model.value.t()); grad_v_first=grad_v.clone(); grad_v0=None; grad_v1=None; grad_v2=None; }
 
