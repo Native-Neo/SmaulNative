@@ -115,60 +115,46 @@ fn pack_k4_scales(scales: &[u8; 8], mins: &[u8; 8]) -> [u8; 12] {
     out
 }
 
-fn quantize_k_subblocks(values: &[f32], bits: u8) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+fn k_group_params(values: &[f32], bits: u8) -> (Vec<f32>, Vec<f32>, f32, f32) {
     let levels = ((1u16 << bits) - 1) as f32;
     let groups = values.len() / 32;
-    let mut scales = vec![0u8; groups];
-    let mut mins = vec![0u8; groups];
-    let mut codes = vec![0u8; values.len()];
-    let mut max_scale = 0.0f32;
-    let mut max_min = 0.0f32;
-
+    let mut scales = Vec::with_capacity(groups);
+    let mut mins = Vec::with_capacity(groups);
     for g in 0..groups {
         let block = &values[g * 32..(g + 1) * 32];
         let min = block.iter().copied().fold(f32::INFINITY, f32::min);
         let max = block.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let scale = if max == min { 0.0 } else { (max - min) / levels };
-        let offset = -min;
-        max_scale = max_scale.max(scale);
-        max_min = max_min.max(offset);
-        let d = if scale == 0.0 { 0.0 } else { scale };
-        for (i, &x) in block.iter().enumerate() {
-            let q = if d == 0.0 { 0 } else { ((x + offset) / d).round().clamp(0.0, levels) as u8 };
-            codes[g * 32 + i] = q;
-        }
-        scales[g] = if max_scale == 0.0 { 0 } else { (scale / max_scale * 63.0).round().clamp(0.0, 63.0) as u8 };
-        mins[g] = if max_min == 0.0 { 0 } else { (offset / max_min * 63.0).round().clamp(0.0, 63.0) as u8 };
+        scales.push(if max == min { 0.0 } else { (max - min) / levels });
+        mins.push(-min);
     }
-
-    Ok((scales, mins, codes))
+    let max_scale = scales.iter().copied().fold(0.0, f32::max);
+    let max_min = mins.iter().copied().fold(0.0, f32::max);
+    (scales, mins, max_scale, max_min)
 }
 
 fn quantize_q4_k(values: &[f32]) -> Result<Vec<u8>, String> {
     if values.len() % 256 != 0 { return Err("Q4_K requires tensor size divisible by 256".into()); }
     let mut out = Vec::with_capacity(values.len() / 256 * 144);
     for block in values.chunks_exact(256) {
-        let (scales, mins, codes) = quantize_k_subblocks(block, 4)?;
-        let max_scale = block.chunks_exact(32).map(|b| {
-            let min = b.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = b.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            if max == min { 0.0 } else { (max - min) / 15.0 }
-        }).fold(0.0, f32::max);
-        let max_min = block.chunks_exact(32).map(|b| -b.iter().copied().fold(f32::INFINITY, f32::min)).fold(0.0, f32::max);
-        let scale_bytes = pack_k4_scales(
-            &scales.try_into().map_err(|_| "invalid Q4_K scales")?,
-            &mins.try_into().map_err(|_| "invalid Q4_K mins")?,
-        );
-        out.extend(f32_to_f16(max_scale / 63.0).to_le_bytes());
-        out.extend(f32_to_f16(max_min / 63.0).to_le_bytes());
-        out.extend(scale_bytes);
-        for j in 0..4 {
-            for l in 0..32 {
-                let a = codes[j * 64 + l];
-                let b = codes[j * 64 + l + 32];
-                out.push(a | (b << 4));
+        let (raw_scales, raw_mins, max_scale, max_min) = k_group_params(block, 4);
+        let d = max_scale / 63.0;
+        let dm = max_min / 63.0;
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        let mut codes = [0u8; 256];
+        for g in 0..8 {
+            scales[g] = if d == 0.0 { 0 } else { (raw_scales[g] / d).round().clamp(0.0, 63.0) as u8 };
+            mins[g] = if dm == 0.0 { 0 } else { (raw_mins[g] / dm).round().clamp(0.0, 63.0) as u8 };
+            let dg = d * scales[g] as f32;
+            let mg = dm * mins[g] as f32;
+            for i in 0..32 {
+                codes[g * 32 + i] = if dg == 0.0 { 0 } else { ((block[g * 32 + i] + mg) / dg).round().clamp(0.0, 15.0) as u8 };
             }
         }
+        out.extend(f32_to_f16(d).to_le_bytes());
+        out.extend(f32_to_f16(dm).to_le_bytes());
+        out.extend(pack_k4_scales(&scales, &mins));
+        for j in 0..4 { for l in 0..32 { out.push(codes[j * 64 + l] | (codes[j * 64 + l + 32] << 4)); } }
     }
     Ok(out)
 }
@@ -177,20 +163,24 @@ fn quantize_q5_k(values: &[f32]) -> Result<Vec<u8>, String> {
     if values.len() % 256 != 0 { return Err("Q5_K requires tensor size divisible by 256".into()); }
     let mut out = Vec::with_capacity(values.len() / 256 * 176);
     for block in values.chunks_exact(256) {
-        let (scales, mins, codes) = quantize_k_subblocks(block, 5)?;
-        let max_scale = block.chunks_exact(32).map(|b| {
-            let min = b.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = b.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            if max == min { 0.0 } else { (max - min) / 31.0 }
-        }).fold(0.0, f32::max);
-        let max_min = block.chunks_exact(32).map(|b| -b.iter().copied().fold(f32::INFINITY, f32::min)).fold(0.0, f32::max);
-        let scale_bytes = pack_k4_scales(
-            &scales.try_into().map_err(|_| "invalid Q5_K scales")?,
-            &mins.try_into().map_err(|_| "invalid Q5_K mins")?,
-        );
-        out.extend(f32_to_f16(max_scale / 63.0).to_le_bytes());
-        out.extend(f32_to_f16(max_min / 63.0).to_le_bytes());
-        out.extend(scale_bytes);
+        let (raw_scales, raw_mins, max_scale, max_min) = k_group_params(block, 5);
+        let d = max_scale / 63.0;
+        let dm = max_min / 63.0;
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        let mut codes = [0u8; 256];
+        for g in 0..8 {
+            scales[g] = if d == 0.0 { 0 } else { (raw_scales[g] / d).round().clamp(0.0, 63.0) as u8 };
+            mins[g] = if dm == 0.0 { 0 } else { (raw_mins[g] / dm).round().clamp(0.0, 63.0) as u8 };
+            let dg = d * scales[g] as f32;
+            let mg = dm * mins[g] as f32;
+            for i in 0..32 {
+                codes[g * 32 + i] = if dg == 0.0 { 0 } else { ((block[g * 32 + i] + mg) / dg).round().clamp(0.0, 31.0) as u8 };
+            }
+        }
+        out.extend(f32_to_f16(d).to_le_bytes());
+        out.extend(f32_to_f16(dm).to_le_bytes());
+        out.extend(pack_k4_scales(&scales, &mins));
         let mut ql = [0u8; 128];
         let mut qh = [0u8; 32];
         for group in 0..4 {
@@ -212,42 +202,35 @@ fn quantize_q2_k(values: &[f32]) -> Result<Vec<u8>, String> {
     if values.len() % 256 != 0 { return Err("Q2_K requires tensor size divisible by 256".into()); }
     let mut out = Vec::with_capacity(values.len() / 256 * 84);
     for block in values.chunks_exact(256) {
-        let mut scales = [0u8; 16];
-        let mut mins = [0u8; 16];
-        let mut codes = [0u8; 256];
+        let mut raw_scales = [0.0f32; 16];
+        let mut raw_mins = [0.0f32; 16];
         let mut max_scale = 0.0f32;
         let mut max_min = 0.0f32;
         for g in 0..16 {
             let b = &block[g * 16..g * 16 + 16];
             let min = b.iter().copied().fold(f32::INFINITY, f32::min);
             let max = b.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let scale = (max - min) / 3.0;
-            let offset = -min;
-            max_scale = max_scale.max(scale);
-            max_min = max_min.max(offset);
+            raw_scales[g] = (max - min) / 3.0;
+            raw_mins[g] = -min;
+            max_scale = max_scale.max(raw_scales[g]);
+            max_min = max_min.max(raw_mins[g]);
         }
+        let d = max_scale / 15.0;
+        let dm = max_min / 15.0;
+        let mut scales = [0u8; 16];
+        let mut codes = [0u8; 256];
         for g in 0..16 {
-            let b = &block[g * 16..g * 16 + 16];
-            let min = b.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = b.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let scale = (max - min) / 3.0;
-            let offset = -min;
-            scales[g] = if max_scale == 0.0 { 0 } else { (scale / max_scale * 15.0).round().clamp(0.0, 15.0) as u8 };
-            mins[g] = if max_min == 0.0 { 0 } else { (offset / max_min * 15.0).round().clamp(0.0, 15.0) as u8 };
-            let d = max_scale / 15.0 * scales[g] as f32;
-            let dm = max_min / 15.0 * mins[g] as f32;
-            for i in 0..16 {
-                codes[g * 16 + i] = if d == 0.0 { 0 } else { ((b[i] + dm) / d).round().clamp(0.0, 3.0) as u8 };
-            }
+            let s = if d == 0.0 { 0 } else { (raw_scales[g] / d).round().clamp(0.0, 15.0) as u8 };
+            let m = if dm == 0.0 { 0 } else { (raw_mins[g] / dm).round().clamp(0.0, 15.0) as u8 };
+            scales[g] = s | (m << 4);
+            let dg = d * s as f32;
+            let mg = dm * m as f32;
+            for i in 0..16 { codes[g * 16 + i] = if dg == 0.0 { 0 } else { ((block[g * 16 + i] + mg) / dg).round().clamp(0.0, 3.0) as u8 }; }
         }
-        out.extend(f32_to_f16(max_scale / 15.0).to_le_bytes());
-        out.extend(f32_to_f16(max_min / 15.0).to_le_bytes());
-        for g in 0..16 { out.push(scales[g] | (mins[g] << 4)); }
-        for base in (0..256).step_by(128) {
-            for l in 0..32 {
-                out.push(codes[base + l] | (codes[base + l + 32] << 2) | (codes[base + l + 64] << 4) | (codes[base + l + 96] << 6));
-            }
-        }
+        out.extend(f32_to_f16(d).to_le_bytes());
+        out.extend(f32_to_f16(dm).to_le_bytes());
+        out.extend_from_slice(&scales);
+        for base in (0..256).step_by(128) { for l in 0..32 { out.push(codes[base + l] | (codes[base + l + 32] << 2) | (codes[base + l + 64] << 4) | (codes[base + l + 96] << 6)); } }
     }
     Ok(out)
 }
@@ -276,7 +259,6 @@ pub fn quantize(input: impl AsRef<Path>, output: impl AsRef<Path>, kind: &str) -
     let mut writer = Writer::new();
     copy_metadata(&reader, &mut writer);
     writer.add_meta_str("smaulnative.quantization", kind);
-
     let tensors = reader.tensors.clone();
     for info in tensors {
         let values = reader.tensor_f32(&info.name)?;
