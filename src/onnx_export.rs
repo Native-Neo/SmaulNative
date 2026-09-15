@@ -15,10 +15,8 @@ fn field(out: &mut Vec<u8>, number: u32, wire: u8, bytes: &[u8]) {
     varint(((number as u64) << 3) | wire as u64, out);
     if wire == 2 {
         varint(bytes.len() as u64, out);
-        out.extend_from_slice(bytes);
-    } else {
-        out.extend_from_slice(bytes);
     }
+    out.extend_from_slice(bytes);
 }
 
 fn bytes_field(out: &mut Vec<u8>, number: u32, bytes: &[u8]) {
@@ -30,9 +28,8 @@ fn string_field(out: &mut Vec<u8>, number: u32, value: &str) {
 }
 
 fn int_field(out: &mut Vec<u8>, number: u32, value: i64) {
-    let mut encoded = Vec::new();
-    varint(value as u64, &mut encoded);
-    field(out, number, 0, &encoded);
+    varint(((number as u64) << 3), out);
+    varint(value as u64, out);
 }
 
 fn tensor_proto(name: &str, shape: &[usize], dtype: i32, data: &[u8]) -> Vec<u8> {
@@ -81,15 +78,16 @@ fn value_info(name: &str, dtype: i32, dims: &[Option<i64>], params: &[&str]) -> 
     out
 }
 
-fn custom_node(inputs: &[String], output: &str, config_json: &str) -> Vec<u8> {
+fn custom_node(weight_names: &[String], output: &str, config_json: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    for input in inputs {
+    string_field(&mut out, 1, "tokens");
+    for input in weight_names {
         string_field(&mut out, 1, input);
     }
     string_field(&mut out, 2, output);
     string_field(&mut out, 3, "SmaulNativeRWKVX");
-    string_field(&mut out, 4, "RWKVX");
-    string_field(&mut out, 5, "smaulnative");
+    string_field(&mut out, 4, "smaulnative");
+    string_field(&mut out, 5, "RWKV-X execution with recurrent state and optional MOBA");
 
     let mut attr = Vec::new();
     string_field(&mut attr, 1, "config_json");
@@ -120,8 +118,7 @@ pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(
         .map_err(|e| format!("invalid Safetensors: {e}"))?;
 
     let mut initializers = Vec::new();
-    let mut inputs = vec!["tokens".to_string()];
-
+    let mut weight_names = Vec::new();
     for name in tensors.names() {
         let tensor = tensors
             .tensor(name)
@@ -131,18 +128,18 @@ pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(
             safetensors::Dtype::F16 => 10,
             _ => {
                 return Err(format!(
-                    "ONNX export requires F32/F16 weights; tensor {name} is {:?}",
+                    "ONNX export currently requires F32/F16 weights; tensor {name} is {:?}",
                     tensor.dtype()
                 ))
             }
         };
         let shape = tensor.shape().to_vec();
         let data = tensor_proto(name, &shape, dtype, tensor.data());
-        bytes_field(&mut initializers, 3, &data);
-        inputs.push(name.to_string());
+        bytes_field(&mut initializers, 5, &data);
+        weight_names.push(name.to_string());
     }
 
-    let node = custom_node(&inputs, "logits", &config);
+    let node = custom_node(&weight_names, "logits", &config);
     let mut graph = Vec::new();
     bytes_field(&mut graph, 1, &node);
     string_field(&mut graph, 2, "SmaulNativeRWKVX");
@@ -155,8 +152,8 @@ pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(
         &[None, None, None],
         &["batch", "sequence", "vocab"],
     );
-    bytes_field(&mut graph, 5, &input);
-    bytes_field(&mut graph, 6, &output);
+    bytes_field(&mut graph, 11, &input);
+    bytes_field(&mut graph, 12, &output);
 
     let mut model = Vec::new();
     int_field(&mut model, 1, 9);
