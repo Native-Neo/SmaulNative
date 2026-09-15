@@ -59,13 +59,8 @@ fn compile(kind: &str, filename: &str, compiler: &str, runtime: &str) {
 fn compile_workflow_libraries() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let profile_dir = out_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .expect("failed to locate Cargo profile directory")
-        .to_path_buf();
-    fs::create_dir_all(&profile_dir).expect("failed to create workflow library directory");
+    fs::create_dir_all(&out_dir).expect("failed to create workflow library directory");
+    println!("cargo:rustc-env=SMAUL_WORKFLOW_LIB_DIR={}", out_dir.display());
 
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let target = env::var("TARGET").unwrap();
@@ -81,7 +76,7 @@ fn compile_workflow_libraries() {
 
     for name in plugins {
         let source = root.join("workflow_plugins").join(format!("{name}.rs"));
-        let output = profile_dir.join(format!("libsmaul_{name}.so"));
+        let output = out_dir.join(format!("libsmaul_{name}.so"));
         let crate_name = format!("smaul_workflow_{}", name.replace('-', "_"));
         let status = Command::new(&rustc)
             .arg("--crate-name")
