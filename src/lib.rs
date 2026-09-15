@@ -53,6 +53,7 @@ pub mod model_io;
 pub mod model_loader;
 pub mod model_saver;
 pub mod model_train_step;
+pub mod onnx_export;
 pub mod optimizer;
 pub mod params;
 pub mod qat;
