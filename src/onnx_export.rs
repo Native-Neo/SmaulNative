@@ -59,7 +59,7 @@ fn tensor_type(dtype: i32, dims: &[Option<i64>], params: &[&str]) -> Vec<u8> {
         if let Some(value) = dim {
             int_field(&mut d, 1, *value);
         } else {
-            d = dimension_param(params[index]).to_vec();
+            d = dimension_param(params[index]);
         }
         bytes_field(&mut shape, 1, &d);
     }
@@ -110,19 +110,31 @@ pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(
     let dir = input_dir.as_ref();
     let config_path = dir.join("config.json");
     let weights_path = dir.join("model.safetensors");
-    let config = fs::read_to_string(&config_path).map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
-    let _: Value = serde_json::from_str(&config).map_err(|e| format!("invalid config.json: {e}"))?;
-    let bytes = fs::read(&weights_path).map_err(|e| format!("failed to read {}: {e}", weights_path.display()))?;
-    let tensors = SafeTensors::deserialize(&bytes).map_err(|e| format!("invalid Safetensors: {e}"))?;
+    let config = fs::read_to_string(&config_path)
+        .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
+    let _: Value = serde_json::from_str(&config)
+        .map_err(|e| format!("invalid config.json: {e}"))?;
+    let bytes = fs::read(&weights_path)
+        .map_err(|e| format!("failed to read {}: {e}", weights_path.display()))?;
+    let tensors = SafeTensors::deserialize(&bytes)
+        .map_err(|e| format!("invalid Safetensors: {e}"))?;
 
     let mut initializers = Vec::new();
-    let mut inputs = Vec::new();
+    let mut inputs = vec!["tokens".to_string()];
+
     for name in tensors.names() {
-        let tensor = tensors.tensor(name).map_err(|e| format!("failed to read tensor {name}: {e}"))?;
+        let tensor = tensors
+            .tensor(name)
+            .map_err(|e| format!("failed to read tensor {name}: {e}"))?;
         let dtype = match tensor.dtype() {
             safetensors::Dtype::F32 => 1,
             safetensors::Dtype::F16 => 10,
-            _ => return Err(format!("ONNX export currently requires F32/F16 weights; tensor {name} is {:?}", tensor.dtype())),
+            _ => {
+                return Err(format!(
+                    "ONNX export requires F32/F16 weights; tensor {name} is {:?}",
+                    tensor.dtype()
+                ))
+            }
         };
         let shape = tensor.shape().to_vec();
         let data = tensor_proto(name, &shape, dtype, tensor.data());
@@ -135,8 +147,14 @@ pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(
     bytes_field(&mut graph, 1, &node);
     string_field(&mut graph, 2, "SmaulNativeRWKVX");
     graph.extend_from_slice(&initializers);
+
     let input = value_info("tokens", 7, &[None, None], &["batch", "sequence"]);
-    let output = value_info("logits", 1, &[None, None, None], &["batch", "sequence", "vocab"]);
+    let output = value_info(
+        "logits",
+        1,
+        &[None, None, None],
+        &["batch", "sequence", "vocab"],
+    );
     bytes_field(&mut graph, 5, &input);
     bytes_field(&mut graph, 6, &output);
 
@@ -144,12 +162,11 @@ pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(
     int_field(&mut model, 1, 9);
     string_field(&mut model, 2, "SmaulNative");
     bytes_field(&mut model, 7, &graph);
-    let core = operator_set("", 19);
-    let custom = operator_set("smaulnative", 1);
-    bytes_field(&mut model, 8, &core);
-    bytes_field(&mut model, 8, &custom);
+    bytes_field(&mut model, 8, &operator_set("", 19));
+    bytes_field(&mut model, 8, &operator_set("smaulnative", 1));
 
-    fs::write(output.as_ref(), model).map_err(|e| format!("failed to write {}: {e}", output.as_ref().display()))?;
+    fs::write(output.as_ref(), model)
+        .map_err(|e| format!("failed to write {}: {e}", output.as_ref().display()))?;
     Ok(())
 }
 
