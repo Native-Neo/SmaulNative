@@ -1,5 +1,9 @@
+use smaul_native::onnx_export::export_cli;
+
 fn main() {
-    eprintln!("SmaulNative ONNX export");
-    eprintln!("The native ONNX exporter is not implemented yet.");
-    std::process::exit(2);
+    let args: Vec<String> = std::env::args().collect();
+    if let Err(error) = export_cli(&args) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
 }
