@@ -173,3 +173,70 @@ pub fn quantize(input: impl AsRef<Path>, output: impl AsRef<Path>, kind: &str) -
     }
     writer.finish(output.as_ref().to_str().ok_or("invalid output path")?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grouped_values() -> Vec<f32> {
+        (0..256)
+            .map(|index| {
+                let group = index / 16;
+                let magnitude = group as f32 + 1.0;
+                if index % 2 == 0 { magnitude } else { -magnitude * 0.5 }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn q3_k_scale_layout_matches_decoder_mapping() {
+        let values = grouped_values();
+        let encoded = quantize_q3_k(&values).expect("Q3_K quantization failed");
+        assert_eq!(encoded.len(), 110);
+
+        let max_scale = 16.0 / 4.0;
+        let step = max_scale / 32.0;
+        let mut expected = [32u8; 16];
+        for group in 0..16 {
+            let group_scale = (group as f32 + 1.0) / 4.0;
+            expected[group] = 32 - round_i32(group_scale / step).clamp(0, 32) as u8;
+        }
+
+        let scales = &encoded[96..108];
+        let mut decoded = [0u8; 16];
+        for j in 0..4 {
+            decoded[j] = (scales[j] & 0x0f) | ((scales[j] >> 4) & 0x0f) * 0;
+            decoded[j + 8] = (scales[j] >> 4) & 0x0f;
+            decoded[j + 4] = scales[4 + j] & 0x0f;
+            decoded[j + 12] = (scales[4 + j] >> 4) & 0x0f;
+            decoded[j] |= (scales[8 + j] & 0x03) << 4;
+            decoded[j + 4] |= ((scales[8 + j] >> 2) & 0x03) << 4;
+            decoded[j + 8] |= ((scales[8 + j] >> 4) & 0x03) << 4;
+            decoded[j + 12] |= ((scales[8 + j] >> 6) & 0x03) << 4;
+        }
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn q6_k_layout_has_expected_block_size_and_scales() {
+        let values = grouped_values();
+        let encoded = quantize_q6_k(&values).expect("Q6_K quantization failed");
+        assert_eq!(encoded.len(), 210);
+
+        let scales = &encoded[192..208];
+        let max_scale = 16.0 / 32.0;
+        let d = max_scale / 127.0;
+        for group in 0..16 {
+            let expected = round_i32(((group as f32 + 1.0) / 32.0) / d).clamp(0, 127) as u8;
+            assert_eq!(scales[group], expected);
+        }
+    }
+
+    #[test]
+    fn k_quantizers_reject_partial_blocks() {
+        let values = vec![1.0; 255];
+        assert!(quantize_q3_k(&values).is_err());
+        assert!(quantize_q6_k(&values).is_err());
+    }
+}
