@@ -11,7 +11,7 @@ pub extern "C" fn smaul_workflow_run() -> i32 {
         }
     };
     let app = exe.with_file_name("smaul-quantize-gguf");
-    match Command::new(app).args(env::args_os().skip(1)).status() {
+    match Command::new(app).args(env::args_os().skip(2)).status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!("failed to start smaul-quantize-gguf: {e}");
