@@ -13,6 +13,7 @@ impl RqtModel {
             q_io!(&mut b.time_mix.w1); q_io!(&mut b.time_mix.w2); q_io!(&mut b.time_mix.a1); q_io!(&mut b.time_mix.a2);
             if let Some(v)=&mut b.time_mix.v1 { q_io!(v); } if let Some(v)=&mut b.time_mix.v2 { q_io!(v); }
             q_io!(&mut b.time_mix.g1); q_io!(&mut b.time_mix.g2); q_io!(&mut b.time_mix.receptance); q_io!(&mut b.time_mix.key); q_io!(&mut b.time_mix.value); q_io!(&mut b.time_mix.output);
+            b.time_mix.refresh_quantized();
             q_io!(&mut b.cmix.key); q_io!(&mut b.cmix.value);
             if let Some(m)=&mut b.moe { q!(&mut m.router.weight); for e in &mut m.experts { q_io!(&mut e.key); q_io!(&mut e.value); } }
         }
