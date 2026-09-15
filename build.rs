@@ -70,21 +70,22 @@ fn compile_workflow_libraries() {
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let target = env::var("TARGET").unwrap();
     let plugins = [
-        ("finetune", "smaul-finetune"),
-        ("sft", "smaul-sft"),
-        ("pretrain", "smaul-pretrain"),
-        ("quantize-gguf", "smaul-quantize-gguf"),
-        ("safetensors-gguf", "smaul-convert-gguf"),
-        ("export-onnx", "smaul-export-onnx"),
-        ("inference", "smaul-infer"),
+        "finetune",
+        "sft",
+        "pretrain",
+        "quantize-gguf",
+        "safetensors-gguf",
+        "export-onnx",
+        "inference",
     ];
 
-    for (name, _) in plugins {
+    for name in plugins {
         let source = root.join("workflow_plugins").join(format!("{name}.rs"));
         let output = profile_dir.join(format!("libsmaul_{name}.so"));
+        let crate_name = format!("smaul_workflow_{}", name.replace('-', "_"));
         let status = Command::new(&rustc)
             .arg("--crate-name")
-            .arg(format!("smaul_workflow_{name}"))
+            .arg(crate_name)
             .arg("--crate-type")
             .arg("cdylib")
             .arg("--edition")
