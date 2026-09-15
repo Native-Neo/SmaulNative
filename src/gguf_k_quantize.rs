@@ -205,7 +205,7 @@ mod tests {
         let scales = &encoded[96..108];
         let mut decoded = [0u8; 16];
         for j in 0..4 {
-            decoded[j] = (scales[j] & 0x0f) | ((scales[j] >> 4) & 0x0f) * 0;
+            decoded[j] = scales[j] & 0x0f;
             decoded[j + 8] = (scales[j] >> 4) & 0x0f;
             decoded[j + 4] = scales[4 + j] & 0x0f;
             decoded[j + 12] = (scales[4 + j] >> 4) & 0x0f;
