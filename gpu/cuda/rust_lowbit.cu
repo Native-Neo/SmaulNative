@@ -6,4 +6,37 @@ __device__ float fp4(uint8_t q){q&=15; switch(q){case 0:return -2.0f;case 1:retu
 
 __global__ void packed_linear_kernel(const float*x,const uint8_t*w,const float*s,float*y,int batch,int out_f,int in_f,int bits){int o=blockIdx.x*blockDim.x+threadIdx.x;int n=blockIdx.y;if(o>=out_f||n>=batch)return;int rb=(in_f+(8/bits)-1)/(8/bits);const uint8_t*row=w+(size_t)o*rb;float sum=0.0f;for(int k=0;k<in_f;k++){uint8_t q=bits==2?((row[k>>2]>>(6-((k&3)<<1)))&3):((row[k>>1]>>(4-((k&1)<<2)))&15);sum+=x[(size_t)n*in_f+k]*s[o]*(bits==2?fp2(q):fp4(q));}y[(size_t)n*out_f+o]=sum;}
 
-extern "C" int smaul_cuda_packed_linear(const float*x,const uint8_t*w,const float*s,float*y,int batch,int out_f,int in_f,int bits){if(bits!=2&&bits!=4)return 1;dim3 block(256,1,1);dim3 grid((out_f+255)/256,batch,1);packed_linear_kernel<<<grid,block>>>(x,w,s,y,batch,out_f,in_f,bits);return cudaGetLastError()!=cudaSuccess;}
+extern "C" int smaul_cuda_packed_linear(const float*x,const uint8_t*w,const float*s,float*y,int batch,int out_f,int in_f,int bits){
+    if(bits!=2&&bits!=4)return 1;
+    // x/w/s/y above are HOST pointers (plain Rust slices). CUDA kernels can only
+    // dereference DEVICE pointers, so we must allocate device buffers and copy
+    // in/out explicitly -- launching directly on host pointers is undefined
+    // behavior (illegal memory access / silent corruption on real hardware).
+    size_t rb=(size_t)((in_f+(8/bits)-1)/(8/bits));
+    size_t x_bytes=(size_t)batch*(size_t)in_f*sizeof(float);
+    size_t w_bytes=rb*(size_t)out_f;
+    size_t s_bytes=(size_t)out_f*sizeof(float);
+    size_t y_bytes=(size_t)batch*(size_t)out_f*sizeof(float);
+    float *dx=nullptr,*ds=nullptr,*dy=nullptr; uint8_t *dw=nullptr;
+    cudaError_t err=cudaSuccess;
+    if((err=cudaMalloc((void**)&dx,x_bytes))!=cudaSuccess) goto fail;
+    if((err=cudaMalloc((void**)&dw,w_bytes))!=cudaSuccess) goto fail;
+    if((err=cudaMalloc((void**)&ds,s_bytes))!=cudaSuccess) goto fail;
+    if((err=cudaMalloc((void**)&dy,y_bytes))!=cudaSuccess) goto fail;
+    if((err=cudaMemcpy(dx,x,x_bytes,cudaMemcpyHostToDevice))!=cudaSuccess) goto fail;
+    if((err=cudaMemcpy(dw,w,w_bytes,cudaMemcpyHostToDevice))!=cudaSuccess) goto fail;
+    if((err=cudaMemcpy(ds,s,s_bytes,cudaMemcpyHostToDevice))!=cudaSuccess) goto fail;
+    {
+        dim3 block(256,1,1);dim3 grid((out_f+255)/256,batch,1);
+        packed_linear_kernel<<<grid,block>>>(dx,dw,ds,dy,batch,out_f,in_f,bits);
+        err=cudaGetLastError();
+        if(err==cudaSuccess) err=cudaDeviceSynchronize();
+    }
+    if(err!=cudaSuccess) goto fail;
+    if((err=cudaMemcpy(y,dy,y_bytes,cudaMemcpyDeviceToHost))!=cudaSuccess) goto fail;
+    cudaFree(dx); cudaFree(dw); cudaFree(ds); cudaFree(dy);
+    return 0;
+fail:
+    if(dx) cudaFree(dx); if(dw) cudaFree(dw); if(ds) cudaFree(ds); if(dy) cudaFree(dy);
+    return err!=cudaSuccess ? 1 : 0;
+}
