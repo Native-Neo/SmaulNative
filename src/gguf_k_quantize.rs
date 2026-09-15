@@ -30,13 +30,15 @@ fn quantize_q3_k(values: &[f32]) -> Result<Vec<u8>, String> {
             group_scales[group] = scale;
             max_scale = max_scale.max(scale);
         }
-        let d = max_scale / 32.0;
-        let mut scale_codes = [0i32; 16];
+        let d = -max_scale / 32.0;
+        let step = d.abs();
+        let mut scale_codes = [32i32; 16];
         let mut q = [0u8; 256];
-        if d != 0.0 {
+        if step != 0.0 {
             for group in 0..16 {
-                scale_codes[group] = round_i32(group_scales[group] / d).clamp(0, 32);
-                let scale = d * scale_codes[group] as f32;
+                let magnitude = round_i32(group_scales[group] / step).clamp(0, 32);
+                scale_codes[group] = 32 - magnitude;
+                let scale = d * (scale_codes[group] - 32) as f32;
                 if scale == 0.0 { continue; }
                 for i in 0..16 {
                     q[group * 16 + i] = (round_i32(block[group * 16 + i] / scale).clamp(-4, 3) + 4) as u8;
