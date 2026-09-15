@@ -28,7 +28,7 @@ fn string_field(out: &mut Vec<u8>, number: u32, value: &str) {
 }
 
 fn int_field(out: &mut Vec<u8>, number: u32, value: i64) {
-    varint(((number as u64) << 3), out);
+    varint((number as u64) << 3, out);
     varint(value as u64, out);
 }
 
@@ -106,6 +106,7 @@ fn operator_set(domain: &str, version: i64) -> Vec<u8> {
 
 pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(), String> {
     let dir = input_dir.as_ref();
+    let output = output.as_ref();
     let config_path = dir.join("config.json");
     let weights_path = dir.join("model.safetensors");
     let config = fs::read_to_string(&config_path)
@@ -162,8 +163,8 @@ pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(
     bytes_field(&mut model, 8, &operator_set("", 19));
     bytes_field(&mut model, 8, &operator_set("smaulnative", 1));
 
-    fs::write(output.as_ref(), model)
-        .map_err(|e| format!("failed to write {}: {e}", output.as_ref().display()))?;
+    fs::write(output, model)
+        .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
     Ok(())
 }
 
