@@ -46,10 +46,16 @@ fn quantize_q3_k(values: &[f32]) -> Result<Vec<u8>, String> {
             }
         }
         let mut scales = [0u8; 12];
-        for j in 0..16 {
-            let code = scale_codes[j] as u8;
-            if j < 8 { scales[j] = code & 0x0f; } else { scales[j - 8] |= (code & 0x0f) << 4; }
-            scales[j % 4 + 8] |= ((code >> 4) & 0x03) << (2 * (j / 4));
+        for j in 0..4 {
+            scales[j] = (scale_codes[j] as u8 & 0x0f)
+                | ((scale_codes[j + 8] as u8 & 0x0f) << 4);
+            scales[4 + j] = (scale_codes[4 + j] as u8 & 0x0f)
+                | ((scale_codes[12 + j] as u8 & 0x0f) << 4);
+            scales[8 + j] =
+                ((scale_codes[j] as u8 >> 4) & 0x03)
+                | (((scale_codes[4 + j] as u8 >> 4) & 0x03) << 2)
+                | (((scale_codes[8 + j] as u8 >> 4) & 0x03) << 4)
+                | (((scale_codes[12 + j] as u8 >> 4) & 0x03) << 6);
         }
         let mut hmask = [0u8; 32];
         let mut low = q;
