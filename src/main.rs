@@ -75,15 +75,23 @@ fn launcher_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "launcher has no parent directory".into())
 }
 
-fn run_workflow(workflow: Workflow) -> Result<(), String> {
-    let library_path = launcher_dir()?.join(workflow.library_name());
-    if !library_path.is_file() {
-        return Err(format!(
-            "workflow library is missing: {}\nRun `cargo build` to build the workflow libraries.",
-            library_path.display()
-        ));
+fn workflow_library_path(workflow: Workflow) -> Result<PathBuf, String> {
+    let name = workflow.library_name();
+    let local = launcher_dir()?.join(name);
+    if local.is_file() {
+        return Ok(local);
     }
+    let build_output = PathBuf::from(env!("SMAUL_WORKFLOW_LIB_DIR")).join(name);
+    if build_output.is_file() {
+        return Ok(build_output);
+    }
+    Err(format!(
+        "workflow library is missing: {name}\nRun `cargo build` to build the workflow libraries."
+    ))
+}
 
+fn run_workflow(workflow: Workflow) -> Result<(), String> {
+    let library_path = workflow_library_path(workflow)?;
     println!("Starting {}...", workflow.name());
     let library = unsafe { Library::new(&library_path) }
         .map_err(|e| format!("failed to load {}: {e}", library_path.display()))?;
