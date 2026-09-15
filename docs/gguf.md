@@ -3,7 +3,7 @@
 SmaulNative has two native GGUF workflows:
 
 - `smaul-convert-gguf`: Safetensors checkpoint -> GGUF.
-- `smaul-quantize-gguf`: existing GGUF -> classic quantized GGUF.
+- `smaul-quantize-gguf`: existing GGUF -> quantized GGUF.
 
 ## Conversion
 
@@ -17,6 +17,8 @@ Supported source output dtypes are `f16` and `f32`.
 
 ```bash
 ./target/debug/smaul-native quantize-gguf model.gguf model-q4.gguf --type q4_0
+./target/debug/smaul-native quantize-gguf model.gguf model-q3k.gguf --type q3_k
+./target/debug/smaul-native quantize-gguf model.gguf model-q6k.gguf --type q6_k
 ```
 
 Native classic formats currently supported:
@@ -27,8 +29,14 @@ Native classic formats currently supported:
 - `q5_1`
 - `q8_0`
 
-Each classic quantizer uses 32-value blocks. Tensors whose size is not divisible by 32 are written as FP16 rather than being truncated or padded silently.
+Native K formats currently supported:
 
-The quantizer can read the GGUF formats already decoded by SmaulNative, so an already-quantized source can be re-quantized through FP32 internally.
+- `q2_k`
+- `q3_k`
+- `q4_k`
+- `q5_k`
+- `q6_k`
 
-K-quants (`q2_K`, `q3_K`, `q4_K`, `q5_K`, `q6_K`) are recognized by the reader but are not yet emitted by the native quantizer. They require their 256-value super-block packing and scale/minimum encoding rather than the classic 32-value layout.
+Classic formats use 32-value blocks. K formats use 256-value super-blocks and their GGML-compatible scale/quant packing. Tensors whose size is not divisible by the required block size are written as FP16 rather than being truncated or padded silently.
+
+The quantizer reads tensor values through SmaulNative's GGUF decoder and requantizes through FP32. The K-format encoders emit the standard GGUF tensor type IDs and block layouts used by the corresponding GGML formats.
