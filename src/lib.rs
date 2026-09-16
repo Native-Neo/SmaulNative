@@ -28,5 +28,6 @@ pub mod rwkv_cmix;
 pub mod rwkv_model;
 pub mod rwkv_time_mix;
 pub mod tokenizer;
+pub mod tokenizer_trainer;
 pub mod training;
 pub mod wkv;
