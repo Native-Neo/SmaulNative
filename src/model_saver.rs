@@ -5,7 +5,7 @@ use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-const LAYOUT_VERSION: &str = "smaul-native-row-major-v1";
+pub const TENSOR_LAYOUT_VERSION: &str = "smaul-native-row-major-v1";
 
 fn bytes_1d(a: &Array1<f32>) -> Vec<u8> { a.iter().flat_map(|v| v.to_le_bytes()).collect() }
 fn bytes_2d(a: &Array2<f32>) -> Vec<u8> { let a = a.as_standard_layout(); a.iter().flat_map(|v| v.to_le_bytes()).collect() }
@@ -40,11 +40,9 @@ pub fn expected_tensor_names(model: &RwkvModel) -> BTreeSet<String> { let mut ow
 pub fn save_model_safetensors(model: &RwkvModel, path: impl AsRef<Path>) -> Result<(), String> {
     let mut owned = Vec::new(); owned.push(OwnedTensor::two("emb.weight", &model.embedding.weight)); add_norm(&mut owned, "ln_out", &model.ln_out.weight, &model.ln_out.bias); add_linear(&mut owned, "head.weight", &model.head.weight, false); for i in 0..model.rwkv_blocks.len() { add_rwkv_block(&mut owned, model, i); } for i in 0..model.moba_blocks.len() { add_moba_block(&mut owned, model, i); }
     let mut tensors = HashMap::with_capacity(owned.len()); for t in &owned { let view = TensorView::new(Dtype::F32, t.shape.clone(), &t.bytes).map_err(|e| format!("failed to build tensor '{}': {e}", t.name))?; tensors.insert(t.name.as_str(), view); }
-    let mut metadata = HashMap::new(); metadata.insert("smaul_checkpoint_version".to_owned(), CheckpointVersion::current().0.to_string()); metadata.insert("smaul_tensor_layout".to_owned(), LAYOUT_VERSION.to_owned());
+    let mut metadata = HashMap::new(); metadata.insert("smaul_checkpoint_version".to_owned(), CheckpointVersion::current().0.to_string()); metadata.insert("smaul_tensor_layout".to_owned(), TENSOR_LAYOUT_VERSION.to_owned());
     serialize_to_file(tensors, &Some(metadata), path.as_ref()).map_err(|e| format!("failed to write {}: {e}", path.as_ref().display()))
 }
-
-pub(crate) const TENSOR_LAYOUT_VERSION: &str = LAYOUT_VERSION;
 
 #[cfg(test)]
 mod tests { use super::*; use crate::rwkv_model::{RwkvModel, RwkvModelConfig}; use crate::safetensors::SafetensorsLoader;
