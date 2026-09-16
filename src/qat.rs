@@ -2,50 +2,70 @@ use ndarray::Array2;
 
 pub const QAT_3BIT_MIN: i8 = -4;
 pub const QAT_3BIT_MAX: i8 = 3;
+pub const FP8_E4M3_MAX: f32 = 448.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Bits { Fp2, Fp4, Fp8 }
+pub enum Bits { Fp2, Fp3, Fp4, Fp8 }
 
 impl Bits {
     pub fn from_bits(bits: u8) -> Result<Self, String> {
-        match bits { 2 => Ok(Self::Fp2), 4 => Ok(Self::Fp4), 8 => Ok(Self::Fp8), _ => Err("bits must be 2, 4, or 8".into()) }
+        match bits { 2 => Ok(Self::Fp2), 3 => Ok(Self::Fp3), 4 => Ok(Self::Fp4), 8 => Ok(Self::Fp8), _ => Err("bits must be 2, 3, 4, or 8".into()) }
     }
-    pub fn bits(self) -> u8 { match self { Self::Fp2 => 2, Self::Fp4 => 4, Self::Fp8 => 8 } }
-    fn levels(self) -> &'static [f32] {
-        match self { Self::Fp2 => &[-1.0, 0.0, 1.0], Self::Fp4 => &[-2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0], Self::Fp8 => &[] }
+    pub fn bits(self) -> u8 { match self { Self::Fp2 => 2, Self::Fp3 => 3, Self::Fp4 => 4, Self::Fp8 => 8 } }
+    /// Codebook indexed by the stored code. FP8 has none: it stores E4M3 bit patterns directly.
+    pub fn levels(self) -> &'static [f32] {
+        match self {
+            Self::Fp2 => &[-1.0, 0.0, 1.0],
+            Self::Fp3 => &[-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+            Self::Fp4 => &[-2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 2.0],
+            Self::Fp8 => &[],
+        }
+    }
+    /// Largest positive codebook entry; a row is scaled so its peak magnitude lands on it.
+    pub fn level_max(self) -> f32 { self.levels().iter().copied().fold(0.0, f32::max) }
+    pub fn row_bytes(self, cols: usize) -> usize {
+        match self { Self::Fp2 => cols.div_ceil(4), Self::Fp3 => (cols * 3).div_ceil(8), Self::Fp4 => cols.div_ceil(2), Self::Fp8 => cols }
     }
 }
 
-fn fp8_code(v: f32) -> u8 {
-    const M: f32 = 448.0;
+/// Encode to OCP E4M3: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits.
+/// Exponent field 0 is subnormal, 0x7f/0xff are NaN, and the largest finite value is 448.
+pub fn fp8_code(v: f32) -> u8 {
     if v.is_nan() { return 0x7f; }
-    if v == 0.0 { return if v.is_sign_negative() { 0x80 } else { 0 }; }
-    let s = if v.is_sign_negative() { 0x80 } else { 0 };
+    let s = if v.is_sign_negative() { 0x80u8 } else { 0 };
     let x = v.abs();
-    if x.is_infinite() || x >= M { return s | 0x7e; }
+    if x >= FP8_E4M3_MAX { return s | 0x7e; }
+    if x < 2f32.powi(-6) {
+        // subnormal: value = m * 2^-9
+        let m = (x * 2f32.powi(9)).round() as i32;
+        if m >= 8 { return s | 0x08; }
+        return s | m.clamp(0, 7) as u8;
+    }
     let mut e = x.log2().floor() as i32;
-    if e < -6 { e = -6; }
-    if e > 8 { e = 8; }
     let mut m = ((x / 2f32.powi(e) - 1.0) * 8.0).round() as i32;
     if m >= 8 { m = 0; e += 1; }
-    if e > 8 || e == 8 && m > 6 { return s | 0x7e; }
+    if e > 8 { return s | 0x7e; }
     s | (((e + 7) as u8) << 3) | (m.clamp(0, 7) as u8)
 }
 
-fn fp8_value(c: u8) -> f32 {
-    if c == 0x7f || c == 0xff { return f32::NAN; }
-    if c & 0x7f == 0 { return if c & 0x80 != 0 { -0.0 } else { 0.0 }; }
+pub fn fp8_value(c: u8) -> f32 {
+    if c & 0x7f == 0x7f { return f32::NAN; }
     let s = if c & 0x80 != 0 { -1.0 } else { 1.0 };
-    s * 2f32.powi(((c >> 3) & 15) as i32 - 7) * (1.0 + (c & 7) as f32 / 8.0)
+    let e = ((c >> 3) & 0x0f) as i32;
+    let m = (c & 7) as f32;
+    if e == 0 { return s * m * 2f32.powi(-9); }
+    s * 2f32.powi(e - 7) * (1.0 + m / 8.0)
 }
 
 pub fn quantize_codes(x: &Array2<f32>, b: Bits) -> (Array2<u8>, Vec<f32>) {
     let levels = b.levels();
+    assert!(!levels.is_empty(), "FP8 stores E4M3 codes directly and has no codebook");
+    let level_max = b.level_max();
     let mut codes = Array2::zeros(x.raw_dim());
     let mut scales = vec![0.0; x.nrows()];
     for r in 0..x.nrows() {
         let max_abs = x.row(r).iter().map(|v| v.abs()).fold(0.0, f32::max);
-        scales[r] = max_abs.max(f32::EPSILON);
+        scales[r] = (max_abs / level_max).max(f32::EPSILON);
         for j in 0..x.ncols() {
             let v = x[[r, j]] / scales[r];
             let mut best = 0;
@@ -68,19 +88,19 @@ pub fn dequantize(codes: &Array2<u8>, scales: &[f32], b: Bits) -> Array2<f32> {
 
 pub fn fake_quantize(x: &Array2<f32>, b: Bits) -> Array2<f32> {
     match b {
-        Bits::Fp8 => x.mapv(|v| if v == 0.0 { v } else { fp8_value(fp8_code(v)) }),
-        Bits::Fp2 | Bits::Fp4 => { let (codes, scales) = quantize_codes(x, b); dequantize(&codes, &scales, b) }
+        Bits::Fp8 => x.mapv(|v| fp8_value(fp8_code(v))),
+        _ => { let (codes, scales) = quantize_codes(x, b); dequantize(&codes, &scales, b) }
     }
 }
 
 pub fn quantized_linear(x: &Array2<f32>, w: &Array2<f32>, b: Bits) -> Array2<f32> { x.dot(&fake_quantize(w, b).t()) }
 
 pub fn pack_3bit(codes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity((codes.len() * 3 + 7) / 8);
-    let (mut acc, mut used) = (0, 0);
+    let mut out = Vec::with_capacity((codes.len() * 3).div_ceil(8));
+    let (mut acc, mut used) = (0u8, 0u32);
     for &code in codes {
         for shift in [2, 1, 0] {
-            acc |= ((code & 7) >> shift) << (7 - used);
+            acc |= ((code & 7) >> shift & 1) << (7 - used);
             used += 1;
             if used == 8 { out.push(acc); acc = 0; used = 0; }
         }
@@ -101,8 +121,8 @@ pub fn unpack_3bit(packed: &[u8], n: usize) -> Vec<u8> {
 pub fn pack_lowbit(codes: &[u8], b: Bits) -> Vec<u8> {
     match b {
         Bits::Fp2 => {
-            let mut out = Vec::with_capacity((codes.len() * 2 + 7) / 8);
-            let (mut acc, mut used) = (0, 0);
+            let mut out = Vec::with_capacity((codes.len() * 2).div_ceil(8));
+            let (mut acc, mut used) = (0u8, 0u32);
             for &code in codes {
                 acc |= (code & 3) << (6 - used);
                 used += 2;
@@ -111,6 +131,7 @@ pub fn pack_lowbit(codes: &[u8], b: Bits) -> Vec<u8> {
             if used > 0 { out.push(acc); }
             out
         }
+        Bits::Fp3 => pack_3bit(codes),
         Bits::Fp4 => codes.chunks(2).map(|x| ((x[0] & 15) << 4) | (x.get(1).copied().unwrap_or(0) & 15)).collect(),
         Bits::Fp8 => codes.to_vec(),
     }
@@ -119,21 +140,22 @@ pub fn pack_lowbit(codes: &[u8], b: Bits) -> Vec<u8> {
 pub fn unpack_lowbit(packed: &[u8], n: usize, b: Bits) -> Vec<u8> {
     match b {
         Bits::Fp2 => (0..n).map(|i| (packed[i / 4] >> (6 - 2 * (i % 4))) & 3).collect(),
+        Bits::Fp3 => unpack_3bit(packed, n),
         Bits::Fp4 => (0..n).map(|i| if i % 2 == 0 { packed[i / 2] >> 4 & 15 } else { packed[i / 2] & 15 }).collect(),
         Bits::Fp8 => packed[..n].to_vec(),
     }
 }
 
 fn pack_lowbit_rows(codes: &Array2<u8>, b: Bits) -> Vec<u8> {
-    let mut out = Vec::new();
-    for row in codes.rows() { out.extend(pack_lowbit(row.as_slice().unwrap(), b)); }
+    let mut out = Vec::with_capacity(codes.nrows() * b.row_bytes(codes.ncols()));
+    for row in codes.rows() { out.extend(pack_lowbit(row.as_standard_layout().as_slice().unwrap(), b)); }
     out
 }
 
 fn unpack_lowbit_rows(packed: &[u8], shape: (usize, usize), b: Bits) -> Vec<u8> {
     let (rows, cols) = shape;
-    let bytes_per_row = match b { Bits::Fp2 => (cols + 3) / 4, Bits::Fp4 => (cols + 1) / 2, Bits::Fp8 => cols };
-    assert!(packed.len() >= rows * bytes_per_row);
+    let bytes_per_row = b.row_bytes(cols);
+    assert!(packed.len() >= rows * bytes_per_row, "packed weight is too small for {rows}x{cols} at {} bits", b.bits());
     let mut out = Vec::with_capacity(rows * cols);
     for r in 0..rows { out.extend(unpack_lowbit(&packed[r * bytes_per_row..(r + 1) * bytes_per_row], cols, b)); }
     out
@@ -141,15 +163,15 @@ fn unpack_lowbit_rows(packed: &[u8], shape: (usize, usize), b: Bits) -> Vec<u8> 
 
 pub fn quantize_weight(w: &Array2<f32>, b: Bits) -> (Vec<u8>, Vec<f32>) {
     match b {
-        Bits::Fp8 => (w.iter().map(|&v| fp8_code(v)).collect(), vec![1.0]),
-        Bits::Fp2 | Bits::Fp4 => { let (codes, scales) = quantize_codes(w, b); (pack_lowbit_rows(&codes, b), scales) }
+        Bits::Fp8 => (w.iter().map(|&v| fp8_code(v)).collect(), vec![1.0; w.nrows()]),
+        _ => { let (codes, scales) = quantize_codes(w, b); (pack_lowbit_rows(&codes, b), scales) }
     }
 }
 
 pub fn dequantize_weight(packed: &[u8], scales: &[f32], shape: (usize, usize), b: Bits) -> Array2<f32> {
     match b {
         Bits::Fp8 => Array2::from_shape_vec(shape, (0..shape.0 * shape.1).map(|i| fp8_value(packed[i])).collect()).unwrap(),
-        Bits::Fp2 | Bits::Fp4 => {
+        _ => {
             assert_eq!(scales.len(), shape.0);
             let codes = unpack_lowbit_rows(packed, shape, b);
             let levels = b.levels();
@@ -158,24 +180,8 @@ pub fn dequantize_weight(packed: &[u8], scales: &[f32], shape: (usize, usize), b
     }
 }
 
-pub fn quantize_weight_3bit(w: &Array2<f32>) -> (Vec<u8>, Vec<f32>) {
-    let mut codes = Vec::with_capacity(w.len());
-    let mut scales = Vec::with_capacity(w.nrows());
-    for row in w.rows() {
-        let max_abs = row.iter().map(|v| v.abs()).fold(0.0, f32::max);
-        let scale = (max_abs / 3.0).max(f32::EPSILON);
-        scales.push(scale);
-        for &v in row { codes.push(((v / scale).round().clamp(-4.0, 3.0) as i8 + 4) as u8); }
-    }
-    (pack_3bit(&codes), scales)
-}
-
-pub fn dequantize_weight_3bit(packed: &[u8], scales: &[f32], shape: (usize, usize)) -> Array2<f32> {
-    let (rows, cols) = shape;
-    assert_eq!(scales.len(), rows);
-    let codes = unpack_3bit(packed, rows * cols);
-    Array2::from_shape_fn(shape, |(r, c)| ((codes[r * cols + c] as i8 - 4) as f32) * scales[r])
-}
+pub fn quantize_weight_3bit(w: &Array2<f32>) -> (Vec<u8>, Vec<f32>) { quantize_weight(w, Bits::Fp3) }
+pub fn dequantize_weight_3bit(packed: &[u8], scales: &[f32], shape: (usize, usize)) -> Array2<f32> { dequantize_weight(packed, scales, shape, Bits::Fp3) }
 
 #[derive(Clone, Debug)]
 pub struct QatLinear { pub weight: Array2<f32>, pub bits: Bits }
@@ -194,7 +200,7 @@ pub struct QatLinear3Bit { pub weight: Array2<f32>, pub signed_activation: bool,
 impl QatLinear3Bit {
     pub fn new(weight: Array2<f32>, signed_activation: bool) -> Self { Self { weight, signed_activation, activation_min: 0.0, activation_max: 0.0, momentum: 0.1 } }
     pub fn observe(&mut self, x: &Array2<f32>) { if x.is_empty() { return; } self.activation_min = x.iter().copied().fold(f32::INFINITY, f32::min); self.activation_max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max); }
-    pub fn fake_quantize_activation(&self, x: &Array2<f32>) -> Array2<f32> { let max_abs = self.activation_min.abs().max(self.activation_max.abs()); let scale = (max_abs / 3.0).max(f32::EPSILON); x.mapv(|v| (v / scale).round().clamp(-4.0, 3.0) * scale) }
+    pub fn fake_quantize_activation(&self, x: &Array2<f32>) -> Array2<f32> { let max_abs = self.activation_min.abs().max(self.activation_max.abs()); let scale = (max_abs / Bits::Fp3.level_max()).max(f32::EPSILON); x.mapv(|v| (v / scale).round().clamp(QAT_3BIT_MIN as f32, QAT_3BIT_MAX as f32) * scale) }
     pub fn forward(&mut self, x: &Array2<f32>) -> Array2<f32> { self.observe(x); let (packed, scales) = quantize_weight_3bit(&self.weight); let weight = dequantize_weight_3bit(&packed, &scales, self.weight.dim()); self.fake_quantize_activation(x).dot(&weight.t()) }
     pub fn convert(&self) -> QuantizedLinear3Bit { let (packed, scales) = quantize_weight_3bit(&self.weight); QuantizedLinear3Bit { packed, scales, shape: self.weight.dim() } }
 }
@@ -207,7 +213,29 @@ impl QuantizedLinear3Bit { pub fn forward(&self, x: &Array2<f32>) -> Array2<f32>
 mod tests {
     use super::*;
     use ndarray::array;
-    #[test] fn bit_modes_are_supported() { assert_eq!(Bits::from_bits(2).unwrap().bits(), 2); assert_eq!(Bits::from_bits(4).unwrap().bits(), 4); assert_eq!(Bits::from_bits(8).unwrap().bits(), 8); assert!(Bits::from_bits(3).is_err()); }
+    #[test] fn bit_modes_are_supported() { for b in [2u8, 3, 4, 8] { assert_eq!(Bits::from_bits(b).unwrap().bits(), b); } assert!(Bits::from_bits(5).is_err()); assert!(Bits::from_bits(0).is_err()); }
+    #[test] fn fp8_codes_round_trip_through_values() { for c in 0u8..=255 { if c & 0x7f == 0x7f { assert!(fp8_value(c).is_nan()); continue; } let v = fp8_value(c); assert!(v.is_finite()); assert_eq!(fp8_code(v), c, "code {c:#04x} decoded to {v} and re-encoded differently"); } }
+    #[test] fn fp8_encodes_subnormals_instead_of_inflating_them() { // 1e-8 used to snap up to 2^-6
+        assert_eq!(fp8_value(fp8_code(1e-8)), 0.0);
+        let smallest = 2f32.powi(-9); assert_eq!(fp8_value(fp8_code(smallest)), smallest);
+        assert_eq!(fp8_value(fp8_code(3.0 * smallest)), 3.0 * smallest);
+        assert_eq!(fp8_value(fp8_code(1e30)), 448.0); assert_eq!(fp8_value(fp8_code(-1e30)), -448.0); }
+    #[test] fn fp8_decoding_is_monotonic_in_magnitude() { let mut prev = -1.0; for c in 0u8..0x7f { let v = fp8_value(c); assert!(v > prev, "code {c:#04x} broke monotonicity"); prev = v; } }
+    #[test] fn low_bit_scales_use_the_whole_codebook() { let w = array![[1.0, -0.6, 0.1, -1.0]];
+        for b in [Bits::Fp2, Bits::Fp3, Bits::Fp4] { let (codes, scales) = quantize_codes(&w, b); let peak = codes.iter().map(|&c| b.levels()[c as usize].abs()).fold(0.0, f32::max);
+            assert_eq!(peak, b.level_max(), "{b:?} never reaches its outermost level"); assert!((scales[0] - 1.0 / b.level_max()).abs() < 1e-6); } }
+    #[test] fn finer_formats_quantize_more_accurately() { let w = Array2::from_shape_fn((4, 16), |(r, c)| ((r * 16 + c) as f32 * 0.37).sin());
+        let err = |b| (&fake_quantize(&w, b) - &w).iter().map(|v| v * v).sum::<f32>();
+        let (e2, e3, e4) = (err(Bits::Fp2), err(Bits::Fp3), err(Bits::Fp4));
+        assert!(e3 < e2, "3-bit ({e3}) should beat 2-bit ({e2})"); assert!(e4 < e2, "4-bit ({e4}) should beat 2-bit ({e2})"); }
+    #[test] fn packed_round_trip_for_every_low_bit_format() { for b in [Bits::Fp2, Bits::Fp3, Bits::Fp4] { for cols in [1usize, 3, 7, 8, 11, 16] {
+        let w = Array2::from_shape_fn((3, cols), |(r, c)| ((r * 13 + c * 7) as f32 * 0.21).cos());
+        let (packed, scales) = quantize_weight(&w, b);
+        assert_eq!(packed.len(), 3 * b.row_bytes(cols), "{b:?} packed size wrong for {cols} columns");
+        assert_eq!(dequantize_weight(&packed, &scales, w.dim(), b), fake_quantize(&w, b), "{b:?} packing changed values at {cols} columns"); } } }
+    #[test] fn three_bit_uses_the_signed_int3_range() { let w = array![[3.0, -3.0, 0.0, 1.0]]; let q = fake_quantize(&w, Bits::Fp3);
+        assert_eq!(q, w, "an exactly representable int3 row must survive unchanged");
+        assert_eq!(QAT_3BIT_MIN as f32, Bits::Fp3.levels()[0]); assert_eq!(QAT_3BIT_MAX as f32, Bits::Fp3.level_max()); }
     #[test] fn fp2_round_trip_uses_three_levels() { let x = array![[-2.0, 0.0], [0.5, 2.0]]; let q = fake_quantize(&x, Bits::Fp2); assert_eq!(q[[0, 0]], -2.0); assert_eq!(q[[0, 1]], 0.0); assert_eq!(q[[1, 0]], 0.0); assert_eq!(q[[1, 1]], 2.0); }
     #[test] fn fp4_quantization_has_expected_shape() { let x = array![[1.0, -0.5, 0.2]]; assert_eq!(fake_quantize(&x, Bits::Fp4).dim(), x.dim()); }
     #[test] fn fp8_quantization_is_finite() { assert!(fake_quantize(&array![[1.0, -0.5, 0.2]], Bits::Fp8).iter().all(|v| v.is_finite())); }
