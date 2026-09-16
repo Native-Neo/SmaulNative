@@ -29,7 +29,7 @@ fn print_help() {
 }
 
 fn run() -> Result<(), String> {
-    let args: Vec<String> = env::args().skip(2).collect();
+    let args: Vec<String> = env::args().skip(1).collect();
     if has(&args, "--help") || has(&args, "-h") { print_help(); return Ok(()); }
     let dataset = value(&args, "--dataset", "./datasets");
     let vocab_size: usize = number(&args, "--vocab-size", "65536")?;
