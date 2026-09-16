@@ -1,19 +1,19 @@
+use crate::moe::{MoeCmix,MoeRouter};
+use rand::{Rng,SeedableRng};
+use std::path::{Path,PathBuf};
+use crate::checkpoint::PretrainedModel;
 use crate::config::RwkvXConfig;
 use crate::group_norm::GroupNorm;
 use crate::layer_norm::LayerNorm;
-use crate::moe::{MoeCmix,MoeRouter};
-use crate::model_io::PretrainedModel;
-use crate::moba_attention::MobaAttention;
-use crate::moba_block::MobaBlock;
+use crate::moba_block::{MobaAttention, MobaBlock};
 use crate::rwkv_block::RwkvBlock;
 use crate::rwkv_cmix::RwkvCmix;
 use crate::rwkv_model::RwkvModel;
 use crate::rwkv_time_mix::RwkvTimeMix;
 use crate::tokenizer::Tokenizer;
 use ndarray::Array2;
-use rand::{Rng,SeedableRng};
 use std::fs;
-use std::path::{Path,PathBuf};
+
 fn copy_norm(src:&LayerNorm)->LayerNorm{LayerNorm{normalized_dim:src.normalized_dim,eps:src.eps,weight:src.weight.clone(),bias:src.bias.clone()}}
 fn copy_group_norm(src:&GroupNorm)->GroupNorm{GroupNorm::from_weights(src.channels,src.groups,src.eps,src.weight.clone(),src.bias.clone())}
 fn copy_time_mix(src:&RwkvTimeMix)->RwkvTimeMix{let mut out=RwkvTimeMix::new_with_qat(src.channels,src.heads,0,1,src.qat_bits);out.x_r=src.x_r.clone();out.x_w=src.x_w.clone();out.x_k=src.x_k.clone();out.x_v=src.x_v.clone();out.x_a=src.x_a.clone();out.x_g=src.x_g.clone();out.w0=src.w0.clone();out.w1=src.w1.clone();out.w2=src.w2.clone();out.a0=src.a0.clone();out.a1=src.a1.clone();out.a2=src.a2.clone();out.v0=src.v0.clone();out.v1=src.v1.clone();out.v2=src.v2.clone();out.g1=src.g1.clone();out.g2=src.g2.clone();out.k_k=src.k_k.clone();out.k_a=src.k_a.clone();out.r_k=src.r_k.clone();out.receptance=src.receptance.clone();out.key=src.key.clone();out.value=src.value.clone();out.output=src.output.clone();out.ln_x=copy_group_norm(&src.ln_x);out.refresh_quantized();out}

@@ -1,6 +1,6 @@
 use smaul_native::inference::Inference;
-use smaul_native::model_io::PretrainedModel;
-use smaul_native::model_train_step::ModelTrainStep;
+use smaul_native::checkpoint::PretrainedModel;
+use smaul_native::model_backward::ModelTrainStep;
 use smaul_native::rwkv_model::{RwkvModel,RwkvModelConfig};
 use smaul_native::tokenizer::{BOS,CAP,EOS,PAD,UNK,UPPER,Tokenizer};
 use ndarray::Array1;
@@ -28,14 +28,14 @@ fn checkpoint_load_inference_and_training_roundtrip(){
 #[test]
 fn a_loaded_checkpoint_can_still_be_trained() {
     use ndarray::Array1;
-    use smaul_native::model_train_step::ModelTrainStep;
+    use smaul_native::model_backward::ModelTrainStep;
     use smaul_native::rwkv_model::{RwkvModel, RwkvModelConfig};
     use smaul_native::training::TrainStep;
 
     let config = RwkvModelConfig::new(24, 16, 2, 8);
     let model = RwkvModel::new(config.clone(), 3);
     let path = std::env::temp_dir().join(format!("smaul-train-after-load-{}.safetensors", std::process::id()));
-    smaul_native::model_saver::save_model_safetensors(&model, &path).unwrap();
+    smaul_native::checkpoint::save_model_safetensors(&model, &path).unwrap();
 
     let mut loaded = RwkvModel::new(config, 99);
     loaded.load_safetensors(&path).unwrap();

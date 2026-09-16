@@ -1,5 +1,5 @@
 use crate::gguf::{GgufReader, GgufValue};
-use crate::gguf_writer::{Tensor, Writer};
+use crate::gguf::{Tensor, Writer};
 use std::path::Path;
 
 fn f32_to_f16(x: f32) -> u16 {

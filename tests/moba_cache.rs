@@ -1,5 +1,5 @@
 use ndarray::{Array2, Array4};
-use smaul_native::moba_attention::MobaAttention;
+use smaul_native::moba_block::MobaAttention;
 
 fn softmax(scores: &[f32]) -> Vec<f32> {
     let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);

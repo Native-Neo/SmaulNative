@@ -2,7 +2,7 @@ use safetensors::tensor::{serialize,Dtype,TensorView};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use smaul_native::model_saver::TENSOR_LAYOUT_VERSION;
+use smaul_native::checkpoint::TENSOR_LAYOUT_VERSION;
 use smaul_native::rwkv_model::{RwkvModel,RwkvModelConfig};
 
 fn tensor_view<'a>(data:&'a [f32],shape:&[usize])->TensorView<'a>{let bytes=unsafe{std::slice::from_raw_parts(data.as_ptr()as*const u8,data.len()*std::mem::size_of::<f32>())};TensorView::new(Dtype::F32,shape.to_vec(),bytes).unwrap()}

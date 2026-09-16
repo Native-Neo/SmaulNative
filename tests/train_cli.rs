@@ -1,6 +1,6 @@
 // Drives the real smaul-train binary over a real model directory and dataset.
 use smaul_native::config::RwkvXConfig;
-use smaul_native::model_io::PretrainedModel;
+use smaul_native::checkpoint::PretrainedModel;
 use smaul_native::rwkv_model::RwkvModel;
 use smaul_native::tokenizer::Tokenizer;
 use std::fs;

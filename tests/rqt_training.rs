@@ -1,7 +1,7 @@
 // End-to-end RQT: quantized forward/backward, full-precision master updates.
 use ndarray::Array1;
-use smaul_native::model_train_step::ModelTrainStep;
-use smaul_native::rqt_model;
+use smaul_native::model_backward::ModelTrainStep;
+use smaul_native::qat;
 use smaul_native::rwkv_model::{RwkvModel, RwkvModelConfig};
 use smaul_native::training::{OptimizerKind, TrainStep};
 
@@ -15,9 +15,9 @@ fn loss_after(bits: u8, steps: usize) -> (f32, f32) {
     let mut first = 0.0;
     let mut last = 0.0;
     for i in 0..steps {
-        let masters = (bits > 0).then(|| rqt_model::quantize_in_place(&mut model, bits).unwrap());
+        let masters = (bits > 0).then(|| qat::quantize_in_place(&mut model, bits).unwrap());
         let step = ModelTrainStep::run_scaled(&model, &tokens, &targets, 1.0);
-        if let Some(m) = masters { rqt_model::restore_masters(&mut model, m); }
+        if let Some(m) = masters { qat::restore_masters(&mut model, m); }
         if i == 0 { first = step.loss; }
         last = step.loss;
         train.step(&mut model, &step.gradients);
@@ -40,7 +40,7 @@ fn rqt_masters_stay_off_the_quantization_grid() {
     let mut train = TrainStep::new_with_optimizer(&model, 1e-4, OptimizerKind::AdamW);
 
     for _ in 0..5 {
-        let masters = rqt_model::quantize_in_place(&mut model, 2).unwrap();
+        let masters = qat::quantize_in_place(&mut model, 2).unwrap();
         // inside the window every row really is on its own 2-bit grid: {-s, 0, +s}
         for row in model.head.weight.rows() {
             let peak = row.iter().fold(0.0f32, |a, b| a.max(b.abs()));
@@ -48,7 +48,7 @@ fn rqt_masters_stay_off_the_quantization_grid() {
                 "2-bit window row should only contain 0 and +-scale");
         }
         let step = ModelTrainStep::run_scaled(&model, &tokens, &targets, 1.0);
-        rqt_model::restore_masters(&mut model, masters);
+        qat::restore_masters(&mut model, masters);
         train.step(&mut model, &step.gradients);
     }
 
@@ -64,10 +64,10 @@ fn rqt_masters_stay_off_the_quantization_grid() {
 #[test]
 fn rqt_rejects_unsupported_widths() {
     let mut model = RwkvModel::new(config(), 1);
-    assert!(rqt_model::quantize_in_place(&mut model, 5).is_err());
+    assert!(qat::quantize_in_place(&mut model, 5).is_err());
     for bits in [2u8, 3, 4, 8] {
-        let masters = rqt_model::quantize_in_place(&mut model, bits).unwrap();
-        rqt_model::restore_masters(&mut model, masters);
+        let masters = qat::quantize_in_place(&mut model, bits).unwrap();
+        qat::restore_masters(&mut model, masters);
     }
 }
 
@@ -76,8 +76,8 @@ fn restoring_masters_is_exact() {
     let mut model = RwkvModel::new(config(), 77);
     let before = model.head.weight.clone();
     let k = model.rwkv_blocks[0].time_mix.key.clone();
-    let masters = rqt_model::quantize_in_place(&mut model, 3).unwrap();
-    rqt_model::restore_masters(&mut model, masters);
+    let masters = qat::quantize_in_place(&mut model, 3).unwrap();
+    qat::restore_masters(&mut model, masters);
     assert_eq!(model.head.weight, before);
     assert_eq!(model.rwkv_blocks[0].time_mix.key, k);
 }

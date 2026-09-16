@@ -1,12 +1,12 @@
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use smaul_native::dataset::{DatasetStream, TokenBatch};
-use smaul_native::dataset_multi::MultiFileDatasetStream;
-use smaul_native::model_gradients::ModelGradients;
-use smaul_native::model_io::PretrainedModel;
-use smaul_native::model_train_step::ModelTrainStep;
-use smaul_native::sft_dataset::SftDataset;
-use smaul_native::rqt_model;
+use smaul_native::dataset::MultiFileDatasetStream;
+use smaul_native::model_backward::ModelGradients;
+use smaul_native::checkpoint::PretrainedModel;
+use smaul_native::model_backward::ModelTrainStep;
+use smaul_native::dataset::SftDataset;
+use smaul_native::qat;
 use smaul_native::training::{OptimizerKind, TrainStep};
 use std::env;
 use std::fs;
@@ -138,7 +138,7 @@ fn require_file(path: &Path, label: &str) -> Result<(), String> {
 
 fn sft_step(
     model: &smaul_native::rwkv_model::RwkvModel,
-    example: &smaul_native::sft_dataset::SftExample,
+    example: &smaul_native::dataset::SftExample,
     scale: f32,
 ) -> ModelTrainStep {
     let (logits, tape, state) = model.forward_with_tape_and_state(&example.input, None);
@@ -299,7 +299,7 @@ fn run() -> Result<(), String> {
         for _ in 0..args.grad_accum {
             for _ in 0..args.batch_size {
                 let masters = if args.rqt_bits > 0 {
-                    Some(rqt_model::quantize_in_place(&mut pretrained.model, args.rqt_bits)?)
+                    Some(qat::quantize_in_place(&mut pretrained.model, args.rqt_bits)?)
                 } else {
                     None
                 };
@@ -331,7 +331,7 @@ fn run() -> Result<(), String> {
                 };
 
                 if let Some(m) = masters {
-                    rqt_model::restore_masters(&mut pretrained.model, m);
+                    qat::restore_masters(&mut pretrained.model, m);
                 }
 
                 loss_sum += step.loss;

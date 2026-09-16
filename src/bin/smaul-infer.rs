@@ -1,6 +1,6 @@
-use smaul_native::gguf_inference::GgufInference;
+use smaul_native::inference::GgufInference;
 use smaul_native::inference::Inference;
-use smaul_native::model_io::PretrainedModel;
+use smaul_native::checkpoint::PretrainedModel;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;

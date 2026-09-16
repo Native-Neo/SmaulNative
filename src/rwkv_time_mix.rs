@@ -1,7 +1,6 @@
 use crate::group_norm::GroupNorm;
 use crate::init::{orthogonal, uniform};
-use crate::rqt::RealQuantLinear;
-use crate::rwkv_time_mix_tape::RwkvTimeMixTape;
+use crate::qat::RealQuantLinear;
 use crate::wkv;
 use ndarray::{Array1, Array2, Array4};
 
@@ -28,5 +27,315 @@ impl RwkvTimeMix {
  pub fn forward(&self,x:&Array2<f32>,state:Option<Array4<f32>>,prev:Option<Array1<f32>>,v_first:Option<Array2<f32>>)->(Array2<f32>,Array4<f32>,Array1<f32>,Array2<f32>){let(out,next,last,first,_)=self.forward_with_tape(x,state,prev,v_first);(out,next,last,first)}
  pub fn parameter_count(&self)->usize{self.x_r.len()+self.x_w.len()+self.x_k.len()+self.x_v.len()+self.x_a.len()+self.x_g.len()+self.w0.len()+self.w1.len()+self.w2.len()+self.a0.len()+self.a1.len()+self.a2.len()+self.v1.as_ref().map_or(0,|v|v.len())+self.v2.as_ref().map_or(0,|v|v.len())+self.v0.as_ref().map_or(0,|v|v.len())+self.g1.len()+self.g2.len()+self.k_k.len()+self.k_a.len()+self.r_k.len()+self.receptance.len()+self.key.len()+self.value.len()+self.output.len()+self.ln_x.parameter_count()}
 }
-#[cfg(test)]mod tests{use super::*;#[test]fn x070_shapes(){let layer=RwkvTimeMix::new(16,2,0,4);let x=Array2::ones((3,16));let(out,state,last,first)=layer.forward(&x,None,None,None);assert_eq!(out.shape(),&[3,16]);assert_eq!(state.shape(),&[1,2,8,8]);assert_eq!(last.len(),16);assert_eq!(first.shape(),&[3,16]);}#[test]fn tape_matches_forward_output(){let layer=RwkvTimeMix::new(16,2,1,4);let x=Array2::ones((3,16));let(a,_,_,_,tape)=layer.forward_with_tape(&x,None,None,None);let(b,_,_,_)=layer.forward(&x,None,None,None);assert!(a.iter().zip(b.iter()).all(|(x,y)|(x-y).abs()<1e-6));assert_eq!(tape.w_hidden.ncols(),layer.w1.ncols());}#[test]fn qat_forward_uses_packed_weights(){let layer=RwkvTimeMix::new_with_qat(16,2,0,4,4);assert!(layer.q_w1.is_some()&&layer.q_output.is_some());let x=Array2::ones((2,16));let(y,_,_,_)=layer.forward(&x,None,None,None);assert_eq!(y.dim(),(2,16));}#[test]fn qat_3bit_really_packs_weights(){let layer=RwkvTimeMix::new_with_qat(16,2,0,4,3);let q=layer.q_receptance.as_ref().expect("3-bit QAT must produce packed weights");assert_eq!(q.bits.bits(),3);assert_eq!(q.quant.packed.len(),q.quant.shape.0*((q.quant.shape.1*3+7)/8));let deq=q.dequantized();let distinct=deq.row(0).iter().map(|v|(v/q.quant.scales[0]).round() as i32).collect::<std::collections::BTreeSet<_>>();assert!(distinct.len()>1&&distinct.iter().all(|c|(-4..=3).contains(c)));let x=Array2::ones((2,16));let(y,_,_,_)=layer.forward(&x,None,None,None);assert_eq!(y.dim(),(2,16));assert!(y.iter().all(|v|v.is_finite()));}
+#[cfg(test)]mod tests_rwkv_time_mix{use super::*;#[test]fn x070_shapes(){let layer=RwkvTimeMix::new(16,2,0,4);let x=Array2::ones((3,16));let(out,state,last,first)=layer.forward(&x,None,None,None);assert_eq!(out.shape(),&[3,16]);assert_eq!(state.shape(),&[1,2,8,8]);assert_eq!(last.len(),16);assert_eq!(first.shape(),&[3,16]);}#[test]fn tape_matches_forward_output(){let layer=RwkvTimeMix::new(16,2,1,4);let x=Array2::ones((3,16));let(a,_,_,_,tape)=layer.forward_with_tape(&x,None,None,None);let(b,_,_,_)=layer.forward(&x,None,None,None);assert!(a.iter().zip(b.iter()).all(|(x,y)|(x-y).abs()<1e-6));assert_eq!(tape.w_hidden.ncols(),layer.w1.ncols());}#[test]fn qat_forward_uses_packed_weights(){let layer=RwkvTimeMix::new_with_qat(16,2,0,4,4);assert!(layer.q_w1.is_some()&&layer.q_output.is_some());let x=Array2::ones((2,16));let(y,_,_,_)=layer.forward(&x,None,None,None);assert_eq!(y.dim(),(2,16));}#[test]fn qat_3bit_really_packs_weights(){let layer=RwkvTimeMix::new_with_qat(16,2,0,4,3);let q=layer.q_receptance.as_ref().expect("3-bit QAT must produce packed weights");assert_eq!(q.bits.bits(),3);assert_eq!(q.quant.packed.len(),q.quant.shape.0*((q.quant.shape.1*3+7)/8));let deq=q.dequantized();let distinct=deq.row(0).iter().map(|v|(v/q.quant.scales[0]).round() as i32).collect::<std::collections::BTreeSet<_>>();assert!(distinct.len()>1&&distinct.iter().all(|c|(-4..=3).contains(c)));let x=Array2::ones((2,16));let(y,_,_,_)=layer.forward(&x,None,None,None);assert_eq!(y.dim(),(2,16));assert!(y.iter().all(|v|v.is_finite()));}
 #[test]fn qat_disabled_keeps_dense_weights(){let layer=RwkvTimeMix::new_with_qat(16,2,0,4,0);assert!(layer.q_w1.is_none()&&layer.q_receptance.is_none());}}
+
+// ===== rwkv_time_mix_backward =====
+
+pub struct TimeMixLinearBackward { pub grad_input: Array2<f32>, pub grad_weight: Array2<f32>, pub grad_bias: Array1<f32> }
+pub struct MixBackward { pub grad_input: Array2<f32>, pub grad_prev: Array1<f32>, pub grad_factor: Array1<f32> }
+
+pub fn linear_backward(input: &Array2<f32>, weight: &Array2<f32>, grad_output: &Array2<f32>) -> TimeMixLinearBackward {
+    assert_eq!(input.ncols(), weight.ncols());
+    assert_eq!(grad_output.dim(), (input.nrows(), weight.nrows()));
+    TimeMixLinearBackward { grad_input: grad_output.dot(weight), grad_weight: grad_output.t().dot(input), grad_bias: grad_output.sum_axis(ndarray::Axis(0)) }
+}
+
+pub fn mix_backward(input: &Array2<f32>, prev: &Array1<f32>, factor: &Array1<f32>, grad_output: &Array2<f32>) -> MixBackward {
+    assert_eq!(input.ncols(), factor.len());
+    assert_eq!(input.dim(), grad_output.dim());
+    assert_eq!(prev.len(), input.ncols());
+    let mut grad_input = Array2::zeros(input.raw_dim());
+    let mut grad_prev = Array1::zeros(prev.raw_dim());
+    let mut grad_factor = Array1::zeros(factor.raw_dim());
+    for t in 0..input.nrows() { for c in 0..input.ncols() {
+        let p = if t == 0 { prev[c] } else { input[[t - 1, c]] };
+        let g = grad_output[[t, c]];
+        grad_input[[t, c]] += g * (1.0 - factor[c]);
+        grad_factor[c] += g * (p - input[[t, c]]);
+        if t == 0 { grad_prev[c] += g * factor[c]; } else { grad_input[[t - 1, c]] += g * factor[c]; }
+    }}
+    MixBackward { grad_input, grad_prev, grad_factor }
+}
+
+pub fn sigmoid_backward(output: &Array2<f32>, grad_output: &Array2<f32>) -> Array2<f32> {
+    assert_eq!(output.dim(), grad_output.dim());
+    output * &(1.0 - output) * grad_output
+}
+
+pub fn tanh_backward(output: &Array2<f32>, grad_output: &Array2<f32>) -> Array2<f32> {
+    assert_eq!(output.dim(), grad_output.dim());
+    (1.0 - output.mapv(|v| v * v)) * grad_output
+}
+
+#[cfg(test)]
+mod tests_rwkv_time_mix_backward {
+    use super::*;
+    use ndarray::{Array1, Array2};
+    #[test]
+    fn mix_backward_propagates_previous_token() {
+        let x = Array2::ones((2, 3)); let p = Array1::zeros(3); let f = Array1::from_elem(3, 0.5);
+        let g = mix_backward(&x, &p, &f, &Array2::ones((2, 3)));
+        assert_eq!(g.grad_input.dim(), (2, 3));
+        assert_eq!(g.grad_prev.len(), 3);
+        assert_eq!(g.grad_factor.len(), 3);
+    }
+}
+
+// ===== rwkv_time_mix_backward_full =====
+
+pub struct RwkvTimeMixBackward {
+    pub grad_input: Array2<f32>, pub grad_prev: Array1<f32>, pub grad_state: Array4<f32>, pub grad_v_first: Array2<f32>,
+    pub grad_x_r: Array1<f32>, pub grad_x_w: Array1<f32>, pub grad_x_k: Array1<f32>, pub grad_x_v: Array1<f32>, pub grad_x_a: Array1<f32>, pub grad_x_g: Array1<f32>,
+    pub grad_w0: Array1<f32>, pub grad_w1: Array2<f32>, pub grad_w2: Array2<f32>, pub grad_a0: Array1<f32>, pub grad_a1: Array2<f32>, pub grad_a2: Array2<f32>,
+    pub grad_v0: Option<Array1<f32>>, pub grad_v1: Option<Array2<f32>>, pub grad_v2: Option<Array2<f32>>,
+    pub grad_g1: Array2<f32>, pub grad_g2: Array2<f32>, pub grad_k_k: Array1<f32>, pub grad_k_a: Array1<f32>, pub grad_r_k: Array2<f32>,
+    pub grad_receptance: Array2<f32>, pub grad_key: Array2<f32>, pub grad_value: Array2<f32>, pub grad_output: Array2<f32>,
+    pub grad_ln_weight: Array1<f32>, pub grad_ln_bias: Array1<f32>,
+}
+
+pub fn backward(model: &RwkvTimeMix, tape: &RwkvTimeMixTape, grad_output: &Array2<f32>) -> RwkvTimeMixBackward {
+    assert_eq!(grad_output.dim(), tape.output.dim());
+    let (steps, channels) = tape.input.dim();
+
+    let grad_gated = grad_output.dot(&model.output.t());
+    let grad_output_weight = tape.gated.t().dot(grad_output);
+    let grad_g = &grad_gated * &(&tape.normalized + &tape.correction);
+    let grad_normalized = &grad_gated * &tape.g;
+    let grad_g2 = tape.g_hidden.t().dot(&grad_g);
+    let grad_g_hidden = grad_g.dot(&model.g2.t());
+    let grad_g_hidden_pre = &grad_g_hidden * &tape.g_hidden.mapv(|v| v * (1.0 - v));
+    let grad_g1 = tape.xg.t().dot(&grad_g_hidden_pre);
+    let grad_xg = grad_g_hidden_pre.dot(&model.g1.t());
+
+    let gn = crate::group_norm::backward(&tape.y, &grad_normalized, &model.ln_x.weight, model.ln_x.groups, model.ln_x.eps);
+    let grad_y = gn.grad_input;
+    let grad_correction = &grad_gated * &tape.g;
+
+    let mut grad_v = Array2::zeros((steps, channels));
+    let mut grad_r = Array2::zeros((steps, channels));
+    let mut grad_k_mod = Array2::zeros((steps, channels));
+    let mut grad_r_k = Array2::zeros((model.heads, model.head_size));
+    for row in 0..steps {
+        for h in 0..model.heads {
+            let start = h * model.head_size;
+            let mut scalar = 0.0;
+            for i in 0..model.head_size {
+                let col = start + i;
+                scalar += tape.r[[row, col]] * tape.k_mod[[row, col]] * model.r_k[[h, i]];
+            }
+            let mut grad_scalar = 0.0;
+            for i in 0..model.head_size {
+                let col = start + i;
+                grad_v[[row, col]] += grad_correction[[row, col]] * scalar;
+                grad_scalar += grad_correction[[row, col]] * tape.v[[row, col]];
+            }
+            for i in 0..model.head_size {
+                let col = start + i;
+                grad_r[[row, col]] += grad_scalar * tape.k_mod[[row, col]] * model.r_k[[h, i]];
+                grad_k_mod[[row, col]] += grad_scalar * tape.r[[row, col]] * model.r_k[[h, i]];
+                grad_r_k[[h, i]] += grad_scalar * tape.r[[row, col]] * tape.k_mod[[row, col]];
+            }
+        }
+    }
+
+    let wk = crate::wkv::backward(&tape.state_initial, &tape.w, &tape.k_mod, &tape.v, &tape.kk, &tape.a, &tape.r, &grad_y, model.heads, model.head_size);
+    grad_v += &wk.v; grad_r += &wk.r; grad_k_mod += &wk.k;
+    let grad_state = wk.state; let grad_w = wk.w; let grad_kk = wk.kk; let mut grad_a = wk.a;
+
+    let mut grad_k = Array2::zeros((steps, channels)); let mut grad_k_a = Array1::zeros(channels);
+    for row in 0..steps { for col in 0..channels {
+        let scale=1.0+(tape.a[[row,col]]-1.0)*model.k_a[col];
+        grad_k[[row,col]] += grad_k_mod[[row,col]]*scale;
+        grad_a[[row,col]] += grad_k_mod[[row,col]]*tape.k[[row,col]]*model.k_a[col];
+        grad_k_a[col] += grad_k_mod[[row,col]]*tape.k[[row,col]]*(tape.a[[row,col]]-1.0);
+    }}
+
+    let mut grad_k_k=Array1::zeros(channels);
+    for row in 0..steps { for h in 0..model.heads {
+        let start=h*model.head_size; let mut norm2=1e-12;
+        for i in 0..model.head_size { let q=tape.kk_pre_norm[[row,start+i]]*model.k_k[start+i]; norm2+=q*q; }
+        let inv=norm2.sqrt().recip(); let mut dot=0.0;
+        for i in 0..model.head_size { dot+=grad_kk[[row,start+i]]*tape.kk[[row,start+i]]; }
+        for i in 0..model.head_size { let col=start+i; let gq=(grad_kk[[row,col]]-tape.kk[[row,col]]*dot)*inv; grad_k[[row,col]]+=gq*model.k_k[col]; grad_k_k[col]+=gq*tape.kk_pre_norm[[row,col]]; }
+    }}
+
+    let grad_a_pre=&grad_a*&tape.a.mapv(|v|v*(1.0-v));
+    let grad_a2=tape.a_hidden.t().dot(&grad_a_pre); let grad_a_hidden=grad_a_pre.dot(&model.a2.t()); let grad_a1=tape.xa.t().dot(&grad_a_hidden); let grad_xa=grad_a_hidden.dot(&model.a1.t());
+    let mut grad_a0=Array1::zeros(channels); for row in 0..steps { for col in 0..channels { grad_a0[col]+=grad_a_pre[[row,col]]; }}
+
+    let mut grad_w0=Array1::zeros(channels); let mut grad_g_decay=Array2::zeros((steps,channels));
+    for row in 0..steps { for col in 0..channels { let z=model.w0[col]+tape.g_decay[[row,col]]; let s=1.0/(1.0+(-z).exp()); let gz=grad_w[[row,col]]*tape.w[[row,col]]*(-0.606531)*s*(1.0-s); grad_w0[col]+=gz; grad_g_decay[[row,col]]=gz; }}
+    let grad_w2=tape.w_hidden.t().dot(&grad_g_decay); let grad_w_hidden=grad_g_decay.dot(&model.w2.t()); let grad_w_hidden_pre=&grad_w_hidden*&tape.w_hidden.mapv(|v|1.0-v*v); let grad_w1=tape.xw.t().dot(&grad_w_hidden_pre); let grad_xw=grad_w_hidden_pre.dot(&model.w1.t());
+
+    let grad_receptance=tape.xr.t().dot(&grad_r); let grad_xr=grad_r.dot(&model.receptance.t());
+    let grad_key=tape.xk.t().dot(&grad_k); let grad_xk=grad_k.dot(&model.key.t());
+    let mut grad_xv=Array2::zeros((steps,channels)); let mut grad_value=Array2::zeros((channels,channels)); let mut grad_v_first=Array2::zeros((steps,channels));
+    let (grad_v0,grad_v1,grad_v2);
+    if let (Some(v1),Some(v2),Some(v0),Some(correction),Some(gate))=(&model.v1,&model.v2,&model.v0,&tape.v_correction,&tape.v_gate) {
+        let mut gv_base=Array2::zeros((steps,channels)); let mut gv_corr=Array2::zeros((steps,channels)); let mut gv0=Array1::zeros(channels);
+        for row in 0..steps { for col in 0..channels { let gv=grad_v[[row,col]]; gv_base[[row,col]]=gv*(1.0-gate[[row,col]]); grad_v_first[[row,col]]=gv*gate[[row,col]]; let gg=gv*(tape.v_first[[row,col]]-tape.v_base[[row,col]])*gate[[row,col]]*(1.0-gate[[row,col]]); gv_corr[[row,col]]=gg; gv0[col]+=gg; }}
+        let v_hidden= tape.xv.dot(v1);
+        grad_value=tape.xv.t().dot(&gv_base); grad_xv+=&gv_base.dot(&model.value.t());
+        let gv2=v_hidden.t().dot(&gv_corr); let gh=gv_corr.dot(&v2.t()); let gv1=tape.xv.t().dot(&gh); grad_xv+=&gh.dot(&v1.t());
+        grad_v0=Some(gv0); grad_v1=Some(gv1); grad_v2=Some(gv2);
+    } else { grad_value=tape.xv.t().dot(&grad_v); grad_xv+=&grad_v.dot(&model.value.t()); grad_v_first=grad_v.clone(); grad_v0=None; grad_v1=None; grad_v2=None; }
+
+    finish(model,tape,grad_xr,grad_xw,grad_xk,grad_xv,grad_xa,grad_xg,grad_v_first,grad_state,grad_receptance,grad_key,grad_value,grad_w0,grad_w1,grad_w2,grad_a0,grad_a1,grad_a2,grad_v0,grad_v1,grad_v2,grad_g1,grad_g2,grad_k_k,grad_k_a,grad_r_k,gn.grad_weight,gn.grad_bias,grad_output_weight)
+}
+
+fn finish(model:&RwkvTimeMix,tape:&RwkvTimeMixTape,grad_xr:Array2<f32>,grad_xw:Array2<f32>,grad_xk:Array2<f32>,grad_xv:Array2<f32>,grad_xa:Array2<f32>,grad_xg:Array2<f32>,grad_v_first:Array2<f32>,grad_state:Array4<f32>,grad_receptance:Array2<f32>,grad_key:Array2<f32>,grad_value:Array2<f32>,grad_w0:Array1<f32>,grad_w1:Array2<f32>,grad_w2:Array2<f32>,grad_a0:Array1<f32>,grad_a1:Array2<f32>,grad_a2:Array2<f32>,grad_v0:Option<Array1<f32>>,grad_v1:Option<Array2<f32>>,grad_v2:Option<Array2<f32>>,grad_g1:Array2<f32>,grad_g2:Array2<f32>,grad_k_k:Array1<f32>,grad_k_a:Array1<f32>,grad_r_k:Array2<f32>,grad_ln_weight:Array1<f32>,grad_ln_bias:Array1<f32>,grad_output:Array2<f32>)->RwkvTimeMixBackward {
+    let mut grad_input=Array2::zeros(tape.input.raw_dim()); let mut grad_prev=Array1::zeros(tape.prev.raw_dim()); let branches=[(&model.x_r,&grad_xr),(&model.x_w,&grad_xw),(&model.x_k,&grad_xk),(&model.x_v,&grad_xv),(&model.x_a,&grad_xa),(&model.x_g,&grad_xg)]; let mut factors=[Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels),Array1::zeros(model.channels)];
+    let mixed=[&tape.xr,&tape.xw,&tape.xk,&tape.xv,&tape.xa,&tape.xg];
+    for i in 0..6 { let b=mix_backward(&tape.input,&tape.prev,branches[i].0,branches[i].1); let _=mixed[i]; grad_input+=&b.grad_input; grad_prev+=&b.grad_prev; factors[i]=b.grad_factor; }
+    RwkvTimeMixBackward{grad_input,grad_prev,grad_state,grad_v_first,grad_x_r:factors[0].clone(),grad_x_w:factors[1].clone(),grad_x_k:factors[2].clone(),grad_x_v:factors[3].clone(),grad_x_a:factors[4].clone(),grad_x_g:factors[5].clone(),grad_w0,grad_w1,grad_w2,grad_a0,grad_a1,grad_a2,grad_v0,grad_v1,grad_v2,grad_g1,grad_g2,grad_k_k,grad_k_a,grad_r_k,grad_receptance,grad_key,grad_value,grad_output,grad_ln_weight,grad_ln_bias}
+}
+
+#[cfg(test)]
+mod tests_rwkv_time_mix_backward_full {
+    use super::*;
+    use ndarray::Array2;
+
+    fn loss(model: &RwkvTimeMix, x: &Array2<f32>) -> f32 {
+        model.forward(x, None, None, None).0.sum()
+    }
+
+    #[test]
+    fn backward_produces_finite_gradients() {
+        let model=RwkvTimeMix::new(16,2,1,4);
+        let x=Array2::from_shape_fn((3,16),|(r,c)|0.01*(r+c) as f32);
+        let (_,_,_,_,tape)=model.forward_with_tape(&x,None,None,None);
+        let b=backward(&model,&tape,&Array2::ones((3,16)));
+        assert!(b.grad_input.iter().all(|v|v.is_finite()));
+        assert!(b.grad_state.iter().all(|v|v.is_finite()));
+        assert!(b.grad_value.iter().all(|v|v.is_finite()));
+    }
+
+    #[test]
+    fn input_gradient_matches_finite_difference() {
+        let model=RwkvTimeMix::new(16,2,1,4);
+        let x=Array2::from_shape_fn((2,16),|(r,c)|0.03*(r as f32)+0.002*(c as f32)+0.01);
+        let (_,_,_,_,tape)=model.forward_with_tape(&x,None,None,None);
+        let analytic=backward(&model,&tape,&Array2::ones((2,16))).grad_input;
+        let eps=1e-3_f32;
+        for &(row,col) in &[(0usize,0usize),(0,7),(1,3),(1,15)] {
+            let mut plus=x.clone();
+            let mut minus=x.clone();
+            plus[[row,col]]+=eps;
+            minus[[row,col]]-=eps;
+            let numeric=(loss(&model,&plus)-loss(&model,&minus))/(2.0*eps);
+            let a=analytic[[row,col]];
+            let tolerance=2e-2_f32.max(2e-2*a.abs());
+            assert!((numeric-a).abs()<=tolerance,"gradient mismatch at ({row},{col}): analytic={a}, numeric={numeric}");
+        }
+    }
+}
+
+// ===== rwkv_time_mix_tape =====
+
+pub struct RwkvTimeMixTape {
+    pub input: Array2<f32>,
+    pub prev: Array1<f32>,
+    pub xr: Array2<f32>,
+    pub xw: Array2<f32>,
+    pub xk: Array2<f32>,
+    pub xv: Array2<f32>,
+    pub xa: Array2<f32>,
+    pub xg: Array2<f32>,
+    pub r: Array2<f32>,
+    pub w_hidden: Array2<f32>,
+    pub g_decay: Array2<f32>,
+    pub k: Array2<f32>,
+    pub v_base: Array2<f32>,
+    pub v_correction: Option<Array2<f32>>,
+    pub v_gate: Option<Array2<f32>>,
+    pub v: Array2<f32>,
+    pub a_hidden: Array2<f32>,
+    pub a: Array2<f32>,
+    pub g_hidden: Array2<f32>,
+    pub g: Array2<f32>,
+    pub kk_pre_norm: Array2<f32>,
+    pub kk: Array2<f32>,
+    pub k_mod: Array2<f32>,
+    pub w: Array2<f32>,
+    pub state_initial: Array4<f32>,
+    pub y: Array2<f32>,
+    pub normalized: Array2<f32>,
+    pub correction: Array2<f32>,
+    pub gated: Array2<f32>,
+    pub output: Array2<f32>,
+    pub v_first: Array2<f32>,
+}
+
+impl RwkvTimeMixTape {
+    pub fn new(
+        input: Array2<f32>,
+        prev: Array1<f32>,
+        state_initial: Array4<f32>,
+        w_hidden: usize,
+        v_hidden: Option<usize>,
+        g_hidden: usize,
+    ) -> Self {
+        let shape = input.raw_dim();
+        let rows = input.nrows();
+        let state_shape = state_initial.raw_dim();
+
+        Self {
+            input,
+            prev,
+            xr: Array2::zeros(shape.clone()),
+            xw: Array2::zeros(shape.clone()),
+            xk: Array2::zeros(shape.clone()),
+            xv: Array2::zeros(shape.clone()),
+            xa: Array2::zeros(shape.clone()),
+            xg: Array2::zeros(shape.clone()),
+            r: Array2::zeros(shape.clone()),
+            w_hidden: Array2::zeros((rows, w_hidden)),
+            g_decay: Array2::zeros(shape.clone()),
+            k: Array2::zeros(shape.clone()),
+            v_base: Array2::zeros(shape.clone()),
+            v_correction: v_hidden.map(|n| Array2::zeros((rows, n))),
+            v_gate: v_hidden.map(|_| Array2::zeros(shape.clone())),
+            v: Array2::zeros(shape.clone()),
+            a_hidden: Array2::zeros((rows, w_hidden)),
+            a: Array2::zeros(shape.clone()),
+            g_hidden: Array2::zeros((rows, g_hidden)),
+            g: Array2::zeros(shape.clone()),
+            kk_pre_norm: Array2::zeros(shape.clone()),
+            kk: Array2::zeros(shape.clone()),
+            k_mod: Array2::zeros(shape.clone()),
+            w: Array2::zeros(shape.clone()),
+            state_initial: Array4::zeros(state_shape),
+            y: Array2::zeros(shape.clone()),
+            normalized: Array2::zeros(shape.clone()),
+            correction: Array2::zeros(shape.clone()),
+            gated: Array2::zeros(shape.clone()),
+            output: Array2::zeros(shape.clone()),
+            v_first: Array2::zeros(shape),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_rwkv_time_mix_tape {
+    use super::*;
+    use ndarray::{Array1, Array2, Array4};
+
+    #[test]
+    fn tape_preserves_forward_shapes() {
+        let tape = RwkvTimeMixTape::new(
+            Array2::zeros((3, 8)),
+            Array1::zeros(8),
+            Array4::zeros((1, 2, 4, 4)),
+            5,
+            Some(6),
+            7,
+        );
+
+        assert_eq!(tape.xr.dim(), (3, 8));
+        assert_eq!(tape.w_hidden.dim(), (3, 5));
+        assert_eq!(tape.v_correction.as_ref().unwrap().dim(), (3, 6));
+        assert_eq!(tape.state_initial.dim(), (1, 2, 4, 4));
+        assert_eq!(tape.output.dim(), (3, 8));
+    }
+}

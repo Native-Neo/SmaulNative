@@ -1,7 +1,7 @@
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use serde_json::Value;
 
 pub const PAD: &str = "<pad>";
 pub const UNK: &str = "<unk>";
