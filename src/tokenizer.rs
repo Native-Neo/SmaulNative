@@ -25,8 +25,6 @@ pub struct Tokenizer {
 impl Tokenizer {
     pub fn from_vocab(vocab: Vec<String>) -> Self { Self::try_from_vocab(vocab).expect("invalid tokenizer vocabulary") }
 
-    /// Every special token must be present: they are looked up by name, and a
-    /// missing one would silently alias id 0 and corrupt encode/decode.
     pub fn try_from_vocab(vocab: Vec<String>) -> Result<Self, String> {
         if vocab.is_empty() { return Err("tokenizer vocabulary is empty".into()); }
         let mut map = HashMap::with_capacity(vocab.len());
@@ -37,16 +35,33 @@ impl Tokenizer {
             if !map.contains_key(special) { return Err(format!("tokenizer is missing required token '{special}'")); }
         }
         let id = |token: &str| map[token];
-        Ok(Self {
-            unk_id: id(UNK),
-            pad_id: id(PAD),
-            bos_id: id(BOS),
-            eos_id: id(EOS),
-            cap_id: id(CAP),
-            upper_id: id(UPPER),
-            vocab: map,
-            inverse: vocab,
-        })
+        Ok(Self { unk_id:id(UNK), pad_id:id(PAD), bos_id:id(BOS), eos_id:id(EOS), cap_id:id(CAP), upper_id:id(UPPER), vocab:map, inverse:vocab })
+    }
+
+    pub fn character_vocab(size: usize) -> Result<Self, String> {
+        if size < 6 { return Err("character tokenizer requires at least six vocabulary entries".into()); }
+        let mut vocab = vec![PAD.into(), UNK.into(), BOS.into(), EOS.into(), CAP.into(), UPPER.into()];
+        let mut add_range = |start: u32, end: u32| {
+            for code in start..=end {
+                if vocab.len() >= size { return; }
+                if let Some(ch) = char::from_u32(code) {
+                    let token = ch.to_string();
+                    if !vocab.contains(&token) { vocab.push(token); }
+                }
+            }
+        };
+        add_range(0x20, 0x7e);
+        add_range(0xa0, 0xff);
+        add_range(0x900, 0x97f);
+        add_range(0x370, 0x3ff);
+        add_range(0x400, 0x4ff);
+        add_range(0x1000, 0x109f);
+        add_range(0x3040, 0x30ff);
+        add_range(0x4e00, 0x9fff);
+        add_range(0x1f300, 0x1faff);
+        add_range(0, 0x10ffff);
+        if vocab.len() != size { return Err(format!("could not construct character vocabulary of size {size}")); }
+        Self::try_from_vocab(vocab)
     }
 
     pub fn from_vocab_file(path: impl AsRef<Path>) -> Result<Self, String> {
@@ -58,22 +73,14 @@ impl Tokenizer {
     pub fn from_json_file(path: impl AsRef<Path>) -> Result<Self, String> {
         let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
         let root: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        if let Some(version) = root.get("version").and_then(Value::as_u64) {
-            if version < 5 { return Err(format!("unsupported SmaulTokenizer version {version}")); }
-        }
+        if let Some(version) = root.get("version").and_then(Value::as_u64) { if version < 5 { return Err(format!("unsupported SmaulTokenizer version {version}")); } }
         let object = root.get("vocab").and_then(Value::as_object).ok_or("tokenizer JSON has no vocab object")?;
         let mut indexed = Vec::with_capacity(object.len());
-        for (token, id) in object {
-            indexed.push((id.as_u64().ok_or("vocabulary id is not an integer")? as usize, token.clone()));
-        }
+        for (token, id) in object { indexed.push((id.as_u64().ok_or("vocabulary id is not an integer")? as usize, token.clone())); }
         indexed.sort_by_key(|x| x.0);
-        for (expected, (actual, _)) in indexed.iter().enumerate() {
-            if expected != *actual { return Err("vocabulary ids are not contiguous".into()); }
-        }
+        for (expected, (actual, _)) in indexed.iter().enumerate() { if expected != *actual { return Err("vocabulary ids are not contiguous".into()); } }
         let tokenizer = Self::try_from_vocab(indexed.into_iter().map(|(_, token)| token).collect())?;
-        if let Some(id) = root.get("unk_id").and_then(Value::as_u64) {
-            if id as usize != tokenizer.unk_id { return Err("unk_id does not match vocab".into()); }
-        }
+        if let Some(id) = root.get("unk_id").and_then(Value::as_u64) { if id as usize != tokenizer.unk_id { return Err("unk_id does not match vocab".into()); } }
         Ok(tokenizer)
     }
 
@@ -111,9 +118,7 @@ impl Tokenizer {
                     if let Some(&id) = self.vocab.get(&unit) { out.push(id); }
                     else { for ch in unit.chars() { out.push(self.vocab.get(&ch.to_string()).copied().unwrap_or(self.unk_id)); } }
                 }
-            } else {
-                for ch in token.chars() { out.push(self.vocab.get(&ch.to_string()).copied().unwrap_or(self.unk_id)); }
-            }
+            } else { for ch in token.chars() { out.push(self.vocab.get(&ch.to_string()).copied().unwrap_or(self.unk_id)); } }
         }
         out
     }
@@ -127,10 +132,8 @@ impl Tokenizer {
             if token == CAP { capitalize = true; uppercase = false; continue; }
             if token == UPPER { uppercase = true; capitalize = false; continue; }
             if token == PAD || token == BOS || token == EOS { continue; }
-            if capitalize {
-                let mut chars = token.chars();
-                if let Some(first) = chars.next() { out.extend(first.to_uppercase()); out.extend(chars); }
-            } else if uppercase { out.push_str(&token.to_uppercase()); }
+            if capitalize { let mut chars = token.chars(); if let Some(first) = chars.next() { out.extend(first.to_uppercase()); out.extend(chars); } }
+            else if uppercase { out.push_str(&token.to_uppercase()); }
             else { out.push_str(token); }
             capitalize = false;
             uppercase = false;
@@ -139,62 +142,26 @@ impl Tokenizer {
     }
 }
 
-fn is_capitalized(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() { Some(first) => first.is_uppercase() && chars.any(char::is_lowercase), None => false }
-}
-
+fn is_capitalized(s: &str) -> bool { let mut chars = s.chars(); match chars.next() { Some(first) => first.is_uppercase() && chars.any(char::is_lowercase), None => false } }
 fn lexical_tokens(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
+    let mut out = Vec::new(); let mut current = String::new();
     let flush = |out: &mut Vec<String>, current: &mut String| { if !current.is_empty() { out.push(std::mem::take(current)); } };
     let multi = ["==", "!=", "<=", ">=", "=>", "->", "::", "//", "**", "&&", "||"];
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
+    let chars: Vec<char> = text.chars().collect(); let mut i = 0;
     while i < chars.len() {
         let ch = chars[i];
-        if ch.is_whitespace() {
-            flush(&mut out, &mut current);
-            let mut s = String::new(); s.push(ch); i += 1;
-            while i < chars.len() && chars[i].is_whitespace() { s.push(chars[i]); i += 1; }
-            out.push(s); continue;
-        }
+        if ch.is_whitespace() { flush(&mut out, &mut current); let mut s = String::new(); s.push(ch); i += 1; while i < chars.len() && chars[i].is_whitespace() { s.push(chars[i]); i += 1; } out.push(s); continue; }
         if ch.is_alphanumeric() || ('\u{0900}'..='\u{097F}').contains(&ch) || ch == '\'' { current.push(ch); i += 1; continue; }
         flush(&mut out, &mut current);
-        if i + 1 < chars.len() {
-            let pair = format!("{}{}", ch, chars[i + 1]);
-            if multi.contains(&pair.as_str()) { out.push(pair); i += 2; continue; }
-        }
+        if i + 1 < chars.len() { let pair = format!("{}{}", ch, chars[i + 1]); if multi.contains(&pair.as_str()) { out.push(pair); i += 2; continue; } }
         out.push(ch.to_string()); i += 1;
     }
-    flush(&mut out, &mut current);
-    out
+    flush(&mut out, &mut current); out
 }
-
-fn is_devanagari_mark(c: char) -> bool {
-    matches!(c,'\u{0900}'..='\u{0903}'|'\u{093A}'..='\u{093C}'|'\u{093E}'..='\u{094F}'|'\u{0951}'..='\u{0957}'|'\u{0962}'..='\u{0963}')
-}
-
+fn is_devanagari_mark(c: char) -> bool { matches!(c,'\u{0900}'..='\u{0903}'|'\u{093A}'..='\u{093C}'|'\u{093E}'..='\u{094F}'|'\u{0951}'..='\u{0957}'|'\u{0962}'..='\u{0963}') }
 fn devanagari_units(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if !('\u{0900}'..='\u{097F}').contains(&c) { out.push(c.to_string()); i += 1; continue; }
-        let mut unit = String::new(); unit.push(c); i += 1;
-        while i < chars.len() {
-            let c = chars[i];
-            if is_devanagari_mark(c) || c == '\u{200C}' || c == '\u{200D}' { unit.push(c); i += 1; continue; }
-            if c == '\u{094D}' {
-                unit.push(c); i += 1;
-                if i < chars.len() && ('\u{0900}'..='\u{097F}').contains(&chars[i]) { unit.push(chars[i]); i += 1; }
-                continue;
-            }
-            break;
-        }
-        out.push(unit);
-    }
+    let mut out = Vec::new(); let chars: Vec<char> = text.chars().collect(); let mut i = 0;
+    while i < chars.len() { let c = chars[i]; if !('\u{0900}'..='\u{097F}').contains(&c) { out.push(c.to_string()); i += 1; continue; } let mut unit = String::new(); unit.push(c); i += 1; while i < chars.len() { let c = chars[i]; if is_devanagari_mark(c) || c == '\u{200C}' || c == '\u{200D}' { unit.push(c); i += 1; continue; } if c == '\u{094D}' { unit.push(c); i += 1; if i < chars.len() && ('\u{0900}'..='\u{097F}').contains(&chars[i]) { unit.push(chars[i]); i += 1; } continue; } break; } out.push(unit); }
     out
 }
 
@@ -206,4 +173,5 @@ mod tests {
     #[test] fn encodes_known_words_and_case_markers() { assert_eq!(tokenizer().encode("Hello world!"), vec![4, 6, 8, 7, 9]); }
     #[test] fn decodes_case_markers() { assert_eq!(tokenizer().decode(&[4, 6, 8, 7]), "Hello world"); }
     #[test] fn json_round_trip() { let tokenizer=tokenizer(); let path=std::env::temp_dir().join("smaul-tokenizer.json"); tokenizer.save_json(&path).unwrap(); let loaded=Tokenizer::from_json_file(&path).unwrap(); assert_eq!(loaded.vocab_size(),tokenizer.vocab_size()); assert_eq!(loaded.encode("Hello world!"),tokenizer.encode("Hello world!")); let _=std::fs::remove_file(path); }
+    #[test] fn character_vocab_has_requested_size_and_core_scripts() { let tokenizer=Tokenizer::character_vocab(1024).unwrap(); assert_eq!(tokenizer.vocab_size(),1024); assert!(tokenizer.token_to_id("a").is_some()); assert!(tokenizer.token_to_id("न").is_some()); }
 }
