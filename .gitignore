@@ -4,5 +4,3 @@ cleaned_datasets
 SmaulNative
 .claude
 checklist
-target
-Cargo.lock
