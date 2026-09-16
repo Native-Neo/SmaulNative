@@ -15,7 +15,12 @@ pub fn packed_linear_fp8_cpu(x:&[f32],packed:&[u8],batch:usize,out_features:usiz
 #[cfg(feature="cuda")] pub fn packed_linear_cuda(x:&[f32],w:&[u8],s:&[f32],batch:usize,out_features:usize,in_features:usize,bits:u8)->Result<Vec<f32>,String>{if bits!=2&&bits!=4{return Err("CUDA packed kernel supports FP2/FP4".into())}let mut y=vec![0.0;batch*out_features];let e=unsafe{smaul_cuda_packed_linear(x.as_ptr(),w.as_ptr(),s.as_ptr(),y.as_mut_ptr(),batch as i32,out_features as i32,in_features as i32,bits as i32)};if e!=0{Err(format!("CUDA low-bit kernel failed: {e}"))}else{Ok(y)}}
 #[cfg(feature="hip")] pub fn packed_linear_hip(x:&[f32],w:&[u8],s:&[f32],batch:usize,out_features:usize,in_features:usize,bits:u8)->Result<Vec<f32>,String>{if bits!=2&&bits!=4{return Err("HIP packed kernel supports FP2/FP4".into())}let mut y=vec![0.0;batch*out_features];let e=unsafe{smaul_hip_packed_linear(x.as_ptr(),w.as_ptr(),s.as_ptr(),y.as_mut_ptr(),batch as i32,out_features as i32,in_features as i32,bits as i32)};if e!=0{Err(format!("HIP low-bit kernel failed: {e}"))}else{Ok(y)}}
 
-pub fn packed_linear(x:&[f32],packed:&[u8],scale:&[f32],batch:usize,out_features:usize,in_features:usize,bits:u8)->Result<Vec<f32>,String>{match bits{2|4=>{#[cfg(feature="cuda")] {return packed_linear_cuda(x,packed,scale,batch,out_features,in_features,bits)}#[cfg(feature="hip")] {return packed_linear_hip(x,packed,scale,batch,out_features,in_features,bits)}#[allow(unreachable_code)] packed_linear_cpu(x,packed,scale,batch,out_features,in_features,bits)},8=>packed_linear_fp8_cpu(x,packed,batch,out_features,in_features),_=>Err("bits must be 2, 4, or 8".into())}}
+pub fn packed_linear(x:&[f32],packed:&[u8],scale:&[f32],batch:usize,out_features:usize,in_features:usize,bits:u8)->Result<Vec<f32>,String>{match bits{2|4=>{
+#[cfg(feature="cuda")]
+{match packed_linear_cuda(x,packed,scale,batch,out_features,in_features,bits){Ok(y)=>return Ok(y),Err(_)=>{}}}
+#[cfg(feature="hip")]
+{match packed_linear_hip(x,packed,scale,batch,out_features,in_features,bits){Ok(y)=>return Ok(y),Err(_)=>{}}}
+packed_linear_cpu(x,packed,scale,batch,out_features,in_features,bits)},8=>packed_linear_fp8_cpu(x,packed,batch,out_features,in_features),_=>Err("bits must be 2, 4, or 8".into())}}
 
 #[cfg(test)]mod tests{use super::*;use crate::qat::{dequantize_weight,fake_quantize,quantize_weight,Bits};use ndarray::array;
 #[test]fn cpu_fp4_matches_shape(){let y=packed_linear_cpu(&[1.0,2.0],&[0x18],&[1.0],1,1,2,4).unwrap();assert_eq!(y.len(),1);assert!(y[0].is_finite())}
