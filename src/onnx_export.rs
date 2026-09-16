@@ -106,7 +106,7 @@ fn operator_set(domain: &str, version: i64) -> Vec<u8> {
 
 pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(), String> {
     let dir = input_dir.as_ref();
-    let output = output.as_ref();
+    let output_path = output.as_ref();
     let config_path = dir.join("config.json");
     let weights_path = dir.join("model.safetensors");
     let config = fs::read_to_string(&config_path)
@@ -163,8 +163,8 @@ pub fn export(input_dir: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<(
     bytes_field(&mut model, 8, &operator_set("", 19));
     bytes_field(&mut model, 8, &operator_set("smaulnative", 1));
 
-    fs::write(output, model)
-        .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
+    fs::write(output_path, model)
+        .map_err(|e| format!("failed to write {}: {e}", output_path.display()))?;
     Ok(())
 }
 
