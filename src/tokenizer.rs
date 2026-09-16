@@ -23,14 +23,21 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    pub fn from_vocab(vocab: Vec<String>) -> Self {
-        assert!(!vocab.is_empty());
+    pub fn from_vocab(vocab: Vec<String>) -> Self { Self::try_from_vocab(vocab).expect("invalid tokenizer vocabulary") }
+
+    /// Every special token must be present: they are looked up by name, and a
+    /// missing one would silently alias id 0 and corrupt encode/decode.
+    pub fn try_from_vocab(vocab: Vec<String>) -> Result<Self, String> {
+        if vocab.is_empty() { return Err("tokenizer vocabulary is empty".into()); }
         let mut map = HashMap::with_capacity(vocab.len());
         for (id, token) in vocab.iter().enumerate() {
-            assert!(map.insert(token.clone(), id).is_none(), "duplicate tokenizer vocabulary token: {token:?}");
+            if map.insert(token.clone(), id).is_some() { return Err(format!("duplicate tokenizer vocabulary token: {token:?}")); }
         }
-        let id = |token: &str| *map.get(token).unwrap_or(&0);
-        Self {
+        for special in [PAD, UNK, BOS, EOS, CAP, UPPER] {
+            if !map.contains_key(special) { return Err(format!("tokenizer is missing required token '{special}'")); }
+        }
+        let id = |token: &str| map[token];
+        Ok(Self {
             unk_id: id(UNK),
             pad_id: id(PAD),
             bos_id: id(BOS),
@@ -39,7 +46,7 @@ impl Tokenizer {
             upper_id: id(UPPER),
             vocab: map,
             inverse: vocab,
-        }
+        })
     }
 
     pub fn from_vocab_file(path: impl AsRef<Path>) -> Result<Self, String> {
@@ -63,10 +70,7 @@ impl Tokenizer {
         for (expected, (actual, _)) in indexed.iter().enumerate() {
             if expected != *actual { return Err("vocabulary ids are not contiguous".into()); }
         }
-        let tokenizer = Self::from_vocab(indexed.into_iter().map(|(_, token)| token).collect());
-        for special in [PAD, UNK, BOS, EOS, CAP, UPPER] {
-            if !tokenizer.vocab.contains_key(special) { return Err(format!("tokenizer is missing required token '{special}'")); }
-        }
+        let tokenizer = Self::try_from_vocab(indexed.into_iter().map(|(_, token)| token).collect())?;
         if let Some(id) = root.get("unk_id").and_then(Value::as_u64) {
             if id as usize != tokenizer.unk_id { return Err("unk_id does not match vocab".into()); }
         }

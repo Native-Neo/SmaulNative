@@ -26,33 +26,37 @@ fn visit_linears(model: &mut RwkvModel, mut f: impl FnMut(&mut Array2<f32>, bool
     }
 }
 
+fn refresh_packed(model: &mut RwkvModel) { for b in &mut model.rwkv_blocks { b.time_mix.refresh_quantized(); } }
+
+/// Replaces every weight with its quantized value and returns the full-precision
+/// masters. Pair with `restore_masters` around a forward/backward pass.
+pub fn quantize_in_place(model: &mut RwkvModel, bits: u8) -> Result<Vec<Array2<f32>>,String> {
+    if !matches!(bits,2|3|4|8) { return Err("RQT supports 2, 3, 4, or 8 bits".into()) }
+    let mut masters = Vec::new();
+    let mut error = None;
+    visit_linears(model, |w, io| {
+        if error.is_some() { return; }
+        masters.push(w.clone());
+        let source = if io { w.t().to_owned() } else { w.clone() };
+        match RealQuantLinear::new(source, None, bits) {
+            Ok(l) => { let d = l.dequantized(); *w = if io { d.t().to_owned() } else { d }; }
+            Err(e) => error = Some(e),
+        }
+    });
+    match error { Some(e) => { restore_masters(model, masters); Err(e) } None => { refresh_packed(model); Ok(masters) } }
+}
+
+pub fn restore_masters(model: &mut RwkvModel, masters: Vec<Array2<f32>>) {
+    let mut it = masters.into_iter();
+    visit_linears(model, |w, _| { if let Some(m) = it.next() { *w = m; } });
+    refresh_packed(model);
+}
+
 impl RqtModel {
     pub fn new(model: RwkvModel, bits: u8) -> Result<Self,String> { if !matches!(bits,2|3|4|8){return Err("RQT supports 2, 3, 4, or 8 bits".into())} Ok(Self{model,bits}) }
 
-    /// Replaces every weight with its quantized value and returns the masters.
-    pub fn take_masters(&mut self) -> Result<Vec<Array2<f32>>,String> {
-        let bits = self.bits;
-        let mut masters = Vec::new();
-        let mut error = None;
-        visit_linears(&mut self.model, |w, io| {
-            if error.is_some() { return; }
-            masters.push(w.clone());
-            let source = if io { w.t().to_owned() } else { w.clone() };
-            match RealQuantLinear::new(source, None, bits) {
-                Ok(l) => { let d = l.dequantized(); *w = if io { d.t().to_owned() } else { d }; }
-                Err(e) => error = Some(e),
-            }
-        });
-        match error { Some(e) => { self.restore_masters(masters); Err(e) } None => { self.refresh_packed(); Ok(masters) } }
-    }
-
-    pub fn restore_masters(&mut self, masters: Vec<Array2<f32>>) {
-        let mut it = masters.into_iter();
-        visit_linears(&mut self.model, |w, _| { if let Some(m) = it.next() { *w = m; } });
-        self.refresh_packed();
-    }
-
-    fn refresh_packed(&mut self) { for b in &mut self.model.rwkv_blocks { b.time_mix.refresh_quantized(); } }
+    pub fn take_masters(&mut self) -> Result<Vec<Array2<f32>>,String> { quantize_in_place(&mut self.model, self.bits) }
+    pub fn restore_masters(&mut self, masters: Vec<Array2<f32>>) { restore_masters(&mut self.model, masters) }
 
     /// Runs `f` with quantized weights in place, then restores the masters.
     fn with_quantized<T>(&mut self, f: impl FnOnce(&mut RwkvModel) -> T) -> Result<T,String> {

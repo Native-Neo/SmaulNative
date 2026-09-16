@@ -24,3 +24,35 @@ fn checkpoint_load_inference_and_training_roundtrip(){
     assert!(step.loss.is_finite());
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn a_loaded_checkpoint_can_still_be_trained() {
+    use ndarray::Array1;
+    use smaul_native::model_train_step::ModelTrainStep;
+    use smaul_native::rwkv_model::{RwkvModel, RwkvModelConfig};
+    use smaul_native::training::TrainStep;
+
+    let config = RwkvModelConfig::new(24, 16, 2, 8);
+    let model = RwkvModel::new(config.clone(), 3);
+    let path = std::env::temp_dir().join(format!("smaul-train-after-load-{}.safetensors", std::process::id()));
+    smaul_native::model_saver::save_model_safetensors(&model, &path).unwrap();
+
+    let mut loaded = RwkvModel::new(config, 99);
+    loaded.load_safetensors(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+
+    // every parameter must come back row-major, or the optimizer cannot read it
+    assert!(loaded.head.weight.as_slice().is_some());
+    for block in &loaded.rwkv_blocks {
+        for w in [&block.time_mix.receptance, &block.time_mix.key, &block.time_mix.value, &block.time_mix.output, &block.cmix.key, &block.cmix.value] {
+            assert!(w.as_slice().is_some(), "checkpoint produced a non-contiguous parameter");
+        }
+    }
+
+    let tokens = [1usize, 2, 3];
+    let targets = Array1::from_vec(vec![2, 3, 4]);
+    let step = ModelTrainStep::run(&loaded, &tokens, &targets);
+    let before = loaded.head.weight[[0, 0]];
+    TrainStep::new(&loaded, 1e-3).step(&mut loaded, &step.gradients);
+    assert_ne!(before, loaded.head.weight[[0, 0]]);
+}

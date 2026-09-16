@@ -6,6 +6,7 @@ use smaul_native::model_gradients::ModelGradients;
 use smaul_native::model_io::PretrainedModel;
 use smaul_native::model_train_step::ModelTrainStep;
 use smaul_native::sft_dataset::SftDataset;
+use smaul_native::rqt_model;
 use smaul_native::training::{OptimizerKind, TrainStep};
 use std::env;
 use std::fs;
@@ -28,6 +29,7 @@ struct Args {
     log_every: usize,
     resume: bool,
     optimizer: String,
+    rqt_bits: u8,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -63,27 +65,33 @@ fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|x| x == name)
 }
 
-fn parse() -> Args {
+fn number<T: std::str::FromStr>(args: &[String], name: &str, default: &str) -> Result<T, String> {
+    let raw = value(args, name, default);
+    raw.parse().map_err(|_| format!("{name} expects a number, got '{raw}'"))
+}
+
+fn parse() -> Result<Args, String> {
     let a: Vec<String> = env::args().collect();
     let dataset = value(&a, "--dataset", &value(&a, "--dataset-dir", "./datasets/train.jsonl"));
 
-    Args {
+    Ok(Args {
         model_dir: value(&a, "--model", "./SmaulNative").into(),
         dataset: dataset.into(),
         output_dir: value(&a, "--output-dir", &value(&a, "--output", "./SmaulNative-trained")).into(),
         mode: value(&a, "--mode", "pretrain"),
-        steps: value(&a, "--steps", "1000").parse().unwrap(),
-        ctx_len: value(&a, "--ctx-len", "1024").parse().unwrap(),
-        batch_size: value(&a, "--batch-size", "1").parse().unwrap(),
-        grad_accum: value(&a, "--grad-accum", "1").parse().unwrap(),
-        lr: value(&a, "--lr", "1e-4").parse().unwrap(),
-        min_lr: value(&a, "--min-lr", "0").parse().unwrap(),
-        warmup: value(&a, "--warmup", "0").parse().unwrap(),
-        save_every: value(&a, "--save-every", "100").parse().unwrap(),
-        log_every: value(&a, "--log-every", "10").parse().unwrap(),
+        steps: number(&a, "--steps", "1000")?,
+        ctx_len: number(&a, "--ctx-len", "1024")?,
+        batch_size: number(&a, "--batch-size", "1")?,
+        grad_accum: number(&a, "--grad-accum", "1")?,
+        lr: number(&a, "--lr", "1e-4")?,
+        min_lr: number(&a, "--min-lr", "0")?,
+        warmup: number(&a, "--warmup", "0")?,
+        save_every: number(&a, "--save-every", "100")?,
+        log_every: number(&a, "--log-every", "10")?,
         resume: has(&a, "--resume"),
         optimizer: value(&a, "--optimizer", "lion"),
-    }
+        rqt_bits: number(&a, "--rqt-bits", "0")?,
+    })
 }
 
 fn cosine_lr(base: f32, min: f32, step: usize, total: usize, warmup: usize) -> f32 {
@@ -131,6 +139,7 @@ fn require_file(path: &Path, label: &str) -> Result<(), String> {
 fn sft_step(
     model: &smaul_native::rwkv_model::RwkvModel,
     example: &smaul_native::sft_dataset::SftExample,
+    scale: f32,
 ) -> ModelTrainStep {
     let (logits, tape, state) = model.forward_with_tape_and_state(&example.input, None);
     let mut grad = Array2::zeros(logits.dim());
@@ -163,7 +172,7 @@ fn sft_step(
     }
 
     let inv = 1.0 / count.max(1) as f32;
-    grad.mapv_inplace(|x| x * inv);
+    grad.mapv_inplace(|x| x * inv * scale);
 
     ModelTrainStep::from_logits_gradient(
         model,
@@ -177,13 +186,16 @@ fn sft_step(
 }
 
 fn run() -> Result<(), String> {
-    let args = parse();
+    let args = parse()?;
 
     if !matches!(args.mode.as_str(), "pretrain" | "sft") {
         return Err("--mode must be pretrain or sft".into());
     }
     if !matches!(args.optimizer.as_str(), "lion" | "adamw") {
         return Err("--optimizer must be lion or adamw".into());
+    }
+    if !matches!(args.rqt_bits, 0 | 2 | 3 | 4 | 8) {
+        return Err("--rqt-bits must be 0 (off), 2, 3, 4 or 8".into());
     }
     if args.steps == 0 || args.ctx_len == 0 || args.batch_size == 0 || args.grad_accum == 0 {
         return Err("steps, ctx-len, batch-size and grad-accum must be > 0".into());
@@ -233,6 +245,15 @@ fn run() -> Result<(), String> {
         )?)
     };
 
+    if let Data::Sft(sft) = &data {
+        if sft.is_empty() {
+            return Err(format!(
+                "SFT dataset {} contains no usable examples",
+                args.dataset.display()
+            ));
+        }
+    }
+
     let state_path = args.output_dir.join("training_state.json");
     let mut state = if args.resume {
         load_state(&state_path)
@@ -261,6 +282,9 @@ fn run() -> Result<(), String> {
         "[TRAIN] mode={} optimizer={} steps={} batch={} grad_accum={} lr={}",
         args.mode, args.optimizer, args.steps, args.batch_size, args.grad_accum, args.lr
     );
+    if args.rqt_bits > 0 {
+        println!("[RQT] {}-bit quantized forward/backward, full-precision masters", args.rqt_bits);
+    }
 
     while state.step < args.steps {
         let lr = cosine_lr(args.lr, args.min_lr, state.step, args.steps, args.warmup);
@@ -269,21 +293,29 @@ fn run() -> Result<(), String> {
         let mut accumulated: Option<ModelGradients> = None;
         let mut loss_sum = 0.0;
         let mut samples = 0usize;
+        let window = (args.grad_accum * args.batch_size) as f32;
+        let scale = 1.0 / window;
 
         for _ in 0..args.grad_accum {
             for _ in 0..args.batch_size {
+                let masters = if args.rqt_bits > 0 {
+                    Some(rqt_model::quantize_in_place(&mut pretrained.model, args.rqt_bits)?)
+                } else {
+                    None
+                };
+
                 let step = if args.mode == "sft" {
-                    loop {
+                    let example = loop {
                         match &mut data {
-                            Data::Sft(sft) => {
-                                if let Some(ex) = sft.next_example()? {
-                                    break sft_step(&pretrained.model, &ex);
-                                }
-                                sft.reset();
-                            }
+                            Data::Sft(sft) => match sft.next_example()? {
+                                Some(ex) => break ex,
+                                None => sft.reset(),
+                            },
                             _ => unreachable!(),
                         }
-                    }
+                    };
+                    state.tokens += example.input.len();
+                    sft_step(&pretrained.model, &example, scale)
                 } else {
                     let batch = match data.next()? {
                         Some(batch) => batch,
@@ -295,15 +327,15 @@ fn run() -> Result<(), String> {
                     };
                     state.tokens += batch.input.len();
                     let targets = Array1::from_vec(batch.target);
-                    ModelTrainStep::run(&pretrained.model, &batch.input, &targets)
+                    ModelTrainStep::run_scaled(&pretrained.model, &batch.input, &targets, scale)
                 };
+
+                if let Some(m) = masters {
+                    rqt_model::restore_masters(&mut pretrained.model, m);
+                }
 
                 loss_sum += step.loss;
                 samples += 1;
-
-                if args.mode == "sft" {
-                    state.tokens += args.ctx_len;
-                }
 
                 if let Some(g) = &mut accumulated {
                     g.add_in_place(&step.gradients);
