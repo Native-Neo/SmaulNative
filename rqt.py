@@ -201,3 +201,28 @@ def prepare_mixed_rqt(model):
     model.cfg.rqt_mixed = True
     print(f"[RQT] mixed FP6/FP8 packed weights | {len(targets)} linear layers")
     return len(targets)
+
+
+def load_rqt_checkpoint(in_dir):
+    from pathlib import Path
+    from safetensors.torch import load_file
+    from rwkv_x_core import RWKVXConfig, RWKVXModel
+
+    in_dir = Path(in_dir)
+    cfg = RWKVXConfig.load(in_dir / "config.json")
+    sd = load_file(str(in_dir / "model.safetensors"))
+    model = RWKVXModel(cfg)
+    packed = [k[:-7] for k in sd if k.endswith(".packed")]
+    if not packed:
+        raise RuntimeError("RQT checkpoint has no packed weights")
+    for path in packed:
+        parent_path, name = path.rsplit(".", 1) if "." in path else ("", path)
+        parent = model.get_submodule(parent_path) if parent_path else model
+        linear = getattr(parent, name)
+        if cfg.rqt_mixed:
+            bits = FP8 if sd[path + ".packed"].dtype == torch.float8_e4m3fn else FP6
+        else:
+            bits = _bits(cfg.rqt_bits)
+        setattr(parent, name, RQTLinear(linear, bits))
+    model.load_state_dict(sd, strict=True)
+    return model
