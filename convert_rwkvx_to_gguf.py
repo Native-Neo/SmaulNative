@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a SmaulNative RWKV-X checkpoint to an FP32/FP16 GGUF container."""
+"""Convert a standard SmaulNative RWKV-X checkpoint to an FP32/FP16 GGUF container."""
 
 import argparse
 import json
@@ -44,7 +44,6 @@ def _write_metadata(writer, cfg, tokens, tokenizer):
     writer.add_bool("rwkv_x.is_moe", bool(cfg.get("is_moe", False)))
     writer.add_uint32("rwkv_x.num_experts", int(cfg.get("num_experts", 1)))
     writer.add_uint32("rwkv_x.num_experts_per_tok", int(cfg.get("num_experts_per_tok", 1)))
-
     writer.add_tokenizer_model("rwkv")
     writer.add_token_list(tokens)
     writer.add_token_scores([0.0] * len(tokens))
@@ -66,6 +65,9 @@ def convert(input_dir: Path, output: Path, dtype: str):
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     tokens, tokenizer = _load_tokenizer(tokenizer_path)
     state = load_file(str(weights_path), device="cpu")
+    packed = [name for name in state if name.endswith(".packed")]
+    if packed:
+        raise ValueError("RQT checkpoints cannot be exported to GGUF; convert a standard FP32/FP16/BF16 checkpoint")
 
     expected_vocab = int(cfg["vocab_size"])
     if len(tokens) != expected_vocab:
