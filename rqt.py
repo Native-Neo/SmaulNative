@@ -121,26 +121,27 @@ class RQTLion:
         self.model, self.lr, self.betas, self.weight_decay = model, lr, betas, weight_decay
         self.rqt_state, self.param_state = {}, {}
         self.params = [p for p in model.parameters() if p.requires_grad]
+        self.param_names = {id(p): name for name, p in model.named_parameters() if p.requires_grad}
 
     def _modules(self):
-        return [m for m in self.model.modules() if isinstance(m, RQTLinear)]
+        return [(name, module) for name, module in self.model.named_modules() if isinstance(module, RQTLinear)]
 
     def zero_grad(self, set_to_none=True):
-        for module in self._modules():
+        for _, module in self._modules():
             module.zero_grad()
         for param in self.params:
             param.grad = None
 
     @torch.no_grad()
     def clip_grad_norm(self, max_norm):
-        grads = [m._grad for m in self._modules() if m._grad is not None]
+        grads = [m._grad for _, m in self._modules() if m._grad is not None]
         grads += [p.grad.float() for p in self.params if p.grad is not None]
         if not grads:
             return torch.tensor(0.0)
         total = torch.stack([g.pow(2).sum() for g in grads]).sum().sqrt()
         if total > max_norm:
             scale = max_norm / (total + 1e-6)
-            for module in self._modules():
+            for _, module in self._modules():
                 if module._grad is not None:
                     module._grad.mul_(scale)
             for param in self.params:
@@ -151,7 +152,7 @@ class RQTLion:
     @torch.no_grad()
     def step(self):
         b1, b2 = self.betas
-        for module in self._modules():
+        for _, module in self._modules():
             if module._grad is None:
                 continue
             grad = module._grad
@@ -171,18 +172,41 @@ class RQTLion:
             param.add_(update, alpha=-self.lr)
 
     def state_dict(self):
-        return {"param_state": {str(i): v.cpu() for i, v in enumerate(self.param_state.values())}, "rqt_state": {str(i): v.cpu() for i, v in enumerate(self.rqt_state.values())}}
+        modules = {name: state.cpu() for name, module in self._modules() if (state := self.rqt_state.get(module)) is not None}
+        params = {self.param_names[id(param)]: state.cpu() for param, state in self.param_state.items() if id(param) in self.param_names}
+        return {"param_state": params, "rqt_state": modules}
 
     def load_state_dict(self, state):
-        rqt = list(state.get("rqt_state", {}).values())
-        params = list(state.get("param_state", {}).values())
-        modules = self._modules()
-        if len(rqt) > len(modules):
-            raise ValueError("RQT optimizer state has too many entries")
-        if len(params) > len(self.params):
-            raise ValueError("optimizer state has too many parameter entries")
-        self.rqt_state = {module: value.to(module.packed.device, dtype=torch.float32) for module, value in zip(modules, rqt)}
-        self.param_state = {param: value.to(param.device, dtype=torch.float32) for param, value in zip(self.params, params)}
+        rqt_state = state.get("rqt_state", {})
+        param_state = state.get("param_state", {})
+        modules = dict(self._modules())
+        named_params = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
+        if all(key.isdigit() for key in rqt_state) and rqt_state:
+            rqt_values = list(rqt_state.values())
+            if len(rqt_values) > len(modules):
+                raise ValueError("RQT optimizer state has too many entries")
+            rqt_state = {name: value for (name, _), value in zip(modules.items(), rqt_values)}
+        if all(key.isdigit() for key in param_state) and param_state:
+            param_values = list(param_state.values())
+            if len(param_values) > len(named_params):
+                raise ValueError("optimizer state has too many parameter entries")
+            param_state = {name: value for (name, _), value in zip(named_params.items(), param_values)}
+        self.rqt_state = {}
+        for name, value in rqt_state.items():
+            if name not in modules:
+                raise ValueError(f"unknown RQT optimizer module: {name}")
+            module = modules[name]
+            if tuple(value.shape) != tuple(module.unpack().shape):
+                raise ValueError(f"invalid RQT optimizer state shape for {name}")
+            self.rqt_state[module] = value.to(module.packed.device, dtype=torch.float32)
+        self.param_state = {}
+        for name, value in param_state.items():
+            if name not in named_params:
+                raise ValueError(f"unknown optimizer parameter: {name}")
+            param = named_params[name]
+            if tuple(value.shape) != tuple(param.shape):
+                raise ValueError(f"invalid optimizer state shape for {name}")
+            self.param_state[param] = value.to(param.device, dtype=torch.float32)
 
 
 def _replace(root, name, bits):
