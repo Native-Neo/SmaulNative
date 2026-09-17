@@ -106,9 +106,7 @@ class RQTLinear(nn.Module):
 
     @torch.no_grad()
     def _replace_weight(self, weight):
-        packed, scale = _encode(weight.detach(), self.bits)
-        self.packed.resize_(packed.shape).copy_(packed)
-        self.scale.resize_(scale.shape).copy_(scale)
+        self.packed, self.scale = _encode(weight.detach(), self.bits)
 
     def unpack_rows(self, start, end, dtype=torch.float32):
         count = (end - start) * self.in_features
