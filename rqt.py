@@ -215,14 +215,12 @@ def load_rqt_checkpoint(in_dir):
     packed = [k[:-7] for k in sd if k.endswith(".packed")]
     if not packed:
         raise RuntimeError("RQT checkpoint has no packed weights")
+    mixed = any(sd[path + ".packed"].dtype == torch.float8_e4m3fn for path in packed)
     for path in packed:
         parent_path, name = path.rsplit(".", 1) if "." in path else ("", path)
         parent = model.get_submodule(parent_path) if parent_path else model
         linear = getattr(parent, name)
-        if cfg.rqt_mixed:
-            bits = FP8 if sd[path + ".packed"].dtype == torch.float8_e4m3fn else FP6
-        else:
-            bits = _bits(cfg.rqt_bits)
+        bits = FP8 if mixed and sd[path + ".packed"].dtype == torch.float8_e4m3fn else _bits(cfg.rqt_bits)
         setattr(parent, name, RQTLinear(linear, bits))
     model.load_state_dict(sd, strict=True)
     return model
