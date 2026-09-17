@@ -131,6 +131,23 @@ class RQTLion:
             param.grad = None
 
     @torch.no_grad()
+    def clip_grad_norm(self, max_norm):
+        grads = [m._grad for m in self._modules() if m._grad is not None]
+        grads += [p.grad.float() for p in self.params if p.grad is not None]
+        if not grads:
+            return torch.tensor(0.0)
+        total = torch.stack([g.pow(2).sum() for g in grads]).sum().sqrt()
+        if total > max_norm:
+            scale = max_norm / (total + 1e-6)
+            for module in self._modules():
+                if module._grad is not None:
+                    module._grad.mul_(scale)
+            for param in self.params:
+                if param.grad is not None:
+                    param.grad.mul_(scale)
+        return total
+
+    @torch.no_grad()
     def step(self):
         b1, b2 = self.betas
         for module in self._modules():
@@ -138,18 +155,19 @@ class RQTLion:
                 continue
             grad = module._grad
             avg = self.rqt_state.setdefault(module, torch.zeros_like(grad, dtype=torch.float32))
-            avg.mul_(b2).add_(grad, alpha=1 - b2)
             update = avg.mul(b1).add_(grad, alpha=1 - b1).sign() * self.lr
+            avg.mul_(b2).add_(grad, alpha=1 - b2)
             module.step(update, self.lr * self.weight_decay)
         for param in self.params:
             if param.grad is None:
                 continue
             grad = param.grad.float()
             avg = self.param_state.setdefault(param, torch.zeros_like(param, dtype=torch.float32))
+            update = avg.mul(b1).add_(grad, alpha=1 - b1).sign()
             avg.mul_(b2).add_(grad, alpha=1 - b2)
             if self.weight_decay:
                 param.mul_(1 - self.lr * self.weight_decay)
-            param.add_(avg.mul(b1).add_(grad, alpha=1 - b1).sign(), alpha=-self.lr)
+            param.add_(update, alpha=-self.lr)
 
     def state_dict(self):
         return {"param_state": {str(i): v.cpu() for i, v in enumerate(self.param_state.values())}, "rqt_state": {str(i): v.cpu() for i, v in enumerate(self.rqt_state.values())}}
