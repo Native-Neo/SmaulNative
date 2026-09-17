@@ -140,3 +140,25 @@ def test_optimizer_selection_keeps_rqt_isolated():
     Args.rqt = True
     rqt = train._build_optimizer(Args(), torch.nn.Linear(4, 2))
     assert isinstance(rqt, train.RQTLion)
+
+
+def test_build_model_reuses_compatible_checkpoint(tmp_path, monkeypatch):
+    (tmp_path / "model.safetensors").write_bytes(b"checkpoint")
+    (tmp_path / "config.json").write_text(
+        '{"vocab_size":65536,"n_embd":832,"n_layer":17,"n_moba_layer":3,'
+        '"head_size":64,"ctx_len_hint":1024,"qat_bits":0,"rqt_bits":6,'
+        '"quantization_bits":0,"rqt_mixed":false}'
+    )
+
+    class Args:
+        output_dir = str(tmp_path)
+        tokenizer_vocab_size = 65536
+        n_embd = 832
+        n_layer = 17
+        n_moba_layer = 3
+        head_size = 64
+        ctx_len = 1024
+
+    sentinel = object()
+    monkeypatch.setattr(train.RWKVXModel, "from_pretrained", classmethod(lambda cls, path: sentinel))
+    assert train._build_model(Args()) is sentinel
