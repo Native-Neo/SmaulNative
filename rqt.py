@@ -92,6 +92,25 @@ def _native_rqt():
     return _RQT_EXT
 
 
+class _RQTLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, packed, scale, in_features, out_features, bits, module):
+        ext = _native_rqt()
+        x2 = x.reshape(-1, in_features).contiguous()
+        ctx.save_for_backward(x2, packed, scale)
+        ctx.in_features, ctx.out_features, ctx.bits, ctx.module, ctx.shape = in_features, out_features, bits, module, x.shape
+        return ext.rqt_linear_forward(x2, packed, scale, in_features, out_features, bits).reshape(*x.shape[:-1], out_features)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, packed, scale = ctx.saved_tensors
+        grad = grad_output.reshape(-1, ctx.out_features).contiguous().float()
+        ext = _native_rqt()
+        grad_x = ext.rqt_linear_backward_input(grad, packed, scale, ctx.in_features, ctx.out_features, ctx.bits).reshape(ctx.shape)
+        ctx.module._grad = ext.rqt_linear_backward_weight(x, grad, ctx.in_features, ctx.out_features)
+        return grad_x, None, None, None, None, None, None
+
+
 class RQTLinear(nn.Module):
     def __init__(self, linear, bits):
         super().__init__(); self.bits = _bits(bits); self.in_features, self.out_features = linear.in_features, linear.out_features
@@ -120,6 +139,9 @@ class RQTLinear(nn.Module):
         self._grad[start:start + grad.shape[0]].copy_(grad.float()); return grad
 
     def forward(self, x):
+        ext = _native_rqt()
+        if ext is not None and ext is not False and self.bits in (FP4, FP6) and x.device.type == "cpu" and x.dtype == torch.float32 and x.shape[-1] == self.in_features:
+            return _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self)
         weight = self._weight_for_forward().detach().requires_grad_(True); weight.register_hook(lambda grad: self._capture_grad(0, grad))
         out = F.linear(x, weight, None); return out if self.bias is None else out + self.bias
 
@@ -217,14 +239,14 @@ def _replace(root, name, bits):
 def prepare_rqt(model, bits=FP6):
     bits = _bits(bits); root = getattr(model, "_orig_mod", model); targets = [(name, module) for name, module in root.named_modules() if isinstance(module, (nn.Linear, RQTLinear))]
     for name, _ in reversed(targets): _replace(root, name, bits)
-    model.cfg.rqt_bits = bits; print(f"[RQT] FP{bits} cached weights | {len(targets)} linear layers | block_rows={_BLOCK_ROWS}"); return len(targets)
+    model.cfg.rqt_bits = bits; print(f"[RQT] FP{bits} packed compute | {len(targets)} linear layers | block_rows={_BLOCK_ROWS}"); return len(targets)
 
 
 def prepare_mixed_rqt(model):
     root = getattr(model, "_orig_mod", model); targets = [(name, module) for name, module in root.named_modules() if isinstance(module, (nn.Linear, RQTLinear))]
     for name, _ in reversed(targets):
         bits = FP8 if name == "head" or ".att." in f".{name}." else FP4 if ".ffn." in f".{name}." else FP6; _replace(root, name, bits)
-    model.cfg.rqt_mixed = True; print(f"[RQT] mixed FP4/FP6/FP8 cached weights | {len(targets)} linear layers | block_rows={_BLOCK_ROWS}"); return len(targets)
+    model.cfg.rqt_mixed = True; print(f"[RQT] mixed FP4/FP6/FP8 packed compute where supported | {len(targets)} linear layers | block_rows={_BLOCK_ROWS}"); return len(targets)
 
 
 def load_rqt_checkpoint(in_dir):
