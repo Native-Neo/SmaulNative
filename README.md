@@ -1,15 +1,15 @@
 # SmaulNative
 
-A compact RWKV-X training and inference repository with English-Hindi data tooling, Mixture of Experts (MoE) upcycling, low-bit floating-point QAT, and native CPU acceleration.
+A compact RWKV-X training and inference repository with English-Hindi data tooling, Mixture of Experts (MoE) upcycling, real packed low-bit RQT, and native CPU acceleration.
 
 ## Overview
 
 - **RWKV-X Architecture**: RWKV-7 TimeMix blocks with interleaved MOBA attention (`rwkv_x_core.py`).
 - **Native CPU Backend**: C++ WKV forward/backward kernels plus CPU-specific training support (`cpu/`).
 - **Bilingual Tokenizer**: A custom word/character tokenizer with Devanagari grapheme fallback, case markers, and special tokens (`tokenizer.py`).
-- **Unified Training Pipeline**: `train.py` supports pretraining, SFT, streaming resume, QAT, and router-only MoE fine-tuning.
+- **Unified Training Pipeline**: `train.py` supports pretraining, SFT, streaming resume, RQT, and router-only MoE fine-tuning.
 - **MoE Upcycling**: Merge multiple dense domain checkpoints into a sparse Mixture of Experts model (`merge_moe.py`).
-- **Low-bit floating-point QAT**: `qat.py` supports FP2, FP4, and FP8 modes. FP2/FP4 weights can be physically packed for export and CPU inference; QAT keeps FP32 master weights for training stability.
+- **RQT**: Real Quantized Training with physically packed FP4/FP6 weights and native FP8 storage. RQT does not keep FP32 master weights for RQT linear layers.
 
 ## Project Layout
 
@@ -22,12 +22,12 @@ A compact RWKV-X training and inference repository with English-Hindi data tooli
 ├── dataset.py         # Dataset loaders
 ├── download.py        # Dataset downloader
 ├── merge_moe.py       # Dense-to-MoE upcycling
-├── qat.py             # Low-bit floating-point QAT and packed weights
+├── rqt.py             # Real packed FP4/FP6/FP8 training
 ├── rwkv_x_core.py     # Core RWKV-X model definition
 ├── stream_data.py     # Remote Hugging Face Parquet streaming
 ├── syntheticdata.py   # Synthetic bilingual data generator
 ├── tokenizer.py       # Custom bilingual tokenizer
-└── train.py           # Pretraining, SFT, and MoE router training
+└── train.py           # Pretraining, SFT, RQT, and MoE router training
 ```
 
 ## Quickstart
@@ -50,26 +50,46 @@ python download.py
 # 2. Train a tokenizer
 python tokenizer.py train --fromdataset ./datasets --output ./SmaulNative/tokenizer.json --vocab-size 32768
 
-# 3. Pretraining
-python train.py --mode pretrain --dataset_dir ./datasets --output_dir ./SmaulNative --ctx_len 256 \
+# 3. Normal pretraining
+python train.py --cpu --mode pretrain --dataset_dir ./datasets --output_dir ./SmaulNative --ctx_len 256 \
     --tokenizer_path ./SmaulNative/tokenizer.json
-
-# 4. SFT + low-bit floating-point QAT
-python train.py --mode sft --dataset_dir ./datasets --output_dir ./SmaulNative-SFT \
-    --tokenizer_path ./SmaulNative/tokenizer.json --qt 4 --qat_export_dir ./SmaulNative-fp4
 ```
-
-`--qt 2`, `--qt 4`, and `--qt 8` select FP2, FP4, and FP8 respectively. The `--qt` compatibility option is translated by `qat.py`; `train.py --qat` remains available as the generic QAT switch.
 
 If `tokenizer.json` is absent, `train.py` can train it automatically. Supplying an existing tokenizer is recommended for reproducible training and resume runs.
 
-### 3. CPU Training
+## RQT Training
+
+RQT means **Real Quantized Training**: the model trains from the physically quantized representation rather than a fake-quantized view of an FP32 master parameter.
+
+```bash
+# Pure FP4
+python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 4
+
+# Pure FP6
+python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 6
+
+# Pure FP8
+python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 8
+
+# Mixed FP4/FP6/FP8
+python train.py --cpu --mode pretrain --dataset_dir ./datasets --mixed_rqt
+```
+
+Pure RQT applies the selected precision to every `nn.Linear`. Mixed RQT uses FP8 for attention/head projections, FP4 for FFN projections, and FP6 for the remaining linear layers.
+
+RQT packs two FP4 codes per byte and four FP6 codes per three bytes. FP8 uses PyTorch `float8_e4m3fn`. RQT Lion keeps its optimizer averages in FP32, while the model weights themselves remain packed after every optimizer step.
+
+The current implementation decodes the packed weights to FP32 for the matrix multiplication. This gives genuine packed model storage and genuine quantized forward weights, but it is not yet a dedicated FP4/FP6 CPU GEMM kernel.
+
+See [docs/rqt.md](docs/rqt.md) for the implementation details and resume format.
+
+## CPU Training
 
 The CPU backend uses the native WKV implementation automatically when `--cpu` is enabled:
 
 ```bash
 SMAUL_CPU_THREADS=2 python train.py --cpu --mode pretrain --dataset_dir ./datasets \
-    --output_dir ./SmaulNative --optimizer lion
+    --output_dir ./SmaulNative
 ```
 
 The native extension is compiled for the host CPU with `-march=native`; do not copy a built extension between different CPU architectures. On an i3-3220, 2 threads are recommended over all 4 hardware threads because Hyper-Threading can reduce throughput for this workload.
@@ -84,13 +104,9 @@ For CPU training, start with a small `--ctx_len`. MOBA attention uses causal sca
 
 `--stream_dataset` can use `hindi`, `english`, `openthoughts`, or `all` to stream filtered Parquet records directly from Hugging Face without downloading the dataset first. Streaming checkpoints preserve the dataset/file/row position and the partially filled token buffer.
 
-## Resume and QAT
+## Resume
 
-Training checkpoints preserve model weights, optimizer state, RNG state, dataset position, token count, and streaming buffer state. Re-running the same training command resumes from the saved checkpoint. `--new_data` resets the dataset position while keeping the model and optimizer state.
-
-QAT supports FP2, FP4, and FP8 floating-point modes. FP2 and FP4 use physically packed sub-byte weight storage when converted/exported. QAT training retains FP32 master parameters and uses fake quantization in the forward pass; packed FP2/FP4 weights are intended for the converted/exported inference path. FP8 uses PyTorch's `float8_e4m3fn` representation where supported.
-
-For FP2/FP4 CPU inference, the packed path processes weights in chunks to avoid materializing the complete low-bit weight matrix as FP32 at once. This reduces temporary memory use, but it is not a hardware FP2/FP4 GEMM kernel; performance should be benchmarked against the normal FP32 path.
+Training checkpoints preserve model weights, optimizer state, RNG state, dataset position, token count, and streaming buffer state. Re-running the same training command resumes from the saved checkpoint. RQT optimizer state is keyed by stable module and parameter names and validates tensor shapes during restore.
 
 ## Testing
 
@@ -98,6 +114,12 @@ Run the optimization and model tests with:
 
 ```bash
 python3 tests/test_optimizations.py
+```
+
+For RQT specifically:
+
+```bash
+python3 -m pytest tests/test_rqt.py
 ```
 
 The native WKV regression test is:
