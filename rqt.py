@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 FP4, FP6, FP8 = 4, 6, 8
 _LEVEL_CACHE = {}
+_BLOCK_ROWS = 256
 
 
 def _bits(bits):
@@ -18,9 +19,8 @@ def _levels(bits, device, dtype):
     if bits == FP8:
         raise ValueError("FP8 uses native torch.float8_e4m3fn")
     key = (bits, device.type, device.index, dtype)
-    cached = _LEVEL_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if key in _LEVEL_CACHE:
+        return _LEVEL_CACHE[key]
     ebits, mbits = (2, 1) if bits == FP4 else (3, 2)
     bias = (1 << (ebits - 1)) - 1
     values = []
@@ -30,9 +30,17 @@ def _levels(bits, device, dtype):
         sign = -1.0 if code >> (bits - 1) else 1.0
         value = (mant / (1 << mbits)) * 2 ** (1 - bias) if exp == 0 else (1 + mant / (1 << mbits)) * 2 ** (exp - bias)
         values.append(sign * value)
-    levels = torch.tensor(values, device=device, dtype=dtype)
-    _LEVEL_CACHE[key] = levels
-    return levels
+    out = torch.tensor(values, device=device, dtype=dtype)
+    _LEVEL_CACHE[key] = out
+    return out
+
+
+def _packed_row_bytes(in_features, bits):
+    if bits == FP4:
+        return (in_features + 1) // 2
+    if bits == FP6:
+        return (in_features + 3) // 4 * 3
+    return in_features
 
 
 def _pack(codes, bits):
@@ -71,12 +79,13 @@ def _unpack(packed, bits, count):
 
 
 def _encode(weight, bits):
+    weight = weight.float()
     if bits == FP8:
         return _pack(weight, bits), torch.empty(0, dtype=torch.float32, device=weight.device)
     levels = _levels(bits, weight.device, weight.dtype)
     scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(torch.finfo(weight.dtype).eps) / levels.abs().max()
     codes = (weight / scale).unsqueeze(-1).sub(levels).abs().argmin(-1).to(torch.uint8)
-    return _pack(codes.flatten(), bits), scale.squeeze(1).float()
+    return _pack(codes.flatten(), bits), scale.squeeze(1)
 
 
 class RQTLinear(nn.Module):
@@ -91,32 +100,56 @@ class RQTLinear(nn.Module):
         self._grad = None
         self._replace_weight(linear.weight)
 
+    def _row_slice(self, start, end):
+        stride = _packed_row_bytes(self.in_features, self.bits)
+        return slice(start * stride, end * stride)
+
     @torch.no_grad()
     def _replace_weight(self, weight):
-        self.packed, self.scale = _encode(weight.detach().float(), self.bits)
+        packed, scale = _encode(weight.detach(), self.bits)
+        self.packed.resize_(packed.shape).copy_(packed)
+        self.scale.resize_(scale.shape).copy_(scale)
+
+    def unpack_rows(self, start, end, dtype=torch.float32):
+        count = (end - start) * self.in_features
+        packed = self.packed[self._row_slice(start, end)]
+        if self.bits == FP8:
+            return packed.to(dtype).reshape(end - start, self.in_features)
+        codes = _unpack(packed, self.bits, count).long()
+        levels = _levels(self.bits, packed.device, dtype)[codes]
+        return (levels * self.scale[start:end].to(dtype)[:, None]).reshape(end - start, self.in_features)
 
     def unpack(self, dtype=torch.float32):
-        if self.bits == FP8:
-            return self.packed.to(dtype)
-        codes = _unpack(self.packed, self.bits, self.in_features * self.out_features).long()
-        levels = _levels(self.bits, self.packed.device, dtype)[codes]
-        return (levels * self.scale.to(dtype)[:, None]).reshape(self.out_features, self.in_features)
+        return self.unpack_rows(0, self.out_features, dtype)
 
-    def _capture_grad(self, grad):
-        self._grad = grad.detach().float()
+    def _capture_grad(self, start, grad):
+        if self._grad is None:
+            self._grad = torch.empty(self.out_features, self.in_features, dtype=torch.float32, device=grad.device)
+        self._grad[start:start + grad.shape[0]].copy_(grad.float())
         return grad
 
     def forward(self, x):
-        weight = self.unpack(torch.float32).detach().requires_grad_(True)
-        weight.register_hook(self._capture_grad)
-        return F.linear(x, weight, self.bias)
+        outputs = []
+        for start in range(0, self.out_features, _BLOCK_ROWS):
+            end = min(start + _BLOCK_ROWS, self.out_features)
+            weight = self.unpack_rows(start, end, torch.float32).detach().requires_grad_(True)
+            weight.register_hook(lambda grad, start=start: self._capture_grad(start, grad))
+            outputs.append(F.linear(x, weight, None))
+        out = torch.cat(outputs, dim=-1)
+        return out if self.bias is None else out + self.bias
 
     @torch.no_grad()
     def step(self, update, decay):
-        weight = self.unpack(torch.float32)
-        if decay:
-            weight.mul_(1 - decay)
-        self._replace_weight(weight - update)
+        if update.shape != (self.out_features, self.in_features):
+            raise ValueError("invalid RQT update shape")
+        for start in range(0, self.out_features, _BLOCK_ROWS):
+            end = min(start + _BLOCK_ROWS, self.out_features)
+            weight = self.unpack_rows(start, end, torch.float32)
+            if decay:
+                weight.mul_(1 - decay)
+            packed, scale = _encode(weight - update[start:end], self.bits)
+            self.packed[self._row_slice(start, end)].copy_(packed)
+            self.scale[start:end].copy_(scale)
         self._grad = None
 
     def zero_grad(self):
@@ -164,7 +197,7 @@ class RQTLion:
                 continue
             grad = module._grad
             avg = self.rqt_state.setdefault(module, torch.zeros_like(grad, dtype=torch.float32))
-            update = avg.mul(b1).add_(grad, alpha=1 - b1).sign() * self.lr
+            update = avg.mul(b1).add(grad, alpha=1 - b1).sign() * self.lr
             avg.mul_(b2).add_(grad, alpha=1 - b2)
             module.step(update, self.lr * self.weight_decay)
         for param in self.params:
@@ -181,42 +214,26 @@ class RQTLion:
     def state_dict(self):
         modules = {name: state.cpu() for name, module in self._modules() if (state := self.rqt_state.get(module)) is not None}
         params = {self.param_names[id(param)]: state.cpu() for param, state in self.param_state.items() if id(param) in self.param_names}
-        return {
-            "version": 2,
-            "lr": self.lr,
-            "betas": self.betas,
-            "weight_decay": self.weight_decay,
-            "param_state": params,
-            "rqt_state": modules,
-        }
+        return {"version": 3, "lr": self.lr, "betas": self.betas, "weight_decay": self.weight_decay, "param_state": params, "rqt_state": modules}
 
     def load_state_dict(self, state):
-        if "lr" in state:
-            self.lr = float(state["lr"])
-        if "betas" in state:
-            self.betas = tuple(state["betas"])
-        if "weight_decay" in state:
-            self.weight_decay = float(state["weight_decay"])
-        rqt_state = state.get("rqt_state", {})
-        param_state = state.get("param_state", {})
+        self.lr = float(state.get("lr", self.lr))
+        self.betas = tuple(state.get("betas", self.betas))
+        self.weight_decay = float(state.get("weight_decay", self.weight_decay))
         modules = dict(self._modules())
         named_params = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
+        rqt_state = state.get("rqt_state", {})
+        param_state = state.get("param_state", {})
         if all(key.isdigit() for key in rqt_state) and rqt_state:
-            rqt_values = list(rqt_state.values())
-            if len(rqt_values) > len(modules):
-                raise ValueError("RQT optimizer state has too many entries")
-            rqt_state = {name: value for (name, _), value in zip(modules.items(), rqt_values)}
+            rqt_state = {name: value for (name, _), value in zip(modules.items(), rqt_state.values())}
         if all(key.isdigit() for key in param_state) and param_state:
-            param_values = list(param_state.values())
-            if len(param_values) > len(named_params):
-                raise ValueError("optimizer state has too many parameter entries")
-            param_state = {name: value for (name, _), value in zip(named_params.items(), param_values)}
+            param_state = {name: value for (name, _), value in zip(named_params.items(), param_state.values())}
         self.rqt_state = {}
         for name, value in rqt_state.items():
             if name not in modules:
                 raise ValueError(f"unknown RQT optimizer module: {name}")
             module = modules[name]
-            if tuple(value.shape) != tuple(module.unpack().shape):
+            if tuple(value.shape) != (module.out_features, module.in_features):
                 raise ValueError(f"invalid RQT optimizer state shape for {name}")
             self.rqt_state[module] = value.to(module.packed.device, dtype=torch.float32)
         self.param_state = {}
@@ -238,7 +255,7 @@ def _replace(root, name, bits):
     if isinstance(current, RQTLinear):
         if current.bits == bits:
             return
-        weight = current.unpack(torch.float32)
+        weight = current.unpack()
         current.bits = bits
         current.bit_width.fill_(bits)
         current._replace_weight(weight)
@@ -253,7 +270,7 @@ def prepare_rqt(model, bits=FP6):
     for name, _ in reversed(targets):
         _replace(root, name, bits)
     model.cfg.rqt_bits = bits
-    print(f"[RQT] FP{bits} packed weights | {len(targets)} linear layers")
+    print(f"[RQT] FP{bits} tiled weights | {len(targets)} linear layers | block_rows={_BLOCK_ROWS}")
     return len(targets)
 
 
@@ -264,7 +281,7 @@ def prepare_mixed_rqt(model):
         bits = FP8 if name == "head" or ".att." in f".{name}." else FP4 if ".ffn." in f".{name}." else FP6
         _replace(root, name, bits)
     model.cfg.rqt_mixed = True
-    print(f"[RQT] mixed FP4/FP6/FP8 packed weights | {len(targets)} linear layers")
+    print(f"[RQT] mixed FP4/FP6/FP8 tiled weights | {len(targets)} linear layers | block_rows={_BLOCK_ROWS}")
     return len(targets)
 
 
@@ -280,14 +297,13 @@ def load_rqt_checkpoint(in_dir):
     packed = [k[:-7] for k in sd if k.endswith(".packed")]
     if not packed:
         raise RuntimeError("RQT checkpoint has no packed weights")
-    mixed = any(sd[path + ".packed"].dtype == torch.float8_e4m3fn for path in packed) or any(path + ".bit_width" in sd for path in packed)
     for path in packed:
         parent_path, name = path.rsplit(".", 1) if "." in path else ("", path)
         parent = model.get_submodule(parent_path) if parent_path else model
         linear = getattr(parent, name)
-        if mixed and path + ".bit_width" in sd:
+        if path + ".bit_width" in sd:
             bits = _bits(int(sd[path + ".bit_width"].item()))
-        elif mixed and sd[path + ".packed"].dtype == torch.float8_e4m3fn:
+        elif sd[path + ".packed"].dtype == torch.float8_e4m3fn:
             bits = FP8
         else:
             bits = _bits(cfg.rqt_bits)
