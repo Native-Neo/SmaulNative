@@ -70,4 +70,59 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
   });
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("lion_step", &lion_step, "Fused Lion update with AVX"); m.def("rqt_requant_step", &rqt_requant_step, "Fused packed RQT requantization"); }
+void rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::Tensor scale, int64_t in_features, int64_t out_features, int64_t bits) {
+  TORCH_CHECK(x.device().is_cpu() && packed.device().is_cpu() && scale.device().is_cpu());
+  TORCH_CHECK(x.dtype() == torch::kFloat32 && packed.dtype() == torch::kUInt8 && scale.dtype() == torch::kFloat32);
+  TORCH_CHECK(x.dim() == 2 && x.size(1) == in_features && packed.is_contiguous() && scale.is_contiguous() && x.is_contiguous());
+  TORCH_CHECK(bits == 4 || bits == 6);
+  auto out = torch::empty({x.size(0), out_features}, x.options());
+  const auto rows = x.size(0); const auto n = in_features; const auto m = out_features;
+  const auto* xx = x.data_ptr<float>(); const auto* pp = packed.data_ptr<uint8_t>(); const auto* ss = scale.data_ptr<float>(); auto* yy = out.data_ptr<float>();
+  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3;
+  at::parallel_for(0, rows * m, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t task = begin; task < end; ++task) {
+      const int64_t r = task / m, o = task - r * m; const uint8_t* row = pp + o * stride; const float s = ss[o]; float acc = 0.0f;
+      for (int64_t i = 0; i < n; ++i) acc += xx[r * n + i] * rqt_level(rqt_code(row, (int)i, (int)bits), (int)bits) * s;
+      yy[r * m + o] = acc;
+    }
+  });
+  return out;
+}
+
+torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed, torch::Tensor scale, int64_t in_features, int64_t out_features, int64_t bits) {
+  TORCH_CHECK(grad.device().is_cpu() && packed.device().is_cpu() && scale.device().is_cpu());
+  TORCH_CHECK(grad.dtype() == torch::kFloat32 && packed.dtype() == torch::kUInt8 && scale.dtype() == torch::kFloat32);
+  TORCH_CHECK(grad.dim() == 2 && grad.size(1) == out_features && grad.is_contiguous() && packed.is_contiguous() && scale.is_contiguous());
+  TORCH_CHECK(bits == 4 || bits == 6);
+  auto out = torch::zeros({grad.size(0), in_features}, grad.options());
+  const auto rows = grad.size(0), n = in_features, m = out_features; const auto* gg = grad.data_ptr<float>(); const auto* pp = packed.data_ptr<uint8_t>(); const auto* ss = scale.data_ptr<float>(); auto* xx = out.data_ptr<float>();
+  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3;
+  at::parallel_for(0, rows * n, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t task = begin; task < end; ++task) {
+      const int64_t r = task / n, i = task - r * n; float acc = 0.0f;
+      for (int64_t o = 0; o < m; ++o) acc += gg[r * m + o] * rqt_level(rqt_code(pp + o * stride, (int)i, (int)bits), (int)bits) * ss[o];
+      xx[r * n + i] = acc;
+    }
+  });
+  return out;
+}
+
+torch::Tensor rqt_linear_backward_weight(torch::Tensor x, torch::Tensor grad, int64_t in_features, int64_t out_features) {
+  TORCH_CHECK(x.device().is_cpu() && grad.device().is_cpu());
+  TORCH_CHECK(x.dtype() == torch::kFloat32 && grad.dtype() == torch::kFloat32 && x.dim() == 2 && grad.dim() == 2);
+  TORCH_CHECK(x.size(0) == grad.size(0) && x.size(1) == in_features && grad.size(1) == out_features && x.is_contiguous() && grad.is_contiguous());
+  auto out = torch::zeros({out_features, in_features}, x.options());
+  const auto rows = x.size(0); const auto* xx = x.data_ptr<float>(); const auto* gg = grad.data_ptr<float>(); auto* ww = out.data_ptr<float>();
+  at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t o = begin; o < end; ++o) for (int64_t i = 0; i < in_features; ++i) { float acc = 0.0f; for (int64_t r = 0; r < rows; ++r) acc += gg[r * out_features + o] * xx[r * in_features + i]; ww[o * in_features + i] = acc; }
+  });
+  return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("lion_step", &lion_step, "Fused Lion update with AVX");
+  m.def("rqt_requant_step", &rqt_requant_step, "Fused packed RQT requantization");
+  m.def("rqt_linear_forward", &rqt_linear_forward, "Packed RQT linear forward");
+  m.def("rqt_linear_backward_input", &rqt_linear_backward_input, "Packed RQT linear input gradient");
+  m.def("rqt_linear_backward_weight", &rqt_linear_backward_weight, "RQT linear weight gradient");
+}
