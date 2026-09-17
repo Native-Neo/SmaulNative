@@ -60,7 +60,8 @@ def test_rqt_lion_state_uses_stable_names():
     )
     clone_opt = RQTLion(clone, lr=1e-3, weight_decay=0.0)
     clone_opt.load_state_dict(state)
-    assert all(module in clone_opt.rqt_state for module in clone_opt._modules() if module[1] in clone_opt.rqt_state)
+    assert len(clone_opt.rqt_state) == 2
+    assert all(state.shape == module.unpack().shape for module, state in clone_opt.rqt_state.items())
 
 
 def test_fp6_levels_are_finite():
