@@ -6,6 +6,12 @@ import torch
 from inference import RWKVXInference, _IncrementalDecoder
 from rwkv_x_core import RWKVXConfig, RWKVXModel
 from tokenizer import SmaulTokenizer
+import rqt
+
+
+def test_rqt_loader_is_installed_for_inference():
+    assert getattr(RWKVXModel.from_pretrained, "__func__", None) is not None
+    assert rqt.load_rqt_checkpoint is not None
 
 
 def test_cpu_fp16_promotes_to_fp32(monkeypatch):
