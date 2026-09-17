@@ -21,7 +21,7 @@ def _levels(bits, device, dtype):
     values = []
     for code in range(1 << bits):
         exp = (code >> mbits) & ((1 << ebits) - 1)
-        mant = code & ((1 << mbits) - 1)
+        mant = code & ((1 << ebits) - 1)
         sign = -1.0 if code >> (bits - 1) else 1.0
         value = (mant / (1 << mbits)) * 2 ** (1 - bias) if exp == 0 else (1 + mant / (1 << mbits)) * 2 ** (exp - bias)
         values.append(sign * value)
@@ -80,6 +80,7 @@ class RQTLinear(nn.Module):
         self.register_parameter("bias", linear.bias)
         self.register_buffer("packed", torch.empty(0, dtype=torch.uint8))
         self.register_buffer("scale", torch.empty(0, dtype=torch.float32))
+        self.register_buffer("bit_width", torch.tensor(self.bits, dtype=torch.uint8))
         self._grad = None
         self._replace_weight(linear.weight)
 
@@ -176,8 +177,6 @@ class RQTLion:
         rqt = list(state.get("rqt_state", {}).values())
         params = list(state.get("param_state", {}).values())
         modules = self._modules()
-        if len(rqt) != len(self.rqt_state) and self.rqt_state:
-            raise ValueError("RQT optimizer state count does not match model")
         if len(rqt) > len(modules):
             raise ValueError("RQT optimizer state has too many entries")
         if len(params) > len(self.params):
@@ -209,10 +208,10 @@ def prepare_mixed_rqt(model):
     root = getattr(model, "_orig_mod", model)
     targets = [(name, module) for name, module in root.named_modules() if isinstance(module, nn.Linear)]
     for name, _ in reversed(targets):
-        bits = FP8 if name == "head" or ".att." in f".{name}." else FP6
+        bits = FP8 if name == "head" or ".att." in f".{name}." else FP4 if ".ffn." in f".{name}." else FP6
         _replace(root, name, bits)
     model.cfg.rqt_mixed = True
-    print(f"[RQT] mixed FP6/FP8 packed weights | {len(targets)} linear layers")
+    print(f"[RQT] mixed FP4/FP6/FP8 packed weights | {len(targets)} linear layers")
     return len(targets)
 
 
@@ -228,14 +227,22 @@ def load_rqt_checkpoint(in_dir):
     packed = [k[:-7] for k in sd if k.endswith(".packed")]
     if not packed:
         raise RuntimeError("RQT checkpoint has no packed weights")
-    mixed = any(sd[path + ".packed"].dtype == torch.float8_e4m3fn for path in packed)
+    mixed = any(sd[path + ".packed"].dtype == torch.float8_e4m3fn for path in packed) or any(path + ".bit_width" in sd for path in packed)
     for path in packed:
         parent_path, name = path.rsplit(".", 1) if "." in path else ("", path)
         parent = model.get_submodule(parent_path) if parent_path else model
         linear = getattr(parent, name)
-        bits = FP8 if mixed and sd[path + ".packed"].dtype == torch.float8_e4m3fn else _bits(cfg.rqt_bits)
+        if mixed and path + ".bit_width" in sd:
+            bits = _bits(int(sd[path + ".bit_width"].item()))
+        elif mixed and sd[path + ".packed"].dtype == torch.float8_e4m3fn:
+            bits = FP8
+        else:
+            bits = _bits(cfg.rqt_bits)
         setattr(parent, name, RQTLinear(linear, bits))
-    model.load_state_dict(sd, strict=True)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    missing = [key for key in missing if not key.endswith(".bit_width")]
+    if missing or unexpected:
+        raise RuntimeError(f"invalid RQT checkpoint: missing={missing}, unexpected={unexpected}")
     return model
 
 
