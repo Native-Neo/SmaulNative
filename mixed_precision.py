@@ -30,11 +30,14 @@ def _levels(bits, device, dtype):
 def quantize(x, bits, dim=-1):
     if bits not in (4, 6, 8):
         return x
-    scale = x.detach().abs().amax(dim=dim, keepdim=True).clamp_min(torch.finfo(x.dtype).eps)
     if bits == 8:
+        max_level = 448.0
+        scale = x.detach().abs().amax(dim=dim, keepdim=True).div(max_level).clamp_min(torch.finfo(x.dtype).eps)
         q = (x.detach() / scale).to(torch.float8_e4m3fn).to(x.dtype) * scale
     else:
         levels = _levels(bits, x.device, x.dtype)
+        max_level = levels[-1]
+        scale = x.detach().abs().amax(dim=dim, keepdim=True).div(max_level).clamp_min(torch.finfo(x.dtype).eps)
         magnitude = (x.detach() / scale).abs().unsqueeze(-1)
         code = magnitude.sub(levels).abs().argmin(-1)
         q = levels[code] * scale
@@ -77,13 +80,10 @@ def apply(model):
         elif ".att." in f".{path}.":
             targets.append((path, 8, 8))
         elif path.endswith(".key") or path.endswith(".value"):
-            if ".ffn." in f".{path}.":
-                targets.append((path, 4, 6))
-            else:
-                targets.append((path, 6, 6))
+            targets.append((path, 4, 6) if ".ffn." in f".{path}." else (path, 6, 6))
         else:
             targets.append((path, 6, 6))
-    for path, wb, ab in reversed(targets):
+    for path, wb, ab in sorted(targets, key=lambda item: item[0].count("."), reverse=True):
         _replace(root, path, wb, ab)
     for parameter in root.parameters():
         if parameter.requires_grad:
