@@ -422,20 +422,5 @@ class RWKVXModel(nn.Module):
         cfg = RWKVXConfig.load(in_dir / "config.json")
         sd = load_file(str(in_dir / "model.safetensors"))
         model = cls(cfg)
-        packed = [k[:-7] for k in sd if k.endswith(".packed")]
-        if packed:
-            from qat import QuantizedLinear
-            for path in packed:
-                sk, pk, shape = path + ".scale", path + ".packed", path + ".weight_shape"
-                if sk not in sd or shape not in sd:
-                    raise RuntimeError(f"quantized layer {path} is missing shape metadata")
-                parent_path, name = path.rsplit(".", 1) if "." in path else ("", path)
-                parent = model.get_submodule(parent_path) if parent_path else model
-                setattr(parent, name, QuantizedLinear(sd[pk], sd[sk], sd[shape].tolist()))
-        else:
-            qat_keys = [k for k in sd if k.endswith(".weight_fq.scale") or k.endswith(".act_fq.scale")]
-            if qat_keys:
-                from qat import prepare_qat
-                prepare_qat(model)
         model.load_state_dict(sd, strict=True)
         return model
