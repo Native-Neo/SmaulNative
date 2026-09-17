@@ -47,6 +47,30 @@ static const std::array<float, 128>& rqt_level_table() {
   return table;
 }
 
+struct RQTOrderedLevels { std::array<float, 64> values{}; std::array<uint8_t, 64> codes{}; };
+
+static const RQTOrderedLevels& rqt_ordered_levels(int bits) {
+  static const auto fp4 = [] {
+    RQTOrderedLevels out;
+    const auto& levels = rqt_level_table();
+    std::array<int, 16> order{};
+    for (int i = 0; i < 16; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return levels[a] < levels[b]; });
+    for (int i = 0; i < 16; ++i) { out.values[i] = levels[order[i]]; out.codes[i] = (uint8_t)order[i]; }
+    return out;
+  }();
+  static const auto fp6 = [] {
+    RQTOrderedLevels out;
+    const auto& levels = rqt_level_table();
+    std::array<int, 64> order{};
+    for (int i = 0; i < 64; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return levels[64 + a] < levels[64 + b]; });
+    for (int i = 0; i < 64; ++i) { out.values[i] = levels[64 + order[i]]; out.codes[i] = (uint8_t)order[i]; }
+    return out;
+  }();
+  return bits == 4 ? fp4 : fp6;
+}
+
 static inline float rqt_level(int code, int bits) { return rqt_level_table()[(bits == 4 ? 0 : 64) + code]; }
 
 static inline uint8_t rqt_code(const uint8_t* packed, int index, int bits) {
@@ -62,10 +86,13 @@ static inline void rqt_set_code(uint8_t* packed, int index, int bits, uint8_t co
 }
 
 static inline int rqt_nearest_code(float value, int bits) {
-  const int count = 1 << bits, base = bits == 4 ? 0 : 64;
-  const auto& levels = rqt_level_table(); int best = 0; float best_dist = std::abs(value - levels[base]);
-  for (int code = 1; code < count; ++code) { const float dist = std::abs(value - levels[base + code]); if (dist < best_dist) { best = code; best_dist = dist; } }
-  return best;
+  const auto& ordered = rqt_ordered_levels(bits); const int count = 1 << bits;
+  int lo = 0, hi = count;
+  while (lo < hi) { const int mid = lo + (hi - lo) / 2; if (ordered.values[mid] < value) lo = mid + 1; else hi = mid; }
+  if (lo == 0) return ordered.codes[0];
+  if (lo == count) return ordered.codes[count - 1];
+  const float left = ordered.values[lo - 1], right = ordered.values[lo];
+  return std::abs(value - left) <= std::abs(right - value) ? ordered.codes[lo - 1] : ordered.codes[lo];
 }
 
 void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor update, int64_t in_features, int64_t out_features, int64_t bits, double decay) {
@@ -76,14 +103,18 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
   TORCH_CHECK(scale.numel() == out_features && update.numel() == out_features * in_features && packed.numel() == out_features * stride);
   auto pp = packed.data_ptr<uint8_t>(); auto ss = scale.data_ptr<float>(); auto uu = update.data_ptr<float>();
   const float decay_mul = (float)(1.0 - decay), max_level = std::abs(rqt_level((1 << bits) - 1, bits));
+  const int ibits = (int)bits;
   at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
     for (int64_t row = begin; row < end; ++row) {
       uint8_t* dst = pp + row * stride; const float old_scale = ss[row]; float max_abs = 0.0f;
-      for (int64_t col = 0; col < in_features; ++col) { const float value = rqt_level(rqt_code(dst, (int)col, (int)bits), (int)bits) * old_scale * decay_mul - uu[row * in_features + col]; max_abs = std::max(max_abs, std::abs(value)); }
+      for (int64_t col = 0; col < in_features; ++col) {
+        const float value = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale * decay_mul - uu[row * in_features + col];
+        max_abs = std::max(max_abs, std::abs(value));
+      }
       const float new_scale = std::max(max_abs, std::numeric_limits<float>::epsilon()) / max_level; ss[row] = new_scale;
       for (int64_t col = 0; col < in_features; ++col) {
-        const float value = (rqt_level(rqt_code(dst, (int)col, (int)bits), (int)bits) * old_scale * decay_mul - uu[row * in_features + col]) / new_scale;
-        rqt_set_code(dst, (int)col, (int)bits, (uint8_t)rqt_nearest_code(value, (int)bits));
+        const float value = (rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale * decay_mul - uu[row * in_features + col]) / new_scale;
+        rqt_set_code(dst, (int)col, ibits, (uint8_t)rqt_nearest_code(value, ibits));
       }
     }
   });
@@ -97,11 +128,24 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   auto out = torch::empty({x.size(0), out_features}, x.options());
   const auto rows = x.size(0); const auto n = in_features; const auto m = out_features;
   const auto* xx = x.data_ptr<float>(); const auto* pp = packed.data_ptr<uint8_t>(); const auto* ss = scale.data_ptr<float>(); auto* yy = out.data_ptr<float>();
-  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3;
+  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3; const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
   at::parallel_for(0, rows * m, 1, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
-      const int64_t r = task / m, o = task - r * m; const uint8_t* row = pp + o * stride; const float s = ss[o]; float acc = 0.0f;
-      for (int64_t i = 0; i < n; ++i) acc += xx[r * n + i] * rqt_level(rqt_code(row, (int)i, (int)bits), (int)bits) * s;
+      const int64_t r = task / m, o = task - r * m; const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base; float acc = 0.0f;
+      if (ibits == 4) {
+        for (int64_t i = 0; i < n; i += 2) {
+          const uint8_t p = row[i >> 1]; acc += xx[r * n + i] * level[p >> 4] * s;
+          if (i + 1 < n) acc += xx[r * n + i + 1] * level[p & 15] * s;
+        }
+      } else {
+        for (int64_t i = 0, b = 0; i < n; i += 4, b += 3) {
+          const uint8_t* p = row + b; const uint8_t c0 = p[0] >> 2, c1 = ((p[0] & 3) << 4) | (p[1] >> 4), c2 = ((p[1] & 15) << 2) | (p[2] >> 6), c3 = p[2] & 63;
+          acc += xx[r * n + i] * level[c0] * s;
+          if (i + 1 < n) acc += xx[r * n + i + 1] * level[c1] * s;
+          if (i + 2 < n) acc += xx[r * n + i + 2] * level[c2] * s;
+          if (i + 3 < n) acc += xx[r * n + i + 3] * level[c3] * s;
+        }
+      }
       yy[r * m + o] = acc;
     }
   });
@@ -115,11 +159,11 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
   TORCH_CHECK(bits == 4 || bits == 6);
   auto out = torch::zeros({grad.size(0), in_features}, grad.options());
   const auto rows = grad.size(0), n = in_features, m = out_features; const auto* gg = grad.data_ptr<float>(); const auto* pp = packed.data_ptr<uint8_t>(); const auto* ss = scale.data_ptr<float>(); auto* xx = out.data_ptr<float>();
-  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3;
+  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3; const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
   at::parallel_for(0, rows * n, 1, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
       const int64_t r = task / n, i = task - r * n; float acc = 0.0f;
-      for (int64_t o = 0; o < m; ++o) acc += gg[r * m + o] * rqt_level(rqt_code(pp + o * stride, (int)i, (int)bits), (int)bits) * ss[o];
+      for (int64_t o = 0; o < m; ++o) acc += gg[r * m + o] * levels[base + rqt_code(pp + o * stride, (int)i, ibits)] * ss[o];
       xx[r * n + i] = acc;
     }
   });
@@ -130,12 +174,7 @@ torch::Tensor rqt_linear_backward_weight(torch::Tensor x, torch::Tensor grad, in
   TORCH_CHECK(x.device().is_cpu() && grad.device().is_cpu());
   TORCH_CHECK(x.dtype() == torch::kFloat32 && grad.dtype() == torch::kFloat32 && x.dim() == 2 && grad.dim() == 2);
   TORCH_CHECK(x.size(0) == grad.size(0) && x.size(1) == in_features && grad.size(1) == out_features && x.is_contiguous() && grad.is_contiguous());
-  auto out = torch::zeros({out_features, in_features}, x.options());
-  const auto rows = x.size(0); const auto* xx = x.data_ptr<float>(); const auto* gg = grad.data_ptr<float>(); auto* ww = out.data_ptr<float>();
-  at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
-    for (int64_t o = begin; o < end; ++o) for (int64_t i = 0; i < in_features; ++i) { float acc = 0.0f; for (int64_t r = 0; r < rows; ++r) acc += gg[r * out_features + o] * xx[r * in_features + i]; ww[o * in_features + i] = acc; }
-  });
-  return out;
+  return torch::mm(grad.transpose(0, 1).contiguous(), x);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
