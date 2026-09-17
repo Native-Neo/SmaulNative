@@ -93,12 +93,6 @@ def set_router_only_training(model, router_only):
     return count
 
 
-def _build_optimizer(args, model):
-    if args.rqt or args.mixed_rqt:
-        return RQTLion(model, lr=args.lr, weight_decay=args.weight_decay)
-    return Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-
 class ResumeState:
     def __init__(self):
         self.global_step = 0
@@ -190,6 +184,104 @@ def _optimizer_step(args, model, optimizer, xb, yb, device):
     return loss
 
 
+def _remote_token_stream(name, tokenizer, ctx_len, resume):
+    dataset = file_path = None
+    record = 0
+    if resume.file_path:
+        try:
+            dataset, file_path = resume.file_path.split("::", 1)
+        except ValueError as exc:
+            raise ValueError("invalid remote resume position") from exc
+        record = resume.record_index
+    buffer_tokens = list(resume.buffer_tokens)
+    for text, position in stream_dataset(name, start_dataset=dataset, start_file=file_path, start_record=record, with_position=True):
+        buffer_tokens.extend(tokenizer.encode(text) + [tokenizer.eos_token_id])
+        while len(buffer_tokens) >= ctx_len + 1:
+            chunk = buffer_tokens[:ctx_len + 1]
+            del buffer_tokens[:ctx_len]
+            yield torch.tensor(chunk[:-1]), torch.tensor(chunk[1:]), f"{position[0]}::{position[1]}", position[2], list(buffer_tokens)
+
+
+def _train_batch(args, model, optimizer, resume, device, batch_x, batch_y, path, record, buffer_tokens):
+    xb, yb = torch.stack(batch_x).to(device), torch.stack(batch_y).to(device)
+    loss = _optimizer_step(args, model, optimizer, xb, yb, device)
+    resume.file_path, resume.record_index, resume.buffer_tokens = path, record, buffer_tokens
+    if loss is None:
+        return None
+    resume.global_step += 1
+    resume.total_tokens += xb.numel()
+    return loss
+
+
+def train_pretrain(args, model, optimizer, resume, device, tokenizer):
+    if args.stream_dataset != "none":
+        stream = _remote_token_stream(args.stream_dataset, tokenizer, args.ctx_len, resume)
+        remote = True
+    else:
+        stream = PretrainStream(Path(args.dataset_dir), tokenizer, args.ctx_len, resume_file=resume.file_path, resume_record=resume.record_index, buffer_tokens=resume.buffer_tokens)
+        remote = False
+    model.train()
+    batch_x, batch_y = [], []
+    t0 = time.perf_counter()
+    tokens_since_log = 0
+    for item in stream:
+        if remote:
+            x, y, path, record, buffer_tokens = item
+        else:
+            x, y, position = item
+            path, record, buffer_tokens = position[0], position[1], stream.buffer_tokens
+        batch_x.append(x)
+        batch_y.append(y)
+        if len(batch_x) < args.batch_size:
+            continue
+        loss = _train_batch(args, model, optimizer, resume, device, batch_x, batch_y, path, record, buffer_tokens)
+        batch_x, batch_y = [], []
+        if loss is None:
+            continue
+        tokens_since_log += args.ctx_len * args.batch_size
+        if resume.global_step % args.log_every == 0:
+            elapsed = time.perf_counter() - t0
+            print(f"step {resume.global_step} | loss {loss.item():.4f} | {tokens_since_log / max(elapsed, 1e-9):.1f} tok/s | tokens {resume.total_tokens:,}")
+            t0, tokens_since_log = time.perf_counter(), 0
+        if resume.global_step % args.save_every == 0:
+            save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), args.save_dtype, False)
+        if resume.global_step % args.optimizer_save_every == 0:
+            _save_optimizer_checkpoint(optimizer, resume, Path(args.checkpoint_dir))
+        if STOP_REQUESTED:
+            break
+
+
+def train_sft(args, model, optimizer, resume, device, tokenizer):
+    dataset = SFTDataset(Path(args.dataset_dir), tokenizer, args.ctx_len)
+    model.train()
+    for epoch in range(resume.epoch, args.epochs):
+        generator = torch.Generator().manual_seed(epoch)
+        permutation = torch.randperm(len(dataset), generator=generator).tolist()
+        start = resume.record_index if epoch == resume.epoch else 0
+        loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, sampler=permutation[start:])
+        consumed = start
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            loss = _optimizer_step(args, model, optimizer, xb, yb, device)
+            consumed += len(xb)
+            resume.epoch, resume.record_index = epoch, consumed
+            if loss is None:
+                continue
+            resume.global_step += 1
+            resume.total_tokens += xb.numel()
+            if resume.global_step % args.log_every == 0:
+                print(f"epoch {epoch} step {resume.global_step} | loss {loss.item():.4f}")
+            if resume.global_step % args.save_every == 0:
+                save_checkpoint(model, optimizer, resume, Path(args.output_dir), Path(args.checkpoint_dir), Path(args.tokenizer_path), args.save_dtype, False)
+            if resume.global_step % args.optimizer_save_every == 0:
+                _save_optimizer_checkpoint(optimizer, resume, Path(args.checkpoint_dir))
+            if STOP_REQUESTED:
+                break
+        if STOP_REQUESTED:
+            break
+        resume.epoch, resume.record_index = epoch + 1, 0
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["pretrain", "sft"], required=True)
@@ -279,7 +371,7 @@ def main():
         print(f"[MOE] router-only trainable={trainable:,}")
     if args.compile:
         model = torch.compile(model)
-    optimizer = _build_optimizer(args, model)
+    optimizer = RQTLion(model, lr=args.lr, weight_decay=args.weight_decay) if (args.rqt or args.mixed_rqt) else Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json") if args.resume else ResumeState()
     if args.resume:
         optimizer_path = Path(args.checkpoint_dir) / "optimizer.pt"
