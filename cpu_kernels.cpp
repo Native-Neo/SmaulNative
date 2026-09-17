@@ -131,20 +131,25 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3; const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
   at::parallel_for(0, rows * m, 1, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
-      const int64_t r = task / m, o = task - r * m; const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base; float acc = 0.0f;
+      const int64_t r = task / m, o = task - r * m; const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base; const float* xr = xx + r * n; float acc = 0.0f;
       if (ibits == 4) {
-        for (int64_t i = 0; i < n; i += 2) {
-          const uint8_t p = row[i >> 1]; acc += xx[r * n + i] * level[p >> 4] * s;
-          if (i + 1 < n) acc += xx[r * n + i + 1] * level[p & 15] * s;
+        int64_t i = 0;
+        for (; i + 7 < n; i += 8) {
+          const uint8_t p0 = row[i >> 1], p1 = row[(i + 2) >> 1], p2 = row[(i + 4) >> 1], p3 = row[(i + 6) >> 1];
+          acc += xr[i] * level[p0 >> 4] * s + xr[i + 1] * level[p0 & 15] * s + xr[i + 2] * level[p1 >> 4] * s + xr[i + 3] * level[p1 & 15] * s;
+          acc += xr[i + 4] * level[p2 >> 4] * s + xr[i + 5] * level[p2 & 15] * s + xr[i + 6] * level[p3 >> 4] * s + xr[i + 7] * level[p3 & 15] * s;
         }
+        for (; i < n; i += 2) { const uint8_t p = row[i >> 1]; acc += xr[i] * level[p >> 4] * s; if (i + 1 < n) acc += xr[i + 1] * level[p & 15] * s; }
       } else {
-        for (int64_t i = 0, b = 0; i < n; i += 4, b += 3) {
-          const uint8_t* p = row + b; const uint8_t c0 = p[0] >> 2, c1 = ((p[0] & 3) << 4) | (p[1] >> 4), c2 = ((p[1] & 15) << 2) | (p[2] >> 6), c3 = p[2] & 63;
-          acc += xx[r * n + i] * level[c0] * s;
-          if (i + 1 < n) acc += xx[r * n + i + 1] * level[c1] * s;
-          if (i + 2 < n) acc += xx[r * n + i + 2] * level[c2] * s;
-          if (i + 3 < n) acc += xx[r * n + i + 3] * level[c3] * s;
+        int64_t i = 0, b = 0;
+        for (; i + 7 < n; i += 8, b += 6) {
+          const uint8_t* p = row + b;
+          const uint8_t c0 = p[0] >> 2, c1 = ((p[0] & 3) << 4) | (p[1] >> 4), c2 = ((p[1] & 15) << 2) | (p[2] >> 6), c3 = p[2] & 63;
+          const uint8_t c4 = p[3] >> 2, c5 = ((p[3] & 3) << 4) | (p[4] >> 4), c6 = ((p[4] & 15) << 2) | (p[5] >> 6), c7 = p[5] & 63;
+          acc += xr[i] * level[c0] * s + xr[i + 1] * level[c1] * s + xr[i + 2] * level[c2] * s + xr[i + 3] * level[c3] * s;
+          acc += xr[i + 4] * level[c4] * s + xr[i + 5] * level[c5] * s + xr[i + 6] * level[c6] * s + xr[i + 7] * level[c7] * s;
         }
+        for (; i < n; i += 4, b += 3) { const uint8_t* p = row + b; const uint8_t c0 = p[0] >> 2, c1 = ((p[0] & 3) << 4) | (p[1] >> 4), c2 = ((p[1] & 15) << 2) | (p[2] >> 6), c3 = p[2] & 63; acc += xr[i] * level[c0] * s; if (i + 1 < n) acc += xr[i + 1] * level[c1] * s; if (i + 2 < n) acc += xr[i + 2] * level[c2] * s; if (i + 3 < n) acc += xr[i + 3] * level[c3] * s; }
       }
       yy[r * m + o] = acc;
     }
@@ -162,8 +167,8 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
   const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3; const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
   at::parallel_for(0, rows * n, 1, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
-      const int64_t r = task / n, i = task - r * n; float acc = 0.0f;
-      for (int64_t o = 0; o < m; ++o) acc += gg[r * m + o] * levels[base + rqt_code(pp + o * stride, (int)i, ibits)] * ss[o];
+      const int64_t r = task / n, i = task - r * n; const float* gr = gg + r * m; float acc = 0.0f;
+      for (int64_t o = 0; o < m; ++o) acc += gr[o] * levels[base + rqt_code(pp + o * stride, (int)i, ibits)] * ss[o];
       xx[r * n + i] = acc;
     }
   });
@@ -174,7 +179,7 @@ torch::Tensor rqt_linear_backward_weight(torch::Tensor x, torch::Tensor grad, in
   TORCH_CHECK(x.device().is_cpu() && grad.device().is_cpu());
   TORCH_CHECK(x.dtype() == torch::kFloat32 && grad.dtype() == torch::kFloat32 && x.dim() == 2 && grad.dim() == 2);
   TORCH_CHECK(x.size(0) == grad.size(0) && x.size(1) == in_features && grad.size(1) == out_features && x.is_contiguous() && grad.is_contiguous());
-  return torch::mm(grad.transpose(0, 1).contiguous(), x);
+  return torch::mm(grad.transpose(0, 1), x);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
