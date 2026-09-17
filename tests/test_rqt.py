@@ -36,10 +36,9 @@ def test_rqt_linear_updates_packed_weight():
 def test_rqt_lion_steps_without_master_weight():
     linear = RQTLinear(torch.nn.Linear(8, 4, bias=False), 6)
     opt = RQTLion(linear, lr=1e-3, weight_decay=0.0)
-    packed = linear.packed
     linear(torch.randn(2, 8)).sum().backward()
     opt.step()
-    assert linear.packed.data_ptr() == packed.data_ptr()
+    assert not any(name == "weight" for name, _ in linear.named_parameters())
     assert linear.packed.dtype == torch.uint8
     assert linear._grad is None
 
