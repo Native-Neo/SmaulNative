@@ -172,6 +172,19 @@ class RQTLion:
     def state_dict(self):
         return {"param_state": {str(i): v.cpu() for i, v in enumerate(self.param_state.values())}, "rqt_state": {str(i): v.cpu() for i, v in enumerate(self.rqt_state.values())}}
 
+    def load_state_dict(self, state):
+        rqt = list(state.get("rqt_state", {}).values())
+        params = list(state.get("param_state", {}).values())
+        modules = self._modules()
+        if len(rqt) != len(self.rqt_state) and self.rqt_state:
+            raise ValueError("RQT optimizer state count does not match model")
+        if len(rqt) > len(modules):
+            raise ValueError("RQT optimizer state has too many entries")
+        if len(params) > len(self.params):
+            raise ValueError("optimizer state has too many parameter entries")
+        self.rqt_state = {module: value.to(module.packed.device, dtype=torch.float32) for module, value in zip(modules, rqt)}
+        self.param_state = {param: value.to(param.device, dtype=torch.float32) for param, value in zip(self.params, params)}
+
 
 def _replace(root, name, bits):
     parts = name.split(".")
