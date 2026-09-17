@@ -1,5 +1,6 @@
 #include <ATen/Parallel.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <immintrin.h>
 #include <limits>
@@ -29,11 +30,24 @@ void lion_step(torch::Tensor p, torch::Tensor g, torch::Tensor m, double lr, dou
   });
 }
 
-static inline float rqt_level(int code, int bits) {
-  const int mbits = bits == 4 ? 1 : 2, ebits = bits == 4 ? 2 : 3, bias = (1 << (ebits - 1)) - 1;
-  const int exp = (code >> mbits) & ((1 << ebits) - 1), mant = code & ((1 << mbits) - 1); const float sign = (code >> (bits - 1)) ? -1.0f : 1.0f;
-  const float value = exp == 0 ? (mant / float(1 << mbits)) * std::ldexp(1.0f, 1 - bias) : (1.0f + mant / float(1 << mbits)) * std::ldexp(1.0f, exp - bias); return sign * value;
+static const std::array<float, 128>& rqt_level_table() {
+  static const auto table = [] {
+    std::array<float, 128> out{};
+    for (int bits : {4, 6}) {
+      const int mbits = bits == 4 ? 1 : 2, ebits = bits == 4 ? 2 : 3, bias = (1 << (ebits - 1)) - 1, base = bits == 4 ? 0 : 64;
+      for (int code = 0; code < (1 << bits); ++code) {
+        const int exp = (code >> mbits) & ((1 << ebits) - 1), mant = code & ((1 << mbits) - 1);
+        const float sign = (code >> (bits - 1)) ? -1.0f : 1.0f;
+        const float value = exp == 0 ? (mant / float(1 << mbits)) * std::ldexp(1.0f, 1 - bias) : (1.0f + mant / float(1 << mbits)) * std::ldexp(1.0f, exp - bias);
+        out[base + code] = sign * value;
+      }
+    }
+    return out;
+  }();
+  return table;
 }
+
+static inline float rqt_level(int code, int bits) { return rqt_level_table()[(bits == 4 ? 0 : 64) + code]; }
 
 static inline uint8_t rqt_code(const uint8_t* packed, int index, int bits) {
   if (bits == 4) { const uint8_t p = packed[index >> 1]; return (index & 1) ? p & 15 : p >> 4; }
@@ -47,6 +61,17 @@ static inline void rqt_set_code(uint8_t* packed, int index, int bits, uint8_t co
   switch (index & 3) { case 0: p[0] = (p[0] & 0x03) | (code << 2); break; case 1: p[0] = (p[0] & 0xFC) | (code >> 4); p[1] = (p[1] & 0x0F) | ((code & 15) << 4); break; case 2: p[1] = (p[1] & 0xF0) | (code >> 2); p[2] = (p[2] & 0x3F) | ((code & 3) << 6); break; default: p[2] = (p[2] & 0xC0) | code; }
 }
 
+static inline int rqt_nearest_code(float value, int bits) {
+  const int count = 1 << bits, base = bits == 4 ? 0 : 64;
+  int lo = 0, hi = count - 1;
+  const auto& levels = rqt_level_table();
+  while (lo < hi) { const int mid = (lo + hi) >> 1; if (levels[base + mid] < value) lo = mid + 1; else hi = mid; }
+  if (lo == 0) return 0;
+  if (lo == count - 1) return count - 1;
+  const float a = levels[base + lo - 1], b = levels[base + lo];
+  return std::abs(value - a) <= std::abs(value - b) ? lo - 1 : lo;
+}
+
 void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor update, int64_t in_features, int64_t out_features, int64_t bits, double decay) {
   TORCH_CHECK(packed.device().is_cpu() && scale.device().is_cpu() && update.device().is_cpu());
   TORCH_CHECK(packed.dtype() == torch::kUInt8 && scale.dtype() == torch::kFloat32 && update.dtype() == torch::kFloat32);
@@ -54,7 +79,7 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
   const int64_t stride = bits == 4 ? (in_features + 1) / 2 : ((in_features + 3) / 4) * 3;
   TORCH_CHECK(scale.numel() == out_features && update.numel() == out_features * in_features && packed.numel() == out_features * stride);
   auto pp = packed.data_ptr<uint8_t>(); auto ss = scale.data_ptr<float>(); auto uu = update.data_ptr<float>();
-  const float decay_mul = (float)(1.0 - decay), max_level = rqt_level((1 << bits) - 1, bits);
+  const float decay_mul = (float)(1.0 - decay), max_level = std::abs(rqt_level((1 << bits) - 1, bits));
   at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
     for (int64_t row = begin; row < end; ++row) {
       uint8_t* dst = pp + row * stride; const float old_scale = ss[row]; float max_abs = 0.0f;
@@ -62,9 +87,7 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
       const float new_scale = std::max(max_abs, std::numeric_limits<float>::epsilon()) / max_level; ss[row] = new_scale;
       for (int64_t col = 0; col < in_features; ++col) {
         const float value = (rqt_level(rqt_code(dst, (int)col, (int)bits), (int)bits) * old_scale * decay_mul - uu[row * in_features + col]) / new_scale;
-        int best = 0; float best_dist = std::abs(value - rqt_level(0, (int)bits));
-        for (int code = 1; code < (1 << bits); ++code) { const float dist = std::abs(value - rqt_level(code, (int)bits)); if (dist < best_dist) { best = code; best_dist = dist; } }
-        rqt_set_code(dst, (int)col, (int)bits, (uint8_t)best);
+        rqt_set_code(dst, (int)col, (int)bits, (uint8_t)rqt_nearest_code(value, (int)bits));
       }
     }
   });
