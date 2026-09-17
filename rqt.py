@@ -21,7 +21,7 @@ def _levels(bits, device, dtype):
     values = []
     for code in range(1 << bits):
         exp = (code >> mbits) & ((1 << ebits) - 1)
-        mant = code & ((1 << ebits) - 1)
+        mant = code & ((1 << mbits) - 1)
         sign = -1.0 if code >> (bits - 1) else 1.0
         value = (mant / (1 << mbits)) * 2 ** (1 - bias) if exp == 0 else (1 + mant / (1 << mbits)) * 2 ** (exp - bias)
         values.append(sign * value)
