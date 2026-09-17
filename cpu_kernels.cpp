@@ -63,13 +63,9 @@ static inline void rqt_set_code(uint8_t* packed, int index, int bits, uint8_t co
 
 static inline int rqt_nearest_code(float value, int bits) {
   const int count = 1 << bits, base = bits == 4 ? 0 : 64;
-  int lo = 0, hi = count - 1;
-  const auto& levels = rqt_level_table();
-  while (lo < hi) { const int mid = (lo + hi) >> 1; if (levels[base + mid] < value) lo = mid + 1; else hi = mid; }
-  if (lo == 0) return 0;
-  if (lo == count - 1) return count - 1;
-  const float a = levels[base + lo - 1], b = levels[base + lo];
-  return std::abs(value - a) <= std::abs(value - b) ? lo - 1 : lo;
+  const auto& levels = rqt_level_table(); int best = 0; float best_dist = std::abs(value - levels[base]);
+  for (int code = 1; code < count; ++code) { const float dist = std::abs(value - levels[base + code]); if (dist < best_dist) { best = code; best_dist = dist; } }
+  return best;
 }
 
 void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor update, int64_t in_features, int64_t out_features, int64_t bits, double decay) {
