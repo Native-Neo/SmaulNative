@@ -234,13 +234,22 @@ def _replace(root, name, bits):
     parent = root
     for part in parts[:-1]:
         parent = getattr(parent, part)
-    setattr(parent, parts[-1], RQTLinear(getattr(parent, parts[-1]), bits))
+    current = getattr(parent, parts[-1])
+    if isinstance(current, RQTLinear):
+        if current.bits == bits:
+            return
+        weight = current.unpack(torch.float32)
+        current.bits = bits
+        current.bit_width.fill_(bits)
+        current._replace_weight(weight)
+        return
+    setattr(parent, parts[-1], RQTLinear(current, bits))
 
 
 def prepare_rqt(model, bits=FP6):
     bits = _bits(bits)
     root = getattr(model, "_orig_mod", model)
-    targets = [(name, module) for name, module in root.named_modules() if isinstance(module, nn.Linear)]
+    targets = [(name, module) for name, module in root.named_modules() if isinstance(module, (nn.Linear, RQTLinear))]
     for name, _ in reversed(targets):
         _replace(root, name, bits)
     model.cfg.rqt_bits = bits
@@ -250,7 +259,7 @@ def prepare_rqt(model, bits=FP6):
 
 def prepare_mixed_rqt(model):
     root = getattr(model, "_orig_mod", model)
-    targets = [(name, module) for name, module in root.named_modules() if isinstance(module, nn.Linear)]
+    targets = [(name, module) for name, module in root.named_modules() if isinstance(module, (nn.Linear, RQTLinear))]
     for name, _ in reversed(targets):
         bits = FP8 if name == "head" or ".att." in f".{name}." else FP4 if ".ffn." in f".{name}." else FP6
         _replace(root, name, bits)
