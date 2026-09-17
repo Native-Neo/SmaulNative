@@ -339,13 +339,14 @@ def _checkpoint_config(output_dir):
 
 
 def _build_model(args):
-    config = dict(vocab_size=args.tokenizer_vocab_size, n_embd=args.n_embd, n_layer=args.n_layer, n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len)
+    expected = dict(vocab_size=args.tokenizer_vocab_size, n_embd=args.n_embd, n_layer=args.n_layer,
+                    n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len)
     checkpoint = _checkpoint_config(args.output_dir)
-    if checkpoint:
-        checkpoint = {k: v for k, v in checkpoint.items() if k not in {"qat_bits", "rqt_bits", "quantization_bits", "rqt_mixed"}}
-    if checkpoint == config and (Path(args.output_dir) / "model.safetensors").exists():
-        return RWKVXModel.from_pretrained(args.output_dir)
-    return RWKVXModel(config)
+    if checkpoint and (Path(args.output_dir) / "model.safetensors").exists():
+        keys = ("vocab_size", "n_embd", "n_layer", "n_moba_layer", "head_size", "ctx_len_hint")
+        if all(checkpoint.get(key) == expected[key] for key in keys):
+            return RWKVXModel.from_pretrained(args.output_dir)
+    return RWKVXModel(expected)
 
 
 def main():
