@@ -71,13 +71,19 @@ def test_rqt_lion_state_uses_stable_names():
     opt.step()
     state = opt.state_dict()
     assert set(state["rqt_state"]) == {"0", "1"}
+    assert state["version"] == 2
+    assert state["lr"] == 1e-3
+    assert state["betas"] == (0.9, 0.99)
 
     clone = torch.nn.Sequential(
         RQTLinear(torch.nn.Linear(8, 4, bias=False), 6),
         RQTLinear(torch.nn.Linear(4, 2, bias=False), 6),
     )
-    clone_opt = RQTLion(clone, lr=1e-3, weight_decay=0.0)
+    clone_opt = RQTLion(clone, lr=9e-4, betas=(0.8, 0.95), weight_decay=0.1)
     clone_opt.load_state_dict(state)
+    assert clone_opt.lr == 1e-3
+    assert clone_opt.betas == (0.9, 0.99)
+    assert clone_opt.weight_decay == 0.0
     assert len(clone_opt.rqt_state) == 2
     assert all(state.shape == module.unpack().shape for module, state in clone_opt.rqt_state.items())
 
@@ -85,8 +91,7 @@ def test_rqt_lion_state_uses_stable_names():
 def test_rqt_rejects_bad_optimizer_state_shape():
     linear = RQTLinear(torch.nn.Linear(8, 4, bias=False), 6)
     opt = RQTLion(linear, lr=1e-3, weight_decay=0.0)
-    with torch.no_grad():
-        state = {"rqt_state": {"": torch.zeros(1)}, "param_state": {}}
+    state = {"rqt_state": {"": torch.zeros(1)}, "param_state": {}}
     try:
         opt.load_state_dict(state)
     except ValueError as exc:
