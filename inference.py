@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from rwkv_x_core import RWKVXConfig, RWKVXModel
 from tokenizer import SmaulTokenizer
+import rqt
 
 
 class _TokenGroupNorm(nn.Module):
