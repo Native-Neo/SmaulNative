@@ -30,8 +30,7 @@ def _levels(bits, device, dtype):
 
 def _pack(codes, bits):
     if bits == FP4:
-        pad = codes.numel() & 1
-        if pad:
+        if codes.numel() & 1:
             codes = torch.cat((codes, torch.zeros(1, dtype=torch.uint8, device=codes.device)))
         c = codes.reshape(-1, 2)
         return ((c[:, 0] << 4) | c[:, 1]).to(torch.uint8)
@@ -86,9 +85,7 @@ class RQTLinear(nn.Module):
 
     @torch.no_grad()
     def _replace_weight(self, weight):
-        packed, scale = _encode(weight.detach().float(), self.bits)
-        self.packed = packed
-        self.scale = scale
+        self.packed, self.scale = _encode(weight.detach().float(), self.bits)
 
     def unpack(self, dtype=torch.float32):
         if self.bits == FP8:
@@ -121,7 +118,8 @@ class RQTLinear(nn.Module):
 class RQTLion:
     def __init__(self, model, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
         self.model, self.lr, self.betas, self.weight_decay = model, lr, betas, weight_decay
-        self.state = {}
+        self.rqt_state, self.param_state = {}, {}
+        self.params = [p for p in model.parameters() if p.requires_grad]
 
     def _modules(self):
         return [m for m in self.model.modules() if isinstance(m, RQTLinear)]
@@ -129,6 +127,8 @@ class RQTLion:
     def zero_grad(self, set_to_none=True):
         for module in self._modules():
             module.zero_grad()
+        for param in self.params:
+            param.grad = None
 
     @torch.no_grad()
     def step(self):
@@ -137,10 +137,22 @@ class RQTLion:
             if module._grad is None:
                 continue
             grad = module._grad
-            avg = self.state.setdefault(module, torch.zeros_like(grad, dtype=torch.float32))
+            avg = self.rqt_state.setdefault(module, torch.zeros_like(grad, dtype=torch.float32))
             avg.mul_(b2).add_(grad, alpha=1 - b2)
             update = avg.mul(b1).add_(grad, alpha=1 - b1).sign() * self.lr
             module.step(update, self.lr * self.weight_decay)
+        for param in self.params:
+            if param.grad is None:
+                continue
+            grad = param.grad.float()
+            avg = self.param_state.setdefault(param, torch.zeros_like(param, dtype=torch.float32))
+            avg.mul_(b2).add_(grad, alpha=1 - b2)
+            if self.weight_decay:
+                param.mul_(1 - self.lr * self.weight_decay)
+            param.add_(avg.mul(b1).add_(grad, alpha=1 - b1).sign(), alpha=-self.lr)
+
+    def state_dict(self):
+        return {"param_state": {str(i): v.cpu() for i, v in enumerate(self.param_state.values())}, "rqt_state": {str(i): v.cpu() for i, v in enumerate(self.rqt_state.values())}}
 
 
 def _replace(root, name, bits):
