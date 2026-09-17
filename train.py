@@ -82,6 +82,12 @@ class Lion(Optimizer):
         return loss
 
 
+def _build_optimizer(args, model):
+    if args.rqt or args.mixed_rqt:
+        return RQTLion(model, lr=args.lr, weight_decay=args.weight_decay)
+    return Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+
 def set_router_only_training(model, router_only):
     if not model.cfg.is_moe:
         raise ValueError("set_router_only_training requires cfg.is_moe=True")
@@ -372,7 +378,7 @@ def main():
         print(f"[MOE] router-only trainable={trainable:,}")
     if args.compile:
         model = torch.compile(model)
-    optimizer = RQTLion(model, lr=args.lr, weight_decay=args.weight_decay) if (args.rqt or args.mixed_rqt) else Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = _build_optimizer(args, model)
     resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json") if args.resume else ResumeState()
     if args.resume:
         optimizer_path = Path(args.checkpoint_dir) / "optimizer.pt"
