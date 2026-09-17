@@ -127,6 +127,21 @@ def test_malformed_remote_resume_position_fails_loudly():
         next(train._remote_token_stream("hindi", object(), 4, resume))
 
 
+def test_optimizer_selection_keeps_rqt_isolated():
+    class Args:
+        lr = 1e-4
+        weight_decay = 0.01
+        rqt = False
+        mixed_rqt = False
+
+    normal = train._build_optimizer(Args(), torch.nn.Linear(4, 2))
+    assert isinstance(normal, train.Lion)
+
+    Args.rqt = True
+    rqt = train._build_optimizer(Args(), torch.nn.Linear(4, 2))
+    assert isinstance(rqt, train.RQTLion)
+
+
 def test_parse_args_rejects_nonpositive_checkpoint_intervals(monkeypatch):
     for flag in ("--save_every", "--optimizer_save_every"):
         monkeypatch.setattr(sys, "argv", ["train.py", "--mode", "pretrain", flag, "0"])
