@@ -226,3 +226,24 @@ def load_rqt_checkpoint(in_dir):
         setattr(parent, name, RQTLinear(linear, bits))
     model.load_state_dict(sd, strict=True)
     return model
+
+
+def _install_checkpoint_loader():
+    from pathlib import Path
+    from safetensors.torch import load_file
+    from rwkv_x_core import RWKVXModel
+
+    original = RWKVXModel.from_pretrained.__func__
+
+    @classmethod
+    def from_pretrained(cls, in_dir):
+        path = Path(in_dir)
+        sd = load_file(str(path / "model.safetensors"))
+        if any(key.endswith(".packed") for key in sd):
+            return load_rqt_checkpoint(path)
+        return original(cls, in_dir)
+
+    RWKVXModel.from_pretrained = from_pretrained
+
+
+_install_checkpoint_loader()
