@@ -100,6 +100,38 @@ def test_rqt_rejects_bad_optimizer_state_shape():
         raise AssertionError("bad optimizer state was accepted")
 
 
+def test_rqt_gradient_matches_quantized_weight_shape():
+    linear = RQTLinear(torch.nn.Linear(8, 4, bias=False), 4)
+    x = torch.randn(3, 8)
+    linear(x).square().mean().backward()
+    assert linear._grad.shape == (4, 8)
+    assert linear._grad.dtype == torch.float32
+    assert not any(name == "weight" for name, _ in linear.named_parameters())
+
+
+def test_rqt_weight_is_requantized_after_every_step():
+    linear = RQTLinear(torch.nn.Linear(8, 4, bias=False), 6)
+    opt = RQTLion(linear, lr=0.1, weight_decay=0.0)
+    packed_before = linear.packed.clone()
+    linear(torch.ones(2, 8)).sum().backward()
+    opt.step()
+    assert linear._grad is None
+    assert linear.packed.dtype == torch.uint8
+    assert linear.packed.shape == packed_before.shape
+    assert torch.isfinite(linear.unpack()).all()
+
+
+def test_rqt_optimizer_rejects_unknown_module():
+    linear = RQTLinear(torch.nn.Linear(8, 4, bias=False), 6)
+    opt = RQTLion(linear)
+    try:
+        opt.load_state_dict({"rqt_state": {"missing": torch.zeros(4, 8)}, "param_state": {}})
+    except ValueError as exc:
+        assert "unknown RQT optimizer module" in str(exc)
+    else:
+        raise AssertionError("unknown RQT module was accepted")
+
+
 def test_prepare_rqt_replaces_all_linear_layers():
     class Model(nn.Module):
         def __init__(self):
