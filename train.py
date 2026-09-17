@@ -18,6 +18,7 @@ if "--cpu" in sys.argv:
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
 
 import torch
+from torch.optim import Optimizer
 
 from backend import backend_device, require_backend
 from dataset import PretrainStream, SFTDataset, discover_files, iter_texts, load_tokenizer, tokenizer_vocab_size
@@ -54,6 +55,33 @@ def _print_model_size(model):
     return parameters
 
 
+class Lion(Optimizer):
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
+        if lr <= 0:
+            raise ValueError("lr must be > 0")
+        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure else None
+        for group in self.param_groups:
+            lr, (b1, b2), decay = group["lr"], group["betas"], group["weight_decay"]
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                state = self.state[param]
+                if not state:
+                    state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+                avg = state["exp_avg"]
+                grad = param.grad.float()
+                if decay:
+                    param.mul_(1 - lr * decay)
+                update = avg.mul(b1).add(grad, alpha=1 - b1).sign()
+                param.add_(update, alpha=-lr)
+                avg.lerp_(grad, 1 - b2)
+        return loss
+
+
 def set_router_only_training(model, router_only):
     if not model.cfg.is_moe:
         raise ValueError("set_router_only_training requires cfg.is_moe=True")
@@ -78,7 +106,10 @@ class ResumeState:
     def load(cls, path):
         state = cls()
         if path.exists():
-            data = json.loads(path.read_text())
+            try:
+                data = json.loads(path.read_text())
+            except Exception as exc:
+                raise RuntimeError(f"could not load resume state: {path}") from exc
             state.__dict__.update(data)
         return state
 
@@ -100,6 +131,8 @@ def _load_rng_state(path):
     if not path.exists():
         return
     state = torch.load(path, map_location="cpu", weights_only=False)
+    if "torch" not in state:
+        raise RuntimeError(f"missing torch RNG state: {path}")
     torch.set_rng_state(state["torch"])
     if torch.cuda.is_available() and "cuda" in state:
         torch.cuda.set_rng_state_all(state["cuda"])
@@ -155,7 +188,10 @@ def _remote_token_stream(name, tokenizer, ctx_len, resume):
     dataset = file_path = None
     record = 0
     if resume.file_path:
-        dataset, file_path = resume.file_path.split("::", 1)
+        try:
+            dataset, file_path = resume.file_path.split("::", 1)
+        except ValueError as exc:
+            raise ValueError("invalid remote resume position") from exc
         record = resume.record_index
     buffer_tokens = list(resume.buffer_tokens)
     for text, position in stream_dataset(name, start_dataset=dataset, start_file=file_path, start_record=record, with_position=True):
@@ -335,7 +371,7 @@ def main():
         print(f"[MOE] router-only trainable={trainable:,}")
     if args.compile:
         model = torch.compile(model)
-    optimizer = RQTLion(model, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = RQTLion(model, lr=args.lr, weight_decay=args.weight_decay) if (args.rqt or args.mixed_rqt) else Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json") if args.resume else ResumeState()
     if args.resume:
         optimizer_path = Path(args.checkpoint_dir) / "optimizer.pt"
