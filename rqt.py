@@ -141,7 +141,8 @@ class RQTLinear(nn.Module):
     def forward(self, x):
         ext = _native_rqt()
         if ext is not None and ext is not False and self.bits in (FP4, FP6) and x.device.type == "cpu" and x.dtype == torch.float32 and x.shape[-1] == self.in_features:
-            return _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self)
+            out = _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self)
+            return out if self.bias is None else out + self.bias
         weight = self._weight_for_forward().detach().requires_grad_(True); weight.register_hook(lambda grad: self._capture_grad(0, grad))
         out = F.linear(x, weight, None); return out if self.bias is None else out + self.bias
 
