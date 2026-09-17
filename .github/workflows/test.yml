@@ -2,7 +2,7 @@ name: Python SmaulNative
 
 on:
   push:
-    branches: [Python-SmaulNative]
+    branches: [Python-SmaulNative, Development/Unstable]
   pull_request:
   workflow_dispatch:
 
