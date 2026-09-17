@@ -18,13 +18,13 @@ if "--cpu" in sys.argv:
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "1")
 
 import torch
-from torch.optim import Optimizer
 
 from backend import backend_device, require_backend
 from dataset import PretrainStream, SFTDataset, discover_files, iter_texts, load_tokenizer, tokenizer_vocab_size
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE
 from stream_data import stream_dataset
 from tokenizer import ensure_tokenizer
+from rqt import RQTLion, prepare_mixed_rqt, prepare_rqt
 
 STOP_REQUESTED = False
 
@@ -52,33 +52,6 @@ def _print_model_size(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[MODEL] {parameters:,} parameters | trainable={trainable:,} | FP32={_format_size(parameters * 4)}")
     return parameters
-
-
-class Lion(Optimizer):
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
-        if lr <= 0:
-            raise ValueError("lr must be > 0")
-        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = closure() if closure else None
-        for group in self.param_groups:
-            lr, (b1, b2), decay = group["lr"], group["betas"], group["weight_decay"]
-            for param in group["params"]:
-                if param.grad is None:
-                    continue
-                state = self.state[param]
-                if not state:
-                    state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
-                avg = state["exp_avg"]
-                grad = param.grad.float()
-                if decay:
-                    param.mul_(1 - lr * decay)
-                update = avg.mul(b1).add(grad, alpha=1 - b1).sign()
-                param.add_(update, alpha=-lr)
-                avg.lerp_(grad, 1 - b2)
-        return loss
 
 
 def set_router_only_training(model, router_only):
@@ -152,7 +125,7 @@ def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokeni
 
 
 def _autocast(args, device):
-    if args.mixed_precision:
+    if args.rqt or args.mixed_rqt:
         return contextlib.nullcontext()
     if device.type == "cuda":
         dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
@@ -297,7 +270,9 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--mixed_precision", action="store_true")
+    parser.add_argument("--rqt", action="store_true")
+    parser.add_argument("--rqt_bits", type=int, choices=[4, 6, 8], default=6)
+    parser.add_argument("--mixed_rqt", action="store_true")
     parser.add_argument("--router_only", action="store_true")
     return parser.parse_args()
 
@@ -328,17 +303,15 @@ def _build_model(args):
     config = dict(vocab_size=args.tokenizer_vocab_size, n_embd=args.n_embd, n_layer=args.n_layer, n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len)
     checkpoint = _checkpoint_config(args.output_dir)
     if checkpoint:
-        checkpoint = {k: v for k, v in checkpoint.items() if k not in {"qat_bits", "rqt_bits", "quantization_bits"}}
+        checkpoint = {k: v for k, v in checkpoint.items() if k not in {"qat_bits", "rqt_bits", "quantization_bits", "rqt_mixed"}}
     if checkpoint == config and (Path(args.output_dir) / "model.safetensors").exists():
-        model = RWKVXModel.from_pretrained(args.output_dir)
-    else:
-        model = RWKVXModel(config)
-    return model
+        return RWKVXModel.from_pretrained(args.output_dir)
+    return RWKVXModel(config)
 
 
 def main():
     args = parse_args()
-    if args.mixed_precision:
+    if args.rqt or args.mixed_rqt:
         args.precision = "fp32"
     elif args.precision is None:
         args.precision = "fp16" if torch.cuda.is_available() and not args.cpu else "fp32"
@@ -347,24 +320,21 @@ def main():
     if device.type == "cpu":
         import cpu
         cpu.configure()
-    print(f"[DEVICE] {device} | precision={args.precision} | mixed={args.mixed_precision}")
+    print(f"[DEVICE] {device} | precision={args.precision} | rqt={args.rqt or args.mixed_rqt}")
     tokenizer = _load_or_build_tokenizer(args)
     model = _build_model(args).to(device)
-    if args.mixed_precision:
-        from mixed_precision import apply, describe
-        count = apply(model)
-        sizes = describe(model)
-        print(f"[MIXED] {count} linear layers | FP4={sizes[4]:,} weights | FP6={sizes[6]:,} weights | FP8={sizes[8]:,} weights")
+    if args.mixed_rqt:
+        prepare_mixed_rqt(model)
+    elif args.rqt:
+        prepare_rqt(model, args.rqt_bits)
     if args.router_only:
         trainable = set_router_only_training(model, True)
         print(f"[MOE] router-only trainable={trainable:,}")
     if args.compile:
         model = torch.compile(model)
-    optimizer = Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = RQTLion(model, lr=args.lr, weight_decay=args.weight_decay)
     resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json") if args.resume else ResumeState()
-    optimizer_path = Path(args.checkpoint_dir) / "optimizer.pt"
-    if args.resume and optimizer_path.exists():
-        optimizer.load_state_dict(torch.load(optimizer_path, map_location=device, weights_only=False))
+    if args.resume:
         _load_rng_state(Path(args.checkpoint_dir) / "rng_state.pt")
     if args.mode == "pretrain":
         train_pretrain(args, model, optimizer, resume, device, tokenizer)
