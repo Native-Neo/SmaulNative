@@ -21,7 +21,7 @@ def _check(bits):
     assert torch.isfinite(layer._grad).all()
 
     old = layer.unpack().clone()
-    update = torch.full_like(old, 1e-5)
+    update = torch.full_like(old, 0.1)
     layer.step(update, 0.0)
     new = layer.unpack()
     assert not torch.equal(old, new)
