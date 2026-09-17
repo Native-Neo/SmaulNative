@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 FP4, FP6, FP8 = 4, 6, 8
+_LEVEL_CACHE = {}
 
 
 def _bits(bits):
@@ -16,6 +17,10 @@ def _bits(bits):
 def _levels(bits, device, dtype):
     if bits == FP8:
         raise ValueError("FP8 uses native torch.float8_e4m3fn")
+    key = (bits, device.type, device.index, dtype)
+    cached = _LEVEL_CACHE.get(key)
+    if cached is not None:
+        return cached
     ebits, mbits = (2, 1) if bits == FP4 else (3, 2)
     bias = (1 << (ebits - 1)) - 1
     values = []
@@ -25,7 +30,9 @@ def _levels(bits, device, dtype):
         sign = -1.0 if code >> (bits - 1) else 1.0
         value = (mant / (1 << mbits)) * 2 ** (1 - bias) if exp == 0 else (1 + mant / (1 << mbits)) * 2 ** (exp - bias)
         values.append(sign * value)
-    return torch.tensor(values, device=device, dtype=dtype)
+    levels = torch.tensor(values, device=device, dtype=dtype)
+    _LEVEL_CACHE[key] = levels
+    return levels
 
 
 def _pack(codes, bits):
