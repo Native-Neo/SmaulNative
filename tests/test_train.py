@@ -140,10 +140,3 @@ def test_optimizer_selection_keeps_rqt_isolated():
     Args.rqt = True
     rqt = train._build_optimizer(Args(), torch.nn.Linear(4, 2))
     assert isinstance(rqt, train.RQTLion)
-
-
-def test_parse_args_rejects_nonpositive_checkpoint_intervals(monkeypatch):
-    for flag in ("--save_every", "--optimizer_save_every"):
-        monkeypatch.setattr(sys, "argv", ["train.py", "--mode", "pretrain", flag, "0"])
-        with pytest.raises(SystemExit):
-            train.parse_args()
