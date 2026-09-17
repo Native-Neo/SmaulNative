@@ -11,14 +11,24 @@ def _check(bits):
     x = torch.randn(5, 17, requires_grad=True)
 
     out = layer(x)
-    ref = torch.nn.functional.linear(x, layer.unpack(), layer.bias)
-    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+    weight = layer.unpack().detach().requires_grad_(True)
+    ref = torch.nn.functional.linear(x.detach().requires_grad_(True), weight, layer.bias)
+    torch.testing.assert_close(out, ref.detach(), rtol=1e-5, atol=1e-5)
 
-    loss = out.square().mean()
-    loss.backward()
-    assert layer._grad is not None
-    assert layer._grad.shape == (11, 17)
-    assert torch.isfinite(layer._grad).all()
+    grad_output = torch.randn_like(out)
+    native_x = x.detach().clone().requires_grad_(True)
+    native_out = layer(native_x)
+    native_out.backward(grad_output)
+
+    ref_x = x.detach().clone().requires_grad_(True)
+    ref_weight = layer.unpack().detach().requires_grad_(True)
+    ref_bias = layer.bias.detach().clone().requires_grad_(True)
+    ref_out = torch.nn.functional.linear(ref_x, ref_weight, ref_bias)
+    ref_out.backward(grad_output)
+
+    torch.testing.assert_close(native_x.grad, ref_x.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(layer._grad, ref_weight.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(layer.bias.grad, ref_bias.grad, rtol=1e-5, atol=1e-5)
 
     old = layer.unpack().clone()
     update = torch.full_like(old, 0.1)
