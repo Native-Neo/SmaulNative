@@ -174,9 +174,22 @@ class RQTLion:
     def state_dict(self):
         modules = {name: state.cpu() for name, module in self._modules() if (state := self.rqt_state.get(module)) is not None}
         params = {self.param_names[id(param)]: state.cpu() for param, state in self.param_state.items() if id(param) in self.param_names}
-        return {"param_state": params, "rqt_state": modules}
+        return {
+            "version": 2,
+            "lr": self.lr,
+            "betas": self.betas,
+            "weight_decay": self.weight_decay,
+            "param_state": params,
+            "rqt_state": modules,
+        }
 
     def load_state_dict(self, state):
+        if "lr" in state:
+            self.lr = float(state["lr"])
+        if "betas" in state:
+            self.betas = tuple(state["betas"])
+        if "weight_decay" in state:
+            self.weight_decay = float(state["weight_decay"])
         rqt_state = state.get("rqt_state", {})
         param_state = state.get("param_state", {})
         modules = dict(self._modules())
