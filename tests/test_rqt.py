@@ -43,6 +43,26 @@ def test_rqt_lion_steps_without_master_weight():
     assert linear._grad is None
 
 
+def test_rqt_lion_state_uses_stable_names():
+    model = torch.nn.Sequential(
+        RQTLinear(torch.nn.Linear(8, 4, bias=False), 6),
+        RQTLinear(torch.nn.Linear(4, 2, bias=False), 6),
+    )
+    opt = RQTLion(model, lr=1e-3, weight_decay=0.0)
+    model(torch.randn(2, 8)).sum().backward()
+    opt.step()
+    state = opt.state_dict()
+    assert set(state["rqt_state"]) == {"0", "1"}
+
+    clone = torch.nn.Sequential(
+        RQTLinear(torch.nn.Linear(8, 4, bias=False), 6),
+        RQTLinear(torch.nn.Linear(4, 2, bias=False), 6),
+    )
+    clone_opt = RQTLion(clone, lr=1e-3, weight_decay=0.0)
+    clone_opt.load_state_dict(state)
+    assert all(module in clone_opt.rqt_state for module in clone_opt._modules() if module[1] in clone_opt.rqt_state)
+
+
 def test_fp6_levels_are_finite():
     levels = _levels(6, torch.device("cpu"), torch.float32)
     assert levels.numel() == 64
