@@ -38,11 +38,11 @@ def test_final_partial_batch_is_flushed(monkeypatch):
 
     calls = []
     monkeypatch.setattr(train, "PretrainStream", lambda *args, **kwargs: Stream())
-    monkeypatch.setattr(train, "_train_pretrain_batch", lambda *args: calls.append(len(args[6])) or torch.tensor(1.0))
+    monkeypatch.setattr(train, "_train_batch", lambda *args: calls.append(len(args[6])) or torch.tensor(1.0))
     monkeypatch.setattr(train, "save_checkpoint", lambda *args, **kwargs: None)
     resume = train.ResumeState()
     train.STOP_REQUESTED = False
-    train.train_pretrain(Args(), DummyModel(), DummyOptimizer(), resume, torch.device("cpu"), object(), None)
+    train.train_pretrain(Args(), DummyModel(), DummyOptimizer(), resume, torch.device("cpu"), object())
     assert calls == [1]
 
 
@@ -73,11 +73,11 @@ def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
         return torch.tensor(1.0)
 
     monkeypatch.setattr(train, "PretrainStream", lambda *args, **kwargs: Stream())
-    monkeypatch.setattr(train, "_train_pretrain_batch", train_batch)
+    monkeypatch.setattr(train, "_train_batch", train_batch)
     monkeypatch.setattr(train, "save_checkpoint", lambda *args, **kwargs: saves.append(args[2].global_step))
     resume = train.ResumeState()
     train.STOP_REQUESTED = False
-    train.train_pretrain(Args(), DummyModel(), DummyOptimizer(), resume, torch.device("cpu"), object(), None)
+    train.train_pretrain(Args(), DummyModel(), DummyOptimizer(), resume, torch.device("cpu"), object())
     assert saves == [1, 2]
 
 
