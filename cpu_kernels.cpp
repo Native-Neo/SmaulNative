@@ -70,7 +70,7 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
   });
 }
 
-void rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::Tensor scale, int64_t in_features, int64_t out_features, int64_t bits) {
+torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::Tensor scale, int64_t in_features, int64_t out_features, int64_t bits) {
   TORCH_CHECK(x.device().is_cpu() && packed.device().is_cpu() && scale.device().is_cpu());
   TORCH_CHECK(x.dtype() == torch::kFloat32 && packed.dtype() == torch::kUInt8 && scale.dtype() == torch::kFloat32);
   TORCH_CHECK(x.dim() == 2 && x.size(1) == in_features && packed.is_contiguous() && scale.is_contiguous() && x.is_contiguous());
