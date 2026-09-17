@@ -143,7 +143,10 @@ def _optimizer_step(args, model, optimizer, xb, yb, device):
         print(f"[WARN] non-finite loss {loss.item()}, skipping step")
         return None
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
+    if args.rqt or args.mixed_rqt:
+        optimizer.clip_grad_norm(1.0)
+    else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
     optimizer.step()
     return loss
 
