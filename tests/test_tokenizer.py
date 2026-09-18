@@ -4,7 +4,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
-from tokenizer import SmaulTokenizer, _build, read_texts
+from tokenizer import SmaulTokenizer, _build, devanagari_units, read_texts
 
 
 def test_recursive_text_order_is_deterministic(tmp_path):
@@ -42,3 +42,10 @@ def test_tiny_tokenizer_preserves_whitespace():
     tok = SmaulTokenizer(data)
     assert " " in tok.vocab
     assert tok.decode(tok.encode("a b")) == "a b"
+
+
+def test_devanagari_units_preserve_marks_and_joiners():
+    assert devanagari_units("कि") == ["कि"]
+    assert devanagari_units("क्ष") == ["क्ष"]
+    assert devanagari_units("क्\u200dष") == ["क्\u200dष"]
+    assert devanagari_units("क\u093c") == ["क\u093c"]
