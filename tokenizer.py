@@ -142,13 +142,15 @@ def devanagari_units(text):
         u = c; i += 1
         while i < len(text):
             c = text[i]
-            if unicodedata.combining(c) or c in "\u200c\u200d":
-                u += c; i += 1; continue
             if c == "्":
                 u += c; i += 1
+                while i < len(text) and (unicodedata.category(text[i]).startswith("M") or text[i] in "\u200c\u200d"):
+                    u += text[i]; i += 1
                 if i < len(text) and DEV_BASE.fullmatch(text[i]):
                     u += text[i]; i += 1
                 continue
+            if unicodedata.category(c).startswith("M") or c in "\u200c\u200d":
+                u += c; i += 1; continue
             break
         out.append(u)
     return out
