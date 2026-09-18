@@ -195,8 +195,17 @@ class RQTLion:
         for _, module in self._modules():
             if module._grad is None: continue
             grad = module._grad; avg = self.rqt_state.setdefault(module, torch.zeros_like(grad, dtype=torch.float32))
-            avg.mul_(b1).add_(grad, alpha=1 - b1); update = avg.sign().mul(self.lr); avg.mul_(b2).add_(grad, alpha=1 - b2)
-            module.step(update, self.lr * self.weight_decay)
+            ext = _native_rqt()
+            fused = (ext is not None and ext is not False and module.bits in (FP4, FP6) and
+                     module.packed.device.type == "cpu" and grad.dtype == torch.float32 and
+                     grad.is_contiguous() and avg.is_contiguous() and module.packed.is_contiguous() and module.scale.is_contiguous())
+            if fused:
+                ext.rqt_lion_step(module.packed, module.scale, grad, avg, module.in_features, module.out_features,
+                                  module.bits, self.lr, b1, b2, self.lr * self.weight_decay)
+                module._cached_weight = None; module._grad = None
+            else:
+                avg.mul_(b1).add_(grad, alpha=1 - b1); update = avg.sign().mul(self.lr); avg.mul_(b2).add_(grad, alpha=1 - b2)
+                module.step(update, self.lr * self.weight_decay)
         for param in self.params:
             if param.grad is None: continue
             grad = param.grad.float(); avg = self.param_state.setdefault(param, torch.zeros_like(param, dtype=torch.float32))
