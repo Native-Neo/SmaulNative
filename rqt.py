@@ -179,7 +179,7 @@ class RQTLinear(nn.Module):
 
     def forward(self, x):
         ext = _native_rqt()
-        if ext is not None and ext is not False and self.bits in (FP4, FP6) and x.device.type == "cpu" and x.dtype == torch.float32 and x.shape[-1] == self.in_features:
+        if ext is not None and ext is not False and self.bits in (FP4, FP6, FP8) and x.device.type == "cpu" and x.dtype == torch.float32 and x.shape[-1] == self.in_features:
             grad_anchor = torch.ones((), dtype=x.dtype, device=x.device, requires_grad=True)
             out = _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self, grad_anchor)
             return out if self.bias is None else out + self.bias
@@ -190,7 +190,7 @@ class RQTLinear(nn.Module):
     def step(self, update, decay):
         if update.shape != (self.out_features, self.in_features): raise ValueError("invalid RQT update shape")
         ext = _native_rqt()
-        if ext is not None and ext is not False and self.bits in (FP4, FP6) and self.packed.device.type == "cpu" and update.dtype == torch.float32 and update.is_contiguous() and self.packed.is_contiguous() and self.scale.is_contiguous():
+        if ext is not None and ext is not False and self.bits in (FP4, FP6, FP8) and self.packed.device.type == "cpu" and update.dtype == torch.float32 and update.is_contiguous() and self.packed.is_contiguous() and self.scale.is_contiguous():
             ext.rqt_requant_step(self.packed, self.scale, update, self.in_features, self.out_features, self.bits, decay)
             self._cached_weight = None; self._grad = None; return
         weight = self._weight_for_forward()
@@ -240,7 +240,7 @@ class RQTLion:
             if module._grad is None: continue
             grad = module._grad; avg = self.rqt_state.setdefault(module, torch.zeros_like(grad, dtype=self.state_dtype))
             ext = _native_rqt()
-            fused = (ext is not None and ext is not False and module.bits in (FP4, FP6) and
+            fused = (ext is not None and ext is not False and module.bits in (FP4, FP6, FP8) and
                      module.packed.device.type == "cpu" and grad.dtype == torch.float32 and avg.dtype == torch.float32 and
                      grad.is_contiguous() and avg.is_contiguous() and module.packed.is_contiguous() and module.scale.is_contiguous())
             if fused:
