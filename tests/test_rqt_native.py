@@ -72,3 +72,31 @@ def test_fused_rqt_lion_matches_reference():
 
         torch.testing.assert_close(avg_fused, avg_reference, rtol=0, atol=0)
         torch.testing.assert_close(fused.unpack(), reference.unpack(), rtol=0, atol=0)
+
+def test_fused_rqt_lion_matches_reference():
+    from rqt import _native_rqt
+
+    for bits in (FP4, FP6):
+        torch.manual_seed(77 + bits)
+        base = nn.Linear(17, 11, bias=False)
+        fused = RQTLinear(base, bits)
+        reference = RQTLinear(nn.Linear(17, 11, bias=False), bits)
+        reference.packed.copy_(fused.packed)
+        reference.scale.copy_(fused.scale)
+
+        grad = torch.randn(11, 17)
+        avg_fused = torch.randn_like(grad)
+        avg_reference = avg_fused.clone()
+        lr, b1, b2, decay = 1e-3, 0.9, 0.99, 2e-5
+
+        ext = _native_rqt()
+        assert ext is not None and ext is not False
+        ext.rqt_lion_step(fused.packed, fused.scale, grad, avg_fused, 17, 11, bits, lr, b1, b2, decay)
+
+        avg_reference.mul_(b1).add_(grad, alpha=1 - b1)
+        update = avg_reference.sign().mul(lr)
+        avg_reference.mul_(b2).add_(grad, alpha=1 - b2)
+        reference.step(update, decay)
+
+        torch.testing.assert_close(avg_fused, avg_reference, rtol=0, atol=0)
+        torch.testing.assert_close(fused.unpack(), reference.unpack(), rtol=0, atol=0)
