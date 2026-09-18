@@ -212,6 +212,8 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
       const int64_t r = task / m, o = task - r * m;
       const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base;
       const float* xr = xx + r * n;
+      float scaled_levels[64];
+      if (ibits == 6) for (int code = 0; code < 64; ++code) scaled_levels[code] = level[code] * s;
       float acc = 0.0f;
       if (ibits == 4) {
         int64_t i = 0;
@@ -238,13 +240,13 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
           const uint8_t c1 = ((p[0] & 3) << 4) | (p[1] >> 4);
           const uint8_t c2 = ((p[1] & 15) << 2) | (p[2] >> 6);
           const uint8_t c3 = p[2] & 63;
-          acc += xr[i] * level[c0] * s;
-          acc += xr[i + 1] * level[c1] * s;
-          acc += xr[i + 2] * level[c2] * s;
-          acc += xr[i + 3] * level[c3] * s;
+          acc += xr[i] * scaled_levels[c0];
+          acc += xr[i + 1] * scaled_levels[c1];
+          acc += xr[i + 2] * scaled_levels[c2];
+          acc += xr[i + 3] * scaled_levels[c3];
         }
         for (; i < n; ++i) {
-          acc += xr[i] * level[rqt_code(row, (int)i, ibits)] * s;
+          acc += xr[i] * scaled_levels[rqt_code(row, (int)i, ibits)];
         }
       }
       yy[r * m + o] = acc;
