@@ -144,31 +144,35 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   TORCH_CHECK(x.dim() == 2 && x.size(1) == in_features && packed.is_contiguous() && scale.is_contiguous() && x.is_contiguous());
   TORCH_CHECK(bits == 4 || bits == 6);
   auto out = torch::empty({x.size(0), out_features}, x.options());
-  const auto rows = x.size(0); const auto n = in_features; const auto m = out_features;
-  const auto* xx = x.data_ptr<float>(); const auto* pp = packed.data_ptr<uint8_t>(); const auto* ss = scale.data_ptr<float>(); auto* yy = out.data_ptr<float>();
-  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3; const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
+  const auto rows = x.size(0), n = in_features, m = out_features;
+  const auto* xx = x.data_ptr<float>(); const auto* pp = packed.data_ptr<uint8_t>();
+  const auto* ss = scale.data_ptr<float>(); auto* yy = out.data_ptr<float>();
+  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3;
+  const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
+
   at::parallel_for(0, rows * m, 1, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
-      const int64_t r = task / m, o = task - r * m; const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base; const float* xr = xx + r * n; float acc = 0.0f;
-      if (ibits == 4) {
-        int64_t i = 0;
-        for (; i + 7 < n; i += 8) {
-          const uint8_t p0 = row[i >> 1], p1 = row[(i + 2) >> 1], p2 = row[(i + 4) >> 1], p3 = row[(i + 6) >> 1];
-          acc += xr[i] * level[p0 >> 4] * s + xr[i + 1] * level[p0 & 15] * s + xr[i + 2] * level[p1 >> 4] * s + xr[i + 3] * level[p1 & 15] * s;
-          acc += xr[i + 4] * level[p2 >> 4] * s + xr[i + 5] * level[p2 & 15] * s + xr[i + 6] * level[p3 >> 4] * s + xr[i + 7] * level[p3 & 15] * s;
-        }
-        for (; i < n; i += 2) { const uint8_t p = row[i >> 1]; acc += xr[i] * level[p >> 4] * s; if (i + 1 < n) acc += xr[i + 1] * level[p & 15] * s; }
-      } else {
-        int64_t i = 0, b = 0;
-        for (; i + 7 < n; i += 8, b += 6) {
-          const uint8_t* p = row + b;
-          const uint8_t c0 = p[0] >> 2, c1 = ((p[0] & 3) << 4) | (p[1] >> 4), c2 = ((p[1] & 15) << 2) | (p[2] >> 6), c3 = p[2] & 63;
-          const uint8_t c4 = p[3] >> 2, c5 = ((p[3] & 3) << 4) | (p[4] >> 4), c6 = ((p[4] & 15) << 2) | (p[5] >> 6), c7 = p[5] & 63;
-          acc += xr[i] * level[c0] * s + xr[i + 1] * level[c1] * s + xr[i + 2] * level[c2] * s + xr[i + 3] * level[c3] * s;
-          acc += xr[i + 4] * level[c4] * s + xr[i + 5] * level[c5] * s + xr[i + 6] * level[c6] * s + xr[i + 7] * level[c7] * s;
-        }
-        for (; i < n; i += 4, b += 3) { const uint8_t* p = row + b; const uint8_t c0 = p[0] >> 2, c1 = ((p[0] & 3) << 4) | (p[1] >> 4), c2 = ((p[1] & 15) << 2) | (p[2] >> 6), c3 = p[2] & 63; acc += xr[i] * level[c0] * s; if (i + 1 < n) acc += xr[i + 1] * level[c1] * s; if (i + 2 < n) acc += xr[i + 2] * level[c2] * s; if (i + 3 < n) acc += xr[i + 3] * level[c3] * s; }
+      const int64_t r = task / m, o = task - r * m;
+      const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base;
+      const float* xr = xx + r * n; float acc = 0.0f;
+      int64_t i = 0;
+
+      for (; i + 7 < n; i += 8) {
+        uint8_t c[8];
+        for (int k = 0; k < 8; ++k) c[k] = rqt_code(row, (int)(i + k), ibits);
+        const __m256 weights = _mm256_set_ps(
+            level[c[7]] * s, level[c[6]] * s, level[c[5]] * s, level[c[4]] * s,
+            level[c[3]] * s, level[c[2]] * s, level[c[1]] * s, level[c[0]] * s);
+        const __m256 input = _mm256_loadu_ps(xr + i);
+        const __m256 product = _mm256_mul_ps(weights, input);
+        const __m128 lo = _mm256_castps256_ps128(product);
+        const __m128 hi = _mm256_extractf128_ps(product, 1);
+        const __m128 sum = _mm_add_ps(lo, hi);
+        const __m128 pair = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+        acc += pair[0] + pair[1];
       }
+
+      for (; i < n; ++i) acc += xr[i] * level[rqt_code(row, (int)i, ibits)] * s;
       yy[r * m + o] = acc;
     }
   });
