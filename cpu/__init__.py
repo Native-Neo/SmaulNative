@@ -1,4 +1,5 @@
 import os
+import warnings
 from pathlib import Path
 
 import torch
@@ -23,8 +24,9 @@ def _load_wkv():
                 extra_cflags=["-O3", "-march=native", "-mtune=native"],
                 verbose=False,
             )
-        except Exception:
+        except Exception as exc:
             _WKV_EXT = False
+            warnings.warn(f"native WKV extension unavailable; using reference implementation ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
     return None if _WKV_EXT is False else _WKV_EXT
 
 
