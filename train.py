@@ -85,7 +85,8 @@ class Lion(Optimizer):
 
 def _build_optimizer(args, model):
     if args.rqt or args.mixed_rqt:
-        return RQTLion(model, lr=args.lr, weight_decay=args.weight_decay)
+        state_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[getattr(args, "rqt_state_dtype", "fp32")]
+        return RQTLion(model, lr=args.lr, weight_decay=args.weight_decay, state_dtype=state_dtype)
     return Lion(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
 
@@ -327,6 +328,7 @@ def parse_args():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--rqt", action="store_true")
     parser.add_argument("--rqt_bits", type=int, choices=[4, 6, 8], default=6)
+    parser.add_argument("--rqt-state-dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
     parser.add_argument("--mixed_rqt", action="store_true")
     parser.add_argument("--router_only", action="store_true")
     return parser.parse_args()
