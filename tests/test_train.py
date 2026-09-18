@@ -183,3 +183,23 @@ def test_build_model_reuses_compatible_checkpoint(tmp_path, monkeypatch):
     sentinel = object()
     monkeypatch.setattr(train.RWKVXModel, "from_pretrained", classmethod(lambda cls, path: sentinel))
     assert train._build_model(Args()) is sentinel
+
+
+def test_resume_rejects_tokenizer_mismatch(tmp_path):
+    (tmp_path / "model.safetensors").write_bytes(b"checkpoint")
+    (tmp_path / "config.json").write_text(
+        '{"vocab_size":32,"n_embd":8,"n_layer":2,"n_moba_layer":0,'
+        '"head_size":4,"ctx_len_hint":16,"tokenizer_sha256":"wrong"}'
+    )
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text("current")
+
+    Args = type("Args", (), {
+        "output_dir": str(tmp_path), "tokenizer_path": str(tokenizer_path),
+        "dataset_dir": str(tmp_path / "missing-dataset"), "tokenizer_vocab_size": 32,
+        "n_embd": 8, "n_layer": 2, "n_moba_layer": 0, "head_size": 4,
+        "ctx_len": 16, "resume": True,
+    })
+
+    with pytest.raises(ValueError, match="checkpoint metadata"):
+        train._build_model(Args())
