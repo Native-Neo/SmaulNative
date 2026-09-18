@@ -11,16 +11,21 @@ _WKV_ORIG = None
 
 def _load_wkv():
     global _WKV_EXT
+    if _WKV_EXT is False:
+        return None
     if _WKV_EXT is None:
         from torch.utils.cpp_extension import load
         root = Path(__file__).resolve().parent
-        _WKV_EXT = load(
-            name="smaulnative_wkv",
-            sources=[str(root / "wkv_kernel.cpp")],
-            extra_cflags=["-O3", "-march=native", "-mtune=native"],
-            verbose=False,
-        )
-    return _WKV_EXT
+        try:
+            _WKV_EXT = load(
+                name="smaulnative_wkv",
+                sources=[str(root / "wkv_kernel.cpp")],
+                extra_cflags=["-O3", "-march=native", "-mtune=native"],
+                verbose=False,
+            )
+        except Exception:
+            _WKV_EXT = False
+    return None if _WKV_EXT is False else _WKV_EXT
 
 
 class _NativeWKV(torch.autograd.Function):
@@ -52,6 +57,14 @@ class _NativeWKV(torch.autograd.Function):
 
 
 def _native_wkv(state, w, k, v, kk, a, r):
+    if _load_wkv() is None:
+        if state.dim() >= 3 and state.shape[-1] > 128:
+            raise ValueError(f"native WKV head size must be <= 128, got {state.shape[-1]}")
+        import rwkv_x_core
+        reference = _WKV_ORIG or rwkv_x_core._wkv_run_chunk
+        if reference is _native_wkv:
+            raise RuntimeError("WKV reference implementation is unavailable")
+        return reference(state, w, k, v, kk, a, r)
     return _NativeWKV.apply(state, w, k, v, kk, a, r)
 
 
