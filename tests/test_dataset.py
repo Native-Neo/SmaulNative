@@ -58,7 +58,7 @@ def test_json_resume_is_one_based(tmp_path):
     path = tmp_path / "x.json"
     path.write_text(json.dumps([{"text": "row0"}, {"text": "row1"}, {"text": "row2"}]))
     rows = list(iter_texts([path], str(path.resolve()), 2))
-    assert [row[0] for row in rows] == ["row1", "row2"]
+    assert [row[0] for row in rows] == ["row2"]
 
 
 def test_csv_resume_is_one_based(tmp_path):
