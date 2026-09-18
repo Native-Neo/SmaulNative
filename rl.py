@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from rwkv_x_core import RWKVXModel
 from tokenizer import SmaulTokenizer
+from rqt import RQTLion, RQTLinear
 
 
 class SmaulRL:
@@ -137,7 +138,8 @@ class SmaulRL:
         rewards = torch.full((len(candidates),), -1.0, device=self.device)
         rewards[chosen] = 1.0
         advantages = (rewards - rewards.mean()) / rewards.std().clamp_min(1e-6)
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
+        rqt_model = any(isinstance(module, RQTLinear) for module in self.model.modules())
+        optimizer = RQTLion(self.model, lr=lr) if rqt_model else torch.optim.SGD(self.model.parameters(), lr=lr)
         losses = []
         for candidate, advantage in zip(candidates, advantages):
             if not candidate["tokens"]:
@@ -158,7 +160,10 @@ class SmaulRL:
         loss = torch.stack(losses).mean()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        if rqt_model:
+            optimizer.clip_grad_norm(1.0)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         optimizer.step()
         policy_dir = self.work_dir / "policy"
         policy_dir.mkdir(parents=True, exist_ok=True)
