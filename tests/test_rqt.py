@@ -71,7 +71,7 @@ def test_rqt_lion_state_uses_stable_names():
     opt.step()
     state = opt.state_dict()
     assert set(state["rqt_state"]) == {"0", "1"}
-    assert state["version"] == 2
+    assert state["version"] == 4
     assert state["lr"] == 1e-3
     assert state["betas"] == (0.9, 0.99)
 
