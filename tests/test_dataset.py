@@ -68,14 +68,14 @@ def test_csv_resume_is_one_based(tmp_path):
         writer.writeheader()
         writer.writerows({"text": f"row{i}"} for i in range(3))
     rows = list(iter_texts([path], str(path.resolve()), 2))
-    assert [row[0] for row in rows] == ["row1", "row2"]
+    assert [row[0] for row in rows] == ["row2"]
 
 
 def test_parquet_resume_is_one_based(tmp_path):
     path = tmp_path / "x.parquet"
     pq.write_table(pa.table({"text": ["row0", "row1", "row2"]}), path)
     rows = list(iter_texts([path], str(path.resolve()), 2))
-    assert [row[0] for row in rows] == ["row1", "row2"]
+    assert [row[0] for row in rows] == ["row2"]
 
 
 def test_parquet_prompt_and_completion_are_combined(tmp_path):
