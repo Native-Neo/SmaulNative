@@ -34,6 +34,12 @@ For a kernel-only test:
 python cpu/benchmark_cpu.py --threads 2 --size 10000000
 ```
 
+For packed RQT forward, backward, and fused Lion timings:
+
+```bash
+python cpu/benchmark_rqt.py --bits 6 --threads 2
+```
+
 For an end-to-end training-step benchmark:
 
 ```bash
