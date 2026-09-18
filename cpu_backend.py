@@ -66,7 +66,7 @@ class NativeLion(Optimizer):
         super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
         self._ext = _load()
         if self._ext is None or self._ext is False:
-            print("[OPTIMIZER] AVX unavailable; using PyTorch Lion fallback")
+            print("[OPTIMIZER] native extension unavailable; using PyTorch Lion fallback")
 
     @torch.no_grad()
     def step(self, closure=None):
