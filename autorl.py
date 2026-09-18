@@ -77,6 +77,10 @@ class AutoRL:
     def _filter_logits(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
         if temperature <= 0:
             raise ValueError("temperature must be > 0 for policy sampling")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
         logits = logits.float() / temperature
         if top_k > 0 and top_k < logits.numel():
             cutoff = torch.topk(logits, top_k).values[-1]
