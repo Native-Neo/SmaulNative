@@ -256,6 +256,12 @@ def train_pretrain(args, model, optimizer, resume, device, tokenizer):
         if STOP_REQUESTED:
             break
 
+    if batch_x and not STOP_REQUESTED:
+        loss = _train_batch(args, model, optimizer, resume, device, batch_x, batch_y, path, record, buffer_tokens)
+        batch_x, batch_y = [], []
+        if loss is not None:
+            resume.global_step += 1
+            resume.total_tokens += len(batch_x) * args.ctx_len
 
 def train_sft(args, model, optimizer, resume, device, tokenizer):
     dataset = SFTDataset(Path(args.dataset_dir), tokenizer, args.ctx_len)
