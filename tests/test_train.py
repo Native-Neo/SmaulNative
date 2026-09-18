@@ -203,3 +203,18 @@ def test_resume_rejects_tokenizer_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="checkpoint metadata"):
         train._build_model(Args())
+
+
+def test_resume_rejects_quantization_mode_mismatch(tmp_path):
+    (tmp_path / "model.safetensors").write_bytes(b"checkpoint")
+    (tmp_path / "config.json").write_text(
+        '{"vocab_size":32,"n_embd":8,"n_layer":2,"n_moba_layer":0,'
+        '"head_size":4,"ctx_len_hint":16,"rqt_bits":6,"rqt_mixed":false}'
+    )
+    Args = type("Args", (), {
+        "output_dir": str(tmp_path), "tokenizer_vocab_size": 32, "n_embd": 8,
+        "n_layer": 2, "n_moba_layer": 0, "head_size": 4, "ctx_len": 16,
+        "resume": True, "rqt": False, "rqt_bits": 6, "mixed_rqt": False,
+    })
+    with pytest.raises(ValueError, match="checkpoint metadata"):
+        train._build_model(Args())
