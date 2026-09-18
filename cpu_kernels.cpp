@@ -203,7 +203,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3;
   const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
 
-  at::parallel_for(0, rows * m, 1, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, rows * m, 64, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
       const int64_t r = task / m, o = task - r * m;
       const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base;
@@ -230,7 +230,7 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
   const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3;
   const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
 
-  at::parallel_for(0, rows * ((n + 7) / 8), 1, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, rows * ((n + 7) / 8), 16, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
       const int64_t r = task / ((n + 7) / 8), block = task - r * ((n + 7) / 8), i = block * 8;
       const float* gr = gg + r * m;
