@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from rqt import FP4, FP6, RQTLinear
+from rqt import FP4, FP6, FP8, RQTLinear
 
 
 def _check(bits):
@@ -44,6 +44,10 @@ def test_fp4_native_rqt_linear():
 
 def test_fp6_native_rqt_linear():
     _check(FP6)
+
+
+def test_fp8_native_rqt_linear():
+    _check(FP8)
 
 def test_fused_rqt_lion_matches_reference():
     from rqt import _native_rqt
