@@ -146,7 +146,6 @@ class RQTLinear(nn.Module):
         if self.bits == FP8: return packed.to(dtype).reshape(rows, self.in_features)
         row_bytes = _packed_row_bytes(self.in_features, self.bits)
         row_packed = packed.reshape(rows, row_bytes)
-        padded = row_bytes * (2 if self.bits == FP4 else 4 // 3)
         if self.bits == FP4:
             codes = torch.empty(rows, row_bytes * 2, dtype=torch.uint8, device=packed.device)
             codes[:, 0::2] = row_packed >> 4
