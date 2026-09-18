@@ -142,11 +142,25 @@ class RQTLinear(nn.Module):
     def _replace_weight(self, weight): self.packed, self.scale = _encode(weight.detach(), self.bits); self._cached_weight = None
 
     def unpack_rows(self, start, end, dtype=torch.float32):
-        count = (end - start) * self.in_features; packed = self.packed[self._row_slice(start, end)]
-        if self.bits == FP8: return packed.to(dtype).reshape(end - start, self.in_features)
-        codes = _unpack(packed, self.bits, count).long(); levels = _levels(self.bits, packed.device, dtype)[codes]
-        levels = levels.reshape(end - start, self.in_features)
-        return (levels * self.scale[start:end].to(dtype)[:, None]).reshape(end - start, self.in_features)
+        rows = end - start; packed = self.packed[self._row_slice(start, end)]
+        if self.bits == FP8: return packed.to(dtype).reshape(rows, self.in_features)
+        row_bytes = _packed_row_bytes(self.in_features, self.bits)
+        row_packed = packed.reshape(rows, row_bytes)
+        padded = row_bytes * (2 if self.bits == FP4 else 4 // 3)
+        if self.bits == FP4:
+            codes = torch.empty(rows, row_bytes * 2, dtype=torch.uint8, device=packed.device)
+            codes[:, 0::2] = row_packed >> 4
+            codes[:, 1::2] = row_packed & 15
+        else:
+            groups = row_packed.reshape(rows, -1, 3)
+            codes = torch.empty(rows, groups.shape[1] * 4, dtype=torch.uint8, device=packed.device)
+            codes[:, 0::4] = groups[:, :, 0] >> 2
+            codes[:, 1::4] = ((groups[:, :, 0] & 3) << 4) | (groups[:, :, 1] >> 4)
+            codes[:, 2::4] = ((groups[:, :, 1] & 15) << 2) | (groups[:, :, 2] >> 6)
+            codes[:, 3::4] = groups[:, :, 2] & 63
+        codes = codes[:, :self.in_features].long()
+        levels = _levels(self.bits, packed.device, dtype)[codes]
+        return levels * self.scale[start:end].to(dtype)[:, None]
 
     def unpack(self, dtype=torch.float32): return self.unpack_rows(0, self.out_features, dtype)
 
