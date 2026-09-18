@@ -94,12 +94,13 @@ def _native_rqt():
 
 class _RQTLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, packed, scale, in_features, out_features, bits, module):
+    def forward(ctx, x, packed, scale, in_features, out_features, bits, module, grad_anchor):
         ext = _native_rqt()
         x2 = x.reshape(-1, in_features).contiguous()
         ctx.save_for_backward(x2, packed, scale)
         ctx.in_features, ctx.out_features, ctx.bits, ctx.module, ctx.shape = in_features, out_features, bits, module, x.shape
-        return ext.rqt_linear_forward(x2, packed, scale, in_features, out_features, bits).reshape(*x.shape[:-1], out_features)
+        out = ext.rqt_linear_forward(x2, packed, scale, in_features, out_features, bits).reshape(*x.shape[:-1], out_features)
+        return out * grad_anchor
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -108,7 +109,7 @@ class _RQTLinearFunction(torch.autograd.Function):
         ext = _native_rqt()
         grad_x = ext.rqt_linear_backward_input(grad, packed, scale, ctx.in_features, ctx.out_features, ctx.bits).reshape(ctx.shape)
         ctx.module._grad = ext.rqt_linear_backward_weight(x, grad, ctx.in_features, ctx.out_features)
-        return grad_x, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None
 
 
 class RQTLinear(nn.Module):
@@ -126,6 +127,7 @@ class RQTLinear(nn.Module):
         count = (end - start) * self.in_features; packed = self.packed[self._row_slice(start, end)]
         if self.bits == FP8: return packed.to(dtype).reshape(end - start, self.in_features)
         codes = _unpack(packed, self.bits, count).long(); levels = _levels(self.bits, packed.device, dtype)[codes]
+        levels = levels.reshape(end - start, self.in_features)
         return (levels * self.scale[start:end].to(dtype)[:, None]).reshape(end - start, self.in_features)
 
     def unpack(self, dtype=torch.float32): return self.unpack_rows(0, self.out_features, dtype)
@@ -141,7 +143,8 @@ class RQTLinear(nn.Module):
     def forward(self, x):
         ext = _native_rqt()
         if ext is not None and ext is not False and self.bits in (FP4, FP6) and x.device.type == "cpu" and x.dtype == torch.float32 and x.shape[-1] == self.in_features:
-            out = _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self)
+            grad_anchor = torch.ones((), dtype=x.dtype, device=x.device, requires_grad=True)
+            out = _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self, grad_anchor)
             return out if self.bias is None else out + self.bias
         weight = self._weight_for_forward().detach().requires_grad_(True); weight.register_hook(lambda grad: self._capture_grad(0, grad))
         out = F.linear(x, weight, None); return out if self.bias is None else out + self.bias
