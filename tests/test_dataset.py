@@ -26,6 +26,27 @@ def test_plain_text_resume_is_one_based(tmp_path):
     assert list(iter_texts(files, str(path.resolve()), 2)) == []
 
 
+def test_pretrain_resume_replays_buffered_tokens(tmp_path):
+    from dataset import PretrainStream
+
+    path = tmp_path / "x.txt"
+    path.write_text("abcdefghij")
+
+    class CharTok:
+        eos_token_id = 99
+
+        def encode(self, text):
+            return list(range(len(text)))
+
+    stream = PretrainStream(tmp_path, CharTok(), ctx_len=3)
+    items = iter(stream)
+    next(items)
+    saved = next(items)
+    resume_path, resume_record = saved[2]
+    resumed = PretrainStream(tmp_path, CharTok(), 3, resume_path, resume_record, list(stream.buffer_tokens))
+    assert next(iter(resumed))[0].tolist() == next(items)[0].tolist()
+
+
 def test_resume_file_must_be_in_discovered_files(tmp_path):
     path = tmp_path / "x.txt"
     path.write_text("text")
