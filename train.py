@@ -394,8 +394,8 @@ def _build_model(args):
             compatible = False
         if checkpoint.get("dataset_fingerprint") and checkpoint["dataset_fingerprint"] != dataset_fingerprint:
             compatible = False
-        requested_bits = args.rqt_bits if getattr(args, "rqt", None) else None
-        requested_mixed = getattr(args, "mixed_rqt", None)
+        requested_bits = None if not hasattr(args, "rqt") else args.rqt_bits if args.rqt else 0
+        requested_mixed = None if not hasattr(args, "mixed_rqt") else bool(args.mixed_rqt)
         if requested_bits is not None and int(checkpoint.get("rqt_bits", 0)) != requested_bits:
             compatible = False
         if requested_mixed is not None and bool(checkpoint.get("rqt_mixed", False)) != bool(requested_mixed):
