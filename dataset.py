@@ -242,9 +242,18 @@ class PretrainStream(IterableDataset):
     def __iter__(self):
         buf = list(self.buffer_tokens)
         subchunk = 4096
+        if buf and self.resume_file is not None:
+            self.last_pos = (str(Path(self.resume_file).resolve()), self.resume_record)
+            while len(buf) >= self.ctx_len + 1:
+                chunk = buf[:self.ctx_len + 1]
+                del buf[:self.ctx_len]
+                self.buffer_tokens = buf
+                yield (torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long), self.last_pos)
         for text, path, rec_idx in iter_texts(self.files, self.resume_file, self.resume_record):
             ids = self.tokenizer.encode(text) + [self.tokenizer.eos_token_id]
-            self.last_pos = (path, rec_idx)
+            # The buffer contains the remainder of this record after each
+            # yielded chunk, so resume must start at the following record.
+            self.last_pos = (path, rec_idx + 1)
             for i in range(0, len(ids), subchunk):
                 buf.extend(ids[i:i + subchunk])
                 while len(buf) >= self.ctx_len + 1:
