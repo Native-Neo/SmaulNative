@@ -145,7 +145,6 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
         const float g = grow[col];
         const float old_m = mrow[col];
         const float mixed = f_b1 * old_m + (1.0f - f_b1) * g;
-        mrow[col] = f_b2 * old_m + (1.0f - f_b2) * g;
         const float old_w = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale;
         const float value = old_w * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f));
         max_abs = std::max(max_abs, std::abs(value));
@@ -159,6 +158,7 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
         const float old_m = mrow[col];
         const float mixed = f_b1 * old_m + (1.0f - f_b1) * g;
         const float old_w = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale;
+        mrow[col] = f_b2 * old_m + (1.0f - f_b2) * g;
         const float value = (old_w * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f))) / new_scale;
         rqt_set_code(dst, (int)col, ibits, (uint8_t)rqt_nearest_code(value, ibits));
       }
