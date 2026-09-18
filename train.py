@@ -200,12 +200,18 @@ def _remote_token_stream(name, tokenizer, ctx_len, resume):
             raise ValueError("invalid remote resume position") from exc
         record = resume.record_index
     buffer_tokens = list(resume.buffer_tokens)
+    if buffer_tokens and dataset is not None and file_path is not None:
+        while len(buffer_tokens) >= ctx_len + 1:
+            chunk = buffer_tokens[:ctx_len + 1]
+            del buffer_tokens[:ctx_len]
+            yield (torch.tensor(chunk[:-1]), torch.tensor(chunk[1:]),
+                   f"{dataset}::{file_path}", record, list(buffer_tokens))
     for text, position in stream_dataset(name, start_dataset=dataset, start_file=file_path, start_record=record, with_position=True):
         buffer_tokens.extend(tokenizer.encode(text) + [tokenizer.eos_token_id])
         while len(buffer_tokens) >= ctx_len + 1:
             chunk = buffer_tokens[:ctx_len + 1]
             del buffer_tokens[:ctx_len]
-            yield torch.tensor(chunk[:-1]), torch.tensor(chunk[1:]), f"{position[0]}::{position[1]}", position[2], list(buffer_tokens)
+            yield torch.tensor(chunk[:-1]), torch.tensor(chunk[1:]), f"{position[0]}::{position[1]}", position[2] + 1, list(buffer_tokens)
 
 
 def _train_batch(args, model, optimizer, resume, device, batch_x, batch_y, path, record, buffer_tokens):
