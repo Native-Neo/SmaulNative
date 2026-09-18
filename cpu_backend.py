@@ -46,12 +46,15 @@ def _load():
         return None
     from torch.utils.cpp_extension import load
     root = Path(__file__).resolve().parent
-    _EXT = load(
-        name="smaulnative_cpu",
-        sources=[str(root / "cpu_kernels.cpp")],
-        extra_cflags=["-O3", "-march=native", "-mavx", "-ffp-contract=off"],
-        verbose=False,
-    )
+    try:
+        _EXT = load(
+            name="smaulnative_cpu",
+            sources=[str(root / "cpu_kernels.cpp")],
+            extra_cflags=["-O3", "-march=native", "-mavx", "-ffp-contract=off"],
+            verbose=False,
+        )
+    except Exception:
+        _EXT = False
     return _EXT
 
 
@@ -62,7 +65,7 @@ class NativeLion(Optimizer):
             raise ValueError("lr must be > 0")
         super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
         self._ext = _load()
-        if self._ext is None:
+        if self._ext is None or self._ext is False:
             print("[OPTIMIZER] AVX unavailable; using PyTorch Lion fallback")
 
     @torch.no_grad()
@@ -73,7 +76,7 @@ class NativeLion(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                if self._ext is None or p.dtype != torch.float32 or not p.is_contiguous() or not p.grad.is_contiguous():
+                if self._ext is None or self._ext is False or p.dtype != torch.float32 or not p.is_contiguous() or not p.grad.is_contiguous():
                     self._fallback(p, p.grad, lr, b1, b2, wd)
                     continue
                 state = self.state[p]
