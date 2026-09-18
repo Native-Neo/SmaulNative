@@ -113,6 +113,59 @@ static inline int rqt_nearest_code(float value, int bits) {
   return negative ? code | half : code;
 }
 
+void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad, torch::Tensor avg,
+                   int64_t in_features, int64_t out_features, int64_t bits,
+                   double lr, double b1, double b2, double decay) {
+  TORCH_CHECK(packed.device().is_cpu() && scale.device().is_cpu() && grad.device().is_cpu() && avg.device().is_cpu());
+  TORCH_CHECK(packed.dtype() == torch::kUInt8 && scale.dtype() == torch::kFloat32 &&
+              grad.dtype() == torch::kFloat32 && avg.dtype() == torch::kFloat32);
+  TORCH_CHECK(packed.is_contiguous() && scale.is_contiguous() && grad.is_contiguous() && avg.is_contiguous());
+  TORCH_CHECK(bits == 4 || bits == 6);
+  TORCH_CHECK(scale.numel() == out_features &&
+              grad.numel() == out_features * in_features &&
+              avg.numel() == out_features * in_features);
+  const int64_t stride = bits == 4 ? (in_features + 1) / 2 : ((in_features + 3) / 4) * 3;
+  TORCH_CHECK(packed.numel() == out_features * stride);
+  auto pp = packed.data_ptr<uint8_t>(); auto ss = scale.data_ptr<float>();
+  auto gg = grad.data_ptr<float>(); auto mm = avg.data_ptr<float>();
+  const float f_lr = (float)lr, f_b1 = (float)b1, f_b2 = (float)b2;
+  const float decay_mul = (float)(1.0 - decay);
+  const float max_level = std::abs(rqt_level((1 << (int)bits) - 1, (int)bits));
+  const int ibits = (int)bits;
+
+  at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      uint8_t* dst = pp + row * stride;
+      const float* grow = gg + row * in_features;
+      float* mrow = mm + row * in_features;
+      const float old_scale = ss[row];
+      float max_abs = 0.0f;
+
+      for (int64_t col = 0; col < in_features; ++col) {
+        const float g = grow[col];
+        const float old_m = mrow[col];
+        const float mixed = f_b1 * old_m + (1.0f - f_b1) * g;
+        mrow[col] = f_b2 * old_m + (1.0f - f_b2) * g;
+        const float old_w = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale;
+        const float value = old_w * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f));
+        max_abs = std::max(max_abs, std::abs(value));
+      }
+
+      const float new_scale = std::max(max_abs, std::numeric_limits<float>::epsilon()) / max_level;
+      ss[row] = new_scale;
+
+      for (int64_t col = 0; col < in_features; ++col) {
+        const float g = grow[col];
+        const float old_m = mrow[col];
+        const float mixed = f_b1 * old_m + (1.0f - f_b1) * g;
+        const float old_w = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale;
+        const float value = (old_w * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f))) / new_scale;
+        rqt_set_code(dst, (int)col, ibits, (uint8_t)rqt_nearest_code(value, ibits));
+      }
+    }
+  });
+}
+
 void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor update, int64_t in_features, int64_t out_features, int64_t bits, double decay) {
   TORCH_CHECK(packed.device().is_cpu() && scale.device().is_cpu() && update.device().is_cpu());
   TORCH_CHECK(packed.dtype() == torch::kUInt8 && scale.dtype() == torch::kFloat32 && update.dtype() == torch::kFloat32);
@@ -233,6 +286,7 @@ torch::Tensor rqt_linear_backward_weight(torch::Tensor x, torch::Tensor grad, in
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lion_step", &lion_step, "Fused Lion update with AVX");
   m.def("rqt_requant_step", &rqt_requant_step, "Fused packed RQT requantization");
+  m.def("rqt_lion_step", &rqt_lion_step, "Fused Lion update and packed RQT requantization");
   m.def("rqt_linear_forward", &rqt_linear_forward, "Packed RQT linear forward");
   m.def("rqt_linear_backward_input", &rqt_linear_backward_input, "Packed RQT linear input gradient");
   m.def("rqt_linear_backward_weight", &rqt_linear_backward_weight, "RQT linear weight gradient");
