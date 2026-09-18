@@ -223,6 +223,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = C // cfg.head_size
         self.chunk_size = cfg.moba_chunk_size
         self.top_k = max(0, cfg.moba_topk)
+        self._mask_cache = {}
         self.receptance = nn.Linear(C, C, bias=False)
         self.key = nn.Linear(C, C, bias=False)
         self.value = nn.Linear(C, C, bias=False)
@@ -231,6 +232,16 @@ class CausalSelfAttention(nn.Module):
         self.key.weight.data.uniform_(-0.05 / C**0.5, 0.05 / C**0.5)
         self.value.weight.data.uniform_(-0.5 / C**0.5, 0.5 / C**0.5)
         self.output.weight.data.zero_()
+
+    def _moba_mask(self, query_len, history_len, device):
+        key = (query_len, history_len, device.type, device.index)
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            history = torch.ones(query_len, history_len, dtype=torch.bool, device=device)
+            causal = torch.tril(torch.ones(query_len, query_len, dtype=torch.bool, device=device))
+            mask = torch.cat((history, causal), 1)
+            self._mask_cache[key] = mask
+        return mask
 
     def forward(self, x, cache=None, use_cache=False):
         B, T, C = x.shape
@@ -283,9 +294,7 @@ class CausalSelfAttention(nn.Module):
                     idx = top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, cs, N)
                     sk = torch.gather(kc[:, :, :i], 2, idx).reshape(B, H, npick * cs, N)
                     sv = torch.gather(vc[:, :, :i], 2, idx).reshape(B, H, npick * cs, N)
-                    hist_mask = torch.ones(hi - lo, npick * cs, dtype=torch.bool, device=x.device)
-                    causal = torch.tril(torch.ones(hi - lo, hi - lo, dtype=torch.bool, device=x.device))
-                    base_mask = torch.cat((hist_mask, causal), 1)
+                    base_mask = self._moba_mask(hi - lo, npick * cs, x.device)
                     yi = F.scaled_dot_product_attention(qi, torch.cat((sk, ownk), 2), torch.cat((sv, ownv), 2), attn_mask=base_mask)
                 out[:, :, lo:hi] = yi
             y = out
