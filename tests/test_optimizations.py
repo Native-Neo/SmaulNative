@@ -11,26 +11,21 @@ import torch
 
 from cpu_backend import NativeLion
 from dataset import SFTDataset
-from qt import QuantizedLinear, _pack_codes, _unpack_codes
+from rqt import RQTLinear, _pack, _unpack
 from rwkv_x_core import RWKVXConfig, RWKV_CMix_MoE
 
 
 def test_lowbit_roundtrip():
-    for bits in (2, 4):
-        per_byte = 8 // bits
-        codes = torch.arange(32, dtype=torch.uint8) % (1 << bits)
-        packed = _pack_codes(codes.reshape(4, -1), bits)
-        unpacked = _unpack_codes(packed, bits, codes.numel()).reshape(4, -1)
-        assert torch.equal(unpacked, codes.reshape(4, -1))
-        assert packed.shape[1] == (codes.reshape(4, -1).shape[1] + per_byte - 1) // per_byte
+    for bits in (4, 6):
+        codes = torch.arange(34, dtype=torch.uint8) % (1 << bits)
+        packed = _pack(codes, bits)
+        unpacked = _unpack(packed, bits, codes.numel())
+        assert torch.equal(unpacked, codes)
 
 
 def test_quantized_linear_forward_is_stable():
     torch.manual_seed(0)
-    weight = torch.randn(6, 4)
-    layer = QuantizedLinear.from_linear(torch.nn.Linear(4, 6, bias=False), 4)
-    with torch.no_grad():
-        layer = QuantizedLinear.from_linear(torch.nn.Linear(4, 6, bias=False), 4)
+    layer = RQTLinear(torch.nn.Linear(4, 6, bias=False), 4)
     x = torch.randn(3, 4)
     y1 = layer(x)
     y2 = layer(x)
