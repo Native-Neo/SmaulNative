@@ -100,3 +100,16 @@ def test_fused_rqt_lion_matches_reference():
 
         torch.testing.assert_close(avg_fused, avg_reference, rtol=0, atol=0)
         torch.testing.assert_close(fused.unpack(), reference.unpack(), rtol=0, atol=0)
+
+def test_native_rqt_weight_grad_without_input_grad():
+    for bits in (FP4, FP6):
+        torch.manual_seed(900 + bits)
+        layer = RQTLinear(nn.Linear(17, 11, bias=False), bits)
+        x = torch.randn(4, 17)
+        out = layer(x)
+        assert out.grad_fn is not None
+        out.sum().backward()
+        assert layer._grad is not None
+        assert layer._grad.shape == (11, 17)
+        expected_stride = (17 + 1) // 2 if bits == FP4 else ((17 + 3) // 4) * 3
+        assert layer.packed.numel() == 11 * expected_stride
