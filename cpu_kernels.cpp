@@ -207,7 +207,9 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
     for (int64_t task = begin; task < end; ++task) {
       const int64_t r = task / m, o = task - r * m;
       const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base;
-      const float* xr = xx + r * n; float acc = 0.0f;
+      const float* xr = xx + r * n;
+      __m256 acc_vec = _mm256_setzero_ps();
+      float acc_tail = 0.0f;
       int64_t i = 0;
 
       for (; i + 7 < n; i += 8) {
@@ -216,17 +218,17 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
         const __m256 weights = _mm256_set_ps(
             level[c[7]] * s, level[c[6]] * s, level[c[5]] * s, level[c[4]] * s,
             level[c[3]] * s, level[c[2]] * s, level[c[1]] * s, level[c[0]] * s);
-        const __m256 input = _mm256_loadu_ps(xr + i);
-        const __m256 product = _mm256_mul_ps(weights, input);
-        const __m128 lo = _mm256_castps256_ps128(product);
-        const __m128 hi = _mm256_extractf128_ps(product, 1);
-        const __m128 sum = _mm_add_ps(lo, hi);
-        const __m128 pair = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
-        acc += pair[0] + pair[1];
+        acc_vec = _mm256_add_ps(acc_vec, _mm256_mul_ps(weights, _mm256_loadu_ps(xr + i)));
       }
 
-      for (; i < n; ++i) acc += xr[i] * level[rqt_code(row, (int)i, ibits)] * s;
-      yy[r * m + o] = acc;
+      const __m128 lo = _mm256_castps256_ps128(acc_vec);
+      const __m128 hi = _mm256_extractf128_ps(acc_vec, 1);
+      const __m128 sum = _mm_add_ps(lo, hi);
+      const __m128 pair = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+      float acc = pair[0] + pair[1];
+
+      for (; i < n; ++i) acc_tail += xr[i] * level[rqt_code(row, (int)i, ibits)] * s;
+      yy[r * m + o] = acc + acc_tail;
     }
   });
   return out;
