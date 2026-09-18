@@ -206,8 +206,12 @@ class RQTLinear(nn.Module):
 
 
 class RQTLion:
-    def __init__(self, model, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01):
-        self.model, self.lr, self.betas, self.weight_decay = model, lr, betas, weight_decay; self.rqt_state, self.param_state = {}, {}
+    def __init__(self, model, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.01, state_dtype=torch.float32):
+        if state_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            raise ValueError("RQT optimizer state dtype must be float32, float16, or bfloat16")
+        self.model, self.lr, self.betas, self.weight_decay = model, lr, betas, weight_decay
+        self.state_dtype = state_dtype
+        self.rqt_state, self.param_state = {}, {}
         self.params = [p for p in model.parameters() if p.requires_grad]; self.param_names = {id(p): name for name, p in model.named_parameters() if p.requires_grad}
 
     def _modules(self): return [(name, module) for name, module in self.model.named_modules() if isinstance(module, RQTLinear)]
@@ -234,10 +238,10 @@ class RQTLion:
         b1, b2 = self.betas
         for _, module in self._modules():
             if module._grad is None: continue
-            grad = module._grad; avg = self.rqt_state.setdefault(module, torch.zeros_like(grad, dtype=torch.float32))
+            grad = module._grad; avg = self.rqt_state.setdefault(module, torch.zeros_like(grad, dtype=self.state_dtype))
             ext = _native_rqt()
             fused = (ext is not None and ext is not False and module.bits in (FP4, FP6) and
-                     module.packed.device.type == "cpu" and grad.dtype == torch.float32 and
+                     module.packed.device.type == "cpu" and grad.dtype == torch.float32 and avg.dtype == torch.float32 and
                      grad.is_contiguous() and avg.is_contiguous() and module.packed.is_contiguous() and module.scale.is_contiguous())
             if fused:
                 ext.rqt_lion_step(module.packed, module.scale, grad, avg, module.in_features, module.out_features,
@@ -248,17 +252,22 @@ class RQTLion:
                 module.step(update, self.lr * self.weight_decay)
         for param in self.params:
             if param.grad is None: continue
-            grad = param.grad.float(); avg = self.param_state.setdefault(param, torch.zeros_like(param, dtype=torch.float32))
+            grad = param.grad.float(); avg = self.param_state.setdefault(param, torch.zeros_like(param, dtype=self.state_dtype))
             avg.mul_(b1).add_(grad, alpha=1 - b1); update = avg.sign(); avg.mul_(b2).add_(grad, alpha=1 - b2)
             if self.weight_decay: param.mul_(1 - self.lr * self.weight_decay)
             param.add_(update, alpha=-self.lr)
 
     def state_dict(self):
         modules = {name: state.cpu() for name, module in self._modules() if (state := self.rqt_state.get(module)) is not None}; params = {self.param_names[id(param)]: state.cpu() for param, state in self.param_state.items() if id(param) in self.param_names}
-        return {"version": 4, "lr": self.lr, "betas": self.betas, "weight_decay": self.weight_decay, "param_state": params, "rqt_state": modules}
+        return {"version": 5, "lr": self.lr, "betas": self.betas, "weight_decay": self.weight_decay,
+                "state_dtype": str(self.state_dtype).split(".")[-1], "param_state": params, "rqt_state": modules}
 
     def load_state_dict(self, state):
-        self.lr = float(state.get("lr", self.lr)); self.betas = tuple(state.get("betas", self.betas)); self.weight_decay = float(state.get("weight_decay", self.weight_decay)); modules = dict(self._modules()); named_params = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
+        self.lr = float(state.get("lr", self.lr)); self.betas = tuple(state.get("betas", self.betas)); self.weight_decay = float(state.get("weight_decay", self.weight_decay))
+        dtype_name = state.get("state_dtype")
+        if dtype_name is not None:
+            self.state_dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}.get(dtype_name, self.state_dtype)
+        modules = dict(self._modules()); named_params = {name: p for name, p in self.model.named_parameters() if p.requires_grad}
         rqt_state, param_state = state.get("rqt_state", {}), state.get("param_state", {})
         if all(key.isdigit() for key in rqt_state) and rqt_state: rqt_state = {name: value for (name, _), value in zip(modules.items(), rqt_state.values())}
         if all(key.isdigit() for key in param_state) and param_state: param_state = {name: value for (name, _), value in zip(named_params.items(), param_state.values())}
@@ -267,13 +276,13 @@ class RQTLion:
             if name not in modules: raise ValueError(f"unknown RQT optimizer module: {name}")
             module = modules[name]
             if tuple(value.shape) != (module.out_features, module.in_features): raise ValueError(f"invalid RQT optimizer state shape for {name}")
-            self.rqt_state[module] = value.to(module.packed.device, dtype=torch.float32)
+            self.rqt_state[module] = value.to(module.packed.device, dtype=self.state_dtype)
         self.param_state = {}
         for name, value in param_state.items():
             if name not in named_params: raise ValueError(f"unknown optimizer parameter: {name}")
             param = named_params[name]
             if tuple(value.shape) != tuple(param.shape): raise ValueError(f"invalid optimizer state shape for {name}")
-            self.param_state[param] = value.to(param.device, dtype=torch.float32)
+            self.param_state[param] = value.to(param.device, dtype=self.state_dtype)
 
 
 def _replace(root, name, bits):
