@@ -86,13 +86,31 @@ static inline void rqt_set_code(uint8_t* packed, int index, int bits, uint8_t co
 }
 
 static inline int rqt_nearest_code(float value, int bits) {
-  const auto& ordered = rqt_ordered_levels(bits); const int count = 1 << bits;
-  int lo = 0, hi = count;
-  while (lo < hi) { const int mid = lo + (hi - lo) / 2; if (ordered.values[mid] < value) lo = mid + 1; else hi = mid; }
-  if (lo == 0) return ordered.codes[0];
-  if (lo == count) return ordered.codes[count - 1];
-  const float left = ordered.values[lo - 1], right = ordered.values[lo];
-  return std::abs(value - left) <= std::abs(right - value) ? ordered.codes[lo - 1] : ordered.codes[lo];
+  const auto& levels = rqt_level_table();
+  const int count = 1 << bits;
+  const int half = count >> 1;
+  const int base = bits == 4 ? 0 : 64;
+  const bool negative = value < 0.0f;
+  const float magnitude = std::abs(value);
+
+  int lo = 0, hi = half;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (levels[base + mid] < magnitude) lo = mid + 1;
+    else hi = mid;
+  }
+
+  int code;
+  if (lo == 0) {
+    code = 0;
+  } else if (lo == half) {
+    code = half - 1;
+  } else {
+    const float left = levels[base + lo - 1];
+    const float right = levels[base + lo];
+    code = std::abs(magnitude - left) <= std::abs(right - magnitude) ? lo - 1 : lo;
+  }
+  return negative ? code | half : code;
 }
 
 void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor update, int64_t in_features, int64_t out_features, int64_t bits, double decay) {
