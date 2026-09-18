@@ -40,6 +40,10 @@ The CPU implementation currently decodes weights to FP32 for the matrix multipli
 
 RQT uses `RQTLion`, which stores optimizer averages separately for packed linear layers and normal floating-point parameters. State is keyed by stable module/parameter names and validates tensor shapes when loaded.
 
+The default optimizer state is FP32. For lower memory use, training accepts
+`--rqt-state-dtype bf16` or `--rqt-state-dtype fp16`; this is an opt-in numerical tradeoff and disables
+the FP32-only fused Lion kernel for those state tensors.
+
 ## Limitations
 
 RQT is experimental. Extremely low precision can make optimization unstable, especially FP4. Gradient clipping is applied before the Lion update. FP8 requires a PyTorch build/device that supports `torch.float8_e4m3fn` conversion.
