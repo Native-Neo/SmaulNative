@@ -126,7 +126,11 @@ class _RQTLinearFunction(torch.autograd.Function):
         grad = grad_output.reshape(-1, ctx.out_features).contiguous().float()
         ext = _native_rqt()
         grad_x = ext.rqt_linear_backward_input(grad, packed, scale, ctx.in_features, ctx.out_features, ctx.bits).reshape(ctx.shape)
-        ctx.module._grad = ext.rqt_linear_backward_weight(x, grad, ctx.in_features, ctx.out_features)
+        weight_grad = ext.rqt_linear_backward_weight(x, grad, ctx.in_features, ctx.out_features)
+        if ctx.module._grad is None:
+            ctx.module._grad = weight_grad
+        else:
+            ctx.module._grad.add_(weight_grad)
         return grad_x, None, None, None, None, None, None, None
 
 
@@ -168,8 +172,8 @@ class RQTLinear(nn.Module):
         return self._cached_weight
 
     def _capture_grad(self, start, grad):
-        if self._grad is None: self._grad = torch.empty(self.out_features, self.in_features, dtype=torch.float32, device=grad.device)
-        self._grad[start:start + grad.shape[0]].copy_(grad.float()); return grad
+        if self._grad is None: self._grad = torch.zeros(self.out_features, self.in_features, dtype=torch.float32, device=grad.device)
+        self._grad[start:start + grad.shape[0]].add_(grad.float()); return grad
 
     def forward(self, x):
         ext = _native_rqt()
@@ -177,7 +181,7 @@ class RQTLinear(nn.Module):
             grad_anchor = torch.ones((), dtype=x.dtype, device=x.device, requires_grad=True)
             out = _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self, grad_anchor)
             return out if self.bias is None else out + self.bias
-        weight = self._weight_for_forward().detach().requires_grad_(True); weight.register_hook(lambda grad: self._capture_grad(0, grad))
+        weight = self._weight_for_forward().detach().to(dtype=x.dtype).requires_grad_(True); weight.register_hook(lambda grad: self._capture_grad(0, grad))
         out = F.linear(x, weight, None); return out if self.bias is None else out + self.bias
 
     @torch.no_grad()
