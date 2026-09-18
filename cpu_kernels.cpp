@@ -209,8 +209,39 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
       const uint8_t* row = pp + o * stride; const float s = ss[o]; const float* level = levels.data() + base;
       const float* xr = xx + r * n;
       float acc = 0.0f;
-      for (int64_t i = 0; i < n; ++i) {
-        acc += xr[i] * level[rqt_code(row, (int)i, ibits)] * s;
+      if (ibits == 4) {
+        int64_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+          const uint8_t p0 = row[i >> 1], p1 = row[(i >> 1) + 1], p2 = row[(i >> 1) + 2], p3 = row[(i >> 1) + 3];
+          acc += xr[i] * level[p0 >> 4] * s;
+          acc += xr[i + 1] * level[p0 & 15] * s;
+          acc += xr[i + 2] * level[p1 >> 4] * s;
+          acc += xr[i + 3] * level[p1 & 15] * s;
+          acc += xr[i + 4] * level[p2 >> 4] * s;
+          acc += xr[i + 5] * level[p2 & 15] * s;
+          acc += xr[i + 6] * level[p3 >> 4] * s;
+          acc += xr[i + 7] * level[p3 & 15] * s;
+        }
+        for (; i < n; ++i) {
+          const uint8_t p = row[i >> 1];
+          acc += xr[i] * level[(i & 1) ? (p & 15) : (p >> 4)] * s;
+        }
+      } else {
+        int64_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+          const uint8_t* p = row + (i >> 2) * 3;
+          const uint8_t c0 = p[0] >> 2;
+          const uint8_t c1 = ((p[0] & 3) << 4) | (p[1] >> 4);
+          const uint8_t c2 = ((p[1] & 15) << 2) | (p[2] >> 6);
+          const uint8_t c3 = p[2] & 63;
+          acc += xr[i] * level[c0] * s;
+          acc += xr[i + 1] * level[c1] * s;
+          acc += xr[i + 2] * level[c2] * s;
+          acc += xr[i + 3] * level[c3] * s;
+        }
+        for (; i < n; ++i) {
+          acc += xr[i] * level[rqt_code(row, (int)i, ibits)] * s;
+        }
       }
       yy[r * m + o] = acc;
     }
