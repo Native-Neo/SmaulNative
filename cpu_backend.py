@@ -49,7 +49,7 @@ def _load():
     _EXT = load(
         name="smaulnative_cpu",
         sources=[str(root / "cpu_kernels.cpp")],
-        extra_cflags=["-O3", "-march=native", "-mavx"],
+        extra_cflags=["-O3", "-march=native", "-mavx", "-ffp-contract=off"],
         verbose=False,
     )
     return _EXT
