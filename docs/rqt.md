@@ -22,7 +22,7 @@ python train.py --cpu --mode pretrain --dataset_dir ./datasets --mixed_rqt
 
 ## How it differs from QAT
 
-QAT keeps an ordinary floating-point parameter and fake-quantizes it during the forward pass. RQT replaces that parameter with packed low-bit storage. The forward pass dequantizes the packed weight for the matrix operation, gradients are captured from that actual quantized forward weight, and the optimizer immediately requantizes the updated weight after every step.
+QAT keeps an ordinary floating-point parameter and fake-quantizes it during the forward pass. RQT replaces that parameter with packed low-bit storage. On CPU, the native FP4/FP6/FP8 kernels decode packed codes while accumulating the matrix operation, without reconstructing a full FP32 weight matrix. Gradients are captured from that actual quantized forward, and the optimizer updates the packed storage in place after every step. Unsupported devices or dtypes use the correctness fallback.
 
 RQT therefore does not maintain a hidden FP32 master copy of an RQT linear weight. Lion's optimizer averages remain FP32 because optimizer state needs more numerical resolution than the stored model weight.
 
@@ -34,7 +34,7 @@ RQT therefore does not maintain a hidden FP32 master copy of an RQT linear weigh
 - FP4 and FP6 use custom E2M1 and E3M2-style finite floating-point codebooks with a per-output-row scale.
 - RQT checkpoints store the packed weights, scales, and per-layer bit-width metadata.
 
-The CPU implementation currently decodes weights to FP32 for the matrix multiplication. Physical packing reduces stored weight memory, but it is not yet a native FP4/FP6 GEMM kernel.
+The CPU implementation has native packed FP4/FP6/FP8 forward, input-gradient, and update kernels. Physical packing therefore remains active through the RQT hot path; fallback execution may materialize a temporary FP32 matrix when the native preconditions are not met.
 
 ## Resume
 
@@ -46,4 +46,4 @@ the FP32-only fused Lion kernel for those state tensors.
 
 ## Limitations
 
-RQT is experimental. Extremely low precision can make optimization unstable, especially FP4. Gradient clipping is applied before the Lion update. FP8 requires a PyTorch build/device that supports `torch.float8_e4m3fn` conversion.
+RQT is experimental. Extremely low precision can make optimization unstable, especially FP4. Gradient clipping is applied before the Lion update. FP8 requires a PyTorch build with `torch.float8_e4m3fn` tensor support.
