@@ -35,6 +35,7 @@ class RWKVXConfig:
     quantization_bits: int = 0
     rqt_mixed: bool = False
     tokenizer_sha256: str = ""
+    dataset_fingerprint: str = ""
 
     def save(self, path: Path):
         Path(path).write_text(json.dumps(asdict(self), indent=2))
