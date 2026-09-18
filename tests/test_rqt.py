@@ -71,7 +71,7 @@ def test_rqt_lion_state_uses_stable_names():
     opt.step()
     state = opt.state_dict()
     assert set(state["rqt_state"]) == {"0", "1"}
-    assert state["version"] == 4
+    assert state["version"] == 5
     assert state["lr"] == 1e-3
     assert state["betas"] == (0.9, 0.99)
 
@@ -86,6 +86,20 @@ def test_rqt_lion_state_uses_stable_names():
     assert clone_opt.weight_decay == 0.0
     assert len(clone_opt.rqt_state) == 2
     assert all(state.shape == module.unpack().shape for module, state in clone_opt.rqt_state.items())
+
+
+def test_rqt_optimizer_supports_reduced_precision_state():
+    linear = RQTLinear(torch.nn.Linear(8, 4, bias=False), 6)
+    opt = RQTLion(linear, lr=1e-3, weight_decay=0.0, state_dtype=torch.bfloat16)
+    linear(torch.randn(2, 8)).sum().backward()
+    opt.step()
+    state = opt.state_dict()
+    assert state["state_dtype"] == "bfloat16"
+    assert next(iter(state["rqt_state"].values())).dtype == torch.bfloat16
+
+    clone = RQTLion(RQTLinear(torch.nn.Linear(8, 4, bias=False), 6))
+    clone.load_state_dict(state)
+    assert clone.state_dtype is torch.bfloat16
 
 
 def test_rqt_rejects_bad_optimizer_state_shape():
