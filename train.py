@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -335,6 +336,14 @@ def _tokenizer_path(args):
     return Path(args.tokenizer_path)
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _load_or_build_tokenizer(args):
     path = _tokenizer_path(args)
     if path.exists() and tokenizer_vocab_size(path) == args.tokenizer_vocab_size:
@@ -354,12 +363,27 @@ def _checkpoint_config(output_dir):
 
 
 def _build_model(args):
+    tokenizer_path_value = getattr(args, "tokenizer_path", None)
+    tokenizer_path = Path(tokenizer_path_value) if tokenizer_path_value else None
+    tokenizer_sha256 = _file_sha256(tokenizer_path) if tokenizer_path is not None and tokenizer_path.exists() else ""
     expected = dict(vocab_size=args.tokenizer_vocab_size, n_embd=args.n_embd, n_layer=args.n_layer,
-                    n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len)
+                    n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len,
+                    tokenizer_sha256=tokenizer_sha256)
     checkpoint = _checkpoint_config(args.output_dir)
     if checkpoint and (Path(args.output_dir) / "model.safetensors").exists():
         keys = ("vocab_size", "n_embd", "n_layer", "n_moba_layer", "head_size", "ctx_len_hint")
-        if all(checkpoint.get(key) == expected[key] for key in keys):
+        compatible = all(checkpoint.get(key) == expected[key] for key in keys)
+        if checkpoint.get("tokenizer_sha256") and checkpoint["tokenizer_sha256"] != tokenizer_sha256:
+            compatible = False
+        requested_bits = args.rqt_bits if getattr(args, "rqt", None) else None
+        requested_mixed = getattr(args, "mixed_rqt", None)
+        if requested_bits is not None and int(checkpoint.get("rqt_bits", 0)) != requested_bits:
+            compatible = False
+        if requested_mixed is not None and bool(checkpoint.get("rqt_mixed", False)) != bool(requested_mixed):
+            compatible = False
+        if not compatible and getattr(args, "resume", False):
+            raise ValueError("checkpoint metadata is incompatible with the requested resume configuration")
+        if compatible:
             return RWKVXModel.from_pretrained(args.output_dir)
     return RWKVXModel(expected)
 
@@ -378,6 +402,7 @@ def main():
     print(f"[DEVICE] {device} | precision={args.precision} | rqt={args.rqt or args.mixed_rqt}")
     tokenizer = _load_or_build_tokenizer(args)
     model = _build_model(args).to(device)
+    model.cfg.tokenizer_sha256 = _file_sha256(_tokenizer_path(args))
     if args.mixed_rqt:
         prepare_mixed_rqt(model)
     elif args.rqt:
