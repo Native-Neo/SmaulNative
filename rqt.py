@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import warnings
 
 FP4, FP6, FP8 = 4, 6, 8
 _LEVEL_CACHE = {}
@@ -105,8 +106,9 @@ def _native_rqt():
     try:
         from cpu_backend import _load
         _RQT_EXT = _load()
-    except Exception:
+    except Exception as exc:
         _RQT_EXT = False
+        warnings.warn(f"native RQT extension unavailable; using packed PyTorch fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
     return _RQT_EXT
 
 
