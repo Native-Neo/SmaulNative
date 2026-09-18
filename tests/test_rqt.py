@@ -109,6 +109,21 @@ def test_rqt_gradient_matches_quantized_weight_shape():
     assert not any(name == "weight" for name, _ in linear.named_parameters())
 
 
+def test_rqt_forward_matches_input_dtype():
+    for dtype in (torch.float16, torch.bfloat16):
+        linear = RQTLinear(torch.nn.Linear(8, 4, bias=False), 6)
+        output = linear(torch.randn(2, 8, dtype=dtype))
+        assert output.dtype == dtype
+
+
+def test_rqt_shared_module_accumulates_weight_gradients():
+    linear = RQTLinear(torch.nn.Linear(4, 3, bias=False), 6)
+    x1, x2 = torch.randn(2, 4), torch.randn(2, 4)
+    (linear(x1) + linear(x2)).sum().backward()
+    expected = torch.ones(2, 3).t() @ (x1 + x2)
+    torch.testing.assert_close(linear._grad, expected, rtol=1e-5, atol=1e-5)
+
+
 def test_rqt_weight_is_requantized_after_every_step():
     linear = RQTLinear(torch.nn.Linear(8, 4, bias=False), 6)
     opt = RQTLion(linear, lr=0.1, weight_decay=0.0)
