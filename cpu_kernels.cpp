@@ -180,14 +180,40 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
   TORCH_CHECK(grad.dtype() == torch::kFloat32 && packed.dtype() == torch::kUInt8 && scale.dtype() == torch::kFloat32);
   TORCH_CHECK(grad.dim() == 2 && grad.size(1) == out_features && grad.is_contiguous() && packed.is_contiguous() && scale.is_contiguous());
   TORCH_CHECK(bits == 4 || bits == 6);
-  auto out = torch::zeros({grad.size(0), in_features}, grad.options());
-  const auto rows = grad.size(0), n = in_features, m = out_features; const auto* gg = grad.data_ptr<float>(); const auto* pp = packed.data_ptr<uint8_t>(); const auto* ss = scale.data_ptr<float>(); auto* xx = out.data_ptr<float>();
-  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3; const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
-  at::parallel_for(0, rows * n, 1, [&](int64_t begin, int64_t end) {
+  auto out = torch::empty({grad.size(0), in_features}, grad.options());
+  const auto rows = grad.size(0), n = in_features, m = out_features;
+  const auto* gg = grad.data_ptr<float>(); const auto* pp = packed.data_ptr<uint8_t>();
+  const auto* ss = scale.data_ptr<float>(); auto* xx = out.data_ptr<float>();
+  const int64_t stride = bits == 4 ? (n + 1) / 2 : ((n + 3) / 4) * 3;
+  const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
+
+  at::parallel_for(0, rows * ((n + 7) / 8), 1, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
-      const int64_t r = task / n, i = task - r * n; const float* gr = gg + r * m; float acc = 0.0f;
-      for (int64_t o = 0; o < m; ++o) acc += gr[o] * levels[base + rqt_code(pp + o * stride, (int)i, ibits)] * ss[o];
-      xx[r * n + i] = acc;
+      const int64_t r = task / ((n + 7) / 8), block = task - r * ((n + 7) / 8), i = block * 8;
+      const float* gr = gg + r * m;
+      const int64_t width = std::min<int64_t>(8, n - i);
+
+      if (width == 8) {
+        __m256 acc = _mm256_setzero_ps();
+        for (int64_t o = 0; o < m; ++o) {
+          const uint8_t* row = pp + o * stride;
+          float w[8];
+          for (int k = 0; k < 8; ++k) w[k] = levels[base + rqt_code(row, (int)(i + k), ibits)] * ss[o];
+          const __m256 weights = _mm256_set_ps(w[7], w[6], w[5], w[4], w[3], w[2], w[1], w[0]);
+          const __m256 g = _mm256_set1_ps(gr[o]);
+          acc = _mm256_add_ps(acc, _mm256_mul_ps(weights, g));
+        }
+        _mm256_storeu_ps(xx + r * n + i, acc);
+      } else {
+        for (int64_t k = 0; k < width; ++k) {
+          float acc = 0.0f;
+          for (int64_t o = 0; o < m; ++o) {
+            const uint8_t* row = pp + o * stride;
+            acc += gr[o] * levels[base + rqt_code(row, (int)(i + k), ibits)] * ss[o];
+          }
+          xx[r * n + i + k] = acc;
+        }
+      }
     }
   });
   return out;
