@@ -344,6 +344,20 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
+def _dataset_fingerprint(args):
+    stream_name = getattr(args, "stream_dataset", "none")
+    if stream_name != "none":
+        return f"stream:{stream_name}"
+    dataset_dir = Path(getattr(args, "dataset_dir", "")).resolve()
+    if not dataset_dir.exists():
+        return ""
+    digest = hashlib.sha256()
+    for path in discover_files(dataset_dir):
+        stat = path.stat()
+        digest.update(f"{path.relative_to(dataset_dir)}:{stat.st_size}:{stat.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
 def _load_or_build_tokenizer(args):
     path = _tokenizer_path(args)
     if path.exists() and tokenizer_vocab_size(path) == args.tokenizer_vocab_size:
@@ -366,14 +380,17 @@ def _build_model(args):
     tokenizer_path_value = getattr(args, "tokenizer_path", None)
     tokenizer_path = Path(tokenizer_path_value) if tokenizer_path_value else None
     tokenizer_sha256 = _file_sha256(tokenizer_path) if tokenizer_path is not None and tokenizer_path.exists() else ""
+    dataset_fingerprint = _dataset_fingerprint(args)
     expected = dict(vocab_size=args.tokenizer_vocab_size, n_embd=args.n_embd, n_layer=args.n_layer,
                     n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len,
-                    tokenizer_sha256=tokenizer_sha256)
+                    tokenizer_sha256=tokenizer_sha256, dataset_fingerprint=dataset_fingerprint)
     checkpoint = _checkpoint_config(args.output_dir)
     if checkpoint and (Path(args.output_dir) / "model.safetensors").exists():
         keys = ("vocab_size", "n_embd", "n_layer", "n_moba_layer", "head_size", "ctx_len_hint")
         compatible = all(checkpoint.get(key) == expected[key] for key in keys)
         if checkpoint.get("tokenizer_sha256") and checkpoint["tokenizer_sha256"] != tokenizer_sha256:
+            compatible = False
+        if checkpoint.get("dataset_fingerprint") and checkpoint["dataset_fingerprint"] != dataset_fingerprint:
             compatible = False
         requested_bits = args.rqt_bits if getattr(args, "rqt", None) else None
         requested_mixed = getattr(args, "mixed_rqt", None)
@@ -403,6 +420,7 @@ def main():
     tokenizer = _load_or_build_tokenizer(args)
     model = _build_model(args).to(device)
     model.cfg.tokenizer_sha256 = _file_sha256(_tokenizer_path(args))
+    model.cfg.dataset_fingerprint = _dataset_fingerprint(args)
     if args.mixed_rqt:
         prepare_mixed_rqt(model)
     elif args.rqt:
