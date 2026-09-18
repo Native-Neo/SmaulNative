@@ -71,6 +71,7 @@ Useful flags include:
 - `--save_dtype fp32|fp16|bf16`
 - `--rqt`
 - `--rqt_bits 4|6|8`
+- `--rqt-state-dtype fp32|fp16|bf16`
 - `--mixed_rqt`
 - `--router_only`
 - `--compile`
