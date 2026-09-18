@@ -46,7 +46,7 @@ def test_final_partial_batch_is_flushed(monkeypatch):
     assert calls == [1]
 
 
-def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
+def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch, tmp_path):
     class Args:
         stream_dataset = "none"
         dataset_dir = "."
@@ -55,8 +55,8 @@ def test_checkpoint_waits_for_optimizer_checkpoint(monkeypatch):
         log_every = 999
         save_every = 1
         optimizer_save_every = 2
-        output_dir = "."
-        checkpoint_dir = "."
+        output_dir = str(tmp_path / "model")
+        checkpoint_dir = str(tmp_path / "checkpoint")
         tokenizer_path = "tokenizer.json"
         save_dtype = "fp32"
 
