@@ -30,7 +30,8 @@ whole words where possible, then Devanagari grapheme units and individual charac
 ## Determinism
 
 Directory inputs are traversed in sorted path order, so the same corpus and settings produce stable
-vocabulary ordering. Text is decoded with replacement rather than silently deleting invalid bytes.
+vocabulary ordering. Text is decoded as strict UTF-8; invalid bytes raise `UnicodeDecodeError` instead
+of being silently discarded.
 
 ## Encoding
 
