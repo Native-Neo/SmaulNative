@@ -129,7 +129,7 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
   TORCH_CHECK(packed.numel() == out_features * stride);
   auto pp = packed.data_ptr<uint8_t>(); auto ss = scale.data_ptr<float>();
   auto gg = grad.data_ptr<float>(); auto mm = avg.data_ptr<float>();
-  const float f_lr = (float)lr, f_b1 = (float)b1, f_b2 = (float)b2;
+  const float f_lr = (float)lr;
   const float decay_mul = (float)(1.0 - decay);
   const float max_level = std::abs(rqt_level((1 << (int)bits) - 1, (int)bits));
   const int ibits = (int)bits;
@@ -146,10 +146,13 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
       for (int64_t col = 0; col < in_features; ++col) {
         const float g = grow[col];
         const float old_m = mrow[col];
-        const float mixed = f_b1 * old_m + (1.0f - f_b1) * g;
+        float mixed = old_m * (float)b1;
+        mixed += g * (float)(1.0 - b1);
         const int8_t sign = mixed > 0.0f ? 1 : (mixed < 0.0f ? -1 : 0);
         signs[(size_t)col] = sign;
-        mrow[col] = f_b2 * mixed + (1.0f - f_b2) * g;
+        float second = mixed * (float)b2;
+        second += g * (float)(1.0 - b2);
+        mrow[col] = second;
         const float old_w = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale;
         const float value = old_w * decay_mul - f_lr * sign;
         max_abs = std::max(max_abs, std::abs(value));
