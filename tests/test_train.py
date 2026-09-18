@@ -127,6 +127,27 @@ def test_malformed_remote_resume_position_fails_loudly():
         next(train._remote_token_stream("hindi", object(), 4, resume))
 
 
+def test_remote_resume_replays_buffered_tokens(monkeypatch):
+    class Tokenizer:
+        eos_token_id = 99
+
+        def encode(self, text):
+            return list(range(len(text)))
+
+    monkeypatch.setattr(train, "stream_dataset", lambda *args, **kwargs: iter([
+        ("abcdefghij", ("english", "file.parquet", 4)),
+    ]))
+    first = train.ResumeState()
+    stream = train._remote_token_stream("english", Tokenizer(), 3, first)
+    next(stream)
+    saved = next(stream)
+    resume = train.ResumeState()
+    resume.file_path, resume.record_index, resume.buffer_tokens = saved[2], saved[3], saved[4]
+    monkeypatch.setattr(train, "stream_dataset", lambda *args, **kwargs: iter(()))
+    resumed = next(train._remote_token_stream("english", Tokenizer(), 3, resume))
+    assert resumed[0].tolist() == next(stream)[0].tolist()
+
+
 def test_optimizer_selection_keeps_rqt_isolated():
     class Args:
         lr = 1e-4
