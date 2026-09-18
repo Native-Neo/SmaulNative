@@ -60,6 +60,24 @@ def _pack(codes, bits):
     return codes.to(torch.float8_e4m3fn)
 
 
+def _pack_rows(codes, bits):
+    if bits == FP4:
+        pad = codes.shape[1] & 1
+        if pad: codes = torch.cat((codes, torch.zeros(codes.shape[0], 1, dtype=torch.uint8, device=codes.device)), dim=1)
+        c = codes.reshape(codes.shape[0], -1, 2)
+        return ((c[..., 0] << 4) | c[..., 1]).to(torch.uint8).reshape(-1)
+    if bits == FP6:
+        pad = (-codes.shape[1]) % 4
+        if pad: codes = torch.cat((codes, torch.zeros(codes.shape[0], pad, dtype=torch.uint8, device=codes.device)), dim=1)
+        c = codes.reshape(codes.shape[0], -1, 4)
+        out = torch.empty((codes.shape[0], c.shape[1] * 3), dtype=torch.uint8, device=codes.device)
+        out[:, 0::3] = (c[..., 0] << 2) | (c[..., 1] >> 4)
+        out[:, 1::3] = ((c[..., 1] & 15) << 4) | (c[..., 2] >> 2)
+        out[:, 2::3] = ((c[..., 2] & 3) << 6) | c[..., 3]
+        return out.reshape(-1)
+    return codes.to(torch.float8_e4m3fn).reshape(-1)
+
+
 def _unpack(packed, bits, count):
     if bits == FP4:
         out = torch.empty(packed.numel() * 2, dtype=torch.uint8, device=packed.device); out[0::2], out[1::2] = packed >> 4, packed & 15
@@ -78,7 +96,7 @@ def _encode(weight, bits):
     scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(torch.finfo(weight.dtype).eps) / levels.abs().max()
     boundaries, codes, _ = _quant_table(bits, weight.device, weight.dtype)
     quant_codes = codes[torch.bucketize(weight / scale, boundaries)].to(torch.uint8)
-    return _pack(quant_codes.flatten(), bits), scale.squeeze(1)
+    return _pack_rows(quant_codes, bits), scale.squeeze(1)
 
 
 def _native_rqt():
