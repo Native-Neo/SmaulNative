@@ -42,6 +42,8 @@ class AutoRL:
         policy_dir = self.work_dir / "policy"
         load_dir = policy_dir if policy_dir.exists() else self.model_dir
         self.model = RWKVXModel.from_pretrained(load_dir).to(self.device)
+        if self.device.type != "cpu" and any(isinstance(module, RQTLinear) for module in self.model.modules()):
+            raise RuntimeError("RQT automated RL training currently requires the native CPU backend")
         self.model.train()
         self.eos_id = self.tokenizer.eos_token_id
         self.bos_id = self.tokenizer.bos_token_id
