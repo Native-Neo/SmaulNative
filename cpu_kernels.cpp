@@ -5,6 +5,7 @@
 #include <immintrin.h>
 #include <limits>
 #include <torch/extension.h>
+#include <vector>
 
 void lion_step(torch::Tensor p, torch::Tensor g, torch::Tensor m, double lr, double b1, double b2, double wd) {
   TORCH_CHECK(p.device().is_cpu() && g.device().is_cpu() && m.device().is_cpu());
@@ -134,6 +135,7 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
   const int ibits = (int)bits;
 
   at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+    std::vector<int8_t> signs((size_t)in_features);
     for (int64_t row = begin; row < end; ++row) {
       uint8_t* dst = pp + row * stride;
       const float* grow = gg + row * in_features;
@@ -145,8 +147,11 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
         const float g = grow[col];
         const float old_m = mrow[col];
         const float mixed = f_b1 * old_m + (1.0f - f_b1) * g;
+        const int8_t sign = mixed > 0.0f ? 1 : (mixed < 0.0f ? -1 : 0);
+        signs[(size_t)col] = sign;
+        mrow[col] = f_b2 * mixed + (1.0f - f_b2) * g;
         const float old_w = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale;
-        const float value = old_w * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f));
+        const float value = old_w * decay_mul - f_lr * sign;
         max_abs = std::max(max_abs, std::abs(value));
       }
 
@@ -154,12 +159,8 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
       ss[row] = new_scale;
 
       for (int64_t col = 0; col < in_features; ++col) {
-        const float g = grow[col];
-        const float old_m = mrow[col];
-        const float mixed = f_b1 * old_m + (1.0f - f_b1) * g;
         const float old_w = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * old_scale;
-        mrow[col] = f_b2 * mixed + (1.0f - f_b2) * g;
-        const float value = (old_w * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f))) / new_scale;
+        const float value = (old_w * decay_mul - f_lr * signs[(size_t)col]) / new_scale;
         rqt_set_code(dst, (int)col, ibits, (uint8_t)rqt_nearest_code(value, ibits));
       }
     }
