@@ -121,14 +121,8 @@ static inline void rqt_set_code(uint8_t* packed, int index, int bits, uint8_t co
 
 static inline int rqt_nearest_code(float value, int bits) {
   if (bits == 8) {
-    if (!std::isfinite(value)) return value < 0.0f ? 0xFE : 0x7E;
-    int best = 0; float best_error = std::numeric_limits<float>::infinity();
-    for (int code = 0; code < 256; ++code) {
-      if ((code & 0x7F) == 0x7F) continue;
-      const float error = std::abs(value - rqt_fp8_level(code));
-      if (error < best_error) { best_error = error; best = code; }
-    }
-    return best;
+    uint32_t rng = 0x9E3779B9u;
+    return rqt_fp8_stochastic_code(value, rng);
   }
   const auto& levels = rqt_level_table();
   const int count = 1 << bits;
