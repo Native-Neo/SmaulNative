@@ -26,7 +26,7 @@ from dataset import PretrainStream, SFTDataset, discover_files, iter_texts, load
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE
 from stream_data import stream_dataset
 from tokenizer import ensure_tokenizer
-from rqt import FP8SGD, RQTLion, prepare_mixed_rqt, prepare_rqt
+from rqt import FP8SGD, RQTLion, prepare_fp8, prepare_mixed_rqt, prepare_rqt
 
 STOP_REQUESTED = False
 
@@ -434,6 +434,8 @@ def main():
     model.cfg.dataset_fingerprint = _dataset_fingerprint(args)
     if args.mixed_rqt:
         prepare_mixed_rqt(model)
+    elif args.fp8:
+        prepare_fp8(model)
     elif args.rqt:
         prepare_rqt(model, args.rqt_bits)
     if args.router_only:
