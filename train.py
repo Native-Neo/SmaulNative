@@ -52,8 +52,12 @@ def _format_size(num_bytes):
 def _print_model_size(model):
     parameters = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[MODEL] {parameters:,} parameters | trainable={trainable:,} | FP32={_format_size(parameters * 4)}")
-    return parameters
+    logical_rqt = sum(m.in_features * m.out_features for m in model.modules() if hasattr(m, "packed") and hasattr(m, "in_features") and hasattr(m, "out_features"))
+    logical_parameters = parameters + logical_rqt
+    stored_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    stored_bytes += sum(b.numel() * b.element_size() for b in model.buffers())
+    print(f"[MODEL] {logical_parameters:,} parameters | trainable={trainable:,} | stored={_format_size(stored_bytes)} | FP32={_format_size(logical_parameters * 4)}")
+    return logical_parameters
 
 
 class Lion(Optimizer):
@@ -444,6 +448,7 @@ def main():
     if args.router_only:
         trainable = set_router_only_training(model, True)
         print(f"[MOE] router-only trainable={trainable:,}")
+    _print_model_size(model)
     if args.compile:
         model = torch.compile(model)
     optimizer = _build_optimizer(args, model)
