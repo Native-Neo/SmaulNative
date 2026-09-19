@@ -168,7 +168,7 @@ def save_checkpoint(model, optimizer, resume, output_dir, checkpoint_dir, tokeni
 
 
 def _autocast(args, device):
-    if args.rqt or args.mixed_rqt:
+    if args.fp8 or args.rqt or args.mixed_rqt:
         return contextlib.nullcontext()
     if device.type == "cuda":
         dtype = torch.float16 if args.precision == "fp16" else torch.bfloat16
