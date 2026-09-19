@@ -379,7 +379,8 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
   const int64_t stride = bits == 4 ? (n + 1) / 2 : bits == 6 ? ((n + 3) / 4) * 3 : n;
   const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
 
-  at::parallel_for(0, rows * ((n + 7) / 8), 16, [&](int64_t begin, int64_t end) {
+  const int64_t input_blocks = (n + 7) / 8;
+  at::parallel_for(0, rows * input_blocks, 64, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
       const int64_t r = task / ((n + 7) / 8), block = task - r * ((n + 7) / 8), i = block * 8;
       const float* gr = gg + r * m;
