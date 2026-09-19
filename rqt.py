@@ -128,8 +128,8 @@ class _RQTLinearFunction(torch.autograd.Function):
         grad = grad_output.reshape(-1, ctx.out_features).contiguous().float()
         ext = _native_rqt()
         grad_x = ext.rqt_linear_backward_input(grad, packed, scale, ctx.in_features, ctx.out_features, ctx.bits).reshape(ctx.shape)
-        weight_grad = ext.rqt_linear_backward_weight(x, grad, ctx.in_features, ctx.out_features)
         if ctx.module.trainable:
+            weight_grad = ext.rqt_linear_backward_weight(x, grad, ctx.in_features, ctx.out_features)
             if ctx.module._grad is None:
                 ctx.module._grad = weight_grad
             else:
@@ -155,13 +155,14 @@ class _PackedTorchLinearFunction(torch.autograd.Function):
         x2 = x.reshape(-1, ctx.in_features)
         grad2 = grad_output.reshape(-1, ctx.out_features)
         grad_x = torch.zeros_like(x2)
-        weight_grad = torch.zeros(ctx.out_features, ctx.in_features, dtype=torch.float32, device=x.device)
+        weight_grad = torch.zeros(ctx.out_features, ctx.in_features, dtype=torch.float32, device=x.device) if ctx.module.trainable else None
         for start in range(0, ctx.out_features, _BLOCK_ROWS):
             end = min(start + _BLOCK_ROWS, ctx.out_features)
             weight = ctx.module.unpack_rows(start, end, x.dtype)
             block_grad = grad2[:, start:end]
             grad_x.add_(block_grad @ weight)
-            weight_grad[start:end].copy_(block_grad.float().transpose(0, 1) @ x2.float())
+            if ctx.module.trainable:
+                weight_grad[start:end].copy_(block_grad.float().transpose(0, 1) @ x2.float())
         if ctx.module.trainable:
             if ctx.module._grad is None:
                 ctx.module._grad = weight_grad
