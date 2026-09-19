@@ -107,6 +107,38 @@ def test_fp8_native_sgd_handles_exponent_boundary():
     assert torch.isfinite(packed.float()).all()
 
 
+
+def test_fp8_native_sgd_preserves_e4m3_boundaries():
+    ext = _native_rqt()
+    if ext is False:
+        return
+    boundaries = [
+        (0.25, 0.234375, 0.25),
+        (0.5, 0.46875, 0.5),
+        (1.0, 0.9375, 1.0),
+        (2.0, 1.875, 2.0),
+        (4.0, 3.75, 4.0),
+        (8.0, 7.5, 8.0),
+    ]
+    for value, lower, upper in boundaries:
+        packed = torch.tensor([value], dtype=torch.float8_e4m3fn)
+        grad = torch.tensor([[0.01]], dtype=torch.float32)
+        ext.fp8_sgd_step(packed, grad, 1, 1, 1.0, 0.0)
+        updated = packed.float().item()
+        assert lower <= updated <= upper
+        assert torch.isfinite(packed.float()).all()
+
+
+def test_fp8_native_sgd_saturates_without_nan():
+    ext = _native_rqt()
+    if ext is False:
+        return
+    packed = torch.tensor([448.0, -448.0], dtype=torch.float8_e4m3fn)
+    grad = torch.tensor([[1.0, -1.0]], dtype=torch.float32)
+    ext.fp8_sgd_step(packed, grad, 2, 1, 100.0, 0.0)
+    assert torch.isfinite(packed.float()).all()
+    assert packed.float().abs().max().item() <= 448.0
+
 def test_fp8_native_forward_and_backward_input_match_reference():
     ext = _native_rqt()
     if ext is False:
