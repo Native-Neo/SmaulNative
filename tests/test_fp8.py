@@ -41,3 +41,40 @@ def test_fp8_native_extension_if_available():
         return
     assert hasattr(ext, "fp8_sgd_step")
     assert hasattr(ext, "rqt_linear_forward")
+
+
+def test_fp8_config_metadata_roundtrip():
+    from rwkv_x_core import RWKVXConfig
+
+    cfg = RWKVXConfig(tokenizer_sha256="abc", dataset_fingerprint="dataset")
+    assert RWKVXConfig.load(_write_config(cfg)).tokenizer_sha256 == "abc"
+
+
+def _write_config(cfg):
+    import tempfile
+    from pathlib import Path
+
+    path = Path(tempfile.mkdtemp()) / "config.json"
+    cfg.save(path)
+    return path
+
+
+def test_fp8_checkpoint_roundtrip(tmp_path):
+    from rwkv_x_core import RWKVXConfig, RWKVXModel
+    from rqt import prepare_fp8
+
+    cfg = RWKVXConfig(vocab_size=32, n_embd=16, n_layer=2, head_size=4, n_moba_layer=1,
+                      checkpoint_ffn=False, tokenizer_sha256="abc", dataset_fingerprint="dataset")
+    model = RWKVXModel(cfg)
+    prepare_fp8(model)
+    model.save_pretrained(tmp_path, dtype="fp32", include_upstream=False)
+    loaded = RWKVXModel.from_pretrained(tmp_path)
+    assert loaded.cfg.fp8_training
+    assert loaded.cfg.rqt_bits == 8
+    assert loaded.cfg.tokenizer_sha256 == "abc"
+    assert loaded.cfg.dataset_fingerprint == "dataset"
+    original = {name: module.packed.detach().clone() for name, module in model.named_modules() if hasattr(module, "packed")}
+    restored = {name: module.packed.detach().clone() for name, module in loaded.named_modules() if hasattr(module, "packed")}
+    assert original.keys() == restored.keys()
+    for name in original:
+        assert torch.equal(original[name], restored[name])
