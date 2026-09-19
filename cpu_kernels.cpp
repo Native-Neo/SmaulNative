@@ -72,12 +72,23 @@ static const RQTOrderedLevels& rqt_ordered_levels(int bits) {
   return bits == 4 ? fp4 : fp6;
 }
 
+static const std::array<float, 256>& rqt_fp8_table() {
+  static const auto table = [] {
+    std::array<float, 256> out{};
+    for (int code = 0; code < 256; ++code) {
+      const int exponent = (code >> 3) & 15, mantissa = code & 7;
+      const float sign = (code & 128) ? -1.0f : 1.0f;
+      if (exponent == 15 && mantissa == 7) out[code] = std::numeric_limits<float>::quiet_NaN();
+      else if (exponent == 0) out[code] = sign * std::ldexp((float)mantissa, -9);
+      else out[code] = sign * (1.0f + mantissa / 8.0f) * std::ldexp(1.0f, exponent - 7);
+    }
+    return out;
+  }();
+  return table;
+}
+
 static inline float rqt_fp8_level(int code) {
-  const int exponent = (code >> 3) & 15, mantissa = code & 7;
-  const float sign = (code & 128) ? -1.0f : 1.0f;
-  if (exponent == 0) return sign * std::ldexp((float)mantissa, -9);
-  if (exponent == 15 && mantissa == 7) return std::numeric_limits<float>::quiet_NaN();
-  return sign * (1.0f + mantissa / 8.0f) * std::ldexp(1.0f, exponent - 7);
+  return rqt_fp8_table()[(uint8_t)code];
 }
 
 static inline float rqt_level(int code, int bits) {
