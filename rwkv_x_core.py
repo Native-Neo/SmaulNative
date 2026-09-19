@@ -421,7 +421,7 @@ class RWKVXModel(nn.Module):
         sd = {}
         for k, v in self.state_dict().items():
             v = v.detach().cpu().contiguous()
-            sd[k] = v.to(cast) if cast is not None and v.is_floating_point() else v
+            sd[k] = v.to(cast) if cast is not None and v.is_floating_point() and not k.endswith(".packed") else v
         save_file(sd, str(out_dir / "model.safetensors"))
         self.cfg.save(out_dir / "config.json")
         if include_upstream:
