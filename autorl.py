@@ -37,6 +37,10 @@ class AutoRL:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif device == "hip":
+            if not torch.version.hip or not torch.cuda.is_available():
+                raise ValueError("HIP device requested but a HIP PyTorch build is unavailable")
+            device = "cuda"
         self.device = torch.device(device)
         self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
         policy_dir = self.work_dir / "policy"
