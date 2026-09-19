@@ -323,6 +323,58 @@ class RQTLion:
             self.param_state[param] = value.to(param.device, dtype=self.state_dtype)
 
 
+class FP8SGD:
+    def __init__(self, model, lr=1e-4, weight_decay=0.0):
+        if lr <= 0: raise ValueError("lr must be > 0")
+        self.model, self.lr, self.weight_decay = model, lr, weight_decay
+        self.params = [p for p in model.parameters() if p.requires_grad]
+
+    def _modules(self): return [(name, module) for name, module in self.model.named_modules() if isinstance(module, RQTLinear)]
+
+    def zero_grad(self, set_to_none=True):
+        for _, module in self._modules(): module.zero_grad()
+        for param in self.params: param.grad = None
+
+    @torch.no_grad()
+    def clip_grad_norm(self, max_norm):
+        grads = [m._grad for _, m in self._modules() if m._grad is not None] + [p.grad.float() for p in self.params if p.grad is not None]
+        if not grads: return torch.tensor(0.0)
+        total = torch.stack([g.pow(2).sum() for g in grads]).sum().sqrt()
+        if total > max_norm:
+            scale = max_norm / (total + 1e-6)
+            for _, module in self._modules():
+                if module._grad is not None: module._grad.mul_(scale)
+            for param in self.params:
+                if param.grad is not None: param.grad.mul_(scale)
+        return total
+
+    @torch.no_grad()
+    def step(self):
+        ext = _native_rqt()
+        for _, module in self._modules():
+            if module.bits != FP8 or module._grad is None: continue
+            grad = module._grad.float().contiguous()
+            if ext is not None and ext is not False and module.packed.device.type == "cpu" and grad.is_contiguous():
+                ext.fp8_sgd_step(module.packed, grad, module.in_features, module.out_features, self.lr, self.lr * self.weight_decay)
+            else:
+                weight = module.unpack(torch.float32)
+                weight.mul_(1 - self.lr * self.weight_decay).sub_(grad, alpha=self.lr)
+                module.packed.copy_(weight.to(torch.float8_e4m3fn).reshape(-1))
+            module._cached_weight = None; module._grad = None
+        for param in self.params:
+            if param.grad is None: continue
+            if isinstance(param, torch.Tensor) and param.dtype.is_floating_point:
+                if self.weight_decay: param.mul_(1 - self.lr * self.weight_decay)
+                param.add_(param.grad.float(), alpha=-self.lr)
+            param.grad = None
+
+    def state_dict(self):
+        return {"version": 1, "type": "fp8_sgd", "lr": self.lr, "weight_decay": self.weight_decay}
+
+    def load_state_dict(self, state):
+        self.lr = float(state.get("lr", self.lr)); self.weight_decay = float(state.get("weight_decay", self.weight_decay))
+
+
 def _replace(root, name, bits):
     parts = name.split("."); parent = root
     for part in parts[:-1]: parent = getattr(parent, part)
