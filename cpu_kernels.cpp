@@ -393,7 +393,7 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
   const int64_t input_blocks = (n + 7) / 8;
   at::parallel_for(0, rows * input_blocks, 64, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
-      const int64_t r = task / ((n + 7) / 8), block = task - r * ((n + 7) / 8), i = block * 8;
+      const int64_t r = task / input_blocks, block = task - r * input_blocks, i = block * 8;
       const float* gr = gg + r * m;
       const int64_t width = std::min<int64_t>(8, n - i);
 
