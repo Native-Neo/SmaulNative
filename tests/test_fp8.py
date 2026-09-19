@@ -112,3 +112,13 @@ def test_fp8_native_forward_and_backward_input_match_reference():
 
     assert torch.allclose(native_out, reference_out, atol=0.0, rtol=0.0)
     assert torch.allclose(native_grad_x, reference_grad_x, atol=0.0, rtol=0.0)
+
+def test_frozen_fp8_backward_does_not_capture_weight_grad():
+    linear = nn.Linear(8, 4, bias=False)
+    module = RQTLinear(linear, FP8)
+    module.trainable = False
+    x = torch.randn(3, 8, dtype=torch.float32, requires_grad=True)
+    out = module(x)
+    out.square().mean().backward()
+    assert module._grad is None
+    assert torch.isfinite(x.grad).all()
