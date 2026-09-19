@@ -84,6 +84,27 @@ static inline float rqt_level(int code, int bits) {
   return bits == 8 ? rqt_fp8_level(code) : rqt_level_table()[(bits == 4 ? 0 : 64) + code];
 }
 
+static inline uint32_t rqt_xorshift(uint32_t& state) {
+  state ^= state << 13; state ^= state >> 17; state ^= state << 5; return state;
+}
+
+static inline uint8_t rqt_fp8_stochastic_code(float value, uint32_t& rng) {
+  if (!std::isfinite(value)) return value < 0.0f ? 0xFE : 0x7E;
+  const bool negative = value < 0.0f; const float magnitude = std::abs(value);
+  uint8_t nearest = c10::Float8_e4m3fn(magnitude).x;
+  if (nearest >= 0x7F) nearest = 0x7E;
+  const float rounded = rqt_fp8_level(nearest);
+  if (rounded == magnitude) return negative ? (uint8_t)(nearest | 0x80) : nearest;
+  uint8_t lower, upper;
+  if (rounded > magnitude) { upper = nearest; lower = nearest > 0 ? (uint8_t)(nearest - 1) : 0; }
+  else { lower = nearest; upper = nearest < 0x7E ? (uint8_t)(nearest + 1) : 0x7E; }
+  const float lo = rqt_fp8_level(lower), hi = rqt_fp8_level(upper);
+  const float p = hi > lo ? (magnitude - lo) / (hi - lo) : 0.0f;
+  const float u = (float)(rqt_xorshift(rng) & 0x00FFFFFFu) / 16777216.0f;
+  const uint8_t code = u < p ? upper : lower;
+  return negative ? (uint8_t)(code | 0x80) : code;
+}
+
 static inline uint8_t rqt_code(const uint8_t* packed, int index, int bits) {
   if (bits == 4) { const uint8_t p = packed[index >> 1]; return (index & 1) ? p & 15 : p >> 4; }
   if (bits == 8) return packed[index];
@@ -236,6 +257,27 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
   });
 }
 
+
+void fp8_sgd_step(torch::Tensor packed, torch::Tensor grad, int64_t in_features, int64_t out_features, double lr, double decay) {
+  TORCH_CHECK(packed.device().is_cpu() && grad.device().is_cpu());
+  TORCH_CHECK(packed.dtype() == torch::kFloat8_e4m3fn && grad.dtype() == torch::kFloat32);
+  TORCH_CHECK(packed.is_contiguous() && grad.is_contiguous());
+  TORCH_CHECK(packed.numel() == out_features * in_features && grad.numel() == out_features * in_features);
+  auto pp = static_cast<uint8_t*>(packed.data_ptr()); auto gg = grad.data_ptr<float>();
+  const float f_lr = (float)lr, decay_mul = (float)(1.0 - decay);
+  at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      uint32_t rng = 0x9E3779B9u ^ (uint32_t)row * 0x85EBCA6Bu;
+      for (int64_t col = 0; col < in_features; ++col) {
+        const int64_t i = row * in_features + col;
+        const float old_w = rqt_fp8_level(pp[i]);
+        const float target = old_w * decay_mul - f_lr * gg[i];
+        pp[i] = rqt_fp8_stochastic_code(target, rng);
+      }
+    }
+  });
+}
+
 torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::Tensor scale, int64_t in_features, int64_t out_features, int64_t bits) {
   TORCH_CHECK(x.device().is_cpu() && packed.device().is_cpu() && scale.device().is_cpu());
   TORCH_CHECK(x.dtype() == torch::kFloat32 && packed.element_size() == 1 && scale.dtype() == torch::kFloat32);
@@ -366,6 +408,7 @@ torch::Tensor rqt_linear_backward_weight(torch::Tensor x, torch::Tensor grad, in
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lion_step", &lion_step, "Fused Lion update with AVX");
   m.def("rqt_requant_step", &rqt_requant_step, "Fused packed RQT requantization");
+  m.def("fp8_sgd_step", &fp8_sgd_step, "Direct FP8 E4M3 SGD with stochastic rounding");
   m.def("rqt_lion_step", &rqt_lion_step, "Fused Lion update and packed RQT requantization");
   m.def("rqt_linear_forward", &rqt_linear_forward, "Packed RQT linear forward");
   m.def("rqt_linear_backward_input", &rqt_linear_backward_input, "Packed RQT linear input gradient");
