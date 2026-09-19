@@ -278,59 +278,87 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   TORCH_CHECK(x.dim() == 2 && x.size(1) == in_features && packed.is_contiguous() && scale.is_contiguous() && x.is_contiguous());
   TORCH_CHECK(bits == 4 || bits == 6 || bits == 8);
   TORCH_CHECK(scale.numel() == (bits == 8 ? 0 : out_features));
-  auto out = torch::empty({x.size(0), out_features}, x.options());
-  const auto rows = x.size(0), n = in_features, m = out_features;
-  const auto* xx = x.data_ptr<float>(); const auto* pp = static_cast<const uint8_t*>(packed.data_ptr());
-  const auto* ss = scale.data_ptr<float>(); auto* yy = out.data_ptr<float>();
-  const int64_t stride = bits == 4 ? (n + 1) / 2 : bits == 6 ? ((n + 3) / 4) * 3 : n;
-  const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
 
-  at::parallel_for(0, rows * m, 64, [&](int64_t begin, int64_t end) {
+  auto out = torch::empty({x.size(0), out_features}, x.options());
+  const int64_t rows = x.size(0), n = in_features, m = out_features;
+  const float* xx = x.data_ptr<float>();
+  const uint8_t* pp = static_cast<const uint8_t*>(packed.data_ptr());
+  const float* ss = scale.data_ptr<float>();
+  float* yy = out.data_ptr<float>();
+  const int64_t stride = bits == 4 ? (n + 1) / 2 : bits == 6 ? ((n + 3) / 4) * 3 : n;
+  const int ibits = (int)bits;
+  const auto& levels = rqt_level_table();
+  const int base = bits == 4 ? 0 : 64;
+
+  at::parallel_for(0, rows * m, 32, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
       const int64_t r = task / m, o = task - r * m;
-      const uint8_t* row = pp + o * stride; const float s = ibits == 8 ? 1.0f : ss[o]; const float* level = levels.data() + base;
+      const uint8_t* wrow = pp + o * stride;
       const float* xr = xx + r * n;
+      const float s = ibits == 8 ? 1.0f : ss[o];
       float acc = 0.0f;
+      int64_t i = 0;
+
       if (ibits == 8) {
-        for (int64_t i = 0; i < n; ++i) acc += xr[i] * rqt_level(row[i], ibits);
-        yy[r * m + o] = acc;
-        continue;
-      }
-      float scaled_levels[64];
-      if (ibits == 6) for (int code = 0; code < 64; ++code) scaled_levels[code] = level[code] * s;
-      if (ibits == 4) {
-        int64_t i = 0;
         for (; i + 8 <= n; i += 8) {
-          const uint8_t p0 = row[i >> 1], p1 = row[(i >> 1) + 1], p2 = row[(i >> 1) + 2], p3 = row[(i >> 1) + 3];
-          acc += xr[i] * level[p0 >> 4] * s;
-          acc += xr[i + 1] * level[p0 & 15] * s;
-          acc += xr[i + 2] * level[p1 >> 4] * s;
-          acc += xr[i + 3] * level[p1 & 15] * s;
-          acc += xr[i + 4] * level[p2 >> 4] * s;
-          acc += xr[i + 5] * level[p2 & 15] * s;
-          acc += xr[i + 6] * level[p3 >> 4] * s;
-          acc += xr[i + 7] * level[p3 & 15] * s;
+          float w[8];
+          for (int k = 0; k < 8; ++k) w[k] = rqt_fp8_level(wrow[i + k]);
+          const __m256 xv = _mm256_loadu_ps(xr + i);
+          const __m256 wv = _mm256_loadu_ps(w);
+          __m256 av = _mm256_mul_ps(xv, wv);
+          __m128 lo = _mm256_castps256_ps128(av), hi = _mm256_extractf128_ps(av, 1);
+          lo = _mm_add_ps(lo, hi);
+          lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+          lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+          acc += _mm_cvtss_f32(lo);
         }
-        for (; i < n; ++i) {
-          const uint8_t p = row[i >> 1];
-          acc += xr[i] * level[(i & 1) ? (p & 15) : (p >> 4)] * s;
+      } else if (ibits == 4) {
+        for (; i + 8 <= n; i += 8) {
+          const uint8_t p0 = wrow[i >> 1], p1 = wrow[(i >> 1) + 1], p2 = wrow[(i >> 1) + 2], p3 = wrow[(i >> 1) + 3];
+          const float w[8] = {
+            levels[p0 >> 4] * s, levels[p0 & 15] * s,
+            levels[p1 >> 4] * s, levels[p1 & 15] * s,
+            levels[p2 >> 4] * s, levels[p2 & 15] * s,
+            levels[p3 >> 4] * s, levels[p3 & 15] * s
+          };
+          const __m256 xv = _mm256_loadu_ps(xr + i);
+          const __m256 wv = _mm256_loadu_ps(w);
+          __m256 av = _mm256_mul_ps(xv, wv);
+          __m128 lo = _mm256_castps256_ps128(av), hi = _mm256_extractf128_ps(av, 1);
+          lo = _mm_add_ps(lo, hi);
+          lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+          lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+          acc += _mm_cvtss_f32(lo);
         }
       } else {
-        int64_t i = 0;
-        for (; i + 4 <= n; i += 4) {
-          const uint8_t* p = row + (i >> 2) * 3;
-          const uint8_t c0 = p[0] >> 2;
-          const uint8_t c1 = ((p[0] & 3) << 4) | (p[1] >> 4);
-          const uint8_t c2 = ((p[1] & 15) << 2) | (p[2] >> 6);
-          const uint8_t c3 = p[2] & 63;
-          acc += xr[i] * scaled_levels[c0];
-          acc += xr[i + 1] * scaled_levels[c1];
-          acc += xr[i + 2] * scaled_levels[c2];
-          acc += xr[i + 3] * scaled_levels[c3];
+        for (; i + 8 <= n; i += 8) {
+          const uint8_t* p0 = wrow + (i >> 2) * 3;
+          const uint8_t c0 = p0[0] >> 2;
+          const uint8_t c1 = ((p0[0] & 3) << 4) | (p0[1] >> 4);
+          const uint8_t c2 = ((p0[1] & 15) << 2) | (p0[2] >> 6);
+          const uint8_t c3 = p0[2] & 63;
+          const uint8_t* p1 = p0 + 6;
+          const uint8_t c4 = p1[0] >> 2;
+          const uint8_t c5 = ((p1[0] & 3) << 4) | (p1[1] >> 4);
+          const uint8_t c6 = ((p1[1] & 15) << 2) | (p1[2] >> 6);
+          const uint8_t c7 = p1[2] & 63;
+          const float w[8] = {
+            levels[64 + c0] * s, levels[64 + c1] * s, levels[64 + c2] * s, levels[64 + c3] * s,
+            levels[64 + c4] * s, levels[64 + c5] * s, levels[64 + c6] * s, levels[64 + c7] * s
+          };
+          const __m256 xv = _mm256_loadu_ps(xr + i);
+          const __m256 wv = _mm256_loadu_ps(w);
+          __m256 av = _mm256_mul_ps(xv, wv);
+          __m128 lo = _mm256_castps256_ps128(av), hi = _mm256_extractf128_ps(av, 1);
+          lo = _mm_add_ps(lo, hi);
+          lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+          lo = _mm_add_ss(lo, _mm_movehdup_ps(lo, lo));
+          acc += _mm_cvtss_f32(lo);
         }
-        for (; i < n; ++i) {
-          acc += xr[i] * scaled_levels[rqt_code(row, (int)i, ibits)];
-        }
+      }
+
+      for (; i < n; ++i) {
+        acc += xr[i] * rqt_level(rqt_code(wrow, (int)i, ibits), ibits) * s;
       }
       yy[r * m + o] = acc;
     }
