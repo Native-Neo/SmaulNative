@@ -122,3 +122,11 @@ def test_frozen_fp8_backward_does_not_capture_weight_grad():
     out.square().mean().backward()
     assert module._grad is None
     assert torch.isfinite(x.grad).all()
+
+def test_fp8_backward_without_input_grad_still_captures_weight_grad():
+    linear = nn.Linear(8, 4, bias=False)
+    module = RQTLinear(linear, FP8)
+    x = torch.randn(3, 8, dtype=torch.float32)
+    module(x).square().mean().backward()
+    assert module._grad is not None
+    assert module._grad.shape == (4, 8)
