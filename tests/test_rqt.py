@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import rqt as rqt_module
 
 from rqt import RQTLinear, RQTLion, _pack, _unpack, _levels, prepare_mixed_rqt, prepare_rqt
 
@@ -148,6 +149,18 @@ def test_rqt_weight_is_requantized_after_every_step():
     assert linear.packed.dtype == torch.uint8
     assert linear.packed.shape == packed_before.shape
     assert torch.isfinite(linear.unpack()).all()
+
+
+def test_packed_torch_path_handles_multiple_row_blocks(monkeypatch):
+    monkeypatch.setattr(rqt_module, "_RQT_EXT", False)
+    for bits in (4, 6, 8):
+        linear = RQTLinear(torch.nn.Linear(17, 300, bias=False), bits)
+        x = torch.randn(2, 3, 17, requires_grad=True)
+        linear(x).square().mean().backward()
+        assert linear._grad.shape == (300, 17)
+        assert not any(name == "weight" for name, _ in linear.named_parameters())
+        RQTLion(linear, lr=1e-4).step()
+        assert linear._grad is None
 
 
 def test_rqt_optimizer_rejects_unknown_module():
