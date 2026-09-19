@@ -53,8 +53,10 @@ def _load():
             extra_cflags=["-O3", "-march=native", "-mavx", "-ffp-contract=off"],
             verbose=False,
         )
-    except Exception:
+    except Exception as exc:
+        import warnings
         _EXT = False
+        warnings.warn(f"native RQT/Lion extension unavailable; packed PyTorch fallback is active ({type(exc).__name__}: {exc})", RuntimeWarning, stacklevel=2)
     return _EXT
 
 
