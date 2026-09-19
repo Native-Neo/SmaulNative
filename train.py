@@ -399,9 +399,12 @@ def _build_model(args):
             compatible = False
         requested_bits = None if not hasattr(args, "rqt") else args.rqt_bits if args.rqt else 0
         requested_mixed = None if not hasattr(args, "mixed_rqt") else bool(args.mixed_rqt)
+        requested_fp8 = bool(getattr(args, "fp8", False))
         if requested_bits is not None and int(checkpoint.get("rqt_bits", 0)) != requested_bits:
             compatible = False
         if requested_mixed is not None and bool(checkpoint.get("rqt_mixed", False)) != bool(requested_mixed):
+            compatible = False
+        if bool(checkpoint.get("fp8_training", False)) != requested_fp8:
             compatible = False
         if not compatible and getattr(args, "resume", False):
             raise ValueError("checkpoint metadata is incompatible with the requested resume configuration")
