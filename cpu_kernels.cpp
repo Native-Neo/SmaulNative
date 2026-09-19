@@ -101,16 +101,40 @@ static inline uint32_t rqt_xorshift(uint32_t& state) {
 
 static inline uint8_t rqt_fp8_stochastic_code(float value, uint32_t& rng) {
   if (!std::isfinite(value)) return value < 0.0f ? 0xFE : 0x7E;
-  const bool negative = value < 0.0f; const float magnitude = std::abs(value);
-  uint8_t nearest = c10::Float8_e4m3fn(magnitude).x;
-  if (nearest >= 0x7F) nearest = 0x7E;
-  const float rounded = rqt_fp8_level(nearest);
-  if (rounded == magnitude) return negative ? (uint8_t)(nearest | 0x80) : nearest;
+  const bool negative = value < 0.0f;
+  const float magnitude = std::abs(value);
+  if (magnitude >= 448.0f) return negative ? 0xFE : 0x7E;
+  if (magnitude == 0.0f) return 0;
+
   uint8_t lower, upper;
-  if (rounded > magnitude) { upper = nearest; lower = nearest > 0 ? (uint8_t)(nearest - 1) : 0; }
-  else { lower = nearest; upper = nearest < 0x7E ? (uint8_t)(nearest + 1) : 0x7E; }
-  const float lo = rqt_fp8_level(lower), hi = rqt_fp8_level(upper);
-  const float p = hi > lo ? (magnitude - lo) / (hi - lo) : 0.0f;
+  float lo, hi;
+  if (magnitude < 0.015625f) {
+    const float scaled = magnitude * 512.0f;
+    const int base = (int)std::floor(scaled);
+    lower = (uint8_t)std::min(base, 7);
+    upper = lower < 7 ? (uint8_t)(lower + 1) : 8;
+    lo = rqt_fp8_level(lower);
+    hi = rqt_fp8_level(upper);
+  } else {
+    const int exponent = (int)std::floor(std::log2(magnitude));
+    const int exponent_field = exponent + 7;
+    const float step = std::ldexp(1.0f, exponent - 3);
+    const float base_value = std::ldexp(1.0f, exponent);
+    int mantissa = (int)std::floor((magnitude - base_value) / step);
+    mantissa = std::max(0, std::min(mantissa, 6));
+    lower = (uint8_t)((exponent_field << 3) | mantissa);
+    lo = rqt_fp8_level(lower);
+    upper = lower;
+    hi = lo;
+    if (lo < magnitude) {
+      upper = lower + 1;
+      if ((upper & 7) == 7 && (upper >> 3) == 15) upper = 0x7E;
+      hi = rqt_fp8_level(upper);
+    }
+  }
+
+  if (lo == hi || lo == magnitude) return negative ? (uint8_t)(lower | 0x80) : lower;
+  const float p = (magnitude - lo) / (hi - lo);
   const float u = (float)(rqt_xorshift(rng) & 0x00FFFFFFu) / 16777216.0f;
   const uint8_t code = u < p ? upper : lower;
   return negative ? (uint8_t)(code | 0x80) : code;
