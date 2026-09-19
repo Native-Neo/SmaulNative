@@ -93,3 +93,36 @@ def test_fp8_prepare_is_idempotent():
     assert before.keys() == after.keys()
     for name in before:
         assert torch.equal(before[name], after[name])
+
+
+def test_build_model_does_not_implicitly_resume(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from rwkv_x_core import RWKVXConfig, RWKVXModel
+    from train import _build_model
+
+    cfg = RWKVXConfig(vocab_size=32, n_embd=16, n_layer=2, head_size=4, n_moba_layer=1,
+                      checkpoint_ffn=False, ctx_len_hint=8)
+    RWKVXModel(cfg).save_pretrained(tmp_path, dtype="fp32", include_upstream=False)
+
+    args = SimpleNamespace(
+        output_dir=str(tmp_path),
+        tokenizer_path=str(tmp_path / "missing-tokenizer.json"),
+        tokenizer_vocab_size=32,
+        n_embd=16,
+        n_layer=2,
+        n_moba_layer=1,
+        head_size=4,
+        ctx_len=8,
+        rqt=False,
+        rqt_bits=6,
+        mixed_rqt=False,
+        fp8=False,
+        resume=False,
+    )
+
+    def fail_if_loaded(*_args, **_kwargs):
+        raise AssertionError("fresh training must not load an existing checkpoint")
+
+    monkeypatch.setattr(RWKVXModel, "from_pretrained", fail_if_loaded)
+    model = _build_model(args)
+    assert model.cfg.vocab_size == 32
