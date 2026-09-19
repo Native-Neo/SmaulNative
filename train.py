@@ -460,8 +460,12 @@ def main():
     resume = ResumeState.load(Path(args.checkpoint_dir) / "resume_state.json") if args.resume else ResumeState()
     if args.resume:
         optimizer_path = Path(args.checkpoint_dir) / "optimizer.pt"
-        if optimizer_path.exists():
-            optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
+        if not optimizer_path.exists():
+            raise FileNotFoundError(f"cannot resume: optimizer state not found in {args.checkpoint_dir}")
+        resume_path = Path(args.checkpoint_dir) / "resume_state.json"
+        if not resume_path.exists():
+            raise FileNotFoundError(f"cannot resume: resume state not found in {args.checkpoint_dir}")
+        optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
         _load_rng_state(Path(args.checkpoint_dir) / "rng_state.pt")
     if args.mode == "pretrain":
         train_pretrain(args, model, optimizer, resume, device, tokenizer)
