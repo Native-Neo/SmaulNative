@@ -351,8 +351,12 @@ class FP8SGD:
     @torch.no_grad()
     def step(self):
         ext = _native_rqt()
-        for _, module in self._modules():
-            if module.bits != FP8 or module._grad is None: continue
+        modules = self._modules()
+        invalid = [name for name, module in modules if module.bits != FP8]
+        if invalid:
+            raise RuntimeError(f"FP8SGD found non-FP8 RQT layers: {', '.join(invalid[:8])}")
+        for _, module in modules:
+            if module._grad is None: continue
             grad = module._grad.float().contiguous()
             if ext is not None and ext is not False and module.packed.device.type == "cpu" and grad.is_contiguous():
                 ext.fp8_sgd_step(module.packed, grad, module.in_features, module.out_features, self.lr, self.lr * self.weight_decay)
@@ -369,7 +373,7 @@ class FP8SGD:
             param.grad = None
 
     def state_dict(self):
-        return {"version": 1, "type": "fp8_sgd", "lr": self.lr, "weight_decay": self.weight_decay}
+        return {"version": 2, "type": "fp8_sgd", "lr": self.lr, "weight_decay": self.weight_decay}
 
     def load_state_dict(self, state):
         self.lr = float(state.get("lr", self.lr)); self.weight_decay = float(state.get("weight_decay", self.weight_decay))
