@@ -104,6 +104,9 @@ def set_router_only_training(model, router_only):
     for p in model.parameters():
         p.requires_grad_(id(p) in gates if router_only else True)
         count += p.numel() if p.requires_grad else 0
+    for module in model.modules():
+        if hasattr(module, "trainable") and hasattr(module, "packed"):
+            module.trainable = not router_only
     return count
 
 
