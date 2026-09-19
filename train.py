@@ -26,7 +26,7 @@ from dataset import PretrainStream, SFTDataset, discover_files, iter_texts, load
 from rwkv_x_core import RWKVXModel, RWKV_CMix_MoE
 from stream_data import stream_dataset
 from tokenizer import ensure_tokenizer
-from rqt import RQTLion, prepare_mixed_rqt, prepare_rqt
+from rqt import FP8SGD, RQTLion, prepare_mixed_rqt, prepare_rqt
 
 STOP_REQUESTED = False
 
@@ -84,6 +84,8 @@ class Lion(Optimizer):
 
 
 def _build_optimizer(args, model):
+    if args.fp8:
+        return FP8SGD(model, lr=args.lr, weight_decay=args.weight_decay)
     if args.rqt or args.mixed_rqt:
         state_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[getattr(args, "rqt_state_dtype", "fp32")]
         return RQTLion(model, lr=args.lr, weight_decay=args.weight_decay, state_dtype=state_dtype)
@@ -327,6 +329,7 @@ def parse_args():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--rqt", action="store_true")
+    parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--rqt_bits", type=int, choices=[4, 6, 8], default=6)
     parser.add_argument("--rqt-state-dtype", choices=["fp32", "fp16", "bf16"], default="fp32")
     parser.add_argument("--mixed_rqt", action="store_true")
@@ -409,7 +412,13 @@ def _build_model(args):
 
 def main():
     args = parse_args()
-    if args.rqt or args.mixed_rqt:
+    if args.fp8 and (args.rqt or args.mixed_rqt):
+        raise ValueError("--fp8 cannot be combined with --rqt or --mixed_rqt")
+    if args.fp8:
+        args.rqt = True
+        args.rqt_bits = 8
+        args.precision = "fp32"
+    elif args.rqt or args.mixed_rqt:
         args.precision = "fp32"
     elif args.precision is None:
         args.precision = "fp16" if torch.cuda.is_available() and not args.cpu else "fp32"
@@ -418,7 +427,7 @@ def main():
     if device.type == "cpu":
         import cpu
         cpu.configure()
-    print(f"[DEVICE] {device} | precision={args.precision} | rqt={args.rqt or args.mixed_rqt}")
+    print(f"[DEVICE] {device} | precision={args.precision} | fp8={args.fp8} | rqt={args.rqt or args.mixed_rqt}")
     tokenizer = _load_or_build_tokenizer(args)
     model = _build_model(args).to(device)
     model.cfg.tokenizer_sha256 = _file_sha256(_tokenizer_path(args))
