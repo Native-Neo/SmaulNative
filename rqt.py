@@ -138,7 +138,7 @@ class _RQTLinearFunction(torch.autograd.Function):
 
 class _PackedTorchLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, packed, scale, in_features, out_features, bits, module):
+    def forward(ctx, x, packed, scale, in_features, out_features, bits, module, grad_anchor):
         x2 = x.reshape(-1, in_features)
         outputs = []
         for start in range(0, out_features, _BLOCK_ROWS):
@@ -146,7 +146,7 @@ class _PackedTorchLinearFunction(torch.autograd.Function):
             outputs.append(F.linear(x2, module.unpack_rows(start, end, x.dtype)))
         ctx.save_for_backward(x, packed, scale)
         ctx.in_features, ctx.out_features, ctx.bits, ctx.module, ctx.shape = in_features, out_features, bits, module, x.shape
-        return torch.cat(outputs, dim=1).reshape(*x.shape[:-1], out_features)
+        return torch.cat(outputs, dim=1).reshape(*x.shape[:-1], out_features) * grad_anchor
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -165,7 +165,7 @@ class _PackedTorchLinearFunction(torch.autograd.Function):
             ctx.module._grad = weight_grad
         else:
             ctx.module._grad.add_(weight_grad)
-        return grad_x.reshape(ctx.shape), None, None, None, None, None, None
+        return grad_x.reshape(ctx.shape), None, None, None, None, None, None, None
 
 
 class RQTLinear(nn.Module):
@@ -215,7 +215,8 @@ class RQTLinear(nn.Module):
             grad_anchor = torch.ones((), dtype=x.dtype, device=x.device, requires_grad=True)
             out = _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self, grad_anchor)
             return out if self.bias is None else out + self.bias
-        out = _PackedTorchLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self)
+        grad_anchor = torch.ones((), dtype=x.dtype, device=x.device, requires_grad=True)
+        out = _PackedTorchLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self, grad_anchor)
         return out if self.bias is None else out + self.bias
 
     @torch.no_grad()
