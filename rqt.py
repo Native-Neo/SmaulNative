@@ -92,7 +92,7 @@ def _unpack(packed, bits, count):
 
 def _encode(weight, bits):
     weight = weight.float()
-    if bits == FP8: return weight.to(torch.float8_e4m3fn), torch.empty(0, dtype=torch.float32, device=weight.device)
+    if bits == FP8: return weight.to(torch.float8_e4m3fn).reshape(-1), torch.empty(0, dtype=torch.float32, device=weight.device)
     levels = _levels(bits, weight.device, weight.dtype)
     scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(torch.finfo(weight.dtype).eps) / levels.abs().max()
     boundaries, codes, _ = _quant_table(bits, weight.device, weight.dtype)
@@ -134,6 +134,38 @@ class _RQTLinearFunction(torch.autograd.Function):
         else:
             ctx.module._grad.add_(weight_grad)
         return grad_x, None, None, None, None, None, None, None
+
+
+class _PackedTorchLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, packed, scale, in_features, out_features, bits, module):
+        x2 = x.reshape(-1, in_features)
+        outputs = []
+        for start in range(0, out_features, _BLOCK_ROWS):
+            end = min(start + _BLOCK_ROWS, out_features)
+            outputs.append(F.linear(x2, module.unpack_rows(start, end, x.dtype)))
+        ctx.save_for_backward(x, packed, scale)
+        ctx.in_features, ctx.out_features, ctx.bits, ctx.module, ctx.shape = in_features, out_features, bits, module, x.shape
+        return torch.cat(outputs, dim=1).reshape(*x.shape[:-1], out_features)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, packed, scale = ctx.saved_tensors
+        x2 = x.reshape(-1, ctx.in_features)
+        grad2 = grad_output.reshape(-1, ctx.out_features)
+        grad_x = torch.zeros_like(x2)
+        weight_grad = torch.zeros(ctx.out_features, ctx.in_features, dtype=torch.float32, device=x.device)
+        for start in range(0, ctx.out_features, _BLOCK_ROWS):
+            end = min(start + _BLOCK_ROWS, ctx.out_features)
+            weight = ctx.module.unpack_rows(start, end, x.dtype)
+            block_grad = grad2[:, start:end]
+            grad_x.add_(block_grad @ weight)
+            weight_grad[start:end].copy_(block_grad.float().transpose(0, 1) @ x2.float())
+        if ctx.module._grad is None:
+            ctx.module._grad = weight_grad
+        else:
+            ctx.module._grad.add_(weight_grad)
+        return grad_x.reshape(ctx.shape), None, None, None, None, None, None
 
 
 class RQTLinear(nn.Module):
@@ -183,8 +215,8 @@ class RQTLinear(nn.Module):
             grad_anchor = torch.ones((), dtype=x.dtype, device=x.device, requires_grad=True)
             out = _RQTLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self, grad_anchor)
             return out if self.bias is None else out + self.bias
-        weight = self._weight_for_forward().detach().to(dtype=x.dtype).requires_grad_(True); weight.register_hook(lambda grad: self._capture_grad(0, grad))
-        out = F.linear(x, weight, None); return out if self.bias is None else out + self.bias
+        out = _PackedTorchLinearFunction.apply(x, self.packed, self.scale, self.in_features, self.out_features, self.bits, self)
+        return out if self.bias is None else out + self.bias
 
     @torch.no_grad()
     def step(self, update, decay):
@@ -193,13 +225,18 @@ class RQTLinear(nn.Module):
         if ext is not None and ext is not False and self.bits in (FP4, FP6, FP8) and self.packed.device.type == "cpu" and update.dtype == torch.float32 and update.is_contiguous() and self.packed.is_contiguous() and self.scale.is_contiguous():
             ext.rqt_requant_step(self.packed, self.scale, update, self.in_features, self.out_features, self.bits, decay)
             self._cached_weight = None; self._grad = None; return
-        weight = self._weight_for_forward()
-        if decay: weight.mul_(1 - decay)
-        weight.sub_(update); packed, scale = _encode(weight, self.bits)
-        if self.packed.shape != packed.shape or self.packed.dtype != packed.dtype: self.packed = packed
-        else: self.packed.copy_(packed)
-        if self.scale.shape != scale.shape: self.scale = scale
-        else: self.scale.copy_(scale)
+        for start in range(0, self.out_features, _BLOCK_ROWS):
+            end = min(start + _BLOCK_ROWS, self.out_features)
+            weight = self.unpack_rows(start, end, torch.float32)
+            if decay: weight.mul_(1 - decay)
+            weight.sub_(update[start:end])
+            packed, scale = _encode(weight, self.bits)
+            packed_slice = self.packed[self._row_slice(start, end)]
+            if packed_slice.shape != packed.shape:
+                raise RuntimeError("invalid packed RQT row shape")
+            packed_slice.copy_(packed)
+            if self.bits != FP8:
+                self.scale[start:end].copy_(scale)
         self._grad = None
 
     def zero_grad(self): self._grad = None
