@@ -391,6 +391,16 @@ def prepare_rqt(model, bits=FP6):
     model.cfg.rqt_bits = bits; print(f"[RQT] FP{bits} packed compute | {len(targets)} linear layers | block_rows={_BLOCK_ROWS}"); return len(targets)
 
 
+def prepare_fp8(model):
+    root = getattr(model, "_orig_mod", model)
+    targets = [(name, module) for name, module in root.named_modules() if isinstance(module, (nn.Linear, RQTLinear))]
+    for name, _ in reversed(targets): _replace(root, name, FP8)
+    model.cfg.rqt_bits = FP8
+    model.cfg.fp8_training = True
+    print(f"[FP8] E4M3FN packed weights | {len(targets)} linear layers | FP32 accumulation/gradients")
+    return len(targets)
+
+
 def prepare_mixed_rqt(model):
     root = getattr(model, "_orig_mod", model); targets = [(name, module) for name, module in root.named_modules() if isinstance(module, (nn.Linear, RQTLinear))]
     for name, _ in reversed(targets):
