@@ -95,6 +95,18 @@ def test_fp8_prepare_is_idempotent():
         assert torch.equal(before[name], after[name])
 
 
+def test_fp8_native_sgd_handles_exponent_boundary():
+    ext = _native_rqt()
+    if ext is False:
+        return
+    packed = torch.tensor([2.0], dtype=torch.float8_e4m3fn)
+    grad = torch.tensor([[1.0]], dtype=torch.float32)
+    ext.fp8_sgd_step(packed, grad, 1, 1, 0.01, 0.0)
+    value = packed.float().item()
+    assert 1.875 <= value <= 2.0
+    assert torch.isfinite(packed.float()).all()
+
+
 def test_fp8_native_forward_and_backward_input_match_reference():
     ext = _native_rqt()
     if ext is False:
