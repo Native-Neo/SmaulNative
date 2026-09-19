@@ -93,3 +93,22 @@ def test_fp8_prepare_is_idempotent():
     assert before.keys() == after.keys()
     for name in before:
         assert torch.equal(before[name], after[name])
+
+
+def test_fp8_native_forward_and_backward_input_match_reference():
+    ext = _native_rqt()
+    if ext is False:
+        return
+    linear = nn.Linear(8, 4, bias=False)
+    module = RQTLinear(linear, FP8)
+    x = torch.randn(5, 8, dtype=torch.float32)
+    grad = torch.randn(5, 4, dtype=torch.float32)
+    weight = module.packed.float()
+
+    native_out = ext.rqt_linear_forward(x, module.packed, module.scale, 8, 4, FP8)
+    native_grad_x = ext.rqt_linear_backward_input(grad, module.packed, module.scale, 8, 4, FP8)
+    reference_out = x @ weight.t()
+    reference_grad_x = grad @ weight
+
+    assert torch.allclose(native_out, reference_out, atol=0.0, rtol=0.0)
+    assert torch.allclose(native_grad_x, reference_grad_x, atol=0.0, rtol=0.0)
