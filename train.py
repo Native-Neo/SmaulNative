@@ -415,8 +415,6 @@ def main():
         args.precision = "fp16" if torch.cuda.is_available() and not args.cpu else "fp32"
     backend = require_backend(torch, force_cpu=args.cpu)
     device = backend_device(torch, backend)
-    if (args.rqt or args.mixed_rqt) and device.type != "cpu":
-        raise RuntimeError("RQT training currently requires the native CPU backend")
     if device.type == "cpu":
         import cpu
         cpu.configure()
