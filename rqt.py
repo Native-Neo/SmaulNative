@@ -129,10 +129,11 @@ class _RQTLinearFunction(torch.autograd.Function):
         ext = _native_rqt()
         grad_x = ext.rqt_linear_backward_input(grad, packed, scale, ctx.in_features, ctx.out_features, ctx.bits).reshape(ctx.shape)
         weight_grad = ext.rqt_linear_backward_weight(x, grad, ctx.in_features, ctx.out_features)
-        if ctx.module._grad is None:
-            ctx.module._grad = weight_grad
-        else:
-            ctx.module._grad.add_(weight_grad)
+        if ctx.module.trainable:
+            if ctx.module._grad is None:
+                ctx.module._grad = weight_grad
+            else:
+                ctx.module._grad.add_(weight_grad)
         return grad_x, None, None, None, None, None, None, None
 
 
@@ -161,10 +162,11 @@ class _PackedTorchLinearFunction(torch.autograd.Function):
             block_grad = grad2[:, start:end]
             grad_x.add_(block_grad @ weight)
             weight_grad[start:end].copy_(block_grad.float().transpose(0, 1) @ x2.float())
-        if ctx.module._grad is None:
-            ctx.module._grad = weight_grad
-        else:
-            ctx.module._grad.add_(weight_grad)
+        if ctx.module.trainable:
+            if ctx.module._grad is None:
+                ctx.module._grad = weight_grad
+            else:
+                ctx.module._grad.add_(weight_grad)
         return grad_x.reshape(ctx.shape), None, None, None, None, None, None, None
 
 
@@ -172,7 +174,7 @@ class RQTLinear(nn.Module):
     def __init__(self, linear, bits):
         super().__init__(); self.bits = _bits(bits); self.in_features, self.out_features = linear.in_features, linear.out_features
         self.register_parameter("bias", linear.bias); self.register_buffer("packed", torch.empty(0, dtype=torch.uint8)); self.register_buffer("scale", torch.empty(0, dtype=torch.float32)); self.register_buffer("bit_width", torch.tensor(self.bits, dtype=torch.uint8))
-        self._grad = None; self._cached_weight = None; self._replace_weight(linear.weight)
+        self._grad = None; self._cached_weight = None; self.trainable = True; self._replace_weight(linear.weight)
 
     def _row_slice(self, start, end): return slice(start * _packed_row_bytes(self.in_features, self.bits), end * _packed_row_bytes(self.in_features, self.bits))
 
@@ -252,7 +254,7 @@ class RQTLion:
         self.rqt_state, self.param_state = {}, {}
         self.params = [p for p in model.parameters() if p.requires_grad]; self.param_names = {id(p): name for name, p in model.named_parameters() if p.requires_grad}
 
-    def _modules(self): return [(name, module) for name, module in self.model.named_modules() if isinstance(module, RQTLinear)]
+    def _modules(self): return [(name, module) for name, module in self.model.named_modules() if isinstance(module, RQTLinear) and module.trainable]
 
     def zero_grad(self, set_to_none=True):
         for _, module in self._modules(): module.zero_grad()
@@ -329,7 +331,7 @@ class FP8SGD:
         self.model, self.lr, self.weight_decay = model, lr, weight_decay
         self.params = [p for p in model.parameters() if p.requires_grad]
 
-    def _modules(self): return [(name, module) for name, module in self.model.named_modules() if isinstance(module, RQTLinear)]
+    def _modules(self): return [(name, module) for name, module in self.model.named_modules() if isinstance(module, RQTLinear) and module.trainable]
 
     def zero_grad(self, set_to_none=True):
         for _, module in self._modules(): module.zero_grad()
