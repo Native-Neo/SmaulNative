@@ -16,7 +16,8 @@ static inline uint8_t rqt_fp8_stochastic_code(float value, uint32_t& rng) {
     lo = rqt_fp8_level(lower);
     hi = rqt_fp8_level(upper);
   } else {
-    const int exponent = (int)std::floor(std::log2(magnitude));
+    const uint32_t bits = std::bit_cast<uint32_t>(magnitude);
+    const int exponent = (int)((bits >> 23) & 0xFF) - 127;
     const int exponent_field = exponent + 7;
     const float step = std::ldexp(1.0f, exponent - 3);
     const float base_value = std::ldexp(1.0f, exponent);
