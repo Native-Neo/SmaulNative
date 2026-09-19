@@ -78,3 +78,18 @@ def test_fp8_checkpoint_roundtrip(tmp_path):
     assert original.keys() == restored.keys()
     for name in original:
         assert torch.equal(original[name], restored[name])
+
+
+def test_fp8_prepare_is_idempotent():
+    from rwkv_x_core import RWKVXConfig, RWKVXModel
+    from rqt import prepare_fp8
+
+    model = RWKVXModel(RWKVXConfig(vocab_size=32, n_embd=16, n_layer=2, head_size=4, n_moba_layer=1,
+                                    checkpoint_ffn=False))
+    prepare_fp8(model)
+    before = {name: module.packed.detach().clone() for name, module in model.named_modules() if hasattr(module, "packed")}
+    prepare_fp8(model)
+    after = {name: module.packed.detach().clone() for name, module in model.named_modules() if hasattr(module, "packed")}
+    assert before.keys() == after.keys()
+    for name in before:
+        assert torch.equal(before[name], after[name])
