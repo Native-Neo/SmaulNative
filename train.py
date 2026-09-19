@@ -397,27 +397,29 @@ def _build_model(args):
                     n_moba_layer=args.n_moba_layer, head_size=args.head_size, ctx_len_hint=args.ctx_len,
                     tokenizer_sha256=tokenizer_sha256, dataset_fingerprint=dataset_fingerprint)
     checkpoint = _checkpoint_config(args.output_dir)
-    if checkpoint and (Path(args.output_dir) / "model.safetensors").exists():
-        keys = ("vocab_size", "n_embd", "n_layer", "n_moba_layer", "head_size", "ctx_len_hint")
-        compatible = all(checkpoint.get(key) == expected[key] for key in keys)
-        if checkpoint.get("tokenizer_sha256") and checkpoint["tokenizer_sha256"] != tokenizer_sha256:
-            compatible = False
-        if checkpoint.get("dataset_fingerprint") and checkpoint["dataset_fingerprint"] != dataset_fingerprint:
-            compatible = False
-        requested_bits = None if not hasattr(args, "rqt") else args.rqt_bits if args.rqt else 0
-        requested_mixed = None if not hasattr(args, "mixed_rqt") else bool(args.mixed_rqt)
-        requested_fp8 = bool(getattr(args, "fp8", False))
-        if requested_bits is not None and int(checkpoint.get("rqt_bits", 0)) != requested_bits:
-            compatible = False
-        if requested_mixed is not None and bool(checkpoint.get("rqt_mixed", False)) != bool(requested_mixed):
-            compatible = False
-        if bool(checkpoint.get("fp8_training", False)) != requested_fp8:
-            compatible = False
-        if not compatible and getattr(args, "resume", False):
-            raise ValueError("checkpoint metadata is incompatible with the requested resume configuration")
-        if compatible:
-            return RWKVXModel.from_pretrained(args.output_dir)
-    return RWKVXModel(expected)
+    checkpoint_exists = checkpoint and (Path(args.output_dir) / "model.safetensors").exists()
+    if not getattr(args, "resume", False):
+        return RWKVXModel(expected)
+    if not checkpoint_exists:
+        raise FileNotFoundError(f"cannot resume: no model checkpoint found in {args.output_dir}")
+    keys = ("vocab_size", "n_embd", "n_layer", "n_moba_layer", "head_size", "ctx_len_hint")
+    compatible = all(checkpoint.get(key) == expected[key] for key in keys)
+    if checkpoint.get("tokenizer_sha256") and checkpoint["tokenizer_sha256"] != tokenizer_sha256:
+        compatible = False
+    if checkpoint.get("dataset_fingerprint") and checkpoint["dataset_fingerprint"] != dataset_fingerprint:
+        compatible = False
+    requested_bits = args.rqt_bits if args.rqt else 0
+    requested_mixed = bool(args.mixed_rqt)
+    requested_fp8 = bool(getattr(args, "fp8", False))
+    if int(checkpoint.get("rqt_bits", 0)) != requested_bits:
+        compatible = False
+    if bool(checkpoint.get("rqt_mixed", False)) != requested_mixed:
+        compatible = False
+    if bool(checkpoint.get("fp8_training", False)) != requested_fp8:
+        compatible = False
+    if not compatible:
+        raise ValueError("checkpoint metadata is incompatible with the requested resume configuration")
+    return RWKVXModel.from_pretrained(args.output_dir)
 
 
 def main():
