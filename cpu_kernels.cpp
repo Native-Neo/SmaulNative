@@ -386,10 +386,26 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
       const int64_t width = std::min<int64_t>(8, n - i);
 
       if (ibits == 8) {
-        for (int64_t k = 0; k < width; ++k) {
-          float acc = 0.0f;
-          for (int64_t o = 0; o < m; ++o) acc += gr[o] * rqt_level(pp[o * stride + i + k], ibits);
-          xx[r * n + i + k] = acc;
+        if (width == 8) {
+          __m256 acc = _mm256_setzero_ps();
+          for (int64_t o = 0; o < m; ++o) {
+            const uint8_t* row = pp + o * stride + i;
+            const float w[8] = {
+              rqt_fp8_level(row[0]), rqt_fp8_level(row[1]),
+              rqt_fp8_level(row[2]), rqt_fp8_level(row[3]),
+              rqt_fp8_level(row[4]), rqt_fp8_level(row[5]),
+              rqt_fp8_level(row[6]), rqt_fp8_level(row[7])
+            };
+            const __m256 weights = _mm256_loadu_ps(w);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(weights, _mm256_set1_ps(gr[o])));
+          }
+          _mm256_storeu_ps(xx + r * n + i, acc);
+        } else {
+          for (int64_t k = 0; k < width; ++k) {
+            float acc = 0.0f;
+            for (int64_t o = 0; o < m; ++o) acc += gr[o] * rqt_fp8_level(pp[o * stride + i + k]);
+            xx[r * n + i + k] = acc;
+          }
         }
         continue;
       }
