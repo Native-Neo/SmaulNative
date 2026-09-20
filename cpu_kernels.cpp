@@ -223,12 +223,13 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
       float max_abs = 0.0f;
 
       if (ibits == 8) {
+        const auto& fp8_levels = rqt_fp8_table();
         for (int64_t col = 0; col < in_features; ++col) {
           const float g = grow[col], old_m = mrow[col];
           const float mixed = old_m * (float)b1 + g * (float)(1.0 - b1);
           mrow[col] = mixed * (float)b2 + g * (float)(1.0 - b2);
-          const float value = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f));
-          rqt_set_code(dst, (int)col, ibits, (uint8_t)rqt_nearest_code(value, ibits));
+          const float value = fp8_levels[dst[col]] * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f));
+          dst[col] = rqt_nearest_code(value, ibits);
         }
         continue;
       }
