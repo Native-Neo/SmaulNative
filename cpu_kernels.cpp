@@ -334,7 +334,9 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   const auto& fp8_levels = rqt_fp8_table();
   const int base = bits == 4 ? 0 : 64;
 
-  at::parallel_for(0, rows * m, 1, [&](int64_t begin, int64_t end) {
+  const int64_t forward_work = rows * m;
+  const int64_t forward_grain = forward_work <= 8192 ? 1 : 64;
+  at::parallel_for(0, forward_work, forward_grain, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
       const int64_t r = task / m, o = task - r * m;
       const float* xr = xx + r * n;
