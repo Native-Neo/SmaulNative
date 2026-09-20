@@ -301,12 +301,13 @@ void fp8_sgd_step(torch::Tensor packed, torch::Tensor grad, int64_t in_features,
   TORCH_CHECK(packed.numel() == out_features * in_features && grad.numel() == out_features * in_features);
   auto pp = static_cast<uint8_t*>(packed.data_ptr()); auto gg = grad.data_ptr<float>();
   const float f_lr = (float)lr, decay_mul = (float)(1.0 - decay);
+  const auto& fp8_levels = rqt_fp8_table();
   at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
     for (int64_t row = begin; row < end; ++row) {
       uint32_t rng = 0x9E3779B9u ^ (uint32_t)row * 0x85EBCA6Bu;
       for (int64_t col = 0; col < in_features; ++col) {
         const int64_t i = row * in_features + col;
-        const float old_w = rqt_fp8_level(pp[i]);
+        const float old_w = fp8_levels[pp[i]];
         const float target = old_w * decay_mul - f_lr * gg[i];
         pp[i] = rqt_fp8_stochastic_code(target, rng);
       }
