@@ -288,7 +288,7 @@ class RQTLion:
             if fused:
                 ext.rqt_lion_step(module.packed, module.scale, grad, avg, module.in_features, module.out_features,
                                   module.bits, self.lr, b1, b2, self.lr * self.weight_decay)
-                module._cached_weight = None; module._grad = None
+                module._grad = None
             else:
                 avg.mul_(b1).add_(grad, alpha=1 - b1); update = avg.sign().mul(self.lr); avg.mul_(b2).add_(grad, alpha=1 - b2)
                 module.step(update, self.lr * self.weight_decay)
@@ -368,7 +368,7 @@ class FP8SGD:
                 weight = module.unpack(torch.float32)
                 weight.mul_(1 - self.lr * self.weight_decay).sub_(grad, alpha=self.lr)
                 module.packed.copy_(weight.to(torch.float8_e4m3fn).reshape(-1))
-            module._cached_weight = None; module._grad = None
+            module._grad = None
         for param in self.params:
             if param.grad is None: continue
             if isinstance(param, torch.Tensor) and param.dtype.is_floating_point:
