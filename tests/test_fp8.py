@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 
@@ -38,6 +40,8 @@ def test_fp8_sgd_updates_packed_weights():
 def test_fp8_native_extension_if_available():
     ext = _native_rqt()
     if ext is False:
+        if os.environ.get("SMAULNATIVE_REQUIRE_NATIVE_RQT") == "1":
+            raise AssertionError("native RQT extension is required but failed to build or load")
         return
     assert hasattr(ext, "fp8_sgd_step")
     assert hasattr(ext, "rqt_linear_forward")
