@@ -179,12 +179,12 @@ class RQTLinear(nn.Module):
     def __init__(self, linear, bits):
         super().__init__(); self.bits = _bits(bits); self.in_features, self.out_features = linear.in_features, linear.out_features
         self.register_parameter("bias", linear.bias); self.register_buffer("packed", torch.empty(0, dtype=torch.uint8)); self.register_buffer("scale", torch.empty(0, dtype=torch.float32)); self.register_buffer("bit_width", torch.tensor(self.bits, dtype=torch.uint8))
-        self._grad = None; self._cached_weight = None; self.trainable = True; self._replace_weight(linear.weight)
+        self._grad = None; self.trainable = True; self._replace_weight(linear.weight)
 
     def _row_slice(self, start, end): return slice(start * _packed_row_bytes(self.in_features, self.bits), end * _packed_row_bytes(self.in_features, self.bits))
 
     @torch.no_grad()
-    def _replace_weight(self, weight): self.packed, self.scale = _encode(weight.detach(), self.bits); self._cached_weight = None
+    def _replace_weight(self, weight): self.packed, self.scale = _encode(weight.detach(), self.bits)
 
     def unpack_rows(self, start, end, dtype=torch.float32):
         rows = end - start; packed = self.packed[self._row_slice(start, end)]
@@ -208,9 +208,6 @@ class RQTLinear(nn.Module):
 
     def unpack(self, dtype=torch.float32): return self.unpack_rows(0, self.out_features, dtype)
 
-    def _weight_for_forward(self):
-        if self._cached_weight is None or self._cached_weight.device != self.packed.device: self._cached_weight = self.unpack(torch.float32)
-        return self._cached_weight
 
     def _capture_grad(self, start, grad):
         if self._grad is None: self._grad = torch.zeros(self.out_features, self.in_features, dtype=torch.float32, device=grad.device)
