@@ -395,7 +395,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
           __m128 lo = _mm256_castps256_ps128(av), hi = _mm256_extractf128_ps(av, 1);
           lo = _mm_add_ps(lo, hi);
           lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
-          lo = _mm_add_ss(lo, _mm_movehdup_ps(lo, lo));
+          lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
           acc += _mm_cvtss_f32(lo);
         }
       }
