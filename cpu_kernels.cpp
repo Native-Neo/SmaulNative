@@ -275,7 +275,7 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
       uint8_t* dst = pp + row * stride; const float old_scale = ibits == 8 ? 1.0f : ss[row]; float max_abs = 0.0f;
       if (ibits == 8) {
         for (int64_t col = 0; col < in_features; ++col) {
-          const float value = rqt_level(rqt_code(dst, (int)col, ibits), ibits) * decay_mul - uu[row * in_features + col];
+          const float value = rqt_fp8_table()[dst[col]] * decay_mul - uu[row * in_features + col];
           rqt_set_code(dst, (int)col, ibits, (uint8_t)rqt_nearest_code(value, ibits));
         }
         continue;
@@ -332,8 +332,6 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   const int ibits = (int)bits;
   const auto& levels = rqt_level_table();
   const auto& fp8_levels = rqt_fp8_table();
-  const int base = bits == 4 ? 0 : 64;
-
   const int64_t forward_work = rows * m;
   const int64_t forward_grain = forward_work <= 8192 ? 1 : 64;
   at::parallel_for(0, forward_work, forward_grain, [&](int64_t begin, int64_t end) {
@@ -396,7 +394,8 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
       acc = _mm_cvtss_f32(lo);
 
       for (; i < n; ++i) {
-        acc += xr[i] * rqt_level(rqt_code(wrow, (int)i, ibits), ibits) * s;
+        if (ibits == 8) acc += xr[i] * fp8_levels[wrow[i]];
+        else acc += xr[i] * levels[(ibits == 4 ? 0 : 64) + rqt_code(wrow, (int)i, ibits)] * s;
       }
       yr[o] = acc;
     }
