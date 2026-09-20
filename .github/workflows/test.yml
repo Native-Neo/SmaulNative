@@ -26,4 +26,6 @@ jobs:
           pip install pytest
 
       - name: Run Python tests
+        env:
+          SMAULNATIVE_REQUIRE_NATIVE_RQT: "1"
         run: pytest -q
