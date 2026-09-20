@@ -178,3 +178,34 @@ def test_fp8_backward_without_input_grad_still_captures_weight_grad():
     module(x).square().mean().backward()
     assert module._grad is not None
     assert module._grad.shape == (4, 8)
+
+
+
+def test_native_rqt_linear_all_packed_formats_match_reference():
+    ext = _native_rqt()
+    if ext is False:
+        return
+
+    for bits in (4, 6, 8):
+        linear = nn.Linear(11, 5, bias=False)
+        module = RQTLinear(linear, bits)
+        x = torch.randn(4, 11, dtype=torch.float32)
+        grad = torch.randn(4, 5, dtype=torch.float32)
+
+        native_out = ext.rqt_linear_forward(
+            x, module.packed, module.scale, 11, 5, bits
+        )
+        reference_out = x @ module.unpack(torch.float32).t()
+        assert torch.equal(native_out, reference_out)
+
+        native_grad_x = ext.rqt_linear_backward_input(
+            grad, module.packed, module.scale, 11, 5, bits
+        )
+        reference_grad_x = grad @ module.unpack(torch.float32)
+        assert torch.equal(native_grad_x, reference_grad_x)
+
+        native_grad_w = ext.rqt_linear_backward_weight(
+            x, grad, 11, 5
+        )
+        reference_grad_w = grad.t() @ x
+        assert torch.equal(native_grad_w, reference_grad_w)
