@@ -339,6 +339,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
       for (int64_t o = 0; o < m; ++o) {
         const uint8_t* wrow = pp + o * stride;
         const float s = ibits == 8 ? 1.0f : ss[o];
+        __m256 vacc = _mm256_setzero_ps();
         float acc = 0.0f;
         int64_t i = 0;
 
@@ -348,12 +349,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
           for (int k = 0; k < 8; ++k) w[k] = rqt_fp8_level(wrow[i + k]);
           const __m256 xv = _mm256_loadu_ps(xr + i);
           const __m256 wv = _mm256_loadu_ps(w);
-          __m256 av = _mm256_mul_ps(xv, wv);
-          __m128 lo = _mm256_castps256_ps128(av), hi = _mm256_extractf128_ps(av, 1);
-          lo = _mm_add_ps(lo, hi);
-          lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
-          lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
-          acc += _mm_cvtss_f32(lo);
+          vacc = _mm256_add_ps(vacc, _mm256_mul_ps(xv, wv));
         }
       } else if (ibits == 4) {
         for (; i + 8 <= n; i += 8) {
@@ -366,12 +362,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
           };
           const __m256 xv = _mm256_loadu_ps(xr + i);
           const __m256 wv = _mm256_loadu_ps(w);
-          __m256 av = _mm256_mul_ps(xv, wv);
-          __m128 lo = _mm256_castps256_ps128(av), hi = _mm256_extractf128_ps(av, 1);
-          lo = _mm_add_ps(lo, hi);
-          lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
-          lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
-          acc += _mm_cvtss_f32(lo);
+          vacc = _mm256_add_ps(vacc, _mm256_mul_ps(xv, wv));
         }
       } else {
         for (; i + 8 <= n; i += 8) {
@@ -391,14 +382,14 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
           };
           const __m256 xv = _mm256_loadu_ps(xr + i);
           const __m256 wv = _mm256_loadu_ps(w);
-          __m256 av = _mm256_mul_ps(xv, wv);
-          __m128 lo = _mm256_castps256_ps128(av), hi = _mm256_extractf128_ps(av, 1);
-          lo = _mm_add_ps(lo, hi);
-          lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
-          lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
-          acc += _mm_cvtss_f32(lo);
+          vacc = _mm256_add_ps(vacc, _mm256_mul_ps(xv, wv));
         }
       }
+      __m128 lo = _mm256_castps256_ps128(vacc), hi = _mm256_extractf128_ps(vacc, 1);
+      lo = _mm_add_ps(lo, hi);
+      lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+      lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+      acc = _mm_cvtss_f32(lo);
 
       for (; i < n; ++i) {
         acc += xr[i] * rqt_level(rqt_code(wrow, (int)i, ibits), ibits) * s;
