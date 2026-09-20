@@ -209,3 +209,25 @@ def test_native_rqt_linear_all_packed_formats_match_reference():
         )
         reference_grad_w = grad.t() @ x
         assert torch.equal(native_grad_w, reference_grad_w)
+
+
+def test_native_rqt_linear_odd_width_matches_reference():
+    ext = _native_rqt()
+    if ext is False:
+        return
+
+    for bits in (4, 6, 8):
+        linear = nn.Linear(13, 7, bias=False)
+        module = RQTLinear(linear, bits)
+        x = torch.randn(3, 13, dtype=torch.float32)
+        grad = torch.randn(3, 7, dtype=torch.float32)
+
+        native_out = ext.rqt_linear_forward(
+            x, module.packed, module.scale, 13, 7, bits
+        )
+        native_grad_x = ext.rqt_linear_backward_input(
+            grad, module.packed, module.scale, 13, 7, bits
+        )
+
+        assert torch.equal(native_out, x @ module.unpack(torch.float32).t())
+        assert torch.equal(native_grad_x, grad @ module.unpack(torch.float32))
