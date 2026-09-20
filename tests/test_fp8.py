@@ -231,3 +231,22 @@ def test_native_rqt_linear_odd_width_matches_reference():
 
         assert torch.equal(native_out, x @ module.unpack(torch.float32).t())
         assert torch.equal(native_grad_x, grad @ module.unpack(torch.float32))
+
+
+def test_fp8_native_lion_updates_packed_weights_and_state():
+    ext = _native_rqt()
+    if ext is False:
+        return
+
+    module = RQTLinear(nn.Linear(9, 3, bias=False), FP8)
+    model = nn.Module()
+    model.add_module("linear", module)
+    x = torch.randn(4, 9, dtype=torch.float32, requires_grad=True)
+    module(x).sum().backward()
+    grad = module._grad.clone()
+    optimizer = FP8SGD(model, lr=0.01)
+    optimizer.step()
+
+    assert module._grad is None
+    assert torch.isfinite(module.packed.float()).all()
+    assert torch.isfinite(grad).all()
