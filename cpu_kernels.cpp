@@ -330,6 +330,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   const int64_t stride = bits == 4 ? (n + 1) / 2 : bits == 6 ? ((n + 3) / 4) * 3 : n;
   const int ibits = (int)bits;
   const auto& levels = rqt_level_table();
+  const auto& fp8_levels = rqt_fp8_table();
   const int base = bits == 4 ? 0 : 64;
 
   at::parallel_for(0, rows * m, 1, [&](int64_t begin, int64_t end) {
@@ -337,8 +338,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
       const int64_t r = task / m, o = task - r * m;
       const float* xr = xx + r * n;
       float* yr = yy + r * m;
-      {
-        const uint8_t* wrow = pp + o * stride;
+      const uint8_t* wrow = pp + o * stride;
         const float s = ibits == 8 ? 1.0f : ss[o];
         __m256 vacc = _mm256_setzero_ps();
         float acc = 0.0f;
@@ -347,7 +347,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
         if (ibits == 8) {
         for (; i + 8 <= n; i += 8) {
           float w[8];
-          for (int k = 0; k < 8; ++k) w[k] = rqt_fp8_level(wrow[i + k]);
+          for (int k = 0; k < 8; ++k) w[k] = fp8_levels[wrow[i + k]];
           const __m256 xv = _mm256_loadu_ps(xr + i);
           const __m256 wv = _mm256_loadu_ps(w);
           vacc = _mm256_add_ps(vacc, _mm256_mul_ps(xv, wv));
@@ -395,8 +395,7 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
       for (; i < n; ++i) {
         acc += xr[i] * rqt_level(rqt_code(wrow, (int)i, ibits), ibits) * s;
       }
-        yr[o] = acc;
-      }
+      yr[o] = acc;
     }
   });
   return out;
@@ -413,7 +412,7 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
   const auto* gg = grad.data_ptr<float>(); const auto* pp = static_cast<const uint8_t*>(packed.data_ptr());
   const auto* ss = scale.data_ptr<float>(); auto* xx = out.data_ptr<float>();
   const int64_t stride = bits == 4 ? (n + 1) / 2 : bits == 6 ? ((n + 3) / 4) * 3 : n;
-  const int ibits = (int)bits; const auto& levels = rqt_level_table(); const int base = bits == 4 ? 0 : 64;
+  const int ibits = (int)bits; const auto& levels = rqt_level_table(); const auto& fp8_levels = rqt_fp8_table(); const int base = bits == 4 ? 0 : 64;
 
   const int64_t input_blocks = (n + 7) / 8;
   at::parallel_for(0, rows * input_blocks, 64, [&](int64_t begin, int64_t end) {
@@ -428,10 +427,10 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
           for (int64_t o = 0; o < m; ++o) {
             const uint8_t* row = pp + o * stride + i;
             const float w[8] = {
-              rqt_fp8_level(row[0]), rqt_fp8_level(row[1]),
-              rqt_fp8_level(row[2]), rqt_fp8_level(row[3]),
-              rqt_fp8_level(row[4]), rqt_fp8_level(row[5]),
-              rqt_fp8_level(row[6]), rqt_fp8_level(row[7])
+              fp8_levels[row[0]], fp8_levels[row[1]],
+              fp8_levels[row[2]], fp8_levels[row[3]],
+              fp8_levels[row[4]], fp8_levels[row[5]],
+              fp8_levels[row[6]], fp8_levels[row[7]]
             };
             const __m256 weights = _mm256_loadu_ps(w);
             acc = _mm256_add_ps(acc, _mm256_mul_ps(weights, _mm256_set1_ps(gr[o])));
@@ -440,7 +439,7 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
         } else {
           for (int64_t k = 0; k < width; ++k) {
             float acc = 0.0f;
-            for (int64_t o = 0; o < m; ++o) acc += gr[o] * rqt_fp8_level(pp[o * stride + i + k]);
+            for (int64_t o = 0; o < m; ++o) acc += gr[o] * fp8_levels[pp[o * stride + i + k]];
             xx[r * n + i + k] = acc;
           }
         }
