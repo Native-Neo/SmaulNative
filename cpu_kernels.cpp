@@ -452,7 +452,7 @@ torch::Tensor rqt_linear_backward_input(torch::Tensor grad, torch::Tensor packed
           const uint8_t* row = pp + o * stride;
           float w[8];
           for (int k = 0; k < 8; ++k) w[k] = levels[base + rqt_code(row, (int)(i + k), ibits)] * ss[o];
-          const __m256 weights = _mm256_set_ps(w[7], w[6], w[5], w[4], w[3], w[2], w[1], w[0]);
+          const __m256 weights = _mm256_loadu_ps(w);
           const __m256 g = _mm256_set1_ps(gr[o]);
           acc = _mm256_add_ps(acc, _mm256_mul_ps(weights, g));
         }
