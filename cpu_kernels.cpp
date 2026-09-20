@@ -270,13 +270,14 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
   const float decay_mul = (float)(1.0 - decay);
   const float max_level = std::abs(rqt_level((1 << (int)bits) - 1, (int)bits));
   const int ibits = (int)bits;
+  const auto& fp8_levels = rqt_fp8_table();
   at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
     for (int64_t row = begin; row < end; ++row) {
       uint8_t* dst = pp + row * stride; const float old_scale = ibits == 8 ? 1.0f : ss[row]; float max_abs = 0.0f;
       if (ibits == 8) {
         for (int64_t col = 0; col < in_features; ++col) {
-          const float value = rqt_fp8_table()[dst[col]] * decay_mul - uu[row * in_features + col];
-          rqt_set_code(dst, (int)col, ibits, (uint8_t)rqt_nearest_code(value, ibits));
+          const float value = fp8_levels[dst[col]] * decay_mul - uu[row * in_features + col];
+          dst[col] = rqt_nearest_code(value, ibits);
         }
         continue;
       }
