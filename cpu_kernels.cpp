@@ -332,11 +332,12 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
   const auto& levels = rqt_level_table();
   const int base = bits == 4 ? 0 : 64;
 
-  at::parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) {
-    for (int64_t r = begin; r < end; ++r) {
+  at::parallel_for(0, rows * m, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t task = begin; task < end; ++task) {
+      const int64_t r = task / m, o = task - r * m;
       const float* xr = xx + r * n;
       float* yr = yy + r * m;
-      for (int64_t o = 0; o < m; ++o) {
+      {
         const uint8_t* wrow = pp + o * stride;
         const float s = ibits == 8 ? 1.0f : ss[o];
         __m256 vacc = _mm256_setzero_ps();
