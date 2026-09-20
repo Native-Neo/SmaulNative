@@ -3,7 +3,7 @@ import os
 import torch
 import torch.nn as nn
 
-from rqt import FP8, FP8SGD, RQTLinear, _native_rqt
+from rqt import FP8, FP8SGD, RQTLinear, RQTLion, _native_rqt
 
 
 def test_fp8_linear_forward_backward():
@@ -244,9 +244,12 @@ def test_fp8_native_lion_updates_packed_weights_and_state():
     x = torch.randn(4, 9, dtype=torch.float32, requires_grad=True)
     module(x).sum().backward()
     grad = module._grad.clone()
-    optimizer = FP8SGD(model, lr=0.01)
+    optimizer = RQTLion(model, lr=0.01, weight_decay=0.0)
     optimizer.step()
 
     assert module._grad is None
+    assert module.packed.dtype == torch.float8_e4m3fn
     assert torch.isfinite(module.packed.float()).all()
-    assert torch.isfinite(grad).all()
+    state = optimizer.rqt_state[module]
+    assert state.shape == grad.shape
+    assert torch.isfinite(state).all()
