@@ -273,7 +273,8 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
   const float max_level = std::abs(rqt_level((1 << (int)bits) - 1, (int)bits));
   const int ibits = (int)bits;
   const auto& fp8_levels = rqt_fp8_table();
-  at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+  const int64_t row_grain = out_features <= 64 ? 1 : 4;
+  at::parallel_for(0, out_features, row_grain, [&](int64_t begin, int64_t end) {
     for (int64_t row = begin; row < end; ++row) {
       uint8_t* dst = pp + row * stride; const float old_scale = ibits == 8 ? 1.0f : ss[row]; float max_abs = 0.0f;
       if (ibits == 8) {
@@ -305,7 +306,8 @@ void fp8_sgd_step(torch::Tensor packed, torch::Tensor grad, int64_t in_features,
   auto pp = static_cast<uint8_t*>(packed.data_ptr()); auto gg = grad.data_ptr<float>();
   const float f_lr = (float)lr, decay_mul = (float)(1.0 - decay);
   const auto& fp8_levels = rqt_fp8_table();
-  at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+  const int64_t row_grain = out_features <= 64 ? 1 : 4;
+  at::parallel_for(0, out_features, row_grain, [&](int64_t begin, int64_t end) {
     for (int64_t row = begin; row < end; ++row) {
       uint32_t rng = 0x9E3779B9u ^ (uint32_t)row * 0x85EBCA6Bu;
       for (int64_t col = 0; col < in_features; ++col) {
