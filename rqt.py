@@ -228,7 +228,9 @@ class RQTLinear(nn.Module):
         if update.shape != (self.out_features, self.in_features): raise ValueError("invalid RQT update shape")
         ext = _native_rqt()
         if ext is not None and ext is not False and self.bits in (FP4, FP6, FP8) and self.packed.device.type == "cpu" and update.dtype == torch.float32 and update.is_contiguous() and self.packed.is_contiguous() and self.scale.is_contiguous():
-            ext.rqt_requant_step(self.packed, self.scale, update, self.in_features, self.out_features, self.bits, decay) self._grad = None; return
+            ext.rqt_requant_step(self.packed, self.scale, update, self.in_features, self.out_features, self.bits, decay)
+            self._grad = None
+            return
         for start in range(0, self.out_features, _BLOCK_ROWS):
             end = min(start + _BLOCK_ROWS, self.out_features)
             weight = self.unpack_rows(start, end, torch.float32)
