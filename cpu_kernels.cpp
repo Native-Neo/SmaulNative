@@ -161,10 +161,10 @@ static inline void rqt_set_code(uint8_t* packed, int index, int bits, uint8_t co
   switch (index & 3) { case 0: p[0] = (p[0] & 0x03) | (code << 2); break; case 1: p[0] = (p[0] & 0xFC) | (code >> 4); p[1] = (p[1] & 0x0F) | ((code & 15) << 4); break; case 2: p[1] = (p[1] & 0xF0) | (code >> 2); p[2] = (p[2] & 0x3F) | ((code & 3) << 6); break; default: p[2] = (p[2] & 0xC0) | code; }
 }
 
-static inline int rqt_nearest_code(float value, int bits) {
+static inline int rqt_nearest_code(float value, int bits, uint32_t* rng_ptr = nullptr) {
   if (bits == 8) {
-    uint32_t rng = 0x9E3779B9u;
-    return rqt_fp8_stochastic_code(value, rng);
+    uint32_t local_rng = 0x9E3779B9u;
+    return rqt_fp8_stochastic_code(value, rng_ptr ? *rng_ptr : local_rng);
   }
   const auto& levels = rqt_level_table();
   const int count = 1 << bits;
@@ -225,12 +225,13 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
 
       if (ibits == 8) {
         const auto& fp8_levels = rqt_fp8_table();
+        uint32_t rng = 0x9E3779B9u ^ (uint32_t)row * 0x85EBCA6Bu;
         for (int64_t col = 0; col < in_features; ++col) {
           const float g = grow[col], old_m = mrow[col];
           const float mixed = old_m * (float)b1 + g * (float)(1.0 - b1);
           mrow[col] = mixed * (float)b2 + g * (float)(1.0 - b2);
           const float value = fp8_levels[dst[col]] * decay_mul - f_lr * (mixed > 0.0f ? 1.0f : (mixed < 0.0f ? -1.0f : 0.0f));
-          dst[col] = rqt_nearest_code(value, ibits);
+          dst[col] = rqt_nearest_code(value, ibits, &rng);
         }
         continue;
       }
@@ -278,9 +279,10 @@ void rqt_requant_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor u
     for (int64_t row = begin; row < end; ++row) {
       uint8_t* dst = pp + row * stride; const float old_scale = ibits == 8 ? 1.0f : ss[row]; float max_abs = 0.0f;
       if (ibits == 8) {
+        uint32_t rng = 0x9E3779B9u ^ (uint32_t)row * 0x85EBCA6Bu;
         for (int64_t col = 0; col < in_features; ++col) {
           const float value = fp8_levels[dst[col]] * decay_mul - uu[row * in_features + col];
-          dst[col] = rqt_nearest_code(value, ibits);
+          dst[col] = rqt_nearest_code(value, ibits, &rng);
         }
         continue;
       }
