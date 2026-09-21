@@ -213,7 +213,8 @@ void rqt_lion_step(torch::Tensor packed, torch::Tensor scale, torch::Tensor grad
   const float max_level = std::abs(rqt_level((1 << (int)bits) - 1, (int)bits));
   const int ibits = (int)bits;
 
-  at::parallel_for(0, out_features, 1, [&](int64_t begin, int64_t end) {
+  const int64_t row_grain = out_features <= 64 ? 1 : 4;
+  at::parallel_for(0, out_features, row_grain, [&](int64_t begin, int64_t end) {
     std::vector<int8_t> signs((size_t)in_features);
     for (int64_t row = begin; row < end; ++row) {
       uint8_t* dst = pp + row * stride;
@@ -342,12 +343,12 @@ torch::Tensor rqt_linear_forward(torch::Tensor x, torch::Tensor packed, torch::T
       const float* xr = xx + r * n;
       float* yr = yy + r * m;
       const uint8_t* wrow = pp + o * stride;
-        const float s = ibits == 8 ? 1.0f : ss[o];
-        __m256 vacc = _mm256_setzero_ps();
-        float acc = 0.0f;
-        int64_t i = 0;
+      const float s = ibits == 8 ? 1.0f : ss[o];
+      __m256 vacc = _mm256_setzero_ps();
+      float acc = 0.0f;
+      int64_t i = 0;
 
-        if (ibits == 8) {
+      if (ibits == 8) {
         for (; i + 8 <= n; i += 8) {
           float w[8];
           for (int k = 0; k < 8; ++k) w[k] = fp8_levels[wrow[i + k]];
