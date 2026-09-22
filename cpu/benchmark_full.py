@@ -1,98 +1,129 @@
 #!/usr/bin/env python3
-"""cpu/benchmark_full.py -- Reproducible CPU training benchmark for SmaulNative.
+"""cpu/benchmark_full.py -- Benchmark the CURRENT SmaulLinear/FP8 pipeline.
 
-Measures: forward time, backward time, optimizer time, total step time, tokens/sec,
-CPU utilization (wall-clock estimate), peak RAM.
+Measures separately: FP8Linear forward/backward, Linear Attention, FFN,
+RMSNorm, residual add, optimizer/requant, complete training step,
+end-to-end tokens/sec, RSS, parameter storage. FP8 vs FP32 side by side.
+Do not assume FP8 is faster; this script measures it.
 
-Usage:
-    python cpu/benchmark_full.py [--ctx_len 512] [--steps 3] [--threads 2]
-
-Compilation is enabled by default. Pass --no-compile to measure eager PyTorch.
+Usage: python cpu/benchmark_full.py [--d 512] [--layers 4] [--ctx 256] [--batch 2] [--iters 10]
 """
 import argparse
-import os
 import resource
+import statistics
 import sys
 import time
 from pathlib import Path
 
 _root = str(Path(__file__).resolve().parent.parent)
-_cpu = str(Path(__file__).resolve().parent)
 if _root not in sys.path:
     sys.path.insert(0, _root)
-if _cpu not in sys.path:
-    sys.path.insert(0, _cpu)
 
 p = argparse.ArgumentParser()
-p.add_argument("--ctx_len", type=int, default=512)
-p.add_argument("--steps", type=int, default=3)
-p.add_argument("--threads", type=int, default=None)
-p.add_argument("--compile", dest="compile", action="store_true", default=True)
-p.add_argument("--no-compile", dest="compile", action="store_false")
+p.add_argument("--d", type=int, default=512)
+p.add_argument("--layers", type=int, default=4)
+p.add_argument("--heads", type=int, default=8)
+p.add_argument("--ctx", type=int, default=256)
+p.add_argument("--batch", type=int, default=2)
+p.add_argument("--iters", type=int, default=10)
+p.add_argument("--threads", type=int, default=2)
 args = p.parse_args()
 
-_default_threads = str(os.environ.get("SMAUL_CPU_THREADS") or max(1, (os.cpu_count() or 2) // 2))
-os.environ.setdefault("OMP_NUM_THREADS", _default_threads)
-os.environ.setdefault("MKL_NUM_THREADS", _default_threads)
-os.environ.setdefault("MKL_ENABLE_INSTRUCTIONS", "AVX")
-
 import torch
-from cpu import NativeLion, configure
-from rwkv_x_core import RWKVXConfig, RWKVXModel
 
-threads = configure(args.threads)
+from compute import get_backend
+from fp8_tile import FP8Linear, decode_tile, fp8_modules
+from smaul_linear import Block, LinearAttention, LinearConfig, RMSNorm, SmaulLinear, SwiFFN
+from train import Lion
+
+be = get_backend()
+be.configure(args.threads)
 torch.manual_seed(42)
 
-torch.set_float32_matmul_precision("high")
 
-cfg = RWKVXConfig(vocab_size=65536, n_embd=832, n_layer=17, head_size=64, n_moba_layer=5, ctx_len_hint=args.ctx_len,
-                  wkv_chunk_size=64)
-model = RWKVXModel(cfg)
-if args.compile:
-    print("[COMPILE] torch.compile(model) ...")
-    model = torch.compile(model)
+def med(fn, warm=3, it=None):
+    it = it or args.iters
+    for _ in range(warm):
+        fn()
+    ts = []
+    for _ in range(it):
+        t0 = time.perf_counter()
+        fn()
+        ts.append((time.perf_counter() - t0) * 1e3)
+    return statistics.median(ts)
 
-optimizer = NativeLion(model.parameters(), lr=1e-4)
 
-x = torch.randint(0, 65536, (1, args.ctx_len))
-y = torch.randint(0, 65536, (1, args.ctx_len))
-tok_per_step = args.ctx_len
+def rss():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
-print(f"\n{'='*60}")
-print(f"SmaulNative CPU Benchmark  |  threads={threads}  ctx_len={args.ctx_len}")
-print(f"Model: {model.num_parameters()/1e6:.1f}M params  |  compile={args.compile}")
-print(f"{'='*60}")
 
-print("Warming up (1 step)...")
-optimizer.zero_grad(set_to_none=True)
-_, loss, _ = model(x, labels=y)
-loss.backward()
-optimizer.step()
-model.zero_grad(set_to_none=True)
+print(f"backend={be.name} native={be.has_native} threads={args.threads} d={args.d} layers={args.layers} ctx={args.ctx}")
+R, D = args.batch * args.ctx, args.d
+out = {}
 
-results = []
-for step in range(args.steps):
-    t_fwd0 = time.perf_counter()
-    _, loss, _ = model(x, labels=y)
-    t_fwd = time.perf_counter() - t_fwd0
+torch.manual_seed(0)
+m8 = FP8Linear(D, D).eval()
+ref = torch.nn.Linear(D, D, bias=False)
+with torch.no_grad():
+    nt = (D + 63) // 64
+    ref.weight.copy_(torch.cat([decode_tile(m8.w8, m8.sc, 0, D, t) for t in range(nt)], 1))
+x = torch.randn(R, D)
+g = torch.randn(R, D)
+out["fp8_fwd"] = med(lambda: m8(x))
+out["fp32_fwd"] = med(lambda: ref(x))
 
-    t_bwd0 = time.perf_counter()
+
+def fp8_bwd():
+    xx = x.clone().requires_grad_(True)
+    m8(xx).backward(g, retain_graph=True)
+
+
+out["fp8_bwd"] = med(fp8_bwd)
+
+
+def ref_bwd():
+    xx = x.clone().requires_grad_(True)
+    ref(xx).backward(g)
+
+
+out["fp32_bwd"] = med(ref_bwd)
+
+cfg = LinearConfig(vocab_size=2000, d_model=D, n_layer=1, n_heads=args.heads)
+blk = Block(cfg).eval()
+xb = torch.randn(args.batch, args.ctx, D).to(torch.bfloat16)
+out["attention"] = med(lambda: blk.att(blk.n1(xb)))
+out["ffn"] = med(lambda: blk.ffn(xb))
+out["rmsnorms"] = med(lambda: (blk.n1(xb), blk.n2(xb.float()), blk.n3(xb), blk.n4(xb.float()), blk.n5(xb)))
+a = torch.randn_like(xb)
+out["residual"] = med(lambda: (xb.float() + a.float()).to(xb.dtype))
+
+model = SmaulLinear(LinearConfig(vocab_size=2000, d_model=D, n_layer=args.layers, n_heads=args.heads))
+model.train()
+opt = Lion(list(model.parameters()), lr=2e-4)
+ids = torch.randint(0, 2000, (args.batch, args.ctx))
+
+
+def full_step():
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
     loss.backward()
-    t_bwd = time.perf_counter() - t_bwd0
+    opt.step(model)
 
-    t_opt0 = time.perf_counter()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    t_opt = time.perf_counter() - t_opt0
 
-    total = t_fwd + t_bwd + t_opt
-    tps = tok_per_step / total
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    results.append((t_fwd, t_bwd, t_opt, total, tps, rss))
-    print(f"  step {step+1}/{args.steps}: fwd={t_fwd:.2f}s  bwd={t_bwd:.2f}s  opt={t_opt:.3f}s  total={total:.2f}s  {tps:.1f} tok/s  RAM={rss:.0f}MB")
+m8r = fp8_modules(model)[0][1]
+out["requant"] = med(lambda: m8r.requant(torch.randn(m8r.out_f, m8r.in_f) * 1e-4, 0.0))
+t0 = time.perf_counter()
+for _ in range(args.iters):
+    full_step()
+step_ms = (time.perf_counter() - t0) / args.iters * 1e3
+tps = ids.numel() / (step_ms / 1e3)
 
-if results:
-    avg = [sum(r[i] for r in results) / len(results) for i in range(6)]
-    print(f"\nAverage over {args.steps} steps:")
-    print(f"  fwd={avg[0]:.2f}s  bwd={avg[1]:.2f}s  opt={avg[2]:.3f}s  total={avg[3]:.2f}s  {avg[4]:.1f} tok/s  peak_RAM={avg[5]:.0f}MB")
+fp8b = sum(m.w8.numel() + m.sc.numel() * 4 for _, m in fp8_modules(model))
+fpb = sum(m.w8.numel() * 4 for _, m in fp8_modules(model))
+
+print(f"\n{'op':12s} {'FP8 ms':>9s} {'FP32 ms':>9s} {'ratio':>6s}")
+print(f"{'linear_fwd':12s} {out['fp8_fwd']:9.2f} {out['fp32_fwd']:9.2f} {out['fp8_fwd']/out['fp32_fwd']:6.2f}x")
+print(f"{'linear_bwd':12s} {out['fp8_bwd']:9.2f} {out['fp32_bwd']:9.2f} {out['fp8_bwd']/out['fp32_bwd']:6.2f}x")
+for k in ("attention", "ffn", "rmsnorms", "residual", "requant"):
+    print(f"{k:12s} {out[k]:9.2f}")
+print(f"\nfull step {step_ms:.0f}ms | {tps:.0f} tok/s | RSS {rss():.0f}MB | stored FP8 {fp8b/1048576:.1f}MiB vs FP32 {fpb/1048576:.1f}MiB")
