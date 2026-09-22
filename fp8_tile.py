@@ -1,14 +1,13 @@
 import math
-import warnings
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from compute import get_backend
+
 TILE = 64
 E4M3_MAX = 448.0
-_EXT = None
 _LUT_CACHE = {}
 
 def _tables(device, dtype=torch.float32):
@@ -37,21 +36,6 @@ def _tables(device, dtype=torch.float32):
 def _lut(device, dtype=torch.float32):
     return _tables(device, dtype)[0]
 
-def _ext():
-    global _EXT
-    if _EXT is not None:
-        return None if _EXT is False else _EXT
-    try:
-        from torch.utils.cpp_extension import load
-        root = Path(__file__).resolve().parent
-        _EXT = load(name="smaul_fp8_ivb", sources=[str(root / "fp8_cpu.cpp")],
-            extra_cflags=["-O3", "-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f", "-ffp-contract=off"],
-            verbose=False)
-    except Exception as exc:
-        _EXT = False
-        warnings.warn(f"FP8 native ext unavailable; torch tiled fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
-    return None if _EXT is False else _EXT
-
 def quantize_tiles(w32, tile=TILE):
     with torch.no_grad():
         w32 = w32.float().contiguous()
@@ -62,9 +46,9 @@ def quantize_tiles(w32, tile=TILE):
             w32 = torch.cat([w32, torch.zeros(out_f, pad, dtype=w32.dtype, device=w32.device)], 1)
         _, order, _, bounds = _tables(w32.device, torch.float32)
         blk = w32.reshape(out_f, nt, tile)
-        amax = blk.abs().amax(dim=2).clamp_min(1e-12)
+        amax = torch.where(torch.isfinite(blk), blk.abs(), 0.0).amax(dim=2).clamp_min(1e-12)
         sc = (amax / E4M3_MAX).clamp_min(1e-12)
-        n = (blk / sc[..., None]).clamp(-E4M3_MAX, E4M3_MAX)
+        n = torch.nan_to_num(blk / sc[..., None], nan=0.0).clamp(-E4M3_MAX, E4M3_MAX)
         nf = n.reshape(-1)
         code = order[torch.bucketize(nf, bounds).clamp(0, 255)].reshape(out_f, nt, tile)
         code.reshape(-1)[nf == 0] = 0
@@ -82,19 +66,7 @@ class _Fn(torch.autograd.Function):
         ctx.in_f, ctx.out_f, ctx.tile, ctx.mod, ctx.xshape = in_f, out_f, tile, mod, x.shape
         ctx.need_x = ctx.needs_input_grad[0]
         x2 = x.reshape(-1, in_f).float().contiguous()
-        e = _ext()
-        if e is not None and x2.device.type == "cpu":
-            y = e.fp8_forward(x2, w.reshape(-1), s.reshape(-1), in_f, out_f, tile)
-        else:
-            y = torch.zeros(x2.shape[0], out_f, dtype=torch.float32, device=x.device)
-            OB, nt = 64, (in_f + tile - 1) // tile
-            for o0 in range(0, out_f, OB):
-                o1 = min(o0 + OB, out_f)
-                acc = torch.zeros(x2.shape[0], o1 - o0, dtype=torch.float32, device=x.device)
-                for t in range(nt):
-                    k1 = min(in_f, (t + 1) * tile)
-                    acc += x2[:, t * tile:k1] @ decode_tile(w, s, o0, o1, t, tile).T
-                y[:, o0:o1] = acc
+        y = get_backend().fp8_forward(x2, w, s, in_f, out_f, tile)
         return y.reshape(*x.shape[:-1], out_f).to(x.dtype if x.dtype != torch.float32 else torch.float32)
 
     @staticmethod
@@ -105,18 +77,7 @@ class _Fn(torch.autograd.Function):
         x2 = x.reshape(-1, in_f).float().contiguous()
         gx = None
         if ctx.need_x:
-            e = _ext()
-            if e is not None and g2.device.type == "cpu":
-                gx = e.fp8_backward_input(g2.contiguous(), w.reshape(-1).contiguous(), s.reshape(-1).contiguous(), in_f, out_f, tile).reshape(ctx.xshape)
-            else:
-                gx = torch.zeros_like(x2)
-                OB, nt = 64, (in_f + tile - 1) // tile
-                for o0 in range(0, out_f, OB):
-                    o1 = min(o0 + OB, out_f)
-                    gb = g2[:, o0:o1]
-                    for t in range(nt):
-                        gx[:, t * tile:min(in_f, (t + 1) * tile)] += gb @ decode_tile(w, s, o0, o1, t, tile)
-                gx = gx.reshape(ctx.xshape)
+            gx = get_backend().fp8_backward_input(g2.contiguous(), w, s, in_f, out_f, tile).reshape(ctx.xshape)
         if mod.training:
             dw = (g2.T @ x2).float()
             if mod._gw is None:
