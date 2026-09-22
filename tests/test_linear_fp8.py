@@ -111,3 +111,99 @@ def test_memory_and_speed(tmp_path):
         ref(x)
     fp32_ms = (time.perf_counter() - t0) / 20 * 1e3
     print(f"\n[bench] fp8 {fp8_ms:.2f}ms vs fp32 {fp32_ms:.2f}ms ratio {fp8_ms / max(fp32_ms, 1e-9):.2f}x (must earn speed, not assumed)")
+
+
+def _err(a, b):
+    d = (a.float() - b.float()).abs()
+    denom = b.float().abs().amax().item()
+    return {"max": d.amax().item(), "mean": d.mean().item(), "rel": (d.amax().item() / denom) if denom else 0.0}
+
+
+def _ref_e4m3(c):
+    e, m = (c >> 3) & 15, c & 7
+    s = -1.0 if c & 128 else 1.0
+    if e == 15 and m == 7:
+        return s * 448.0
+    if e == 0:
+        return s * m * 2.0 ** -9
+    return s * (1 + m / 8.0) * 2.0 ** (e - 7)
+
+
+def test_lut_matches_reference_e4m3():
+    from fp8_tile import _lut
+    lut = _lut("cpu", torch.float64)
+    errs = [abs(float(lut[c]) - _ref_e4m3(c)) for c in range(256)]
+    assert max(errs) == 0.0
+    assert float(lut[0]) == 0.0 and float(lut[0x80]) == 0.0
+    assert float(lut[0x7E]) == 448.0 and float(lut[0xFE]) == -448.0
+    sub = [float(lut[c]) for c in range(1, 8)]
+    assert all(v > 0 and v < 0.02 for v in sub)
+
+
+def test_tile_scaling_is_dynamic():
+    torch.manual_seed(11)
+    from fp8_tile import decode_tile
+    w = torch.cat([torch.randn(4, 64) * 0.01, torch.randn(4, 64) * 100], 1)
+    wq, sc = quantize_tiles(w)
+    assert (sc[:, 1] / sc[:, 0] > 100).all()
+    rec = torch.cat([decode_tile(wq, sc, 0, 4, t) for t in range(2)], 1)
+    e = _err(rec, w)
+    print(f"\n[quant] max={e['max']:.4g} mean={e['mean']:.4g} rel={e['rel']:.4g}")
+    assert e["rel"] < 0.08
+
+
+def test_nan_inf_inputs_stay_finite():
+    w = torch.tensor([[float("nan"), float("inf"), float("-inf"), 1.0] * 16])
+    wq, sc = quantize_tiles(w)
+    from fp8_tile import decode_tile
+    rec = decode_tile(wq, sc, 0, 1, 0)
+    assert torch.isfinite(rec).all(), rec
+    m = FP8Linear(64, 8, tile=64).eval()
+    with torch.no_grad():
+        m.w8.copy_(wq.repeat(8, 1))
+        m.sc.copy_(sc.repeat(8, 1))
+    y = m(torch.randn(2, 64))
+    assert torch.isfinite(y).all()
+
+
+def test_forward_matches_fp32_reference():
+    from compute import get_backend
+    from fp8_tile import decode_tile
+    be = get_backend()
+    for in_f, out_f, rows in [(128, 64, 9), (100, 70, 5), (65, 65, 33), (512, 256, 64)]:
+        torch.manual_seed(0)
+        m = FP8Linear(in_f, out_f).eval()
+        x = torch.randn(rows, in_f)
+        y = m(x)
+        nt = (in_f + 63) // 64
+        W = torch.cat([decode_tile(m.w8, m.sc, 0, out_f, t)[:, :min(64, in_f - t * 64)] for t in range(nt)], 1)
+        e = _err(y, x @ W.T)
+        print(f"\n[fwd {in_f}x{out_f}r{rows}] max={e['max']:.3g} rel={e['rel']:.3g} backend={be.name}")
+        assert e["rel"] < 1e-5
+
+
+def test_gradients_match_reference():
+    from fp8_tile import decode_tile
+    for in_f, out_f, rows in [(64, 32, 7), (130, 97, 11)]:
+        torch.manual_seed(1)
+        m = FP8Linear(in_f, out_f).eval()
+        tile = m.tile
+        nt = (in_f + tile - 1) // tile
+        W = torch.cat([decode_tile(m.w8, m.sc, 0, out_f, t)[:, :min(tile, in_f - t * tile)] for t in range(nt)], 1)
+        xe = torch.randn(rows, in_f, requires_grad=True)
+        g = torch.randn(rows, out_f)
+        m(xe).backward(g)
+        e = _err(xe.grad, g @ W)
+        print(f"\n[grad {in_f}x{out_f}r{rows}] max={e['max']:.3g} rel={e['rel']:.3g}")
+        assert e["rel"] < 1e-4
+
+
+def test_batch_seq_sweep_finite():
+    torch.manual_seed(2)
+    cfg = LinearConfig(vocab_size=256, d_model=64, n_layer=1, n_heads=2, tile=32)
+    m = SmaulLinear(cfg).eval()
+    with torch.no_grad():
+        for B, T in [(1, 1), (1, 17), (3, 48), (4, 129)]:
+            idx = torch.randint(0, 256, (B, T))
+            logits, loss = m(idx, idx)
+            assert torch.isfinite(logits).all() and torch.isfinite(loss), (B, T)
