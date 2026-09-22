@@ -11,12 +11,14 @@ SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>"]
 CASE = ["<cap>", "<upper>"]
 TOKEN_RE = re.compile(r"\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F]+|\d+(?:\.\d+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]", re.UNICODE)
 DEV_BASE = re.compile(r"[\u0900-\u097F]")
+CHATML_TAG = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>")
 TEXT_KEYS = ("text", "content", "document", "body", "code", "prompt", "completion", "input", "output", "question", "answer")
+VERSION = 6
 
 class TokenIds(list):
     @property
     def ids(self):
-        return self
+        return list(self)
 
 def _string_values(data):
     if isinstance(data, str):
@@ -55,11 +57,6 @@ def _record_text(record):
         if isinstance(value, str):
             return value
     return "\n".join(x for value in record.values() for x in _string_values(value))
-
-def _yield_texts(data, max_records, seen):
-    for text in _string_values(data):
-        if text:
-            yield text
 
 def read_texts(path, max_records=0):
     files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
@@ -130,8 +127,11 @@ def read_texts(path, max_records=0):
                         if max_records and seen >= max_records: return
         if max_records and seen >= max_records: return
 
+def _clean(text):
+    return CHATML_TAG.sub(" ", text)
+
 def tokenize_text(text):
-    return TOKEN_RE.findall(text)
+    return TOKEN_RE.findall(_clean(text))
 
 def devanagari_units(text):
     out, i = [], 0
@@ -144,12 +144,12 @@ def devanagari_units(text):
             c = text[i]
             if c == "्":
                 u += c; i += 1
-                while i < len(text) and (unicodedata.category(text[i]).startswith("M") or text[i] in "\u200c\u200d"):
+                while i < len(text) and (unicodedata.category(text[i]).startswith("M") or text[i] in "‌‍"):
                     u += text[i]; i += 1
                 if i < len(text) and DEV_BASE.fullmatch(text[i]):
                     u += text[i]; i += 1
                 continue
-            if unicodedata.category(c).startswith("M") or c in "\u200c\u200d":
+            if unicodedata.category(c).startswith("M") or c in "‌‍":
                 u += c; i += 1; continue
             break
         out.append(u)
@@ -163,9 +163,19 @@ def case_type(x):
     if x[:1].isupper() and x[1:].islower(): return "cap"
     return None
 
-def _build(texts, vocab_size, word_budget, max_records=0):
-    if vocab_size < len(SPECIAL) + len(CASE):
-        raise ValueError(f"vocab_size must be at least {len(SPECIAL) + len(CASE)}")
+def _guaranteed():
+    chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+    chars.update([" ", "\n", "\t", ".", ",", "!", "?", ";", ":", "-", "(", ")", "[", "]", "{", "}", "'", '"', "/", "\\", "|", "@", "#", "$", "%", "^", "&", "*", "+", "=", "<", ">", "~", "`"])
+    for cp in range(0x0900, 0x0980):
+        try:
+            chars.add(chr(cp))
+        except ValueError:
+            pass
+    return sorted(chars)
+
+def _build(texts, vocab_size, word_budget=40000, max_records=0):
+    if vocab_size < len(SPECIAL) + len(CASE) + 1:
+        raise ValueError(f"vocab_size must be at least {len(SPECIAL) + len(CASE) + 1}")
     if word_budget < 0 or max_records < 0:
         raise ValueError("word_budget and max_records must be non-negative")
     words, graphemes, chars, symbols = Counter(), Counter(), Counter(), Counter()
@@ -173,8 +183,9 @@ def _build(texts, vocab_size, word_budget, max_records=0):
     total_words = total_tokens = seen = 0
     for text in texts:
         seen += 1
+        text = _clean(text)
         chars.update(text)
-        for token in tokenize_text(text):
+        for token in TOKEN_RE.findall(text):
             total_tokens += 1
             if token.isspace(): continue
             if token.isalpha() or token.isdigit():
@@ -188,7 +199,10 @@ def _build(texts, vocab_size, word_budget, max_records=0):
     if seen == 0 or total_tokens == 0:
         raise RuntimeError("no usable text records found for tokenizer training")
     tokens, seen_tokens = SPECIAL + CASE, set(SPECIAL + CASE)
-    whitespace = [(x, n) for x, n in chars.most_common() if x.isspace()]
+    for g in _guaranteed():
+        if g not in seen_tokens:
+            tokens.append(g); seen_tokens.add(g)
+    whitespace = [(x, n) for x, n in chars.most_common() if x.isspace() and x not in seen_tokens]
     for source in (whitespace, words.most_common(word_budget), graphemes.most_common(), symbols.most_common(), chars.most_common()):
         for x, _ in source:
             if x not in seen_tokens:
@@ -200,9 +214,9 @@ def _build(texts, vocab_size, word_budget, max_records=0):
         tokens.append(token)
         seen_tokens.add(token)
     vocab = {x: i for i, x in enumerate(tokens)}
-    return {"version": 5, "vocab": vocab, "special_tokens": SPECIAL, "case_tokens": CASE, "case_stats": {w: dict(c) for w, c in cases.items()}, "unk_id": vocab["<unk>"], "stats": {"vocab_size": len(vocab), "whole_words": min(word_budget, len(words)), "unique_words": len(words), "total_words": total_words, "total_tokens": total_tokens, "devanagari_units": len(graphemes), "characters": len(chars), "symbols": len(symbols)}}
+    return {"version": VERSION, "vocab": vocab, "special_tokens": SPECIAL, "case_tokens": CASE, "case_stats": {w: dict(c) for w, c in cases.items()}, "unk_id": vocab["<unk>"], "stats": {"vocab_size": len(vocab), "whole_words": min(word_budget, len(words)), "unique_words": len(words), "total_words": total_words, "total_tokens": total_tokens, "devanagari_units": len(graphemes), "characters": len(chars), "symbols": len(symbols)}}
 
-def train(dataset, vocab_size=64000, word_budget=40000, max_records=0):
+def train(dataset, vocab_size=32000, word_budget=20000, max_records=0):
     return _build(read_texts(Path(dataset), max_records), vocab_size, word_budget, max_records)
 
 class SmaulTokenizer:
@@ -212,7 +226,7 @@ class SmaulTokenizer:
         self.unk_token_id = data["unk_id"]; self.pad_token_id = self.vocab["<pad>"]; self.bos_token_id = self.vocab["<bos>"]; self.eos_token_id = self.vocab["<eos>"]
     @classmethod
     def from_file(cls, path): return cls(json.loads(Path(path).read_text(encoding="utf-8")))
-    def save(self, path): Path(path).write_text(json.dumps(self.data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    def save(self, path): Path(path).parent.mkdir(parents=True, exist_ok=True); Path(path).write_text(json.dumps(self.data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     def get_vocab_size(self): return len(self.vocab)
     def token_to_id(self, token): return self.vocab.get(token)
     def encode(self, text): return TokenIds(encode(text, self))
@@ -223,7 +237,8 @@ def load(path): return SmaulTokenizer.from_file(path)
 def encode(text, tok):
     v, u = tok.vocab, tok.unk_token_id; cap, upper = v.get("<cap>"), v.get("<upper>"); out = []
     for t in tokenize_text(text):
-        if t.isspace(): out.extend(v.get(c, u) for c in t); continue
+        if t.isspace():
+            out.extend(v.get(c, u) for c in t); continue
         b = canonical(t)
         if b in v:
             c = case_type(t)
@@ -242,51 +257,62 @@ def decode(ids, tok):
         if t == "<cap>": case = "cap"; continue
         if t == "<upper>": case = "upper"; continue
         if t in {"<pad>", "<bos>", "<eos>"}: continue
+        if t.startswith("<unused_"): continue
         if case == "cap": t = t[:1].upper() + t[1:]
         elif case == "upper": t = t.upper()
         out.append(t); case = None
     return "".join(out)
 
-def train_tokenizer(dataset_dir, output_path, vocab_size=64000, stream_name="none", max_records=0, texts=None):
+def train_tokenizer(dataset_dir, output_path, vocab_size=32000, stream_name="none", max_records=0, texts=None):
     if texts is not None:
-        data = _build(texts, vocab_size, 40000, max_records)
+        data = _build(texts, vocab_size, min(20000, vocab_size // 2), max_records)
     elif stream_name != "none":
         from stream_data import stream_dataset
-        data = _build(stream_dataset(stream_name), vocab_size, 40000, max_records)
+        data = _build((_clean(t) for t in stream_dataset(stream_name)), vocab_size, min(20000, vocab_size // 2), max_records)
     else: data = train(dataset_dir, vocab_size=vocab_size, max_records=max_records)
     tok = SmaulTokenizer(data); tok.save(output_path); return tok
 
-def ensure_tokenizer(dataset_dir, output_path, vocab_size, stream_name="none", max_records=0):
-    if not isinstance(output_path, (str, Path)):
-        path = Path(dataset_dir)
-        texts = output_path
+def ensure_tokenizer(output_path, texts_or_dir=None, vocab_size=32000, max_records=0, stream_name="none"):
+    if texts_or_dir is not None and not isinstance(texts_or_dir, (str, Path)):
+        path = Path(output_path)
         if path.exists():
-            tok = load(path)
-            if tok.get_vocab_size() == vocab_size:
-                return tok
-            print(f"[TOKENIZER] vocabulary mismatch: existing={tok.get_vocab_size()} requested={vocab_size}; rebuilding")
+            try:
+                tok = load(path)
+                if tok.get_vocab_size() == vocab_size and tok.data.get("version") == VERSION:
+                    return tok
+                print(f"[TOKENIZER] rebuild: existing={tok.get_vocab_size()} v={tok.data.get('version')} requested={vocab_size} v={VERSION}")
+            except Exception:
+                print("[TOKENIZER] existing file unreadable; rebuilding")
         else:
             print(f"[TOKENIZER] creating vocabulary={vocab_size}")
-        return train_tokenizer(path, path, vocab_size, max_records=max_records, texts=texts)
+        return train_tokenizer(path.parent, path, vocab_size, max_records=max_records, texts=texts_or_dir)
+    dataset_dir = texts_or_dir if texts_or_dir is not None else output_path
     path = Path(output_path)
+    if isinstance(dataset_dir, (str, Path)) and Path(dataset_dir).suffix == ".json":
+        dataset_dir = Path(dataset_dir).parent
     if path.exists():
-        tok = load(path)
-        if tok.get_vocab_size() == vocab_size:
-            return tok, False
-        print(f"[TOKENIZER] vocabulary mismatch: existing={tok.get_vocab_size()} requested={vocab_size}; rebuilding")
+        try:
+            tok = load(path)
+            if tok.get_vocab_size() == vocab_size and tok.data.get("version") == VERSION:
+                return tok
+            print(f"[TOKENIZER] rebuild: existing={tok.get_vocab_size()} v={tok.data.get('version')} requested={vocab_size} v={VERSION}")
+        except Exception:
+            print("[TOKENIZER] existing file unreadable; rebuilding")
     else:
         print(f"[TOKENIZER] creating vocabulary={vocab_size}")
-    return train_tokenizer(dataset_dir, path, vocab_size, stream_name, max_records), True
+    if stream_name != "none":
+        return train_tokenizer(dataset_dir, path, vocab_size, stream_name, max_records)
+    return train_tokenizer(dataset_dir if isinstance(dataset_dir, (str, Path)) else "./datasets", path, vocab_size, max_records=max_records)
 
 def main():
     p = argparse.ArgumentParser(); s = p.add_subparsers(dest="cmd", required=True)
-    x = s.add_parser("train"); x.add_argument("--fromdataset", required=True); x.add_argument("--vocab-size", type=int, default=64000); x.add_argument("--word-budget", type=int, default=40000); x.add_argument("--max-records", type=int, default=0); x.add_argument("--output", default="tokenizer.json"); x.set_defaults(f=train_cmd)
+    x = s.add_parser("train"); x.add_argument("--fromdataset", required=True); x.add_argument("--vocab-size", type=int, default=32000); x.add_argument("--word-budget", type=int, default=20000); x.add_argument("--max-records", type=int, default=0); x.add_argument("--output", default="tokenizer.json"); x.set_defaults(f=train_cmd)
     x = s.add_parser("encode"); x.add_argument("--tokenizer", required=True); x.add_argument("--text", required=True); x.set_defaults(f=lambda a: print(*load(a.tokenizer).encode(a.text)))
-    x = s.add_parser("decode"); x.add_argument("--tokenizer", required=True); x.add_argument("--ids", required=True); x.set_defaults(f=lambda a: print(load(a.tokenizer).decode(a.ids.split())))
+    x = s.add_parser("decode"); x.add_argument("--tokenizer", required=True); x.add_argument("--ids", required=True); x.set_defaults(f=lambda a: print(load(a.tokenizer).decode([int(v) for v in a.ids.split()])))
     a = p.parse_args(); a.f(a)
 
 def train_cmd(a):
-    d = _build(read_texts(Path(a.fromdataset), a.max_records), a.vocab_size, a.word_budget, a.max_records)
+    d = _build((t for t in read_texts(Path(a.fromdataset), a.max_records)), a.vocab_size, a.word_budget, a.max_records)
     Path(a.output).write_text(json.dumps(d, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     s = d["stats"]
     print(f"Vocabulary: {s['vocab_size']:,}\nWhole words: {s['whole_words']:,}\nUnique words: {s['unique_words']:,}\nCorpus words: {s['total_words']:,}\nDevanagari units: {s['devanagari_units']:,}\nCharacters: {s['characters']:,}\nSymbols/operators: {s['symbols']:,}\nSaved: {a.output}")
