@@ -16,7 +16,7 @@ def _load_wkv():
         return None
     if _WKV_EXT is None:
         from torch.utils.cpp_extension import load
-        root = Path(__file__).resolve().parent
+        root = Path(__file__).resolve().parent.parent / "old"
         try:
             _WKV_EXT = load(
                 name="smaulnative_wkv",
