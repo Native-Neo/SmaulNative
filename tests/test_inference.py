@@ -3,45 +3,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from inference import RWKVXInference, _IncrementalDecoder
-from rwkv_x_core import RWKVXConfig, RWKVXModel
+from inference import LinearInference, _IncrementalDecoder
 from tokenizer import SmaulTokenizer
-import rqt
-
-
-def test_rqt_loader_is_installed_for_inference():
-    assert getattr(RWKVXModel.from_pretrained, "__func__", None) is not None
-    assert rqt.load_rqt_checkpoint is not None
-
-
-def test_cpu_fp16_promotes_to_fp32(monkeypatch):
-    class Model:
-        def __init__(self):
-            self.dtype = None
-        def to(self, value):
-            self.dtype = value
-            return self
-        def eval(self):
-            return self
-
-    model = Model()
-    obj = RWKVXInference.__new__(RWKVXInference)
-    obj.device = torch.device("cpu")
-    obj.model = model
-    obj.tokenizer = None
-    monkeypatch.setattr("inference.RWKVXModel.from_pretrained", lambda _: model)
-    obj.model = obj.model.to(torch.float32)
-    assert obj.model.dtype == torch.float32
 
 
 def test_sampling_temperature_zero_is_deterministic():
-    obj = RWKVXInference.__new__(RWKVXInference)
+    obj = LinearInference.__new__(LinearInference)
     logits = torch.tensor([1.0, 5.0, 2.0])
     assert obj._sample(logits, 0.0, 0, 1.0, 1.0, []) == 1
 
 
 def test_sampling_top_k_top_p_matches_full_sort_reference():
-    obj = RWKVXInference.__new__(RWKVXInference)
+    obj = LinearInference.__new__(LinearInference)
     logits = torch.linspace(-4.0, 4.0, 1000)
     top_k, top_p = 50, 0.9
 
@@ -66,7 +39,7 @@ def test_sampling_top_k_top_p_matches_full_sort_reference():
 
 
 def test_sampling_top_k_excludes_tied_logits(monkeypatch):
-    obj = RWKVXInference.__new__(RWKVXInference)
+    obj = LinearInference.__new__(LinearInference)
     captured = {}
 
     def multinomial(probs, count):
@@ -76,6 +49,18 @@ def test_sampling_top_k_excludes_tied_logits(monkeypatch):
     monkeypatch.setattr(torch, "multinomial", multinomial)
     obj._sample(torch.tensor([5.0, 5.0, 5.0, 4.0]), 1.0, 1, 1.0, 1.0, [])
     assert torch.count_nonzero(captured["probs"]).item() == 1
+
+
+def test_repetition_penalty_and_validation():
+    obj = LinearInference.__new__(LinearInference)
+    logits = torch.tensor([10.0, 0.0, 0.0])
+    assert obj._sample(logits, 0.0, 0, 1.0, 2.0, [0]) == 0
+    try:
+        obj._validate(1, -1.0, 0, 1.0, 1.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("negative temperature must fail")
 
 
 def test_incremental_decoder_matches_tokenizer_decode():
@@ -94,21 +79,6 @@ def test_incremental_decoder_matches_tokenizer_decode():
     assert incremental == tokenizer.decode(ids)
 
 
-def test_cached_decode_preserves_first_token_v():
-    torch.manual_seed(0)
-    cfg = RWKVXConfig(vocab_size=32, n_embd=32, n_layer=3, head_size=8, n_moba_layer=0, checkpoint_ffn=False)
-    model = RWKVXModel(cfg).eval()
-    prompt = torch.tensor([[1, 4, 7, 9]])
-    continuation = torch.tensor([[2, 6, 3]])
-    with torch.no_grad():
-        full_logits = model(torch.cat((prompt, continuation), 1))[0]
-        _, _, state = model(prompt, use_cache=True)
-        for i in range(continuation.size(1)):
-            logits, _, state = model(continuation[:, i:i + 1], state=state, use_cache=True)
-            expected = full_logits[:, prompt.size(1) + i:prompt.size(1) + i + 1]
-            assert torch.allclose(logits, expected, rtol=1e-5, atol=1e-6)
-
-
 def test_stream_stop_sequence_can_cross_tokens(monkeypatch):
     data = {
         "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "h": 4, "e": 5, "l": 6, "o": 7, "!": 8},
@@ -118,14 +88,14 @@ def test_stream_stop_sequence_can_cross_tokens(monkeypatch):
         "unk_id": 1,
         "stats": {"vocab_size": 9},
     }
-    obj = RWKVXInference.__new__(RWKVXInference)
+    obj = LinearInference.__new__(LinearInference)
     obj.device = torch.device("cpu")
     obj.tokenizer = SmaulTokenizer(data)
     obj.eos_id = 3
     obj.bos_id = 2
     obj.last_prompt_tokens = 0
     monkeypatch.setattr(obj, "_prepare", lambda prompt: [2])
-    monkeypatch.setattr(obj, "_forward", lambda tokens, state=None: (torch.zeros(1, 1, 9), None, state))
+    monkeypatch.setattr(obj, "_forward", lambda tokens: (torch.zeros(1, 1, 9), None))
     tokens = iter([4, 5, 6, 6, 7, 8])
     monkeypatch.setattr(obj, "_sample", lambda *args: next(tokens))
     output = "".join(obj.stream("", max_new_tokens=6, temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0, stop=["hello"]))
@@ -141,14 +111,14 @@ def test_stream_stop_sequence_preserves_text_before_boundary(monkeypatch):
         "unk_id": 1,
         "stats": {"vocab_size": 9},
     }
-    obj = RWKVXInference.__new__(RWKVXInference)
+    obj = LinearInference.__new__(LinearInference)
     obj.device = torch.device("cpu")
     obj.tokenizer = SmaulTokenizer(data)
     obj.eos_id = 3
     obj.bos_id = 2
     obj.last_prompt_tokens = 0
     monkeypatch.setattr(obj, "_prepare", lambda prompt: [2])
-    monkeypatch.setattr(obj, "_forward", lambda tokens, state=None: (torch.zeros(1, 1, 9), None, state))
+    monkeypatch.setattr(obj, "_forward", lambda tokens: (torch.zeros(1, 1, 9), None))
     tokens = iter([4, 5, 6, 7, 7, 8, 3])
     monkeypatch.setattr(obj, "_sample", lambda *args: next(tokens))
     output = "".join(obj.stream("", max_new_tokens=7, temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0, stop=["hello"]))
