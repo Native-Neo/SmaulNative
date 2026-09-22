@@ -60,9 +60,9 @@ def test_generate_disables_dropout_and_restores_training_state():
             self.training = mode
             return self
 
-        def __call__(self, ids, state=None, use_cache=False, return_logits=True):
+        def __call__(self, ids):
             assert not self.training
-            return torch.tensor([[[10.0, 0.0, 0.0]]]), None, state
+            return torch.tensor([[[10.0, 0.0, 0.0]]]), None
 
     obj = SmaulRL.__new__(SmaulRL)
     obj.model = Model()
