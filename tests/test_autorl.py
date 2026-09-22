@@ -51,8 +51,8 @@ def test_generate_disables_dropout_and_restores_training_state():
             self.training = mode
             return self
 
-        def __call__(self, ids, state=None, use_cache=False, return_logits=True):
-            return torch.tensor([[[10.0, 0.0, 0.0]]]), None, state
+        def __call__(self, ids):
+            return torch.tensor([[[10.0, 0.0, 0.0]]]), None
 
     obj = AutoRL.__new__(AutoRL)
     obj.model = Model()
