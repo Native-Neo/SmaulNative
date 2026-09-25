@@ -17,7 +17,7 @@ Download pre-tokenized shards or generate synthetic data into `./datasets`:
 
 ```bash
 python download.py --languages hindi english --max_rows 100000
-# or: python syntheticdata.py --count 250000 --format both --output-dir ./datasets
+# or: python syntheticdata.py --count 250000 --format both --output-dir ./datasets/synthetic
 ```
 
 ## Tokenizer
@@ -52,6 +52,21 @@ python infer_cli.py --model ./runs/linear
 python infer_server.py --model ./runs/linear --port 8080
 ```
 
+See [inference.md](inference.md), [infer_cli.md](infer_cli.md), and
+[infer_server.md](infer_server.md) for sampling flags, history controls, and auth.
+
+## Preference RL
+
+Collect human preferences and GRPO-train, or run verified automatic RL:
+
+```bash
+python rl.py --model_dir ./runs/linear --prompt "Explain gravity" --responses 8
+python autorl.py --model_dir ./runs/linear --prompt "Explain gravity" --responses 8
+```
+
+See [rl.md](rl.md) and [autorl.md](autorl.md). Auto-labeling without `--no-verify`
+requires at least 4 human preference records first.
+
 ## MoE + export
 
 Merge dense checkpoints into a sparse MoE, and export a checkpoint to GGUF:
@@ -60,6 +75,10 @@ Merge dense checkpoints into a sparse MoE, and export a checkpoint to GGUF:
 python merge_moe.py --base ./runs/base --branches ./runs/b1 ./runs/b2 --out ./runs/moe
 python convert_linear_to_gguf.py ./runs/linear ./runs/linear.gguf --dtype f16
 ```
+
+MoE merge copies the base `tokenizer.json` into the output (branch tokenizers must match)
+and refuses non-empty `--out` without `--force`. GGUF export refuses to overwrite without
+`--overwrite`.
 
 ## Benchmark
 
