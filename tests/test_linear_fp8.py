@@ -209,6 +209,189 @@ def test_batch_seq_sweep_finite():
             assert torch.isfinite(logits).all() and torch.isfinite(loss), (B, T)
 
 
+def test_blockwise_grad_accumulation():
+    torch.manual_seed(5)
+    for in_f, out_f, rows in [(128, 130, 6), (65, 65, 9)]:
+        m = FP8Linear(in_f, out_f, tile=32)
+        m.train()
+        x1 = torch.randn(rows, in_f, requires_grad=True)
+        g1 = torch.randn(rows, out_f)
+        x2 = torch.randn(rows, in_f, requires_grad=True)
+        g2 = torch.randn(rows, out_f)
+        m(x1).backward(g1)
+        m(x2).backward(g2)
+        expected = g1.T @ x1 + g2.T @ x2
+        e = _err(m._gw, expected)
+        print(f"\n[gwacc {in_f}x{out_f}r{rows}] max={e['max']:.3g} rel={e['rel']:.3g}")
+        assert e["rel"] < 1e-5
+
+
+def test_fused_lion_requant_matches_full_matrix():
+    torch.manual_seed(6)
+    lr, wd, b1, b2 = 2e-4, 0.01, 0.9, 0.99
+    m = FP8Linear(128, 130, tile=32)
+    m.train()
+    m(torch.randn(6, 128, requires_grad=True)).backward(torch.randn(6, 130))
+    gw = m._gw.clone()
+    gw_snapshot = gw.clone()
+    w8_before, sc_before = m.w8.clone(), m.sc.clone()
+    st = torch.zeros_like(gw)
+    m.fused_lion_requant(gw, st, lr, wd, b1, b2)
+    assert m._gw is None
+    assert torch.equal(gw, gw_snapshot)
+    # Reference: the old full-matrix formulas computed with plain torch ops.
+    st_ref = torch.zeros_like(gw)
+    upd = (st_ref * b1 + gw * (1 - b1)).sign() * lr
+    st_ref.mul_(b2).add_(gw, alpha=1 - b2)
+    assert torch.equal(st, st_ref)
+    m_ref = FP8Linear(128, 130, tile=32)
+    m_ref.w8.copy_(w8_before)
+    m_ref.sc.copy_(sc_before)
+    m_ref.requant(upd, lr * wd)
+    assert torch.equal(m.w8, m_ref.w8)
+    assert torch.equal(m.sc, m_ref.sc)
+
+
+def _attn_cases():
+    return [(1, 1, 1, 7), (2, 65, 4, 40), (2, 129, 8, 64), (1, 33, 2, 32)]
+
+
+def test_no_fp32_master_weights():
+    cfg = LinearConfig(vocab_size=256, d_model=64, n_layer=2, n_heads=4, tile=32)
+    m = SmaulLinear(cfg)
+    for name, mod in fp8_modules(m):
+        for pname, p in mod.named_parameters(recurse=False):
+            assert p.shape != mod.w8.shape or p.dtype != torch.float32, (name, pname)
+        for bname, b in mod.named_buffers(recurse=False):
+            if bname in ("w8", "sc"):
+                continue
+            assert b.shape != mod.w8.shape or b.dtype != torch.float32, (name, bname)
+        assert mod.w8.dtype == torch.uint8
+        assert mod.sc.dtype == torch.float32
+        assert mod.sc.numel() * 4 + mod.w8.numel() < mod.w8.numel() * 4
+
+
+def test_fp32_precision_trains_and_roundtrips(tmp_path):
+    from train import Lion
+    torch.manual_seed(21)
+    cfg = LinearConfig(vocab_size=256, d_model=64, n_layer=1, n_heads=2, tile=32, precision="fp32")
+    m = SmaulLinear(cfg)
+    assert fp8_modules(m) == []
+    keys = list(m.state_dict())
+    assert any(k.endswith(".weight") for k in keys)
+    assert not any(k.endswith(".w8") for k in keys)
+    opt = Lion(list(m.parameters()), lr=2e-4)
+    for _ in range(3):
+        idx = torch.randint(0, 256, (2, 16))
+        opt.zero_grad(m)
+        _, loss = m(idx, idx)
+        assert torch.isfinite(loss)
+        loss.backward()
+        opt.step(m)
+    out = tmp_path / "fp32ckpt"
+    m.save_pretrained(out)
+    assert LinearConfig.load(out / "config.json").precision == "fp32"
+    m2 = SmaulLinear.from_pretrained(out)
+    assert fp8_modules(m2) == []
+    for (k1, v1), (k2, v2) in zip(sorted(m.state_dict().items()), sorted(m2.state_dict().items())):
+        assert k1 == k2 and torch.equal(v1, v2)
+
+
+def test_bad_precision_rejected():
+    try:
+        LinearConfig(precision="int8")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for unknown precision")
+
+
+def test_merge_precision_rules(tmp_path):
+    from merge_moe import merge
+    torch.manual_seed(22)
+    tiny8 = dict(vocab_size=64, d_model=32, n_layer=1, n_heads=2)
+    base = SmaulLinear(LinearConfig(**tiny8, precision="fp8"))
+    br32 = SmaulLinear(LinearConfig(**tiny8, precision="fp32"))
+    br32b = SmaulLinear(LinearConfig(**tiny8, precision="fp32"))
+    bd, rd = tmp_path / "base", tmp_path / "br"
+    base.save_pretrained(bd)
+    br32.save_pretrained(rd)
+    try:
+        merge(bd, [rd], tmp_path / "out")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for precision mismatch")
+    br32b.save_pretrained(tmp_path / "br2")
+    merge(rd, [tmp_path / "br2"], tmp_path / "moe32", top_k=1)
+    moe = SmaulLinear.from_pretrained(tmp_path / "moe32")
+    assert moe.cfg.is_moe and moe.cfg.precision == "fp32" and fp8_modules(moe) == []
+
+
+def test_attn_native_matches_reference():
+    from compute import get_backend
+    from smaul_linear import _attn_reference, _LinearAttnFn
+    be = get_backend()
+    torch.manual_seed(7)
+    for B, T, H, D in _attn_cases():
+        # In-regime inputs: post-elu feature map, raw keys (op normalizes).
+        Q = torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0
+        K = torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0
+        V = torch.randn(B, T, H, D)
+        Y = _LinearAttnFn.apply(Q, K, V, 1e-6)
+        R = _attn_reference(Q, K, V, 1e-6)
+        e = _err(Y, R)
+        print(f"\n[attn {B}x{T}x{H}x{D}] max={e['max']:.3g} rel={e['rel']:.3g} native={be.has_attn_native}")
+        assert e["rel"] < 1e-5
+
+
+def test_attn_backward_matches_autograd():
+    from smaul_linear import _attn_reference, _LinearAttnFn
+    torch.manual_seed(8)
+    for B, T, H, D in [(1, 17, 2, 16), (2, 65, 4, 40)]:
+        Q = (torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0).requires_grad_()
+        K = (torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0).requires_grad_()
+        V = torch.randn(B, T, H, D, requires_grad=True)
+        dY = torch.randn(B, T, H, D)
+        _LinearAttnFn.apply(Q, K, V, 1e-6).backward(dY)
+        got = (Q.grad.clone(), K.grad.clone(), V.grad.clone())
+        Q2 = Q.detach().requires_grad_()
+        K2 = K.detach().requires_grad_()
+        V2 = V.detach().requires_grad_()
+        _attn_reference(Q2, K2, V2, 1e-6).backward(dY)
+        for name, g, r in zip("QKV", got, (Q2.grad, K2.grad, V2.grad)):
+            e = _err(g, r)
+            print(f"\n[attnb {name} {B}x{T}x{H}x{D}] max={e['max']:.3g} rel={e['rel']:.3g}")
+            assert e["rel"] < 1e-4
+
+
+def test_attn_fallback_matches_native():
+    from compute import get_backend
+    from smaul_linear import _attn_reference, _LinearAttnFn
+    be = get_backend()
+    if not be.has_attn_native:
+        return
+    torch.manual_seed(9)
+    B, T, H, D = 2, 48, 4, 32
+    Q = torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0
+    K = torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0
+    V = torch.randn(B, T, H, D)
+    Y_nat = _LinearAttnFn.apply(Q, K, V, 1e-6)
+    real = be._attn
+    be._attn = False
+    try:
+        assert not be.has_attn_native
+        Y_ref = _LinearAttnFn.apply(Q, K, V, 1e-6)
+        R = _attn_reference(Q, K, V, 1e-6)
+        assert _err(Y_ref, R)["rel"] == 0.0
+    finally:
+        be._attn = real
+    assert be.has_attn_native
+    e = _err(Y_nat, Y_ref)
+    print(f"\n[attnfb] max={e['max']:.3g} rel={e['rel']:.3g}")
+    assert e["rel"] < 1e-5
+
+
 def test_block_checkpoint_matches_eager():
     import torch.utils.checkpoint as C
     from fp8_tile import fp8_modules
