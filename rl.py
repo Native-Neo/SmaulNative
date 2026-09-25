@@ -17,20 +17,34 @@ from train import Lion
 
 
 class SmaulRL:
+    MODEL_WINDOW = 512
+
     def __init__(self, model_dir: str, work_dir: str = "./rl", device: str = "auto"):
         self.model_dir = Path(model_dir)
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
+        try:
+            self.device = torch.device(device)
+        except RuntimeError as exc:
+            raise ValueError(f"invalid device {device!r}: {exc}") from exc
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but CUDA is unavailable")
         self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
         load_dir = self.work_dir / "policy" if (self.work_dir / "policy").exists() else self.model_dir
+        if load_dir != self.model_dir:
+            print(f"[RL] resuming policy from {load_dir} (not {self.model_dir})")
         self.model = SmaulLinear.from_pretrained(load_dir).to(self.device)
+        # Tokenizer must match the loaded policy, not just model_dir.
+        tok_vocab = self.tokenizer.get_vocab_size()
+        if tok_vocab != self.model.cfg.vocab_size:
+            raise ValueError(f"tokenizer vocab ({tok_vocab}) != model vocab ({self.model.cfg.vocab_size})")
         self.model.train()
         self.eos_id = self.tokenizer.eos_token_id
         self.bos_id = self.tokenizer.bos_token_id
         self.preference_path = self.work_dir / "preferences.jsonl"
+        self._opt: Optional[Lion] = None
 
     def _encode(self, text: str) -> List[int]:
         return list(self.tokenizer.encode(text).ids)
@@ -61,13 +75,31 @@ class SmaulRL:
 
     @classmethod
     def _sample(cls, logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> Tuple[int, float]:
-        log_probs = F.log_softmax(cls._filter_logits(logits, temperature, top_k, top_p), -1)
+        filtered = cls._filter_logits(logits, temperature, top_k, top_p)
+        if not bool(torch.isfinite(filtered).any()):
+            # All-masked: fall back to greedy on unfiltered logits instead of NaN crash.
+            filtered = logits.float()
+        log_probs = F.log_softmax(filtered, -1)
+        if not bool(torch.isfinite(log_probs).any()):
+            raise RuntimeError("sampling failed: all logits non-finite")
         token = int(torch.multinomial(log_probs.exp(), 1))
         return token, float(log_probs[token])
+
+    @staticmethod
+    def _validate_gen(max_new_tokens: int, temperature: float, top_k: int, top_p: float) -> None:
+        if not 1 <= max_new_tokens <= 4096:
+            raise ValueError(f"max_new_tokens must be in [1, 4096], got {max_new_tokens}")
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0 for policy sampling")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
 
     @torch.no_grad()
     def generate(self, prompt: str, max_new_tokens: int, temperature: float, top_k: int, top_p: float,
                  seed: Optional[int] = None) -> Tuple[str, List[int], List[float]]:
+        self._validate_gen(max_new_tokens, temperature, top_k, top_p)
         if seed is not None:
             torch.manual_seed(seed)
             random.seed(seed)
@@ -75,7 +107,9 @@ class SmaulRL:
         self.model.eval()
         try:
             prompt_ids = self._encode(prompt) or [self.bos_id if self.bos_id is not None else self.eos_id]
-            ids = prompt_ids[-512:]
+            if len(prompt_ids) > self.MODEL_WINDOW:
+                print(f"[WARN] prompt truncated to last {self.MODEL_WINDOW} tokens ({len(prompt_ids)} provided)")
+            ids = prompt_ids[-self.MODEL_WINDOW:]
             logits, _ = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
             response, old_logprobs = [], []
             for _ in range(max_new_tokens):
@@ -84,13 +118,16 @@ class SmaulRL:
                     break
                 response.append(token)
                 old_logprobs.append(logprob)
-                ids = (ids + [token])[-512:]
+                ids = (ids + [token])[-self.MODEL_WINDOW:]
                 logits, _ = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
             return self._decode(response), response, old_logprobs
         finally:
             self.model.train(was_training)
 
     def candidates(self, prompt: str, count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float) -> List[Dict]:
+        if count < 1 or count > 64:
+            raise ValueError(f"count must be in [1, 64], got {count}")
+        self._validate_gen(max_new_tokens, temperature, top_k, top_p)
         result = []
         for i in range(count):
             text, tokens, old_logprobs = self.generate(prompt, max_new_tokens, temperature, top_k, top_p, seed=random.randrange(2**31))
@@ -106,7 +143,11 @@ class SmaulRL:
     def _pick(self, candidates: List[Dict]) -> int:
         self._show(candidates)
         while True:
-            raw = input(f"Choose best response [1-{len(candidates)}]: ").strip()
+            try:
+                raw = input(f"Choose best response [1-{len(candidates)}]: ").strip()
+            except EOFError:
+                print("\n[RL] stdin closed; keeping first response")
+                return 0
             try:
                 choice = int(raw) - 1
                 if 0 <= choice < len(candidates):
@@ -116,14 +157,28 @@ class SmaulRL:
             print("Invalid choice.")
 
     def _save(self, prompt: str, candidates: List[Dict], chosen: int):
+        import os
         record = {"prompt": prompt, "responses": [c["text"] for c in candidates], "chosen": chosen, "source": "human"}
+        self.work_dir.mkdir(parents=True, exist_ok=True)
         with self.preference_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
 
     def _logprob(self, prompt: str, response_tokens: List[int], temperature: float, top_k: int, top_p: float) -> torch.Tensor:
+        # Use the SAME sliding window as sampling: prompt truncated to window,
+        # response truncated so prompt+response fits without OOM.
         prompt_ids = self._encode(prompt) or [self.bos_id if self.bos_id is not None else self.eos_id]
         if not response_tokens:
             return torch.empty(0, device=self.device)
+        prompt_ids = prompt_ids[-self.MODEL_WINDOW:]
+        max_resp = max(1, self.MODEL_WINDOW - len(prompt_ids) + 1)
+        if len(response_tokens) > max_resp:
+            print(f"[WARN] _logprob truncating response {len(response_tokens)} -> {max_resp} to fit window")
+            response_tokens = response_tokens[:max_resp]
         ids = torch.tensor([prompt_ids + response_tokens], dtype=torch.long, device=self.device)
         logits, _ = self.model(ids)
         start = len(prompt_ids) - 1
@@ -135,10 +190,24 @@ class SmaulRL:
                    temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> float:
         if not 0 <= chosen < len(candidates):
             raise ValueError("chosen response is out of range")
+        if len(candidates) < 2:
+            raise ValueError("grpo_step needs at least 2 candidates (std of 1 is NaN)")
+        if not 0 < lr < 1 or not 0 <= clip < 1 or not 0 <= kl_coef < 10:
+            raise ValueError(f"invalid hyperparams lr={lr} clip={clip} kl_coef={kl_coef}")
+        self._validate_gen(256, temperature, top_k, top_p)
         rewards = torch.full((len(candidates),), -1.0, device=self.device)
         rewards[chosen] = 1.0
-        advantages = (rewards - rewards.mean()) / rewards.std().clamp_min(1e-6)
-        opt = Lion(list(self.model.parameters()), lr=lr, wd=0.0)
+        std = rewards.std(unbiased=False)
+        advantages = (rewards - rewards.mean()) / std.clamp_min(1e-6)
+        if not bool(torch.isfinite(advantages).all()):
+            raise ValueError("non-finite advantages; check rewards")
+        # Reuse one optimizer so momentum persists across steps (fresh Lion
+        # every step discards convergence state).
+        if self._opt is None:
+            self._opt = Lion(list(self.model.parameters()), lr=lr, wd=0.0)
+        else:
+            self._opt.lr = lr
+        opt = self._opt
         losses = []
         for candidate, advantage in zip(candidates, advantages):
             if not candidate["tokens"]:
@@ -153,8 +222,10 @@ class SmaulRL:
             adv = advantage.detach().expand_as(ratio)
             losses.append(-torch.minimum(ratio * adv, clipped * adv).mean() + kl_coef * -log_ratio.mean())
         if not losses:
-            return 0.0
+            raise ValueError("no non-empty candidates to train on (not success=0.0)")
         loss = torch.stack(losses).mean()
+        if not bool(torch.isfinite(loss.detach())):
+            raise ValueError(f"non-finite GRPO loss {float(loss):.3f}; checkpoint NOT saved")
         opt.zero_grad(self.model)
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], 1.0)
