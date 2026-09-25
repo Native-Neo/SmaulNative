@@ -1,15 +1,15 @@
 # SmaulNative
 
-A compact RWKV-X training and inference repository with English-Hindi data tooling, Mixture of Experts (MoE) upcycling, real packed low-bit RQT, and native CPU acceleration.
+A compact SmaulLinear training and inference repository with English-Hindi data tooling, Mixture of Experts (MoE) upcycling, real quantized FP8 training, and native CPU acceleration.
 
 ## Overview
 
 - **SmaulLinear Architecture**: Linear-attention blocks with SwiGLU FFN/MoE and tiled E4M3 FP8 weights (`smaul_linear.py`, `fp8_tile.py`).
 - **Native CPU Backend**: Tiled FP8 kernels with a torch fallback plus a training-step benchmark (`compute.py`, `fp8_cpu.cpp`, `cpu/benchmark_full.py`).
 - **Bilingual Tokenizer**: A custom word/character tokenizer with Devanagari grapheme fallback, case markers, and special tokens (`tokenizer.py`).
-- **Unified Training Pipeline**: `train.py` supports pretraining, SFT, streaming resume, RQT, and router-only MoE fine-tuning.
-- **MoE Upcycling**: Merge multiple dense domain checkpoints into a sparse Mixture of Experts model (`merge_moe.py`).
-- **RQT**: Real Quantized Training with physically packed FP4/FP6 weights and native FP8 storage. RQT does not keep FP32 master weights for RQT linear layers.
+- **Unified Training Pipeline**: `train.py` pretrains SmaulLinear with tiled FP8 weights, an FP32 Lion optimizer, automatic tokenizer builds, and resume-free checkpoints.
+- **MoE Upcycling**: Merge multiple dense SmaulLinear checkpoints into a sparse SwiGLU Mixture of Experts model (`merge_moe.py`).
+- **RQT**: Real Quantized Training with tiled E4M3 FP8 weights and per-tile scales, requantized in place after every optimizer step. No FP32 master copy of an FP8 weight is kept; optimizer momentum stays FP32.
 
 ## Project Layout
 
@@ -44,95 +44,106 @@ A compact RWKV-X training and inference repository with English-Hindi data tooli
 ### 1. Installation
 
 ```bash
-pip install torch safetensors huggingface_hub pyarrow tqdm
+python -m pip install -r requirements.txt
 ```
 
-For native CPU acceleration, a working C++ compiler and the Python packages used by `cpu/__init__.py` are required.
+For the native CPU FP8 extension, `ninja` and a working C++ compiler are also required.
+Without them training still works through the torch fallback.
 
 ### 2. End-to-End Workflow
 
 ```bash
 # 1. Download or generate data
-python download.py
-# or: python syntheticdata.py --output_file datasets/synthetic.jsonl
+python download.py --languages hindi english --max_rows 100000
+# or: python syntheticdata.py --count 250000 --format both --output-dir ./datasets
 
-# 2. Train a tokenizer
-python tokenizer.py train --fromdataset ./datasets --output ./SmaulNative/tokenizer.json --vocab-size 32768
+# 2. Train a tokenizer (must match train.py --vocab)
+python tokenizer.py train --fromdataset ./datasets --vocab-size 8000 \
+    --output ./runs/linear/tokenizer.json
 
-# 3. Normal pretraining
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --output_dir ./SmaulNative --ctx_len 256 \
-    --tokenizer_path ./SmaulNative/tokenizer.json
+# 3. Pretraining
+python train.py --data ./datasets --out ./runs/linear \
+    --tokenizer ./runs/linear/tokenizer.json \
+    --d 512 --layers 8 --heads 8 --vocab 8000 \
+    --ctx 256 --batch 2 --steps 1000 --threads 2
 ```
 
-If `tokenizer.json` is absent, `train.py` can train it automatically. Supplying an existing tokenizer is recommended for reproducible training and resume runs.
+If the tokenizer file is absent (or its vocabulary size / format version mismatches),
+`train.py` trains it automatically. Supplying an existing tokenizer is recommended for
+reproducible training.
 
 ## RQT Training
 
-RQT means **Real Quantized Training**: the model trains from the physically quantized representation rather than a fake-quantized view of an FP32 master parameter.
+RQT means **Real Quantized Training**: the model trains from the quantized
+representation rather than a fake-quantized view of an FP32 master parameter.
 
-```bash
-# Pure FP4
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 4
+Every `FP8Linear` stores `uint8` E4M3 codes plus `float32` per-tile scales (tile width
+64 by default). The forward pass runs through the compute backend -- natively in AVX
+when the extension is available, otherwise via a bounded torch fallback that never
+materializes the full FP32 matrix. Weight gradients accumulate in FP32 and are folded
+back into the quantized storage by `requant` after every Lion step, so the packed
+weights themselves carry the training forward.
 
-# Pure FP6
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 6
-
-# Pure FP8
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 8
-
-# Mixed FP4/FP6/FP8
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --mixed_rqt
-```
-
-Pure RQT applies the selected precision to every `nn.Linear`. Mixed RQT uses FP8 for attention/head projections, FP4 for FFN projections, and FP6 for the remaining linear layers.
-
-RQT packs two FP4 codes per byte and four FP6 codes per three bytes. FP8 uses PyTorch `float8_e4m3fn`. RQT Lion keeps its optimizer averages in FP32, while the model weights themselves remain packed after every optimizer step.
-
-The current implementation decodes the packed weights to FP32 for the matrix multiplication. This gives genuine packed model storage and genuine quantized forward weights, but it is not yet a dedicated FP4/FP6 CPU GEMM kernel.
-
-See [docs/rqt.md](docs/rqt.md) for the implementation details and resume format.
+See [docs/rqt.md](docs/rqt.md) for the storage format, the training step, and GGUF export.
 
 ## CPU Training
 
-The CPU backend uses the native WKV implementation automatically when `--cpu` is enabled:
+The CPU backend is the default compute backend (`compute.get_backend()`). Threading is
+configured explicitly or via `SMAUL_CPU_THREADS`:
 
 ```bash
-SMAUL_CPU_THREADS=2 python train.py --cpu --mode pretrain --dataset_dir ./datasets \
-    --output_dir ./SmaulNative
+SMAUL_CPU_THREADS=2 python train.py --data ./datasets --out ./runs/linear
 ```
 
-The native extension is compiled for the host CPU with `-march=native`; do not copy a built extension between different CPU architectures. On an i3-3220, 2 threads are recommended over all 4 hardware threads because Hyper-Threading can reduce throughput for this workload.
+`configure()` sets `OMP_NUM_THREADS`/`MKL_NUM_THREADS` and the torch thread counts. The
+native extension (`smaul_fp8_ivb`, built from `fp8_cpu.cpp` for Ivy Bridge-era CPUs)
+loads lazily; if the build fails, a warning is issued once and the torch tiled fallback
+takes over. Do not copy a built extension between different CPU architectures. Measure
+before tuning -- see `python cpu/benchmark_full.py --help`.
 
 ## Configuration
 
-The default model configuration is approximately 256M parameters for a 65K vocabulary. `--n_embd` controls width, `--n_layer` controls depth, and `--n_moba_layer` controls the number of MOBA blocks. `--head_size` must divide `--n_embd`, and at least one RWKV block must remain.
+The default training configuration is `--d 512 --layers 8 --heads 8 --vocab 8000` with
+`--ctx 256 --batch 2`. `--d` controls width, `--layers` controls depth, `--vocab` must
+match the tokenizer, and `d_model` must be divisible by `n_heads`. `LinearConfig` also
+exposes `ffn_mult` (default `2.5`), `tile` (default `64`), and the MoE fields
+`is_moe`/`num_experts`/`num_experts_per_tok` (set via `merge_moe.py`, not training).
 
-For CPU training, start with a small `--ctx_len`. MOBA attention uses causal scaled-dot-product attention and becomes increasingly expensive as sequence length grows.
+For CPU training, start with a small `--ctx`: the linear-attention state is compact,
+but longer contexts still cost more per step.
 
 ## Remote Streaming
 
-`--stream_dataset` can use `hindi`, `english`, `openthoughts`, or `all` to stream filtered Parquet records directly from Hugging Face without downloading the dataset first. Streaming checkpoints preserve the dataset/file/row position and the partially filled token buffer.
+`train.py` itself has no streaming mode. To use remote data without downloading a full
+dataset first, stream filtered records to stdout and consume them downstream:
+
+```bash
+python stream_data.py --dataset hindi --max_records 1000 > streamed.jsonl
+```
+
+`--dataset` accepts `hindi`, `english`, `openthoughts`, or `all`. Records are filtered
+by `filter_data` rules (`--min_chars`, `--max_chars`); authentication uses `HF_TOKEN` /
+`HUGGINGFACE_HUB_TOKEN`, and library callers can resume from a dataset/file/row
+position via `start_dataset` / `start_file` / `start_record`.
 
 ## Resume
 
-Training checkpoints preserve model weights, optimizer state, RNG state, dataset position, token count, and streaming buffer state. Re-running the same training command resumes from the saved checkpoint. RQT optimizer state is keyed by stable module and parameter names and validates tensor shapes during restore.
+Training checkpoints are resume-free: each save writes `model.safetensors` +
+`config.json`, the tokenizer, and `optimizer.pt` holding only the Lion
+hyperparameters (`lr`, `wd`, betas). No optimizer momentum, RNG state, or dataset
+position is stored, so re-running a training command always starts from step 0.
 
 ## Testing
 
-Run the optimization and model tests with:
+Run the full suite (63 tests) with:
 
 ```bash
-python3 tests/test_optimizations.py
+python -m pytest -q
 ```
 
-For RQT specifically:
+This is the same command CI runs (`.github/workflows/test.yml`). For the FP8
+training-step benchmark instead of the test suite:
 
 ```bash
-python3 -m pytest tests/test_rqt.py
-```
-
-The native WKV regression test is:
-
-```bash
-python3 tests/test_wkv_native.py
+python cpu/benchmark_full.py --d 512 --layers 4 --ctx 256 --batch 2 --iters 10
 ```
