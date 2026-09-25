@@ -30,7 +30,9 @@ be.configure(threads=2)
 
 The extension (`smaul_fp8_ivb`, built from `fp8_cpu.cpp`) exposes `fp8_forward` and
 `fp8_backward_input` over CPU `float32` activations, `uint8` E4M3 codes, and `float32`
-scales. It is compiled for Ivy Bridge-era CPUs (`-mavx -mf16c`, explicitly *without*
+scales. A second extension (`smaul_attn`, built from `attn_cpu.cpp` with the same
+flags) exposes `attn_forward` / `attn_backward` for the linear-attention recurrence
+(FP32 state, exact reference math, O(D^2) state, nothing sequence-sized stored). It is compiled for Ivy Bridge-era CPUs (`-mavx -mf16c`, explicitly *without*
 AVX2/AVX512) and loads lazily on first use; if compilation fails, a `RuntimeWarning`
 is issued once and the torch fallback is used. Do not copy a built extension between
 different CPU architectures.
