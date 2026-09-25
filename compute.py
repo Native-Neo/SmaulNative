@@ -8,6 +8,7 @@ Future backends (e.g. AMD FP16/ROCm) register via register_backend()
 without changing model code. No fake backends: unknown names raise.
 """
 import os
+import threading
 import warnings
 from pathlib import Path
 
@@ -37,11 +38,23 @@ class CpuBackend:
     def __init__(self):
         self._ext = None
         self._attn = None
+        self._lock = threading.Lock()
+        self._warned_fallback = False
 
     def configure(self, threads=None):
         if threads is None:
             env = os.environ.get("SMAUL_CPU_THREADS")
-            threads = int(env) if env else max(1, (os.cpu_count() or 2) // 2)
+            if env:
+                try:
+                    threads = int(float(env))
+                except (TypeError, ValueError):
+                    raise ValueError(f"SMAUL_CPU_THREADS must be an integer, got {env!r}")
+            else:
+                threads = max(1, (os.cpu_count() or 2) // 2)
+        try:
+            threads = int(threads)
+        except (TypeError, ValueError):
+            raise ValueError(f"threads must be an integer, got {threads!r}")
         threads = max(1, threads)
         os.environ.setdefault("OMP_NUM_THREADS", str(threads))
         os.environ.setdefault("MKL_NUM_THREADS", str(threads))
@@ -59,45 +72,62 @@ class CpuBackend:
     def _load(self):
         if self._ext is not None:
             return None if self._ext is False else self._ext
-        try:
-            from torch.utils.cpp_extension import load
-            root = Path(__file__).resolve().parent
-            self._ext = load(name="smaul_fp8_ivb", sources=[str(root / "fp8_cpu.cpp")],
-                extra_cflags=["-O3", "-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f", "-ffp-contract=off"],
-                verbose=False)
-        except Exception as exc:
-            self._ext = False
-            warnings.warn(f"FP8 native ext unavailable; torch tiled fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
+        with self._lock:
+            if self._ext is not None:
+                return None if self._ext is False else self._ext
+            try:
+                from torch.utils.cpp_extension import load
+                root = Path(__file__).resolve().parent
+                self._ext = load(name="smaul_fp8_ivb", sources=[str(root / "fp8_cpu.cpp")],
+                    extra_cflags=["-O3", "-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f", "-ffp-contract=off"],
+                    verbose=False)
+            except Exception as exc:
+                self._ext = False
+                warnings.warn(f"FP8 native ext unavailable; torch tiled fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
         return None if self._ext is False else self._ext
 
     def fp8_forward(self, x, w, s, in_f, out_f, tile):
+        if tile <= 0 or in_f <= 0 or out_f <= 0:
+            raise ValueError(f"tile/in_f/out_f must be positive, got {tile}/{in_f}/{out_f}")
         e = self._load()
         if e is not None and x.device.type == "cpu":
             xc = x if x.is_contiguous() else x.contiguous()
             wc = w.reshape(-1).contiguous()
             sc = s.reshape(-1).contiguous()
             return e.fp8_forward(xc, wc, sc, in_f, out_f, tile)
+        self._warn_fallback_once("fp8_forward torch fallback (native missing or non-CPU input)")
         return _torch_forward(x, w, s, in_f, out_f, tile)
 
+    def _warn_fallback_once(self, msg: str) -> None:
+        if not self._warned_fallback:
+            self._warned_fallback = True
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+
     def fp8_backward_input(self, g, w, s, in_f, out_f, tile):
+        if tile <= 0 or in_f <= 0 or out_f <= 0:
+            raise ValueError(f"tile/in_f/out_f must be positive, got {tile}/{in_f}/{out_f}")
         e = self._load()
         if e is not None and g.device.type == "cpu":
             gc = g if g.is_contiguous() else g.contiguous()
             return e.fp8_backward_input(gc, w.reshape(-1).contiguous(), s.reshape(-1).contiguous(), in_f, out_f, tile)
+        self._warn_fallback_once("fp8_backward torch fallback (native missing or non-CPU input)")
         return _torch_backward_input(g, w, s, in_f, out_f, tile)
 
     def _load_attn(self):
         if self._attn is not None:
             return None if self._attn is False else self._attn
-        try:
-            from torch.utils.cpp_extension import load
-            root = Path(__file__).resolve().parent
-            self._attn = load(name="smaul_attn", sources=[str(root / "attn_cpu.cpp")],
-                extra_cflags=["-O3", "-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f", "-ffp-contract=off"],
-                verbose=False)
-        except Exception as exc:
-            self._attn = False
-            warnings.warn(f"linear-attention native ext unavailable; python reference fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
+        with self._lock:
+            if self._attn is not None:
+                return None if self._attn is False else self._attn
+            try:
+                from torch.utils.cpp_extension import load
+                root = Path(__file__).resolve().parent
+                self._attn = load(name="smaul_attn", sources=[str(root / "attn_cpu.cpp")],
+                    extra_cflags=["-O3", "-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f", "-ffp-contract=off"],
+                    verbose=False)
+            except Exception as exc:
+                self._attn = False
+                warnings.warn(f"linear-attention native ext unavailable; python reference fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
         return None if self._attn is False else self._attn
 
     @property
@@ -129,29 +159,34 @@ class CpuBackend:
 
 
 def _torch_forward(x, w, s, in_f, out_f, tile):
-    from fp8_tile import decode_tile
-    y = torch.zeros(x.shape[0], out_f, dtype=torch.float32, device=x.device)
-    OB, nt = 64, (in_f + tile - 1) // tile
-    for o0 in range(0, out_f, OB):
-        o1 = min(o0 + OB, out_f)
-        acc = torch.zeros(x.shape[0], o1 - o0, dtype=torch.float32, device=x.device)
-        for t in range(nt):
-            k1 = min(in_f, (t + 1) * tile)
-            acc += x[:, t * tile:k1] @ decode_tile(w, s, o0, o1, t, tile).T
-        y[:, o0:o1] = acc
-    return y
+    from fp8_tile import TILE as _TILE, _OB, decode_tile
+    if tile != _TILE:
+        # Fallback honors the layer tile; OB stays blocked for cache reuse.
+        pass
+    with torch.no_grad():
+        y = torch.zeros(x.shape[0], out_f, dtype=torch.float32, device=x.device)
+        OB, nt = _OB, (in_f + tile - 1) // tile
+        for o0 in range(0, out_f, OB):
+            o1 = min(o0 + OB, out_f)
+            acc = torch.zeros(x.shape[0], o1 - o0, dtype=torch.float32, device=x.device)
+            for t in range(nt):
+                k1 = min(in_f, (t + 1) * tile)
+                acc += x[:, t * tile:k1] @ decode_tile(w, s, o0, o1, t, tile).T
+            y[:, o0:o1] = acc
+        return y
 
 
 def _torch_backward_input(g, w, s, in_f, out_f, tile):
-    from fp8_tile import decode_tile
-    gx = torch.zeros(g.shape[0], in_f, dtype=torch.float32, device=g.device)
-    OB, nt = 64, (in_f + tile - 1) // tile
-    for o0 in range(0, out_f, OB):
-        o1 = min(o0 + OB, out_f)
-        gb = g[:, o0:o1]
-        for t in range(nt):
-            gx[:, t * tile:min(in_f, (t + 1) * tile)] += gb @ decode_tile(w, s, o0, o1, t, tile)
-    return gx
+    from fp8_tile import _OB, decode_tile
+    with torch.no_grad():
+        gx = torch.zeros(g.shape[0], in_f, dtype=torch.float32, device=g.device)
+        OB, nt = _OB, (in_f + tile - 1) // tile
+        for o0 in range(0, out_f, OB):
+            o1 = min(o0 + OB, out_f)
+            gb = g[:, o0:o1]
+            for t in range(nt):
+                gx[:, t * tile:min(in_f, (t + 1) * tile)] += gb @ decode_tile(w, s, o0, o1, t, tile)
+        return gx
 
 
 register_backend(CpuBackend())
