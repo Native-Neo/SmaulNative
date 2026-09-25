@@ -1,49 +1,50 @@
 # RQT
 
-SmaulNative RQT (Real Quantized Training) trains directly from physically quantized weights. It is separate from QAT: there is no FP32 master weight for an RQT linear layer.
-
-## Modes
-
-```bash
-# Pure FP4
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 4
-
-# Pure FP6
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 6
-
-# Pure FP8
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --rqt --rqt_bits 8
-
-# Mixed FP4/FP6/FP8
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --mixed_rqt
-```
-
-`--rqt` selects one precision for every `nn.Linear`. `--mixed_rqt` uses FP8 for RWKV TimeMix/MOBA attention projections and the model head, FP4 for Channel-Mix/FFN projections, and FP6 for the remaining linear layers.
-
-## How it differs from QAT
-
-QAT keeps an ordinary floating-point parameter and fake-quantizes it during the forward pass. RQT replaces that parameter with packed low-bit storage. CPU uses native FP4/FP6/FP8 kernels; CUDA and HIP use a blockwise PyTorch path that decodes only bounded row blocks, without reconstructing a full FP32 weight matrix. Gradients are captured from that actual quantized forward, and the optimizer updates the packed storage in place after every step.
-
-RQT therefore does not maintain a hidden FP32 master copy of an RQT linear weight. Lion's optimizer averages remain FP32 because optimizer state needs more numerical resolution than the stored model weight.
+SmaulNative trains directly from quantized weights: every `FP8Linear` stores tiled E4M3
+codes plus per-tile scales, with no FP32 master copy of the weight. Gradients are captured
+from that quantized forward, and the packed storage is requantized in place after every
+optimizer step. Optimizer momentum stays FP32 -- it needs more numerical resolution than
+the stored weight.
 
 ## Storage
 
-- FP4 packs two 4-bit codes into each byte.
-- FP6 packs four 6-bit codes into three bytes.
-- FP8 uses PyTorch `float8_e4m3fn` storage.
-- FP4 and FP6 use custom E2M1 and E3M2-style finite floating-point codebooks with a per-output-row scale.
-- RQT checkpoints store the packed weights, scales, and per-layer bit-width metadata.
+`fp8_tile.py` quantizes each `(out_f, in_f)` matrix in tiles of 64 columns (`TILE = 64`,
+overridable per layer via `LinearConfig.tile` / `FP8Linear(..., tile)`):
 
-The CPU implementation has native packed FP4/FP6/FP8 forward, input-gradient, and update kernels. CUDA and HIP keep the same packed representation and use bounded block decoding for forward, input gradients, and updates. Physical packing therefore remains active through the RQT hot path; only unsupported dtype combinations may use a temporary FP32 block.
+- `w8`: `uint8` E4M3 codes, shape `(out_f, in_f)`.
+- `sc`: `float32` per-tile scales, shape `(out_f, n_tiles)`, where each scale is the
+  tile's `amax / 448.0` (`E4M3_MAX = 448.0`).
+- Exact zeros quantize to code `0`, so sparsity patterns survive quantization.
+- Subnormals are representable through the 256-entry E4M3 codebook.
 
-## Resume
+`FP8Linear.from_float(nn.Linear)` converts an existing float layer; `err_stats()` reports
+`amax_fp8` and `mean_scale` for inspecting quantization health.
 
-RQT uses `RQTLion`, which stores optimizer averages separately for packed linear layers and normal floating-point parameters. State is keyed by stable module/parameter names and validates tensor shapes when loaded.
+## Forward / backward
 
-The default optimizer state is FP32. For lower memory use, training accepts
-`--rqt-state-dtype bf16` or `--rqt-state-dtype fp16`; this is an opt-in numerical tradeoff and disables
-the FP32-only fused Lion kernel for those state tensors.
+The forward pass calls `compute.get_backend()` (default `cpu`, see [cpu.md](cpu.md)):
 
-## Limitations
+- With the native extension, tiled E4M3 forward accumulates from the codes in AVX.
+- Without it, the torch fallback decodes one bounded tile block at a time -- the full
+  FP32 weight matrix is never materialized.
 
-RQT is experimental. Extremely low precision can make optimization unstable, especially FP4. Gradient clipping is applied before the Lion update. FP8 requires a PyTorch build with `torch.float8_e4m3fn` tensor support.
+For the backward pass, input gradients flow through the same backend path, while weight
+gradients accumulate in FP32 into the module's `_gw` buffer (`g.T @ x`, summed over
+micro-batches) and are consumed by the Lion step.
+
+## Training step
+
+`train.Lion` clips the global grad norm to `1.0`, applies a sign update, and calls
+`requant(update, lr * wd)` on each FP8 module: decode the current tiles, apply weight
+decay and the update in FP32, then re-quantize. `_gw` is cleared afterwards.
+
+## Export
+
+`convert_linear_to_gguf.py` dequantizes each tile at export time and writes plain
+`f32`/`f16` tensors:
+
+```bash
+python convert_linear_to_gguf.py ./runs/linear ./runs/linear.gguf --dtype f16
+```
+
+The exported model is intended for inference rather than continued quantized training.
