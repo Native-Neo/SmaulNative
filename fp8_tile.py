@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from compute import get_backend
 
 TILE = 64
+_OB = 64
 E4M3_MAX = 448.0
 _LUT_CACHE = {}
 
@@ -79,11 +80,12 @@ class _Fn(torch.autograd.Function):
         if ctx.need_x:
             gx = get_backend().fp8_backward_input(g2.contiguous(), w, s, in_f, out_f, tile).reshape(ctx.xshape)
         if mod.training:
-            dw = (g2.T @ x2).float()
             if mod._gw is None:
-                mod._gw = dw
-            else:
-                mod._gw.add_(dw)
+                mod._gw = torch.zeros(out_f, in_f, dtype=torch.float32, device=g2.device)
+            gw = mod._gw
+            for o0 in range(0, out_f, _OB):
+                o1 = min(o0 + _OB, out_f)
+                gw[o0:o1].add_(g2[:, o0:o1].T @ x2)
         return gx, None, None, None, None, None, None
 
 class FP8Linear(nn.Module):
@@ -115,19 +117,39 @@ class FP8Linear(nn.Module):
         return _Fn.apply(x, self.w8, self.sc, self.in_f, self.out_f, self.tile, self) + (0 if self.bias is None else self.bias)
 
     @torch.no_grad()
-    def requant(self, update=None, decay=0.0):
+    def _requant_block(self, o0, o1, update, decay):
         nt = (self.in_f + self.tile - 1) // self.tile
-        OB = 64
-        for o0 in range(0, self.out_f, OB):
-            o1 = min(o0 + OB, self.out_f)
-            cur = torch.cat([decode_tile(self.w8, self.sc, o0, o1, t, self.tile) for t in range(nt)], dim=1)
-            if decay:
-                cur.mul_(1 - decay)
-            if update is not None:
-                cur.sub_(update[o0:o1].to(cur.dtype))
-            wq, sq = quantize_tiles(cur, self.tile)
-            self.w8[o0:o1].copy_(wq)
-            self.sc[o0:o1].copy_(sq)
+        cur = torch.cat([decode_tile(self.w8, self.sc, o0, o1, t, self.tile) for t in range(nt)], dim=1)
+        if decay:
+            cur.mul_(1 - decay)
+        if update is not None:
+            cur.sub_(update.to(cur.dtype))
+        wq, sq = quantize_tiles(cur, self.tile)
+        self.w8[o0:o1].copy_(wq)
+        self.sc[o0:o1].copy_(sq)
+
+    @torch.no_grad()
+    def requant(self, update=None, decay=0.0):
+        for o0 in range(0, self.out_f, _OB):
+            o1 = min(o0 + _OB, self.out_f)
+            self._requant_block(o0, o1, update[o0:o1] if update is not None else None, decay)
+        self._gw = None
+
+    @torch.no_grad()
+    def fused_lion_requant(self, gw, st, lr, wd, b1, b2):
+        """Tile-local Lion update fused into requantization.
+
+        Same elementwise math as the full-matrix path (sign step from FP32
+        momentum, decay folded into requant), but computed one output block
+        (``_OB`` rows) at a time: no full-matrix ``upd`` transient is ever
+        built, and only the block's tiles are decoded. Clears ``self._gw``.
+        """
+        for o0 in range(0, self.out_f, _OB):
+            o1 = min(o0 + _OB, self.out_f)
+            g_b, s_b = gw[o0:o1], st[o0:o1]
+            upd_b = (s_b * b1 + g_b * (1.0 - b1)).sign() * lr
+            s_b.mul_(b2).add_(g_b, alpha=1.0 - b2)
+            self._requant_block(o0, o1, upd_b, lr * wd)
         self._gw = None
 
     def err_stats(self):
