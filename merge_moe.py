@@ -23,7 +23,7 @@ def merge(base_dir: Path, branch_dirs: list, out_dir: Path, top_k: int = 1):
     base_cfg, base_sd = _load(base_dir)
     branches = [_load(bd) for bd in branch_dirs]
     for cfg, _ in branches:
-        for f in ("vocab_size", "d_model", "n_layer", "n_heads"):
+        for f in ("vocab_size", "d_model", "n_layer", "n_heads", "precision"):
             if getattr(cfg, f) != getattr(base_cfg, f):
                 raise ValueError(f"branch {f}={getattr(cfg, f)} != base {f}={getattr(base_cfg, f)}")
     n_exp = len(branches)
