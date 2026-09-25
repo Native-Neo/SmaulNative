@@ -266,20 +266,25 @@ def main() -> None:
     if args.max_records < 0:
         p.error("--max_records must be non-negative")
     count = 0
+    buf: list = []
     try:
         for text in stream_dataset(args.dataset, args.min_chars, args.max_chars, workers=args.workers):
-            try:
-                print(json.dumps({"text": text}, ensure_ascii=False), flush=True)
-            except BrokenPipeError:
-                # Piped to `head`: exit quietly instead of traceback.
-                try:
-                    sys.stdout.close()
-                except Exception:
-                    pass
-                return
+            # Buffer 500 lines per syscall: per-record print() kills throughput
+            # for millions of rows.
+            buf.append(json.dumps({"text": text}, ensure_ascii=False))
             count += 1
+            if len(buf) >= 500:
+                try:
+                    sys.stdout.write("\n".join(buf) + "\n")
+                except BrokenPipeError:
+                    return
+                buf.clear()
             if args.max_records and count >= args.max_records:
-                print(f"[DONE] streamed {count:,} records", file=sys.stderr)
+                break
+        if buf:
+            try:
+                sys.stdout.write("\n".join(buf) + "\n")
+            except BrokenPipeError:
                 return
     except BrokenPipeError:
         return
