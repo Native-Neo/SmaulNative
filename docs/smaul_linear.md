@@ -27,13 +27,22 @@ model = SmaulLinear.from_pretrained("./runs/linear")
 | `is_moe` | `False` | use `SwiFFN_MoE` instead of `SwiFFN` |
 | `num_experts` | `1` | expert count (MoE) |
 | `num_experts_per_tok` | `1` | active experts per token (MoE) |
+| `precision` | `fp8` | `fp8` (tiled E4M3) or `fp32` (plain) linear weights |
+
+`precision` is validated on construction and persisted in `config.json`, so
+checkpoints self-describe. In `fp32` mode every projection is a plain FP32 linear with
+the same float-compute/input-dtype behavior as `FP8Linear`; the attention core,
+Lion, inference, and export paths are shared.
 
 ## Architecture
 
 - **`LinearAttention`** -- Q/K/V/O projections are `FP8Linear`. Queries and keys pass
-  through an `elu + 1` feature map with normalized keys; a recurrent state `(S, z)`
-  accumulates `k^T v` outer products per timestep, so memory is `O(D^2)` per head
-  instead of `O(T^2)` in sequence length.
+  through an `elu + 1` feature map; the recurrent core (`_LinearAttnFn`) normalizes
+  keys per step, then accumulates FP32 state `(S, z)` causally with no softmax and no
+  QK^T materialization. The core runs a native AVX1 kernel when available
+  (`attn_cpu.cpp`, same Ivy Bridge-safe flags as the FP8 kernels) and falls back to
+  the pure-torch `_attn_reference` otherwise; gradients flow through a native
+  two-pass backward with the same fallback.
 - **`SwiFFN`** -- gated feed-forward (`silu(gate(x)) * up(x)` through `down`), all
   three projections `FP8Linear`.
 - **`SwiFFN_MoE`** -- one `SwiFFN` per expert plus a softmax router; the top-k experts
