@@ -21,9 +21,9 @@ python merge_moe.py --base ./runs/base --branches ./runs/branch1 ./runs/branch2 
 
 ## Requirements
 
-- Base and branch checkpoints must share `vocab_size`, `d_model`, `n_layer`, and
-  `n_heads` -- a mismatch raises `ValueError`. Tokenizers are *not* unioned, so the
-  vocabularies must already agree.
+- Base and branch checkpoints must share `vocab_size`, `d_model`, `n_layer`,
+  `n_heads`, **and `precision`** -- a mismatch raises `ValueError`. Tokenizers are
+  *not* unioned, so the vocabularies must already agree.
 - `top_k` must be `>= 1` and `<=` the number of experts.
 - Every checkpoint dir needs `config.json` + `model.safetensors` (any `train.py` run
   produces both).
