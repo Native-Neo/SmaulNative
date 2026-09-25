@@ -207,3 +207,29 @@ def test_batch_seq_sweep_finite():
             idx = torch.randint(0, 256, (B, T))
             logits, loss = m(idx, idx)
             assert torch.isfinite(logits).all() and torch.isfinite(loss), (B, T)
+
+
+def test_block_checkpoint_matches_eager():
+    import torch.utils.checkpoint as C
+    from fp8_tile import fp8_modules
+
+    def run(seed):
+        torch.manual_seed(seed)
+        m = SmaulLinear(LinearConfig(vocab_size=256, d_model=64, n_layer=2, n_heads=4, tile=32))
+        m.train()
+        idx = torch.randint(0, 256, (2, 16))
+        _, loss = m(idx, idx)
+        loss.backward()
+        return (loss.item(), [p.grad.float().clone() for p in m.parameters() if p.grad is not None],
+                [mm._gw.clone() for _, mm in fp8_modules(m)])
+
+    l1, g1, w1 = run(0)
+    real = C.checkpoint
+    C.checkpoint = lambda f, *a, **k: f(*a)
+    try:
+        l2, g2, w2 = run(0)
+    finally:
+        C.checkpoint = real
+    assert l1 == l2
+    assert max((a - b).abs().amax().item() for a, b in zip(g1, g2)) == 0.0
+    assert max((a - b).abs().amax().item() for a, b in zip(w1, w2)) == 0.0
