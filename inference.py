@@ -16,6 +16,18 @@ MAX_PROMPT_TOKENS = 4096
 _ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
 
+def _seed_all(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed % (2 ** 32))
+    except ImportError:
+        pass
+
+
 class _IncrementalDecoder:
     def __init__(self, tokenizer: SmaulTokenizer):
         self.table = tokenizer.id_to_token
@@ -161,10 +173,7 @@ class LinearInference:
                stop: Optional[List[str]] = None, seed: Optional[int] = None) -> Iterable[str]:
         self._validate(max_new_tokens, temperature, top_k, top_p, repetition_penalty)
         if seed is not None:
-            random.seed(seed)
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
+            _seed_all(seed)
         ids = self._prepare(prompt)
         logits, _ = self._forward(ids[-MODEL_WINDOW:])
         recent = ids[-128:]
