@@ -4,8 +4,8 @@ A compact RWKV-X training and inference repository with English-Hindi data tooli
 
 ## Overview
 
-- **RWKV-X Architecture**: RWKV-7 TimeMix blocks with interleaved MOBA attention (`rwkv_x_core.py`).
-- **Native CPU Backend**: C++ WKV forward/backward kernels plus CPU-specific training support (`cpu/`).
+- **SmaulLinear Architecture**: Linear-attention blocks with SwiGLU FFN/MoE and tiled E4M3 FP8 weights (`smaul_linear.py`, `fp8_tile.py`).
+- **Native CPU Backend**: Tiled FP8 kernels with a torch fallback plus a training-step benchmark (`compute.py`, `fp8_cpu.cpp`, `cpu/benchmark_full.py`).
 - **Bilingual Tokenizer**: A custom word/character tokenizer with Devanagari grapheme fallback, case markers, and special tokens (`tokenizer.py`).
 - **Unified Training Pipeline**: `train.py` supports pretraining, SFT, streaming resume, RQT, and router-only MoE fine-tuning.
 - **MoE Upcycling**: Merge multiple dense domain checkpoints into a sparse Mixture of Experts model (`merge_moe.py`).
@@ -14,20 +14,29 @@ A compact RWKV-X training and inference repository with English-Hindi data tooli
 ## Project Layout
 
 ```
-├── cpu/               # Native WKV kernels and CPU benchmarks
-├── datasets/          # Local training datasets and token streams
-├── docs/              # Detailed guides and command references
-├── tests/             # Unit and optimization regression tests
-├── USEME.md           # CLI cheat sheet
-├── dataset.py         # Dataset loaders
-├── download.py        # Dataset downloader
-├── merge_moe.py       # Dense-to-MoE upcycling
-├── rqt.py             # Real packed FP4/FP6/FP8 training
-├── rwkv_x_core.py     # Core RWKV-X model definition
-├── stream_data.py     # Remote Hugging Face Parquet streaming
-├── syntheticdata.py   # Synthetic bilingual data generator
-├── tokenizer.py       # Custom bilingual tokenizer
-└── train.py           # Pretraining, SFT, RQT, and MoE router training
+├── cpu/benchmark_full.py  # SmaulLinear/FP8 training-step benchmark
+├── docs/                  # Detailed guides and command references
+├── tests/                 # Unit and optimization regression tests
+├── USEME.md               # CLI cheat sheet
+├── smaul_linear.py        # SmaulLinear model definition
+├── fp8_tile.py            # Tiled E4M3 FP8 linear layers
+├── compute.py             # Compute-backend boundary (CPU native + torch fallback)
+├── fp8_cpu.cpp            # Native AVX FP8 kernels
+├── train.py               # SmaulLinear FP8 trainer
+├── inference.py           # Inference engine for SmaulLinear checkpoints
+├── infer_cli.py           # Interactive chat CLI
+├── infer_linear.py        # Single-prompt CLI
+├── infer_server.py        # Local server with chat UI
+├── merge_moe.py           # Dense-to-MoE upcycling
+├── convert_linear_to_gguf.py  # Checkpoint export to GGUF
+├── autorl.py              # Automated preference learning + RL
+├── rl.py                  # Human preference collection + GRPO training
+├── dataset.py             # Dataset loaders
+├── download.py            # Dataset downloader
+├── filter_data.py         # Lightweight filters for streamed records
+├── stream_data.py         # Remote Hugging Face Parquet streaming
+├── syntheticdata.py       # Synthetic bilingual data generator
+└── tokenizer.py           # Custom bilingual tokenizer
 ```
 
 ## Quickstart
