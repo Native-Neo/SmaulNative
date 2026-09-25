@@ -2,13 +2,21 @@ name: Python SmaulNative
 
 on:
   push:
-    branches: [Python-SmaulNative, Development/Unstable]
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  test-fallback:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,7 +31,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest
+
+      - name: Run Python tests (torch fallback)
+        run: pytest -q
+
+  test-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Verify native extensions
         env:
@@ -38,7 +66,7 @@ jobs:
               raise SystemExit('SMAULNATIVE_REQUIRE_NATIVE_RQT=1 but a native extension failed to load')
           "
 
-      - name: Run Python tests
+      - name: Run Python tests (native)
         env:
           SMAULNATIVE_REQUIRE_NATIVE_RQT: "1"
         run: pytest -q
