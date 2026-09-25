@@ -54,8 +54,8 @@ def gen_linear_equation() -> Dict[str, str]:
                     f"1. दोनों पक्षों से {b} घटाएं:\n"
                     f"   $${a}x = {c} - {b} = {c - b}$$\n\n"
                     f"2. {a} से विभाजित करें:\n"
-                    f"   $$x = \\frac{{{c - b}}}{{{a}}} = {x:.4f}$$\n\n"
-                    f"**उत्तर:** $x = {x:.4f}$")
+                    f"   $$x = \\frac{{{c - b}}}{{{a}}} \\approx {x:.4f}$$\n\n"
+                    f"**उत्तर:** $x = {c - b}/{a} \\approx {x:.4f}$")
         domain = "math_algebra_hi"
     else:
         prompt = f"Solve for x in the linear equation: {a}x + {b} = {c}"
@@ -64,8 +64,8 @@ def gen_linear_equation() -> Dict[str, str]:
                     f"1. **Subtract {b} from both sides:**\n"
                     f"   $${a}x = {c} - {b} = {c - b}$$\n\n"
                     f"2. **Divide by {a}:**\n"
-                    f"   $$x = \\frac{{{c - b}}}{{{a}}} = {x:.4f}$$\n\n"
-                    f"**Final Answer:** $x = {x:.4f}$")
+                    f"   $$x = \\frac{{{c - b}}}{{{a}}} \\approx {x:.4f}$$\n\n"
+                    f"**Final Answer:** $x = {c - b}/{a} \\approx {x:.4f}$")
         domain = "math_algebra_en"
     return {"instruction": prompt, "response": response, "think": think, "domain": domain}
 
@@ -464,7 +464,8 @@ def export_dataset(samples: List[Dict[str, str]], output_dir: Path, fmt: str = "
 
 def main():
     parser = argparse.ArgumentParser(description="Massive Synthetic Data Generator for SmaulNative LLM")
-    parser.add_argument("--output-dir", type=str, default="./datasets", help="Output directory.")
+    parser.add_argument("--output-dir", type=str, default="./datasets/synthetic",
+                        help="Output directory (default keeps synthetic data separate from real datasets).")
     parser.add_argument("--count", type=int, default=250000, help="Number of unique synthetic samples.")
     parser.add_argument("--format", type=str, choices=["jsonl", "parquet", "both"], default="both", help="Export format.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation.")
