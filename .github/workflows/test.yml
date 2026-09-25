@@ -25,6 +25,19 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pytest
 
+      - name: Verify native extensions
+        env:
+          SMAULNATIVE_REQUIRE_NATIVE_RQT: "1"
+        run: |
+          python -c "
+          import os
+          from compute import get_backend
+          be = get_backend(); be.configure()
+          print('native fp8:', be.has_native, '| native attn:', be.has_attn_native)
+          if os.environ.get('SMAULNATIVE_REQUIRE_NATIVE_RQT') == '1' and not (be.has_native and be.has_attn_native):
+              raise SystemExit('SMAULNATIVE_REQUIRE_NATIVE_RQT=1 but a native extension failed to load')
+          "
+
       - name: Run Python tests
         env:
           SMAULNATIVE_REQUIRE_NATIVE_RQT: "1"
