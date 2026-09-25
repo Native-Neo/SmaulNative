@@ -1,14 +1,15 @@
 # merge_moe.py
 
-Combines a base checkpoint with one or more branch checkpoints (same architecture, e.g. SFT'd on
-different domains) into one **Channel-Mix MoE** model: each branch's FFN becomes an expert,
-everything else is shared from the base. Also union-merges their tokenizers. This is this
-project's own MoE-upcycling extension -- *not* part of upstream RWKV-X.
+Merges one base SmaulLinear checkpoint plus one or more branch checkpoints (same
+architecture, e.g. trained on different domains) into one SwiGLU-MoE model: each
+branch's block FFN becomes one expert; attention, embeddings, norms, and head come
+from the base; the router is freshly initialized.
 
 ## Run it
 
 ```bash
-python merge_moe.py --base ./RWKV-X-256M --branches ./sft_branch1 ./sft_branch2 --out ./RWKV-X-MoE --top_k 1
+python merge_moe.py --base ./runs/base --branches ./runs/branch1 ./runs/branch2 \
+    --out ./runs/moe --top_k 1
 ```
 
 | Flag | Default | What it does |
@@ -20,27 +21,27 @@ python merge_moe.py --base ./RWKV-X-256M --branches ./sft_branch1 ./sft_branch2 
 
 ## Requirements
 
-- All base + branch checkpoints must share `n_embd`, `n_layer`, `n_moba_layer`, and `head_size` --
-  vocab size may differ (tokenizers get unioned, embeddings/head auto-resized). A mismatch raises
-  a clear error (`assert_compatible`, `merge_moe.py:25`).
-- Every checkpoint dir needs a bundled `tokenizer.json` (any `train.py` run does this
-  automatically, `merge_moe.py:47`).
-- Result loads via `RWKVXModel.from_pretrained("./RWKV-X-MoE")` like any other checkpoint.
+- Base and branch checkpoints must share `vocab_size`, `d_model`, `n_layer`, and
+  `n_heads` -- a mismatch raises `ValueError`. Tokenizers are *not* unioned, so the
+  vocabularies must already agree.
+- `top_k` must be `>= 1` and `<=` the number of experts.
+- Every checkpoint dir needs `config.json` + `model.safetensors` (any `train.py` run
+  produces both).
 
 ## How it works
 
-- **Tokenizer union** (`merge_tokenizers`, `merge_moe.py:56`): the merged vocab keeps the base's
-  ids, then appends each branch's new tokens/merges (`next_id` continues from base's max).
-  Duplicate tokens/merges are skipped; a token string that maps to a *different* id across
-  branches is a conflict where **base's id wins** (with a `[WARN]`, `merge_moe.py:110`).
-- **Model merge** (`merge`, `merge_moe.py:136`):
-  1. Base config, plus `is_moe: True`, `num_experts = len(branches)`, and
-     `num_experts_per_tok = min(top_k, num_experts)` (`merge_moe.py:153`).
-  2. Every non-FFN tensor is copied straight from base (`merge_moe.py:162`); `emb.weight` and
-     `head.weight` are resized if the vocab grew, with new rows drawn from a small-normal
-     distribution matched to existing stats (`resize_vocab_matrix`, `merge_moe.py:119`).
-  3. Each expert's `ffn.key`/`ffn.value` are filled from the corresponding branch's FFN tensors
-     (`merge_moe.py:173`); the router gate keeps the model's own random init.
-- Writes `config.json` + `model.safetensors` + a unioned `tokenizer.json`, plus a
-  `merge_config.json` metadata file recording the base, branches, expert count, and tokenizer-merge
-  stats (`merge_moe.py:196`).
+1. Builds a `LinearConfig` from the base with `is_moe=True`,
+   `num_experts = len(branches)`, `num_experts_per_tok = top_k`.
+2. Copies every shared tensor straight from the base, skipping `.ffn.` and `.gate.`
+   keys; a missing key or shape mismatch raises `ValueError`.
+3. Fills each expert from the corresponding branch's `.ffn.` tensors
+   (`.ffn.` -> `.ffn.experts.{e}.`); the router gate keeps its random init.
+4. Writes `config.json` + `model.safetensors` plus a `merge_config.json` recording the
+   base, branches, expert count, and top_k.
+
+The result loads like any other checkpoint:
+
+```python
+from smaul_linear import SmaulLinear
+model = SmaulLinear.from_pretrained("./runs/moe")
+```
