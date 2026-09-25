@@ -36,6 +36,7 @@ class CpuBackend:
 
     def __init__(self):
         self._ext = None
+        self._attn = None
 
     def configure(self, threads=None):
         if threads is None:
@@ -80,6 +81,47 @@ class CpuBackend:
         if e is not None and g.device.type == "cpu":
             return e.fp8_backward_input(g, w.reshape(-1).contiguous(), s.reshape(-1).contiguous(), in_f, out_f, tile)
         return _torch_backward_input(g, w, s, in_f, out_f, tile)
+
+    def _load_attn(self):
+        if self._attn is not None:
+            return None if self._attn is False else self._attn
+        try:
+            from torch.utils.cpp_extension import load
+            root = Path(__file__).resolve().parent
+            self._attn = load(name="smaul_attn", sources=[str(root / "attn_cpu.cpp")],
+                extra_cflags=["-O3", "-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f", "-ffp-contract=off"],
+                verbose=False)
+        except Exception as exc:
+            self._attn = False
+            warnings.warn(f"linear-attention native ext unavailable; python reference fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
+        return None if self._attn is False else self._attn
+
+    @property
+    def has_attn_native(self):
+        return self._load_attn() is not None
+
+    def attn_forward(self, Q, K, V, eps, need_den):
+        e = self._load_attn()
+        if (e is not None and Q.device.type == "cpu" and Q.dtype == torch.float32
+                and K.dtype == torch.float32 and V.dtype == torch.float32):
+            Qc = Q if Q.is_contiguous() else Q.contiguous()
+            Kc = K if K.is_contiguous() else K.contiguous()
+            Vc = V if V.is_contiguous() else V.contiguous()
+            Y, DEN = e.attn_forward(Qc, Kc, Vc, float(eps), bool(need_den))
+            return Y, (DEN if need_den else None)
+        from smaul_linear import _attn_reference
+        return _attn_reference(Q, K, V, eps), None
+
+    def attn_backward(self, dY, Q, K, V, Y, DEN, eps):
+        e = self._load_attn()
+        if (e is not None and DEN is not None and dY.device.type == "cpu"
+                and dY.dtype == torch.float32 and Q.dtype == torch.float32
+                and K.dtype == torch.float32 and V.dtype == torch.float32
+                and Y.dtype == torch.float32):
+            args = [a if a.is_contiguous() else a.contiguous() for a in (dY, Q, K, V, Y, DEN)]
+            return e.attn_backward(*args, float(eps))
+        from smaul_linear import _attn_reference_backward
+        return _attn_reference_backward(dY, Q, K, V, eps)
 
 
 def _torch_forward(x, w, s, in_f, out_f, tile):
