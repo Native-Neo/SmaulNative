@@ -1,4 +1,5 @@
 import math
+import threading
 
 import torch
 import torch.nn as nn
@@ -99,17 +100,18 @@ class _Fn(torch.autograd.Function):
         if ctx.need_x:
             gx = get_backend().fp8_backward_input(g2.contiguous(), w, s, in_f, out_f, tile).reshape(ctx.xshape)
         if mod.training:
-            if mod._gw is None:
-                mod._gw = torch.zeros(out_f, in_f, dtype=torch.float32, device=g2.device)
-            elif mod._gw.device != g2.device:
-                # Device changed mid-training (e.g. .to(device)); migrate.
-                mod._gw = mod._gw.to(g2.device)
-            gw = mod._gw
-            if gw.shape != (out_f, in_f):
-                raise RuntimeError(f"_gw shape {tuple(gw.shape)} != ({out_f}, {in_f})")
-            for o0 in range(0, out_f, _OB):
-                o1 = min(o0 + _OB, out_f)
-                gw[o0:o1].add_(g2[:, o0:o1].T @ x2)
+            with mod._gw_lock:
+                if mod._gw is None:
+                    mod._gw = torch.zeros(out_f, in_f, dtype=torch.float32, device=g2.device)
+                elif mod._gw.device != g2.device:
+                    # Device changed mid-training (e.g. .to(device)); migrate.
+                    mod._gw = mod._gw.to(g2.device)
+                gw = mod._gw
+                if gw.shape != (out_f, in_f):
+                    raise RuntimeError(f"_gw shape {tuple(gw.shape)} != ({out_f}, {in_f})")
+                for o0 in range(0, out_f, _OB):
+                    o1 = min(o0 + _OB, out_f)
+                    gw[o0:o1].add_(g2[:, o0:o1].T @ x2)
         return gx, None, None, None, None, None, None
 
 class FP8Linear(nn.Module):
@@ -120,6 +122,7 @@ class FP8Linear(nn.Module):
         if tile <= 0:
             raise ValueError(f"tile must be > 0, got {tile}")
         self.in_f, self.out_f, self.tile = in_f, out_f, tile
+        self._gw_lock = threading.Lock()
         nt = (in_f + tile - 1) // tile
         w0 = torch.empty(out_f, in_f, dtype=torch.float32)
         nn.init.kaiming_uniform_(w0, a=math.sqrt(5))
@@ -128,6 +131,15 @@ class FP8Linear(nn.Module):
         self.register_buffer("sc", sq)
         self.bias = nn.Parameter(torch.zeros(out_f)) if bias else None
         self._gw = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_gw_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._gw_lock = threading.Lock()
 
     @classmethod
     def from_float(cls, lin, tile=TILE):
@@ -188,8 +200,15 @@ class FP8Linear(nn.Module):
     def err_stats(self):
         with torch.no_grad():
             nt = (self.in_f + self.tile - 1) // self.tile
-            cur = torch.cat([decode_tile(self.w8, self.sc, 0, self.out_f, t, self.tile) for t in range(nt)], dim=1)
-            return {"amax_fp8": cur.abs().amax().item(), "mean_scale": self.sc.mean().item()}
+            # Stream tiles: avoid materializing the full [out_f, in_f] FP32 matrix (OOM on 4k+).
+            amax = 0.0
+            ssum, scount = 0.0, 0
+            for t in range(nt):
+                blk = decode_tile(self.w8, self.sc, 0, self.out_f, t, self.tile)
+                amax = max(amax, float(blk.abs().amax()))
+                ssum += float(self.sc[:, t].float().sum())
+                scount += self.sc.shape[0]
+            return {"amax_fp8": amax, "mean_scale": ssum / max(1, scount)}
 
 def fp8_modules(model):
     return [(n, m) for n, m in model.named_modules() if isinstance(m, FP8Linear)]
