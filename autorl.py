@@ -14,6 +14,16 @@ import torch.nn.functional as F
 from rl import SmaulRL
 
 
+# Minimum human preference records required before unattended (--no-verify)
+# auto-labeling is allowed. Below this the reward model is effectively random
+# and training on its own argmax causes a self-reinforcing collapse loop.
+MIN_HUMAN_PREFS_FOR_AUTO = 4
+
+# Hard cap for a single (prompt + response) pair fed to the reward model.
+# Prevents one huge prompt/response from OOMing the (n, max_len) batch tensor.
+MAX_PREF_PAIR_LEN = 2048
+
+
 class PreferenceModel(nn.Module):
     def __init__(self, vocab_size: int, embed_dim: int = 32):
         super().__init__()
@@ -38,7 +48,11 @@ class AutoRL(SmaulRL):
 
     def _load_preference_model(self):
         if self.preference_model_path.exists():
-            self.preference_model.load_state_dict(torch.load(self.preference_model_path, map_location=self.device, weights_only=True))
+            try:
+                state = torch.load(self.preference_model_path, map_location=self.device, weights_only=True)
+                self.preference_model.load_state_dict(state)
+            except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                print(f"[WARN] ignoring corrupt preference checkpoint {self.preference_model_path}: {exc}")
         if self.preference_meta_path.exists():
             try:
                 self.preference_trained = max(0, int(json.loads(self.preference_meta_path.read_text()).get("records", 0)))
@@ -51,16 +65,23 @@ class AutoRL(SmaulRL):
         self.preference_trained = record_count
 
     def _batch_ids(self, token_lists: List[List[int]]):
-        max_len = max(1, max(map(len, token_lists)))
-        tokens = torch.zeros(len(token_lists), max_len, dtype=torch.long, device=self.device)
+        if not token_lists:
+            raise ValueError("token_lists must not be empty")
+        # Truncate each sequence first so one huge prompt/response cannot OOM
+        # the dense (n, max_len) batch tensor.
+        truncated = [ids[:MAX_PREF_PAIR_LEN] if len(ids) > MAX_PREF_PAIR_LEN else ids for ids in token_lists]
+        max_len = max(1, max(map(len, truncated)))
+        tokens = torch.zeros(len(truncated), max_len, dtype=torch.long, device=self.device)
         mask = torch.zeros_like(tokens, dtype=torch.bool)
-        for row, ids in enumerate(token_lists):
+        for row, ids in enumerate(truncated):
             if ids:
                 tokens[row, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=self.device)
                 mask[row, :len(ids)] = True
         return tokens, mask
 
     def _batch_pairs(self, prompt: str, responses: List[str]):
+        if not responses:
+            raise ValueError("responses must not be empty")
         prompt_ids = self._encode(prompt)
         sep = [self.eos_id] if self.eos_id is not None else []
         return self._batch_ids([prompt_ids + sep + self._encode(r) for r in responses])
@@ -77,52 +98,99 @@ class AutoRL(SmaulRL):
         with self.preference_path.open("r", encoding="utf-8") as handle:
             return sum(1 for line in handle if line.strip())
 
-    def train_preferences(self, epochs: int, lr: float):
+    def train_preferences(self, epochs: int, lr: float) -> int:
+        """Incrementally train the reward model on new human records.
+
+        Returns the total number of preference records seen (for meta tracking).
+        Never marks a random/untrained model as trained: if there is nothing
+        valid to train on, the checkpoint is left untouched.
+        """
         if not self.preference_path.exists():
             print("[PREF] no preferences.jsonl found")
-            return
-        records = [json.loads(line) for line in self.preference_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            return 0
+        records = []
+        bad_lines = 0
+        try:
+            with self.preference_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        bad_lines += 1
+        except OSError as exc:
+            print(f"[PREF] could not read {self.preference_path}: {exc}")
+            return 0
+        if bad_lines:
+            print(f"[WARN] skipped {bad_lines} malformed preference line(s)")
         if not records:
             print("[PREF] no preference records found")
-            return
+            return 0
+        if epochs <= 0:
+            print("[PREF] epochs<=0, skipping training (checkpoint untouched)")
+            return len(records)
         start = min(self.preference_trained, len(records))
         if start == len(records):
             print(f"[PREF] up to date ({len(records)} records)")
-            return
+            return len(records)
         new_records = records[start:]
         optimizer = torch.optim.AdamW(self.preference_model.parameters(), lr=lr)
         self.preference_model.train()
+        trained_valid = 0
         for epoch in range(epochs):
             random.shuffle(new_records)
             total, valid = 0.0, 0
             for record in new_records:
+                if not isinstance(record, dict):
+                    continue
                 responses = record.get("responses", [])
                 chosen = int(record.get("chosen", -1))
                 prompt = record.get("prompt")
                 if not isinstance(prompt, str) or len(responses) < 2 or not 0 <= chosen < len(responses):
                     continue
-                tokens, mask = self._batch_pairs(prompt, responses)
+                try:
+                    tokens, mask = self._batch_pairs(prompt, responses)
+                except (ValueError, RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+                    print(f"[WARN] skipping over-long/bad preference record: {exc}")
+                    continue
                 scores = self.preference_model(tokens, mask)
                 rejected = torch.cat((scores[:chosen], scores[chosen + 1:]))
                 loss = -F.logsigmoid(scores[chosen] - rejected).mean()
+                if not torch.isfinite(loss.detach()):
+                    print("[WARN] skipping non-finite preference loss")
+                    continue
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
                 total += float(loss.detach())
                 valid += 1
+            trained_valid += valid
             print(f"[PREF] epoch={epoch + 1}/{epochs} loss={total / max(1, valid):.5f}")
+        if trained_valid == 0:
+            print("[PREF] no valid records trained; checkpoint left untouched (still random)")
+            return len(records)
         self._save_preference_model(len(records))
+        return len(records)
 
     def _verify(self, candidates: List[Dict], predicted: int) -> int:
         while True:
-            answer = input("Did automated RL choose correctly? [Y/n]: ").strip().lower()
+            try:
+                answer = input("Did automated RL choose correctly? [Y/n]: ").strip().lower()
+            except EOFError:
+                print("\n[AUTO] stdin closed; keeping predicted choice")
+                return predicted
             if answer in ("", "y", "yes"):
                 print(f"[AUTO] confirmed response {predicted + 1}/{len(candidates)}")
                 return predicted
             if answer in ("n", "no"):
                 SmaulRL._show(candidates)
                 while True:
-                    raw = input(f"Which response is better? [1-{len(candidates)}]: ").strip()
+                    try:
+                        raw = input(f"Which response is better? [1-{len(candidates)}]: ").strip()
+                    except EOFError:
+                        print("\n[AUTO] stdin closed; keeping predicted choice")
+                        return predicted
                     try:
                         choice = int(raw) - 1
                         if 0 <= choice < len(candidates):
@@ -143,8 +211,20 @@ class AutoRL(SmaulRL):
             preference_epochs: int, preference_lr: float, rl_lr: float, clip: float, kl_coef: float, verify: bool):
         if count < 2:
             raise ValueError("--responses must be at least 2")
+        if max_new_tokens <= 0:
+            raise ValueError("--max_new_tokens must be positive")
         print(f"[PREF] loading {self.preference_count()} preference records")
         self.train_preferences(preference_epochs, preference_lr)
+        human_records = self.preference_count()
+        reward_trained = self.preference_trained
+        if not verify and (human_records < MIN_HUMAN_PREFS_FOR_AUTO or reward_trained <= 0):
+            raise RuntimeError(
+                f"Refusing unattended auto-labeling: found {human_records} human preference record(s) "
+                f"(trained={reward_trained}); need >= {MIN_HUMAN_PREFS_FOR_AUTO} human records before "
+                f"--no-verify. Collect preferences with rl.py first, or run with verification enabled."
+            )
+        if not verify:
+            print(f"[PREF] auto-labeling with reward model trained on {reward_trained} record(s)")
         for prompt in prompts:
             candidates = self.candidates(prompt, count, max_new_tokens, temperature, top_k, top_p)
             scores = self.preference_scores(prompt, candidates)
