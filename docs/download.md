@@ -1,43 +1,41 @@
 # download.py
 
-Downloads FineWeb (English) and FineWeb-2 (Hindi) parquet shards from Hugging Face into
-`./datasets/raw/{english,hindi}/`.
+Downloads Hugging Face Parquet datasets and re-shards them into uniform local Parquet
+shards with a resumable manifest -- no tokenization involved.
 
-## Configuration
+## Datasets
 
-There are no CLI flags -- edit the constants at the top of the file if you want different
-repos/paths/limits:
+| Name | Repo | Path |
+|---|---|---|
+| `hindi` | `HuggingFaceFW/fineweb-2` | `data/hin_Deva/train` |
+| `english` | `HuggingFaceFW/fineweb` | `data/100BT` |
+| `openthoughts` | `open-thoughts/OpenThoughts3-1.2M` | `data` |
 
-```python
-OUTPUT_ROOT           = Path("./datasets/raw")
-MAX_GIB_PER_LANGUAGE  = 40                          # per-language download cap
-HINDI_REPO, HINDI_PATH     = "HuggingFaceFW/fineweb-2", "data/hin_Deva/train"
-ENGLISH_REPO, ENGLISH_PATH = "HuggingFaceFW/fineweb", "data/100BT"
-```
-
-- `MAX_GIB_PER_LANGUAGE` is a hard per-language ceiling: it stops downloading once a language
-  reaches the limit, so you can cap disk usage without touching the rest of the file.
-- `ENGLISH_PATH = "data/100BT"` points at the original FineWeb English 100BT sample; change it to
-  another FineWeb split if you want a different English subset.
+`--languages all` currently downloads `hindi` + `english` only (`download.py:247`).
 
 ## Run it
 
 ```bash
-python download.py
+python download.py --languages hindi english --max_rows 100000
 ```
 
-## How it behaves
+| Flag | Default | What it does |
+|---|---|---|
+| `--languages` | `all` | `hindi`, `english`, `openthoughts`, and/or `all` |
+| `--max_rows` | `0` | max rows per dataset; `0` means unlimited |
+| `--shard_rows` | `100000` | rows per output shard |
+| `--compression` | `zstd` | `zstd`, `snappy`, `gzip`, or `none` |
+| `--output_dir` | `./datasets` | root; each dataset lands in `<output_dir>/<name>/` |
+| `--temp_dir` | `./datasets/.temp_raw` | raw download staging area |
+| `--no_clean_temp` | off | keep staged raw files after processing |
 
-- **Safe to re-run**: it lists the available repo files, compares against what's already on disk,
-  and skips files whose size matches. A partial or corrupt file (size mismatch) is deleted and
-  re-downloaded, and a broken partial is *counted against* the cap so it can't silently eat your
-  limit.
-- **Size limit is checked *before* each download** (`download.py:225`), so it never starts a file
-  that would push past `MAX_GIB_PER_LANGUAGE` -- it prints the current/remaing/next-file sizes and
-  breaks instead of exceeding the cap.
-- **Verification**: every download is checked after it lands; a file whose on-disk size doesn't
-  match the repo's declared size raises a `RuntimeError`.
-- Hugging Face access: you need an account/token for gated or rate-limited pulls
-  (`huggingface-cli login`).
-- Output goes straight under `./datasets/raw/` -- point `dataset.py`-consuming scripts
-  (`tokenizer.py`, `train.py`) at `./datasets` (or wherever you move/symlink the parquet files).
+Gated repos use your cached Hugging Face credentials (`huggingface-cli login`).
+
+## Output & resume
+
+Each dataset directory holds `shard_*.parquet` (single `text` column) plus a
+`manifest.json` tracking total rows, committed shards, completed raw files, and the
+in-progress file/row position. Re-running resumes where it stopped: finished raw files
+are skipped, orphan shard files not listed in the manifest are deleted, and a manifest
+whose row count disagrees with its shards raises `RuntimeError`. Point `train.py`
+`--data` at the output root -- `dataset.py` discovers shards recursively.
