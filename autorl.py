@@ -2,6 +2,7 @@
 """Train from rl.py preferences and run verified automatic RL for SmaulLinear."""
 
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -55,14 +56,28 @@ class AutoRL(SmaulRL):
                 print(f"[WARN] ignoring corrupt preference checkpoint {self.preference_model_path}: {exc}")
         if self.preference_meta_path.exists():
             try:
-                self.preference_trained = max(0, int(json.loads(self.preference_meta_path.read_text()).get("records", 0)))
+                meta = json.loads(self.preference_meta_path.read_text())
+                self.preference_trained = max(0, int(meta.get("records", 0)))
+                self._preference_hash = str(meta.get("sha256", ""))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 self.preference_trained = 0
+                self._preference_hash = ""
+        else:
+            self._preference_hash = ""
 
-    def _save_preference_model(self, record_count: int):
+    def _prefs_hash(self, lines: List[str]) -> str:
+        h = hashlib.sha256()
+        for line in lines:
+            h.update(line.encode("utf-8"))
+            h.update(b"\n")
+        return h.hexdigest()
+
+    def _save_preference_model(self, record_count: int, raw_lines: List[str]):
         torch.save(self.preference_model.state_dict(), self.preference_model_path)
-        self.preference_meta_path.write_text(json.dumps({"records": record_count}))
+        meta = {"records": record_count, "sha256": self._prefs_hash(raw_lines)}
+        self.preference_meta_path.write_text(json.dumps(meta))
         self.preference_trained = record_count
+        self._preference_hash = meta["sha256"]
 
     def _batch_ids(self, token_lists: List[List[int]]):
         if not token_lists:
@@ -109,6 +124,7 @@ class AutoRL(SmaulRL):
             print("[PREF] no preferences.jsonl found")
             return 0
         records = []
+        raw_lines: List[str] = []
         bad_lines = 0
         try:
             with self.preference_path.open("r", encoding="utf-8") as handle:
@@ -117,6 +133,7 @@ class AutoRL(SmaulRL):
                         continue
                     try:
                         records.append(json.loads(line))
+                        raw_lines.append(line.strip())
                     except json.JSONDecodeError:
                         bad_lines += 1
         except OSError as exc:
@@ -130,18 +147,33 @@ class AutoRL(SmaulRL):
         if epochs <= 0:
             print("[PREF] epochs<=0, skipping training (checkpoint untouched)")
             return len(records)
+        # Hash-based resume: edited/reordered/truncated files retrain from
+        # scratch instead of training on the wrong slice.
         start = min(self.preference_trained, len(records))
+        prev_hash = getattr(self, "_preference_hash", "")
+        if start > 0 and prev_hash:
+            if self._prefs_hash(raw_lines[:start]) != prev_hash:
+                print("[WARN] preferences file changed since last train; retraining from scratch")
+                start = 0
         if start == len(records):
             print(f"[PREF] up to date ({len(records)} records)")
             return len(records)
         new_records = records[start:]
+        # Mix a small replay sample to reduce forgetting (old behavior trained
+        # new-only). Deterministic: seeded by file hash.
+        replay: List[Dict] = []
+        if start > 0:
+            seed = int(hashlib.sha256("".join(raw_lines[:start]).encode()).hexdigest()[:8], 16)
+            rng = random.Random(seed)
+            replay = rng.sample(records[:start], min(start, max(4, len(new_records) // 2)))
+        train_pool = new_records + replay
         optimizer = torch.optim.AdamW(self.preference_model.parameters(), lr=lr)
         self.preference_model.train()
         trained_valid = 0
         for epoch in range(epochs):
-            random.shuffle(new_records)
+            random.shuffle(train_pool)
             total, valid = 0.0, 0
-            for record in new_records:
+            for record in train_pool:
                 if not isinstance(record, dict):
                     continue
                 responses = record.get("responses", [])
@@ -170,7 +202,7 @@ class AutoRL(SmaulRL):
         if trained_valid == 0:
             print("[PREF] no valid records trained; checkpoint left untouched (still random)")
             return len(records)
-        self._save_preference_model(len(records))
+        self._save_preference_model(len(records), raw_lines)
         return len(records)
 
     def _verify(self, candidates: List[Dict], predicted: int) -> int:
