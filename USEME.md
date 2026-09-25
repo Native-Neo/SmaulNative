@@ -10,7 +10,7 @@ repo root.
 - [tokenizer.py](docs/tokenizer.md)
 - [dataset.py](docs/dataset.md)
 - [train.py](docs/train.md)
-- [RQT](docs/rqt.md) -- real packed FP4/FP6/FP8 training
+- [RQT](docs/rqt.md) -- tiled E4M3 FP8 training
 - [smaul_linear.py](docs/smaul_linear.md)
 - [merge_moe.py](docs/merge_moe.md)
 - [CPU Optimizations](docs/cpu.md)
