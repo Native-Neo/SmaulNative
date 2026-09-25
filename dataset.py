@@ -33,7 +33,11 @@ class TokenizerWrapper:
 def load_tokenizer(path: Path) -> TokenizerWrapper:
     if not Path(path).exists():
         raise FileNotFoundError(f"No tokenizer found at {path}. Run tokenizer.py first")
-    from tokenizer import SmaulTokenizer
+    try:
+        from tokenizer import SmaulTokenizer
+    except ImportError:
+        # Support `python -m package` / relative layouts.
+        from .tokenizer import SmaulTokenizer  # type: ignore
     return TokenizerWrapper(SmaulTokenizer.from_file(path))
 
 
@@ -56,25 +60,44 @@ PLAIN_TEXT_SUFFIXES = SUPPORTED_SUFFIXES - {".jsonl", ".json", ".csv", ".parquet
 
 
 def discover_files(dataset_dir: Path) -> List[Path]:
+    dataset_dir = Path(dataset_dir)
     if not dataset_dir.exists():
         raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
-    files = [p.resolve() for p in dataset_dir.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES]
+    root = dataset_dir.resolve()
+    files: List[Path] = []
+    for p in root.rglob("*"):
+        # Skip symlinks that escape the dataset root and cap scan size.
+        try:
+            if p.is_symlink() and p.resolve() != p and root not in p.resolve().parents:
+                print(f"[WARN] skipping symlink escaping dataset root: {p}")
+                continue
+            if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES:
+                files.append(p.resolve())
+        except OSError:
+            continue
+        if len(files) > 100_000:
+            print("[WARN] file scan capped at 100k files")
+            break
     files.sort()
     return files
 
 
 def _looks_numeric(s: str) -> bool:
-    s = s.strip()
-    if not s:
+    t = s.strip()
+    if not t:
         return True
-    core = s.replace(".", "", 1).replace("-", "", 1).replace(":", "", 1).replace("/", "", 1)
-    return core.isdigit()
+    # Robust: timestamps (12:30:45), fractions (1/2), ranges (--) are numeric.
+    allowed = set("0123456789.,-: /+%_")
+    return all(c in allowed for c in t)
 
 
 _WARNED_FILES: set = set()
+_WARNED_COUNT: int = 0
 
 
-def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
+def extract_text(obj: Any, source_path: Optional[str] = None, _depth: int = 0) -> str:
+    if _depth > 8:
+        return ""
     if isinstance(obj, str):
         return obj
     if isinstance(obj, dict):
@@ -89,14 +112,29 @@ def extract_text(obj: Any, source_path: Optional[str] = None) -> str:
                 return v
         candidates = [v for v in obj.values() if isinstance(v, str) and not _looks_numeric(v)]
         if candidates:
+            global _WARNED_COUNT
             if source_path and source_path not in _WARNED_FILES:
                 _WARNED_FILES.add(source_path)
-                print(f"[WARN] {source_path}: no recognized text column; guessing from {list(obj.keys())}")
-            return max(candidates, key=len)
+                _WARNED_COUNT += 1
+                if _WARNED_COUNT <= 5:
+                    print(f"[WARN] {source_path}: no recognized text column; guessing from {list(obj.keys())}")
+            # Prefer sentence-like candidates (contain spaces) over IDs/hashes.
+            spaced = [c for c in candidates if " " in c.strip() and len(c.strip()) > 20]
+            pool = spaced or candidates
+            return max(pool, key=len)
         return ""
     if isinstance(obj, list):
-        return "\n".join(extract_text(x, source_path) for x in obj)
+        return "\n".join(extract_text(x, source_path, _depth + 1) for x in obj)
     return ""
+
+
+MAX_TEXT_FILE_BYTES = 10_000_000
+MAX_JSON_FILE_BYTES = 50_000_000
+
+
+def _open_text(path: Path):
+    # utf-8-sig strips BOM; errors=replace keeps one bad file from killing training.
+    return open(path, "r", encoding="utf-8-sig", errors="replace")
 
 
 def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_record: int = 0) -> Iterator[Tuple[str, str, int]]:
@@ -108,6 +146,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
         if resume_file not in resolved_files:
             raise FileNotFoundError(f"resume file not found in discovered dataset files: {resume_file}")
     started = resume_file is None
+    skipped_jsonl = 0
     for path in files:
         if not started:
             if str(path.resolve()) == resume_file:
@@ -118,7 +157,7 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
         suffix = path.suffix.lower()
         try:
             if suffix in (".txt", ".text"):
-                with open(path, "r", encoding="utf-8") as f:
+                with _open_text(path) as f:
                     doc = []
                     record = -1
                     for line in f:
@@ -137,12 +176,21 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                         if record >= start_idx:
                             yield "\n".join(doc), str(path), record + 1
             elif suffix in PLAIN_TEXT_SUFFIXES:
-                with open(path, "r", encoding="utf-8") as f:
+                try:
+                    if path.stat().st_size > MAX_TEXT_FILE_BYTES:
+                        print(f"[WARN] skipping oversized text file {path} "
+                              f"({path.stat().st_size} bytes > {MAX_TEXT_FILE_BYTES})")
+                        continue
+                except OSError:
+                    pass
+                with _open_text(path) as f:
                     content = f.read().strip()
+                # Preserve code indentation: only strip trailing/leading blank lines,
+                # not inner leading spaces (already handled by read().strip() on ends).
                 if content and start_idx == 0:
                     yield content, str(path), 1
             elif suffix == ".jsonl":
-                with open(path, "r", encoding="utf-8") as f:
+                with _open_text(path) as f:
                     for i, line in enumerate(f):
                         line = line.strip()
                         if not line:
@@ -153,13 +201,25 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                         try:
                             obj = json.loads(line)
                         except json.JSONDecodeError:
+                            skipped_jsonl += 1
                             continue
                         text = extract_text(obj, str(path)).strip()
                         if text:
                             yield text, str(path), record
             elif suffix == ".json":
-                data = json.loads(path.read_text(encoding="utf-8"))
-                records = data.get("data", data) if isinstance(data, dict) else data
+                try:
+                    if path.stat().st_size > MAX_JSON_FILE_BYTES:
+                        print(f"[WARN] skipping oversized JSON file {path}")
+                        continue
+                except OSError:
+                    pass
+                data = json.loads(path.read_text(encoding="utf-8-sig", errors="replace"))
+                # Only unwrap {"data": [...]} when data is a list; a legit
+                # string field named "data" must not misfire.
+                if isinstance(data, dict) and isinstance(data.get("data"), list):
+                    records = data["data"]
+                else:
+                    records = data
                 if not isinstance(records, list):
                     records = [records]
                 for i, record_obj in enumerate(records, 1):
@@ -169,8 +229,14 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                     if text:
                         yield text, str(path), i
             elif suffix == ".csv":
-                with open(path, "r", encoding="utf-8", newline="") as f:
-                    for i, row in enumerate(csv.DictReader(f), 1):
+                import csv as _csv
+                _csv.field_size_limit(min(10_000_000, max(131072, _csv.field_size_limit())))
+                with _open_text(path) as f:
+                    reader = _csv.DictReader(f)
+                    if reader.fieldnames is None:
+                        print(f"[WARN] skipping CSV with missing header: {path}")
+                        continue
+                    for i, row in enumerate(reader, 1):
                         if i <= start_idx:
                             continue
                         text = extract_text(row, str(path)).strip()
@@ -178,7 +244,10 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                             yield text, str(path), i
             elif suffix == ".parquet":
                 import pyarrow.parquet as pq
-                pf = pq.ParquetFile(path)
+                try:
+                    pf = pq.ParquetFile(path)
+                except ImportError as exc:
+                    raise RuntimeError("parquet support requires pyarrow") from exc
                 schema_names = pf.schema_arrow.names
                 schema_lower = [c.lower() for c in schema_names]
                 fast_col = None
@@ -220,8 +289,14 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                             text = extract_text(row, str(path)).strip()
                             if text:
                                 yield text, str(path), record
+        except RuntimeError:
+            raise
         except Exception as e:
-            raise RuntimeError(f"failed to read dataset file {path}") from e
+            # Warn-and-skip: one bad file must not abort the whole stream.
+            print(f"[WARN] skipping dataset file {path}: {type(e).__name__}: {e}")
+            continue
+    if skipped_jsonl:
+        print(f"[WARN] skipped {skipped_jsonl} malformed JSONL line(s)")
 
 
 class PretrainStream(IterableDataset):
@@ -242,14 +317,19 @@ class PretrainStream(IterableDataset):
     def __iter__(self):
         buf = list(self.buffer_tokens)
         subchunk = 4096
+        # Cap single-document encode to avoid RAM spikes on huge docs.
+        max_doc_chars = 100_000
         if buf and self.resume_file is not None:
             self.last_pos = (str(Path(self.resume_file).resolve()), self.resume_record)
             while len(buf) >= self.ctx_len + 1:
                 chunk = buf[:self.ctx_len + 1]
                 del buf[:self.ctx_len]
-                self.buffer_tokens = buf
+                self.buffer_tokens = list(buf)
                 yield (torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long), self.last_pos)
         for text, path, rec_idx in iter_texts(self.files, self.resume_file, self.resume_record):
+            if len(text) > max_doc_chars:
+                print(f"[WARN] truncating oversized document ({len(text)} chars) from {path}")
+                text = text[:max_doc_chars]
             ids = self.tokenizer.encode(text) + [self.tokenizer.eos_token_id]
             # The buffer contains the remainder of this record after each
             # yielded chunk, so resume must start at the following record.
@@ -259,7 +339,7 @@ class PretrainStream(IterableDataset):
                 while len(buf) >= self.ctx_len + 1:
                     chunk = buf[:self.ctx_len + 1]
                     del buf[:self.ctx_len]
-                    self.buffer_tokens = buf
+                    self.buffer_tokens = list(buf)
                     yield (torch.tensor(chunk[:-1], dtype=torch.long), torch.tensor(chunk[1:], dtype=torch.long), self.last_pos)
 
 
@@ -287,15 +367,27 @@ def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
 
 
 def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrapper, ctx_len: int, pad_token_id: int) -> Dict[str, torch.Tensor]:
+    if ctx_len < 1:
+        raise ValueError("ctx_len must be positive")
     if not isinstance(conversations, list):
         raise ValueError("SFT record 'conversations' must be a list")
     input_ids, tokenized_lens, speakers, prefix_lens = [], [], [], []
     for c in _add_speaker_and_signal(conversations):
-        ids = tokenizer.encode(c["value"])
-        input_ids.extend(ids)
-        tokenized_lens.append(len(ids))
+        turn_ids = tokenizer.encode(c["value"])
+        if not turn_ids:
+            continue
+        prefix_ids = tokenizer.encode(c["from"] + ": ")
+        # Prefix encoded in isolation may not match in-context tokenization.
+        # Only use it when it matches the turn start; otherwise include the
+        # whole turn (slight prefix leak beats masking response tokens).
+        if prefix_ids and turn_ids[:len(prefix_ids)] == prefix_ids:
+            prefix_len = len(prefix_ids)
+        else:
+            prefix_len = 0
+        input_ids.extend(turn_ids)
+        tokenized_lens.append(len(turn_ids))
         speakers.append(c["from"])
-        prefix_lens.append(len(tokenizer.encode(c["from"] + ": ")))
+        prefix_lens.append(prefix_len)
     if not input_ids:
         raise ValueError("SFT record contains no valid conversation turns")
     targets = [IGNORE_INDEX] * len(input_ids)
@@ -305,8 +397,11 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
             start = cur + min(prefix_len, length)
             targets[start:cur + length] = input_ids[start:cur + length]
         cur += length
-    input_ids = input_ids[:ctx_len + 1]
-    targets = targets[:ctx_len + 1]
+    # Overlong: keep the TAIL (recent assistant turns) instead of crashing
+    # when no targets fall in the head window.
+    if len(input_ids) > ctx_len + 1:
+        input_ids = input_ids[-(ctx_len + 1):]
+        targets = targets[-(ctx_len + 1):]
     if not any(x != IGNORE_INDEX for x in targets[1:]):
         raise ValueError("SFT record contains no assistant targets within ctx_len")
     input_ids = input_ids[:-1]
@@ -325,29 +420,43 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
             continue
         try:
             if path.suffix.lower() == ".jsonl":
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
                             continue
                         try:
-                            records.append(json.loads(line))
+                            obj = json.loads(line)
                         except json.JSONDecodeError:
                             print(f"[WARN] skipping malformed SFT record in {path}")
+                            continue
+                        # Accept both {"conversations": [...]} and {"data": {"conversations": ...}}.
+                        if isinstance(obj, dict) and isinstance(obj.get("data"), dict):
+                            obj = obj["data"]
+                        records.append(obj)
             else:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                records.extend(data if isinstance(data, list) else [data])
+                data = json.loads(path.read_text(encoding="utf-8-sig", errors="replace"))
+                if isinstance(data, dict) and isinstance(data.get("data"), list):
+                    records.extend(data["data"])
+                else:
+                    records.extend(data if isinstance(data, list) else [data])
         except Exception as e:
-            raise RuntimeError(f"failed to read SFT file {path}") from e
-    records = [r for r in records if isinstance(r, dict) and isinstance(r.get("conversations"), list)]
+            print(f"[WARN] skipping SFT file {path}: {type(e).__name__}: {e}")
+            continue
+    records = [r for r in records if isinstance(r, dict) and isinstance(r.get("conversations"), list)
+               and r["conversations"]]
     if not records:
         raise RuntimeError(f"No valid SFT conversation records found under {dataset_dir}")
+    if len(records) > 200_000:
+        print(f"[WARN] {len(records):,} SFT records materialized in RAM; consider sharding")
     return records
 
 
 class SFTDataset(Dataset):
     _CACHE_MAX = 2048
     def __init__(self, dataset_dir: Path, tokenizer: TokenizerWrapper, ctx_len: int):
+        if ctx_len < 1:
+            raise ValueError("ctx_len must be positive")
         self.records = discover_sft_records(dataset_dir)
         self.tokenizer = tokenizer
         self.ctx_len = ctx_len
@@ -360,10 +469,15 @@ class SFTDataset(Dataset):
     def __getitem__(self, idx):
         if idx in self._processed_cache:
             self._processed_cache.move_to_end(idx)
-            return self._processed_cache[idx]
-        d = _preprocess_conversation(self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id)
+            ids, labels = self._processed_cache[idx]
+            # Return clones: callers/collators may mutate in place.
+            return ids.clone(), labels.clone()
+        try:
+            d = _preprocess_conversation(self.records[idx]["conversations"], self.tokenizer, self.ctx_len, self.pad_token_id)
+        except ValueError as exc:
+            raise ValueError(f"SFT record {idx} invalid: {exc}") from exc
         item = (d["input_ids"], d["labels"])
-        self._processed_cache[idx] = item
+        self._processed_cache[idx] = (item[0].clone(), item[1].clone())
         if len(self._processed_cache) > self._CACHE_MAX:
             self._processed_cache.popitem(last=False)
-        return item
+        return item[0].clone(), item[1].clone()
