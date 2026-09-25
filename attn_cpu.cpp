@@ -36,15 +36,17 @@ static inline float hsum8(__m256 v) {
 // Per-step key normalization: kn = k / max(||k||, 1e-6).
 // Matches the old caller-side `k / k.norm(dim=-1, keepdim=True).clamp_min(1e-6)`
 // exactly; keeping raw k visible lets the backward pass differentiate the norm.
+// Norm accumulates in double to avoid fp32 overflow (which would silently zero keys).
 static inline void normalize_key(const float* k, float* kn, int64_t D) {
-  float n2 = 0.0f;
-  for (int64_t i = 0; i < D; ++i) n2 += k[i] * k[i];
-  const float n = std::sqrt(n2);
-  const __m256 inv = _mm256_set1_ps(1.0f / (n < 1e-6f ? 1e-6f : n));
+  double n2 = 0.0;
+  for (int64_t i = 0; i < D; ++i) n2 += (double)k[i] * (double)k[i];
+  const float n = (float)std::sqrt(n2);
+  const float nc = (!std::isfinite(n) || n < 1e-6f) ? 1e-6f : n;
+  const __m256 inv = _mm256_set1_ps(1.0f / nc);
   int64_t i = 0;
   for (; i + 8 <= D; i += 8)
     _mm256_storeu_ps(kn + i, _mm256_mul_ps(_mm256_loadu_ps(k + i), inv));
-  for (; i < D; ++i) kn[i] = k[i] * (1.0f / (n < 1e-6f ? 1e-6f : n));
+  for (; i < D; ++i) kn[i] = k[i] * (1.0f / nc);
 }
 
 static void attn_forward_task(const float* Q, const float* K, const float* V,
@@ -96,14 +98,24 @@ static void attn_forward_task(const float* Q, const float* K, const float* V,
 std::pair<torch::Tensor, torch::Tensor> attn_forward(torch::Tensor Q, torch::Tensor K,
                                                      torch::Tensor V, double eps,
                                                      bool need_den) {
-  TORCH_CHECK(Q.device().is_cpu() && K.device().is_cpu() && V.device().is_cpu());
+  TORCH_CHECK(Q.device().is_cpu() && K.device().is_cpu() && V.device().is_cpu(),
+              "attn_forward: all tensors must be CPU");
   TORCH_CHECK(Q.dtype() == torch::kFloat32 && K.dtype() == torch::kFloat32 &&
-              V.dtype() == torch::kFloat32);
-  TORCH_CHECK(Q.dim() == 4 && K.sizes() == Q.sizes() && V.sizes() == Q.sizes());
-  TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous());
+              V.dtype() == torch::kFloat32,
+              "attn_forward: Q/K/V must be float32");
+  TORCH_CHECK(Q.dim() == 4 && K.sizes() == Q.sizes() && V.sizes() == Q.sizes(),
+              "attn_forward: Q/K/V must be [B,T,H,D] with matching shapes");
+  TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous(),
+              "attn_forward: Q/K/V must be contiguous");
+  TORCH_CHECK(std::isfinite(eps) && eps > 0, "attn_forward: eps must be positive finite, got ", eps);
   const int64_t B = Q.size(0), T = Q.size(1), H = Q.size(2), D = Q.size(3);
+  TORCH_CHECK(B >= 0 && T >= 0 && H >= 0 && D > 0, "attn_forward: bad shape [", B, ",", T, ",", H, ",", D, "]");
+  TORCH_CHECK(D <= 2048, "attn_forward: D=", D, " too large (per-task O(D^2) state would OOM); "
+              "reduce d_model/n_heads");
   auto Y = torch::empty_like(Q);
-  torch::Tensor DEN;
+  // Always return a *defined* tensor: an undefined Tensor crashes pybind
+  // conversion on the eval path (need_den==false). Callers discard this.
+  torch::Tensor DEN = torch::empty({0}, Q.options().dtype(torch::kFloat32));
   float* denp = nullptr;
   if (need_den) {
     DEN = torch::empty({B, T, H}, Q.options().dtype(torch::kFloat32));
@@ -249,16 +261,18 @@ static void attn_bwd_B_task(const float* Q, const float* K, const float* V,
       dkt[i] = dz[i] + dot;
     }
     // k/||k|| backward: dk = dk~/nc - k*(k.dk~)/nc^3 with nc = max(||k||, 1e-6).
-    // (Matches torch autograd through the clamped normalization; the clamp
-    // never binds in practice because elu+1 keys keep a non-tiny norm.)
-    float n2 = 0.0f, kd = 0.0f;
+    // (Matches torch autograd through the clamped normalization.)
+    // Guarded: all-zero keys hit the clamp (nc=1e-6, nc^3=1e-18), so an
+    // unguarded kd/nc^3 division yields inf.
+    double n2 = 0.0, kd = 0.0;
     for (int64_t i = 0; i < D; ++i) {
-      n2 += kt[i] * kt[i];
-      kd += kt[i] * dkt[i];
+      n2 += (double)kt[i] * (double)kt[i];
+      kd += (double)kt[i] * (double)dkt[i];
     }
-    const float n = std::sqrt(n2);
-    const float nc = n < 1e-6f ? 1e-6f : n;
-    const float s = kd / (nc * nc * nc);
+    const float n = (float)std::sqrt(n2);
+    const float nc = (!std::isfinite(n) || n < 1e-6f) ? 1e-6f : n;
+    float s = (float)(kd / ((double)nc * nc * nc));
+    if (!std::isfinite(s)) s = 0.0f;
     const float invn = 1.0f / nc;
     for (int64_t i = 0; i < D; ++i) dkt[i] = dkt[i] * invn - kt[i] * s;
   }
@@ -268,17 +282,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> attn_backward(
     torch::Tensor dY, torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor Y, torch::Tensor DEN, double eps) {
   TORCH_CHECK(dY.device().is_cpu() && Q.device().is_cpu() && K.device().is_cpu() &&
-              V.device().is_cpu() && Y.device().is_cpu() && DEN.device().is_cpu());
+              V.device().is_cpu() && Y.device().is_cpu() && DEN.device().is_cpu(),
+              "attn_backward: all tensors must be CPU");
   TORCH_CHECK(dY.dtype() == torch::kFloat32 && Q.dtype() == torch::kFloat32 &&
               K.dtype() == torch::kFloat32 && V.dtype() == torch::kFloat32 &&
-              Y.dtype() == torch::kFloat32 && DEN.dtype() == torch::kFloat32);
+              Y.dtype() == torch::kFloat32 && DEN.dtype() == torch::kFloat32,
+              "attn_backward: all tensors must be float32");
   TORCH_CHECK(Q.dim() == 4 && K.sizes() == Q.sizes() && V.sizes() == Q.sizes() &&
-              dY.sizes() == Q.sizes() && Y.sizes() == Q.sizes());
+              dY.sizes() == Q.sizes() && Y.sizes() == Q.sizes(),
+              "attn_backward: Q/K/V/dY/Y shape mismatch");
   TORCH_CHECK(DEN.dim() == 3 && DEN.size(0) == Q.size(0) && DEN.size(1) == Q.size(1) &&
-              DEN.size(2) == Q.size(2));
+              DEN.size(2) == Q.size(2),
+              "attn_backward: DEN must be [B,T,H]");
   TORCH_CHECK(dY.is_contiguous() && Q.is_contiguous() && K.is_contiguous() &&
-              V.is_contiguous() && Y.is_contiguous() && DEN.is_contiguous());
+              V.is_contiguous() && Y.is_contiguous() && DEN.is_contiguous(),
+              "attn_backward: all tensors must be contiguous");
+  TORCH_CHECK(std::isfinite(eps) && eps > 0, "attn_backward: eps must be positive finite");
   const int64_t B = Q.size(0), T = Q.size(1), H = Q.size(2), D = Q.size(3);
+  TORCH_CHECK(D > 0 && D <= 2048, "attn_backward: D=", D, " out of supported range (1, 2048]");
   auto dQ = torch::empty_like(Q);
   auto dK = torch::zeros_like(K);
   auto dV = torch::zeros_like(V);
