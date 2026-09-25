@@ -8,11 +8,42 @@ Future backends (e.g. AMD FP16/ROCm) register via register_backend()
 without changing model code. No fake backends: unknown names raise.
 """
 import os
+import platform
 import threading
 import warnings
 from pathlib import Path
 
 import torch
+
+# Cached reference fallbacks (avoids repeated lazy imports + breaks the
+# smaul_linear <-> compute import cycle cost after first use).
+_attn_ref_fn = None
+_attn_ref_bwd_fn = None
+
+
+def _get_attn_ref():
+    global _attn_ref_fn
+    if _attn_ref_fn is None:
+        from smaul_linear import _attn_reference
+        _attn_ref_fn = _attn_reference
+    return _attn_ref_fn
+
+
+def _get_attn_ref_bwd():
+    global _attn_ref_bwd_fn
+    if _attn_ref_bwd_fn is None:
+        from smaul_linear import _attn_reference_backward
+        _attn_ref_bwd_fn = _attn_reference_backward
+    return _attn_ref_bwd_fn
+
+
+def _native_cflags() -> list:
+    # Ivy Bridge AVX1 flags only on x86_64; elsewhere use portable -O3 so ARM
+    # / non-AVX builds fall back cleanly instead of failing silently.
+    base = ["-O3", "-ffp-contract=off"]
+    if platform.machine().lower() in ("x86_64", "amd64", "x64"):
+        base += ["-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f"]
+    return base
 
 _BACKENDS = {}
 
@@ -79,8 +110,7 @@ class CpuBackend:
                 from torch.utils.cpp_extension import load
                 root = Path(__file__).resolve().parent
                 self._ext = load(name="smaul_fp8_ivb", sources=[str(root / "fp8_cpu.cpp")],
-                    extra_cflags=["-O3", "-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f", "-ffp-contract=off"],
-                    verbose=False)
+                    extra_cflags=_native_cflags(), verbose=False)
             except Exception as exc:
                 self._ext = False
                 warnings.warn(f"FP8 native ext unavailable; torch tiled fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
@@ -123,8 +153,7 @@ class CpuBackend:
                 from torch.utils.cpp_extension import load
                 root = Path(__file__).resolve().parent
                 self._attn = load(name="smaul_attn", sources=[str(root / "attn_cpu.cpp")],
-                    extra_cflags=["-O3", "-mavx", "-mf16c", "-msse4.2", "-mno-avx2", "-mno-avx512f", "-ffp-contract=off"],
-                    verbose=False)
+                    extra_cflags=_native_cflags(), verbose=False)
             except Exception as exc:
                 self._attn = False
                 warnings.warn(f"linear-attention native ext unavailable; python reference fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
@@ -143,8 +172,7 @@ class CpuBackend:
             Vc = V if V.is_contiguous() else V.contiguous()
             Y, DEN = e.attn_forward(Qc, Kc, Vc, float(eps), bool(need_den))
             return Y, (DEN if need_den else None)
-        from smaul_linear import _attn_reference
-        return _attn_reference(Q, K, V, eps), None
+        return _get_attn_ref()(Q, K, V, eps), None
 
     def attn_backward(self, dY, Q, K, V, Y, DEN, eps):
         e = self._load_attn()
@@ -154,8 +182,7 @@ class CpuBackend:
                 and Y.dtype == torch.float32):
             args = [a if a.is_contiguous() else a.contiguous() for a in (dY, Q, K, V, Y, DEN)]
             return e.attn_backward(*args, float(eps))
-        from smaul_linear import _attn_reference_backward
-        return _attn_reference_backward(dY, Q, K, V, eps)
+        return _get_attn_ref_bwd()(dY, Q, K, V, eps)
 
 
 def _torch_forward(x, w, s, in_f, out_f, tile):
