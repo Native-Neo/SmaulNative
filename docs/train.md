@@ -21,6 +21,7 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--d` | `512` | model width (`d_model`) |
 | `--layers` | `8` | block count (`n_layer`) |
 | `--heads` | `8` | linear-attention head count |
+| `--precision` | `fp8` | weight precision: tiled-E4M3 `fp8` or plain `fp32` |
 | `--ctx` | `256` | training sequence length |
 | `--batch` | `2` | sequences per optimizer step |
 | `--steps` | `1000` | optimizer steps |
@@ -31,7 +32,11 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--tok_records` | `200000` | reserved; currently unused |
 | `--threads` | `2` | CPU threads (`torch` + `OMP_NUM_THREADS`) |
 
-There are no SFT, streaming, precision, or resume flags: the trainer only pretrains.
+There are no SFT, streaming, or resume flags: the trainer only pretrains.
+
+In `fp32` mode every projection is a plain FP32 linear (`fp8_modules` is empty) and
+Lion runs its standard parameter path; checkpoints, inference, and GGUF export work
+identically, with `.weight` tensors instead of packed `w8`/`sc` pairs.
 
 ## Tokenizer
 
