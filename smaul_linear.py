@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from fp8_tile import FP8Linear
 
@@ -114,9 +115,13 @@ class Block(nn.Module):
         self.n4 = RMSNorm(d, cfg.eps)
         self.n5 = RMSNorm(d, cfg.eps)
     def forward(self, x):
-        a = self.n2(self.att(self.n1(x)).float())
+        ck = self.training and torch.is_grad_enabled()
+        n1x = self.n1(x)
+        ax = torch.utils.checkpoint.checkpoint(self.att, n1x, use_reentrant=False) if ck else self.att(n1x)
+        a = self.n2(ax.float())
         x = self.n3((x.float() + a.float()).to(x.dtype))
-        f = self.n4(self.ffn(x).float())
+        fx = torch.utils.checkpoint.checkpoint(self.ffn, x, use_reentrant=False) if ck else self.ffn(x)
+        f = self.n4(fx.float())
         return self.n5((x.float() + f.float()).to(x.dtype))
 
 class SmaulLinear(nn.Module):
