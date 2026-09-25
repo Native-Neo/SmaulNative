@@ -142,11 +142,24 @@ def read_manifest(output_dir: Path) -> Dict[str, Any]:
     path = output_dir / "manifest.json"
     if not path.exists():
         return default_manifest()
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        print(f"[WARN] corrupt manifest {path}: {exc}; starting from empty manifest (existing shards kept).")
+        return default_manifest()
+    if not isinstance(manifest, dict):
+        print(f"[WARN] corrupt manifest {path}: expected object; starting fresh (existing shards kept).")
+        return default_manifest()
     base = default_manifest()
     base.update(manifest)
-    base["shards"] = list(base.get("shards") or [])
-    base["completed_raw_files"] = list(base.get("completed_raw_files") or [])
+    shards = base.get("shards") or []
+    # Drop malformed shard entries instead of crashing later with AttributeError.
+    clean_shards = [s for s in shards if isinstance(s, dict) and isinstance(s.get("shard_file"), str)]
+    if len(clean_shards) != len(shards):
+        print(f"[WARN] dropped {len(shards) - len(clean_shards)} malformed shard entries from manifest.")
+    base["shards"] = clean_shards
+    completed = base.get("completed_raw_files") or []
+    base["completed_raw_files"] = sorted({c for c in completed if isinstance(c, str)})
     return base
 
 
@@ -157,22 +170,43 @@ def save_manifest(output_dir: Path, manifest: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def reconcile_output(output_dir: Path, manifest: Dict[str, Any]) -> Dict[str, Any]:
-    committed = {str(s.get("shard_file")) for s in manifest["shards"]}
-    for path in output_dir.glob("shard_*.parquet"):
-        if path.name not in committed:
-            path.unlink()
-    rows = sum(int(s.get("row_count", 0)) for s in manifest["shards"])
-    if rows != int(manifest.get("total_rows", 0)):
-        raise RuntimeError("Manifest row count does not match committed shards")
+def reconcile_output(output_dir: Path, manifest: Dict[str, Any], prune: bool = False) -> Dict[str, Any]:
+    """Validate manifest against on-disk shards without destroying data by default.
+
+    Historically this deleted any ``shard_*.parquet`` not listed in the manifest,
+    so a corrupt/truncated manifest caused mass deletion of valid shards.
+    Now orphans are kept and reported unless ``prune=True`` is passed explicitly.
+    """
+    shards = manifest.get("shards") or []
+    if not isinstance(shards, list):
+        raise RuntimeError("Manifest 'shards' must be a list")
+    committed = {str(s.get("shard_file")) for s in shards if isinstance(s, dict) and s.get("shard_file")}
+    orphans = [p for p in output_dir.glob("shard_*.parquet") if p.name not in committed]
+    if orphans:
+        if prune:
+            for path in orphans:
+                try:
+                    path.unlink()
+                    print(f"[PRUNE] removed orphan shard {path.name}")
+                except OSError as exc:
+                    print(f"[WARN] could not remove orphan shard {path.name}: {exc}")
+        else:
+            names = ", ".join(sorted(p.name for p in orphans))
+            print(f"[WARN] found {len(orphans)} orphan shard(s) not in manifest (kept): {names}. "
+                  f"Pass prune=True/--prune to delete them.")
+    rows = sum(int(s.get("row_count", 0)) for s in shards if isinstance(s, dict))
+    total = int(manifest.get("total_rows", 0))
+    if rows != total:
+        print(f"[WARN] manifest total_rows={total} != sum(shard row_counts)={rows}; repairing total_rows.")
+        manifest["total_rows"] = rows
     return manifest
 
 
 def process_dataset(name: str, config: dict, output_dir: Path, temp_dir: Path, max_rows: int, shard_rows: int,
-                    compression: Optional[str], clean_temp: bool) -> None:
+                    compression: Optional[str], clean_temp: bool, prune: bool = False) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
-    manifest = reconcile_output(output_dir, read_manifest(output_dir))
+    manifest = reconcile_output(output_dir, read_manifest(output_dir), prune=prune)
     total_rows = int(manifest["total_rows"])
     if max_rows and total_rows >= max_rows:
         print(f"[COMPLETE] {name}: row limit already reached.")
@@ -237,6 +271,8 @@ def parse_args():
     p.add_argument("--languages", nargs="+", choices=["hindi", "english", "openthoughts", "all"], default=["all"])
     p.add_argument("--temp_dir", default="./datasets/.temp_raw")
     p.add_argument("--no_clean_temp", action="store_true")
+    p.add_argument("--prune", action="store_true",
+                   help="Delete orphan shard_*.parquet files not listed in manifest.json (default: keep them)")
     return p.parse_args()
 
 
@@ -250,7 +286,7 @@ def main():
     temp = Path(args.temp_dir)
     for name in langs:
         process_dataset(name, DATASET_CONFIGS[name], root / name, temp / name, args.max_rows, args.shard_rows,
-                        compression, not args.no_clean_temp)
+                        compression, not args.no_clean_temp, prune=args.prune)
 
 
 if __name__ == "__main__":
