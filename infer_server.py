@@ -2,18 +2,18 @@
 """Local SmaulLinear server with chat UI."""
 
 import argparse
+import asyncio
 import json
-import threading
 import time
 import uuid
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
-from inference import LinearInference
+from inference import MODEL_WINDOW, LinearInference
 
 HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -25,27 +25,28 @@ let messages=[],busy=false;const $=id=>document.getElementById(id),input=$('inpu
 
 
 class Message(BaseModel):
-    role: str
-    content: str
+    role: Literal["user", "assistant", "tool"]
+    content: str = Field(max_length=50_000)
 
 
 class ChatRequest(BaseModel):
     model: str = "smaul-linear"
-    messages: List[Message]
+    messages: List[Message] = Field(min_length=1, max_length=100)
     max_tokens: int = Field(256, ge=1, le=4096)
     temperature: float = Field(0.7, ge=0, le=5)
     top_p: float = Field(0.95, gt=0, le=1)
     top_k: int = Field(50, ge=0)
     repetition_penalty: float = Field(1.05, ge=0.5, le=2)
     stream: bool = True
-    system: Optional[str] = None
+    system: Optional[str] = Field(default=None, max_length=10_000)
 
 
-def create_app(engine: LinearInference, max_prompt_tokens: int = 4096):
+def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW):
     if max_prompt_tokens < 1:
         raise ValueError("max_prompt_tokens must be positive")
+    if max_prompt_tokens > 4096:
+        raise ValueError("max_prompt_tokens must be <= 4096")
     app = FastAPI(title="SmaulLinear", version="0.2.0")
-    model_lock = threading.Lock()
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -60,32 +61,80 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = 4096):
         return {"object": "list", "data": [{"id": "smaul-linear", "object": "model", "owned_by": "SmaulNative"}]}
 
     @app.post("/v1/chat/completions")
-    async def chat(req: ChatRequest):
+    async def chat(req: ChatRequest, request: Request):
         msgs = [m.model_dump() for m in req.messages]
         system = req.system or "You are SmaulLinear, a helpful local AI assistant. Be concise, accurate, and practical."
-        prompt = engine.chat_prompt(msgs, system)
-        prompt_tokens = len(engine.encode(prompt))
+        # Fast char guard BEFORE expensive tokenization (OOM/CPU guard).
+        total_chars = sum(len(m.get("content", "")) for m in msgs) + len(system)
+        if total_chars > max_prompt_tokens * 4 + 10_000:
+            raise HTTPException(413, f"prompt too large ({total_chars} chars)")
+        try:
+            prompt = engine.chat_prompt(msgs, system)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            prompt_tokens = len(engine.encode(prompt))
+        except Exception as exc:
+            raise HTTPException(400, f"could not tokenize prompt: {exc}") from exc
         if prompt_tokens > max_prompt_tokens:
             raise HTTPException(413, f"prompt exceeds {max_prompt_tokens} tokens ({prompt_tokens})")
         created = int(time.time())
         request_id = "chatcmpl-" + uuid.uuid4().hex
 
-        def chunks():
-            with model_lock:
-                for text in engine.stream(prompt, max_new_tokens=req.max_tokens, temperature=req.temperature,
-                                          top_k=req.top_k, top_p=req.top_p, repetition_penalty=req.repetition_penalty):
+        async def chunks():
+            try:
+                # Run blocking generation in a thread so the event loop stays
+                # responsive; the model is stateless per-request (no shared KV),
+                # so no global lock is needed (lock starved all requests).
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue = asyncio.Queue()
+
+                def _produce():
+                    try:
+                        for text in engine.stream(
+                            prompt, max_new_tokens=req.max_tokens, temperature=req.temperature,
+                            top_k=req.top_k, top_p=req.top_p,
+                            repetition_penalty=req.repetition_penalty):
+                            loop.call_soon_threadsafe(queue.put_nowait, ("data", text))
+                    except Exception as exc:  # surface as SSE error, not silent cut
+                        loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+                    finally:
+                        loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+                import threading
+                worker = threading.Thread(target=_produce, daemon=True)
+                worker.start()
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    kind, payload = await queue.get()
+                    if kind == "done":
+                        break
+                    if kind == "error":
+                        yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
+                            "created": created, "model": req.model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "error",
+                                         "error": payload}]}) + "\n\n"
+                        break
                     yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk", "created": created,
-                        "model": req.model, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}) + "\n\n"
+                        "model": req.model, "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}]}) + "\n\n"
                 yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk", "created": created,
                     "model": req.model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}) + "\n\n"
                 yield "data: [DONE]\n\n"
+            except Exception as exc:
+                yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
 
         if req.stream:
             return StreamingResponse(chunks(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-        with model_lock:
-            text = engine.generate(prompt, max_new_tokens=req.max_tokens, temperature=req.temperature,
-                                   top_k=req.top_k, top_p=req.top_p, repetition_penalty=req.repetition_penalty)
+        if await request.is_disconnected():
+            raise HTTPException(499, "client disconnected")
+        try:
+            text = await asyncio.to_thread(
+                engine.generate, prompt, req.max_tokens, req.temperature,
+                req.top_k, req.top_p, req.repetition_penalty)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         return JSONResponse({"id": request_id, "object": "chat.completion", "created": created, "model": req.model,
                              "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]})
 
@@ -93,14 +142,17 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = 4096):
 
 
 def main():
-    p = argparse.ArgumentParser(description="SmaulLinear server")
+    p = argparse.ArgumentParser(description="SmaulLinear server (local only; no auth — do not expose)")
     p.add_argument("--model", default="./runs/linear")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--dtype", default="auto", choices=["auto", "fp32", "bf16"])
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--max-prompt-tokens", type=int, default=4096)
+    p.add_argument("--max-prompt-tokens", type=int, default=MODEL_WINDOW,
+                   help=f"max prompt tokens (default {MODEL_WINDOW} = model window)")
     args = p.parse_args()
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"[WARN] binding to {args.host} exposes unauthenticated inference to the network")
     engine = LinearInference(args.model, args.device, args.dtype)
     uvicorn.run(create_app(engine, args.max_prompt_tokens), host=args.host, port=args.port)
 
