@@ -51,9 +51,7 @@ class Lion:
             if m._gw is None: continue
             g = m._gw.float().contiguous()
             st = self.m.setdefault(m, torch.zeros_like(g))
-            upd = (st * self.b1 + g * (1 - self.b1)).sign() * self.lr
-            st.mul_(self.b2).add_(g, alpha=1 - self.b2)
-            m.requant(upd, self.lr * self.wd)
+            m.fused_lion_requant(g, st, self.lr, self.wd, self.b1, self.b2)
         for p in self.p:
             if p.grad is None: continue
             g = p.grad.float()
@@ -93,6 +91,7 @@ def main():
     a.add_argument("--d", type=int, default=512)
     a.add_argument("--layers", type=int, default=8)
     a.add_argument("--heads", type=int, default=8)
+    a.add_argument("--precision", choices=("fp8", "fp32"), default="fp8")
     a.add_argument("--ctx", type=int, default=256)
     a.add_argument("--batch", type=int, default=2)
     a.add_argument("--steps", type=int, default=1000)
@@ -109,7 +108,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     tok = _tok(args)
     tok.save(args.tokenizer)
-    cfg = LinearConfig(vocab_size=args.vocab, d_model=args.d, n_layer=args.layers, n_heads=args.heads)
+    cfg = LinearConfig(vocab_size=args.vocab, d_model=args.d, n_layer=args.layers, n_heads=args.heads,
+                       precision=args.precision)
     model = SmaulLinear(cfg)
     opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd)
     wrap = load_tokenizer(args.tokenizer)
