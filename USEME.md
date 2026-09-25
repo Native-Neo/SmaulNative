@@ -11,7 +11,6 @@ repo root.
 - [dataset.py](docs/dataset.md)
 - [train.py](docs/train.md)
 - [RQT](docs/rqt.md) -- real packed FP4/FP6/FP8 training
-- [qat.py](docs/qat.md)
 - [rwkv_x_core.py](docs/rwkv_x_core.md)
 - [merge_moe.py](docs/merge_moe.md)
 - [CPU Optimizations](docs/cpu.md)
