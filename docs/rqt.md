@@ -29,14 +29,17 @@ The forward pass calls `compute.get_backend()` (default `cpu`, see [cpu.md](cpu.
   FP32 weight matrix is never materialized.
 
 For the backward pass, input gradients flow through the same backend path, while weight
-gradients accumulate in FP32 into the module's `_gw` buffer (`g.T @ x`, summed over
-micro-batches) and are consumed by the Lion step.
+gradients accumulate in FP32 into the module's `_gw` buffer output-block by
+output-block (`g2[:, o0:o1].T @ x2`, summed over micro-batches) -- no full-matrix `dW`
+transient is ever built.
 
 ## Training step
 
-`train.Lion` clips the global grad norm to `1.0`, applies a sign update, and calls
-`requant(update, lr * wd)` on each FP8 module: decode the current tiles, apply weight
-decay and the update in FP32, then re-quantize. `_gw` is cleared afterwards.
+`train.Lion` clips the global grad norm to `1.0`, then each FP8 module applies its sign
+update blockwise via `fused_lion_requant`: per 64-row output block, the Lion step is
+computed from the FP32 momentum slice, the block's tiles are decoded, decay and update
+are applied in FP32, and the block is re-quantized in place. Full-matrix `upd`
+temporaries are never built. `_gw` is cleared afterwards.
 
 ## Export
 
