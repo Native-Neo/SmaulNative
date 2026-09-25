@@ -212,18 +212,35 @@ class SwiFFN_MoE(nn.Module):
         # No silent clamp: misconfig must fail fast instead of training a
         # different MoE than requested.
         self.top_k = cfg.num_experts_per_tok
+        self.num_experts = cfg.num_experts
         self.experts = nn.ModuleList([SwiFFN(cfg) for _ in range(cfg.num_experts)])
         self.gate = nn.Linear(cfg.d_model, cfg.num_experts, bias=False)
+
+    def balance_loss(self, prob: torch.Tensor) -> torch.Tensor:
+        # Switch-Transformer style load-balancing aux loss. Top-k routing is
+        # non-differentiable, so without this the gate collapses to 1-2 experts.
+        # Callers add `1e-2 * moe.balance_loss(prob)` during training.
+        density = prob.mean(0)
+        return (density * density * self.num_experts).sum()
+
     def forward(self, x):
+        # NOTE: top-k routing is non-differentiable; the gate only learns via
+        # straight-through on topv weights. Monitor expert usage and add
+        # balance_loss() during training to prevent collapse.
         prob = torch.softmax(self.gate(x.float()), -1)
         topv, topi = torch.topk(prob, self.top_k, -1)
-        topv = topv / topv.sum(-1, keepdim=True).clamp_min(1e-9)
+        denom = topv.sum(-1, keepdim=True)
+        # Guard tiny denominators (would explode weights); fall back to uniform.
+        tiny = denom.squeeze(-1) < 1e-6
+        topv = torch.where(tiny.unsqueeze(-1), torch.full_like(topv, 1.0 / self.top_k),
+                           topv / denom.clamp_min(1e-9))
         out = torch.zeros_like(x.float())
         for e, expert in enumerate(self.experts):
             w = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(-1, keepdim=True)
             m = (w.squeeze(-1) > 0)
             if m.any():
-                out[m] += expert(x[m]).float() * w[m]
+                xm = x[m].contiguous()
+                out[m] += expert(xm).float() * w[m]
         return out.to(x.dtype if x.is_floating_point() else torch.float32)
 
 class Block(nn.Module):
