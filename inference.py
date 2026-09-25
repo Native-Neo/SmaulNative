@@ -2,6 +2,7 @@
 """Inference engine for SmaulLinear FP8 checkpoints."""
 
 import random
+import warnings
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -9,6 +10,10 @@ import torch
 
 from smaul_linear import SmaulLinear
 from tokenizer import SmaulTokenizer
+
+MODEL_WINDOW = 512
+MAX_PROMPT_TOKENS = 4096
+_ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
 
 class _IncrementalDecoder:
@@ -46,9 +51,17 @@ class LinearInference:
         self.device = torch.device(device)
         self.model = SmaulLinear.from_pretrained(self.model_dir).to(self.device)
         self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
+        # Fail fast on checkpoint/tokenizer mismatch (silent wrong-tokenization).
+        cfg_vocab = self.model.cfg.vocab_size
+        tok_vocab = self.tokenizer.get_vocab_size()
+        if cfg_vocab != tok_vocab:
+            raise ValueError(
+                f"checkpoint vocab_size ({cfg_vocab}) != tokenizer vocab ({tok_vocab}); "
+                f"retrain tokenizer with matching --vocab or fix {self.model_dir}")
         self.eos_id = self.tokenizer.eos_token_id
         self.bos_id = self.tokenizer.bos_token_id
         self.last_prompt_tokens = 0
+        self.truncated_prompt = False
         if dtype != "auto":
             if dtype not in {"fp32", "bf16"}:
                 raise ValueError(f"unsupported dtype: {dtype}")
@@ -97,6 +110,12 @@ class LinearInference:
                 remove[1:] = remove[:-1].clone()
                 remove[0] = False
                 logits[candidate_idx[order[remove]]] = -float("inf")
+        if not bool(torch.isfinite(logits).any()):
+            # Aggressive top_k/top_p (or all-masked logits) left nothing to
+            # sample; end gracefully instead of multinomial RuntimeError.
+            if self.eos_id is not None:
+                return self.eos_id
+            return int(torch.argmax(logits.nan_to_num(0.0)).item())
         return int(torch.multinomial(torch.softmax(logits, dim=-1), 1).item())
 
     @torch.inference_mode()
@@ -109,12 +128,20 @@ class LinearInference:
         tokens = self.encode(prompt)
         if not tokens:
             tokens = [self.bos_id] if self.bos_id is not None else [self.eos_id]
+        if len(tokens) > MAX_PROMPT_TOKENS:
+            raise ValueError(f"prompt too long: {len(tokens)} tokens (max {MAX_PROMPT_TOKENS})")
         self.last_prompt_tokens = len(tokens)
+        self.truncated_prompt = len(tokens) > MODEL_WINDOW
+        if self.truncated_prompt:
+            warnings.warn(
+                f"prompt truncated to last {MODEL_WINDOW} tokens "
+                f"({len(tokens)} provided); early context is ignored",
+                RuntimeWarning, stacklevel=3)
         return tokens
 
     def _validate(self, max_new_tokens: int, temperature: float, top_k: int, top_p: float, repetition_penalty: float):
-        if max_new_tokens < 0:
-            raise ValueError("max_new_tokens must be non-negative")
+        if not 1 <= max_new_tokens <= 4096:
+            raise ValueError(f"max_new_tokens must be in [1, 4096], got {max_new_tokens}")
         if temperature < 0:
             raise ValueError("temperature must be non-negative")
         if top_k < 0:
@@ -136,8 +163,10 @@ class LinearInference:
         if seed is not None:
             random.seed(seed)
             torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
         ids = self._prepare(prompt)
-        logits, _ = self._forward(ids[-512:])
+        logits, _ = self._forward(ids[-MODEL_WINDOW:])
         recent = ids[-128:]
         stops = [s for s in (stop or []) if s]
         decoder = _IncrementalDecoder(self.tokenizer)
@@ -149,6 +178,10 @@ class LinearInference:
                 break
             recent = (recent + [token])[-128:]
             ids.append(token)
+            # Sliding window: model only sees the last MODEL_WINDOW tokens.
+            # Keep ids bounded so long generations do not grow RAM/CPU linearly.
+            if len(ids) > MODEL_WINDOW + max_new_tokens:
+                del ids[:len(ids) - (MODEL_WINDOW + max_new_tokens)]
             pending += decoder.push(token)
             stop_pos = min((pending.find(s) for s in stops if pending.find(s) >= 0), default=-1)
             if stop_pos >= 0:
@@ -163,14 +196,33 @@ class LinearInference:
             elif pending:
                 yield pending
                 pending = ""
-            logits, _ = self._forward(ids[-512:])
+            logits, _ = self._forward(ids[-MODEL_WINDOW:])
         if pending:
             yield pending
 
+    @staticmethod
+    def _sanitize_content(content: str) -> str:
+        # Prevent role spoofing like "System:\n..." inside user content from
+        # becoming a fake turn when formatted as "Role:\ncontent".
+        lines = str(content).splitlines()
+        cleaned = []
+        for line in lines:
+            if line.strip().lower() in ("system:", "assistant:", "user:", "tool:"):
+                cleaned.append(line.strip() + " (quoted)")
+            else:
+                cleaned.append(line)
+        return "\n".join(cleaned)
+
     def chat_prompt(self, messages: List[Dict[str, str]], system: Optional[str] = None) -> str:
-        parts = [f"System:\n{system}\n"] if system else []
+        parts = [f"System:\n{self._sanitize_content(system)}\n"] if system else []
         for msg in messages:
-            parts.append(f"{msg.get('role', 'user').capitalize()}:\n{msg.get('content', '')}\n")
+            role = str(msg.get("role", "user")).lower()
+            if role not in _ALLOWED_ROLES:
+                raise ValueError(f"invalid role {msg.get('role')!r}; expected one of {sorted(_ALLOWED_ROLES)}")
+            if role == "system":
+                raise ValueError("pass system instructions via `system=`, not messages with role='system'")
+            content = self._sanitize_content(msg.get("content", ""))
+            parts.append(f"{role.capitalize()}:\n{content}\n")
         parts.append("Assistant:\n")
         return "\n".join(parts)
 
