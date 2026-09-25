@@ -48,7 +48,9 @@ def _coerce_str(value: Any) -> Optional[str]:
     return None
 
 
-def filter_text(text: Any, dataset: str = "auto", min_chars: int = 20, max_chars: int = 1_000_000) -> Optional[str]:
+def filter_text(text: Any, dataset: str = "auto", min_chars: int = 20, max_chars: int = 1_000_000,
+                min_unique: int = 8, min_dev: int = 8, min_latin: int = 12,
+                dev_ratio: float = 0.20, latin_ratio: float = 0.50) -> Optional[str]:
     if min_chars < 0 or max_chars < 0 or min_chars > max_chars:
         raise ValueError(f"require 0 <= min_chars <= max_chars, got {min_chars}/{max_chars}")
     if not isinstance(text, str):
@@ -61,19 +63,22 @@ def filter_text(text: Any, dataset: str = "auto", min_chars: int = 20, max_chars
         return None
     if "\ufffd" in text or _URL_ONLY.fullmatch(text):
         return None
-    if len(set(text.replace(" ", ""))) < 8:
+    # set() on 1M-char strings is slow; sample first 50k chars for diversity.
+    if len(set(text.replace(" ", "")[:50_000])) < min_unique:
         return None
     if dataset == "hindi":
-        if len(_DEVANAGARI.findall(text)) < 8 or _ratio(_DEVANAGARI, text) < 0.20:
+        if len(_DEVANAGARI.findall(text)) < min_dev or _ratio(_DEVANAGARI, text) < dev_ratio:
             return None
     elif dataset == "english":
-        if len(_LATIN.findall(text)) < 12 or _ratio(_LATIN, text) < 0.50:
+        if len(_LATIN.findall(text)) < min_latin or _ratio(_LATIN, text) < latin_ratio:
             return None
+    # "auto"/"openthoughts": no script gate (lenient); mixed bilingual text
+    # should use --dataset auto or tune thresholds explicitly.
     return text
 
 
 def filter_record(record: dict[str, Any], dataset: str = "auto", min_chars: int = 20,
-                  max_chars: int = 1_000_000) -> Optional[str]:
+                  max_chars: int = 1_000_000, **kwargs) -> Optional[str]:
     if not isinstance(record, dict):
         return None
     lower = {str(key).lower(): value for key, value in record.items()}
@@ -92,7 +97,7 @@ def filter_record(record: dict[str, Any], dataset: str = "auto", min_chars: int 
             if coerced and coerced.strip():
                 value = coerced
                 break
-    return filter_text(value, dataset, min_chars, max_chars)
+    return filter_text(value, dataset, min_chars, max_chars, **kwargs)
 
 
 def main() -> None:
@@ -100,12 +105,20 @@ def main() -> None:
     p.add_argument("--dataset", choices=["auto", "hindi", "english", "openthoughts"], default="auto")
     p.add_argument("--min_chars", type=int, default=20)
     p.add_argument("--max_chars", type=int, default=1_000_000)
+    p.add_argument("--min_unique", type=int, default=8)
+    p.add_argument("--min_dev", type=int, default=8)
+    p.add_argument("--min_latin", type=int, default=12)
+    p.add_argument("--dev_ratio", type=float, default=0.20)
+    p.add_argument("--latin_ratio", type=float, default=0.50)
     args = p.parse_args()
     kept = 0
     for line in sys.stdin:
         try:
             record = json.loads(line)
-            text = filter_record(record, args.dataset, args.min_chars, args.max_chars)
+            text = filter_record(record, args.dataset, args.min_chars, args.max_chars,
+                                 min_unique=args.min_unique, min_dev=args.min_dev,
+                                 min_latin=args.min_latin, dev_ratio=args.dev_ratio,
+                                 latin_ratio=args.latin_ratio)
             if text is None:
                 continue
             print(json.dumps({"text": text}, ensure_ascii=False), flush=True)
