@@ -10,10 +10,19 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from fp8_tile import fp8_modules
 from smaul_linear import SmaulLinear
 from tokenizer import SmaulTokenizer
 from train import Lion
+
+
+def _seed_all(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed % (2 ** 32))
+    except ImportError:
+        pass
 
 
 class SmaulRL:
@@ -101,8 +110,7 @@ class SmaulRL:
                  seed: Optional[int] = None) -> Tuple[str, List[int], List[float]]:
         self._validate_gen(max_new_tokens, temperature, top_k, top_p)
         if seed is not None:
-            torch.manual_seed(seed)
-            random.seed(seed)
+            _seed_all(seed)
         was_training = self.model.training
         self.model.eval()
         try:
