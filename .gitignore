@@ -1,4 +1,7 @@
 __pycache__
+*.pyc
+*.pyo
+.pytest_cache/
 datasets
 cleaned_datasets
 SmaulNative
