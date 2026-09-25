@@ -4,12 +4,14 @@
 import argparse
 import asyncio
 import json
+import os
 import time
 import uuid
 from typing import List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -41,12 +43,24 @@ class ChatRequest(BaseModel):
     system: Optional[str] = Field(default=None, max_length=10_000)
 
 
-def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW):
+def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW,
+               api_token: Optional[str] = None):
     if max_prompt_tokens < 1:
         raise ValueError("max_prompt_tokens must be positive")
     if max_prompt_tokens > 4096:
         raise ValueError("max_prompt_tokens must be <= 4096")
     app = FastAPI(title="SmaulLinear", version="0.2.0")
+    bearer = HTTPBearer(auto_error=False)
+
+    async def check_auth(request: Request,
+                         creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)):
+        expected = api_token or os.environ.get("SMAUL_API_TOKEN")
+        if not expected:
+            return
+        token = creds.credentials if creds else request.headers.get("X-API-Key", "")
+        if token != expected:
+            raise HTTPException(401, "invalid API token")
+        return
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -61,7 +75,7 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW):
         return {"object": "list", "data": [{"id": "smaul-linear", "object": "model", "owned_by": "SmaulNative"}]}
 
     @app.post("/v1/chat/completions")
-    async def chat(req: ChatRequest, request: Request):
+    async def chat(req: ChatRequest, request: Request, _auth=Depends(check_auth)):
         msgs = [m.model_dump() for m in req.messages]
         system = req.system or "You are SmaulLinear, a helpful local AI assistant. Be concise, accurate, and practical."
         # Fast char guard BEFORE expensive tokenization (OOM/CPU guard).
@@ -142,19 +156,21 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW):
 
 
 def main():
-    p = argparse.ArgumentParser(description="SmaulLinear server (local only; no auth — do not expose)")
+    p = argparse.ArgumentParser(description="SmaulLinear server (local only unless --api-token is set)")
     p.add_argument("--model", default="./runs/linear")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--dtype", default="auto", choices=["auto", "fp32", "bf16"])
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--api-token", default=None,
+                   help="Require Bearer token (or SMAUL_API_TOKEN env) for /v1/chat/completions")
     p.add_argument("--max-prompt-tokens", type=int, default=MODEL_WINDOW,
                    help=f"max prompt tokens (default {MODEL_WINDOW} = model window)")
     args = p.parse_args()
-    if args.host not in ("127.0.0.1", "localhost", "::1"):
-        print(f"[WARN] binding to {args.host} exposes unauthenticated inference to the network")
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not (args.api_token or os.environ.get("SMAUL_API_TOKEN")):
+        print(f"[WARN] binding to {args.host} without --api-token exposes open inference to the network")
     engine = LinearInference(args.model, args.device, args.dtype)
-    uvicorn.run(create_app(engine, args.max_prompt_tokens), host=args.host, port=args.port)
+    uvicorn.run(create_app(engine, args.max_prompt_tokens, api_token=args.api_token), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
