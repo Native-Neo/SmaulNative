@@ -42,3 +42,11 @@ python tokenizer.py decode --tokenizer ./tokenizer.json --ids "1 2 3"
 
 `SmaulTokenizer.encode()` returns a list-like object with an `.ids` property for compatibility with the
 training code.
+
+## Automatic tokenizer
+
+`train.py` builds the tokenizer itself via `ensure_tokenizer`: an existing file is reused
+only when its vocabulary size matches `--vocab` and its format version is current
+(version 6, `tokenizer.VERSION`); otherwise it is rebuilt from the training data. The
+manual `train` command above uses the same builder with defaults `--vocab-size 32000`
+and `--word-budget 20000`.
