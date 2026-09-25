@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 datasets/
 cleaned_datasets/
+SmaulNative/
 runs/
 rl/
 *.safetensors
