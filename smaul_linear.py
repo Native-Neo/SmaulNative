@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
+from compute import get_backend
 from fp8_tile import FP8Linear
 
 @dataclass
@@ -22,12 +23,39 @@ class LinearConfig:
     is_moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
+    precision: str = "fp8"
     tokenizer_sha256: str = ""
     dataset_fingerprint: str = ""
+
+    def __post_init__(self):
+        if self.precision not in ("fp8", "fp32"):
+            raise ValueError(f"unknown precision {self.precision!r}; expected 'fp8' or 'fp32'")
 
     def save(self, p: Path): Path(p).write_text(json.dumps(asdict(self), indent=2))
     @classmethod
     def load(cls, p: Path): return cls(**json.loads(Path(p).read_text()))
+
+def _linear(cfg: LinearConfig, in_f: int, out_f: int, bias: bool = False) -> nn.Module:
+    """Precision-selected linear layer: tiled-E4M3 FP8 or plain FP32."""
+    if cfg.precision == "fp8":
+        return FP8Linear(in_f, out_f, cfg.tile)
+    if cfg.precision == "fp32":
+        return _DenseLinear(in_f, out_f, bias=bias)
+    raise ValueError(f"unknown precision {cfg.precision!r}; expected 'fp8' or 'fp32'")
+
+class _DenseLinear(nn.Module):
+    """Plain-FP32 linear with FP8Linear-compatible dtype behavior.
+
+    Computes in float32 and returns the input dtype, so the surrounding model
+    code (bf16 activations, fp32 attention core) is identical in both modes.
+    """
+
+    def __init__(self, in_f: int, out_f: int, bias: bool = False):
+        super().__init__()
+        self.lin = nn.Linear(in_f, out_f, bias=bias)
+
+    def forward(self, x):
+        return self.lin(x.float()).to(x.dtype if x.is_floating_point() else torch.float32)
 
 class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-6):
@@ -46,10 +74,10 @@ class LinearAttention(nn.Module):
         assert d % self.nh == 0
         self.hd = d // self.nh
         self.eps = cfg.eps
-        self.q = FP8Linear(d, d, cfg.tile)
-        self.k = FP8Linear(d, d, cfg.tile)
-        self.v = FP8Linear(d, d, cfg.tile)
-        self.o = FP8Linear(d, d, cfg.tile)
+        self.q = _linear(cfg, d, d)
+        self.k = _linear(cfg, d, d)
+        self.v = _linear(cfg, d, d)
+        self.o = _linear(cfg, d, d)
 
     def forward(self, x):
         B, T, _ = x.shape
@@ -59,27 +87,85 @@ class LinearAttention(nn.Module):
         v = self.v(x).float().view(B, T, H, D)
         q = F.elu(q) + 1.0
         k = F.elu(k) + 1.0
-        k = k / (k.norm(dim=-1, keepdim=True).clamp_min(1e-6))
-        S = torch.zeros(B, H, D, D, dtype=torch.float32, device=x.device)
-        z = torch.zeros(B, H, D, dtype=torch.float32, device=x.device)
-        ys = []
-        for t in range(T):
-            kt, vt, qt = k[:, t], v[:, t], q[:, t]
-            S = S + kt.unsqueeze(-1) @ vt.unsqueeze(-2)
-            z = z + kt
-            num = (qt.unsqueeze(-2) @ S).squeeze(-2)
-            den = (qt * z).sum(-1, keepdim=True).clamp_min(self.eps)
-            ys.append(num / den)
-        y = torch.stack(ys, 1).reshape(B, T, -1)
+        y = _LinearAttnFn.apply(q, k, v, self.eps).reshape(B, T, -1)
         return self.o(y.to(x.dtype if x.is_floating_point() else torch.float32))
+
+
+def _attn_reference(Q, K, V, eps):
+    """Pure-torch linear-attention recurrence (exact math reference).
+
+    Same formulas as the native kernel: elu+1 feature map applied by the
+    caller, per-step key normalization, FP32 S/z state, causal steps, no
+    softmax, no QK^T.
+    """
+    B, T, H, D = Q.shape
+    S = torch.zeros(B, H, D, D, dtype=torch.float32, device=Q.device)
+    z = torch.zeros(B, H, D, dtype=torch.float32, device=Q.device)
+    ys = []
+    for t in range(T):
+        kt, vt, qt = K[:, t], V[:, t], Q[:, t]
+        kt = kt / kt.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        S = S + kt.unsqueeze(-1) @ vt.unsqueeze(-2)
+        z = z + kt
+        num = (qt.unsqueeze(-2) @ S).squeeze(-2)
+        den = (qt * z).sum(-1, keepdim=True).clamp_min(eps)
+        ys.append(num / den)
+    return torch.stack(ys, 1)
+
+
+def _attn_reference_backward(dY, Q, K, V, eps):
+    """Gradients via autograd through the reference recurrence."""
+    wants = (Q.requires_grad, K.requires_grad, V.requires_grad)
+    Qr = Q.detach().requires_grad_(wants[0])
+    Kr = K.detach().requires_grad_(wants[1])
+    Vr = V.detach().requires_grad_(wants[2])
+    with torch.enable_grad():
+        Yr = _attn_reference(Qr, Kr, Vr, eps)
+        outs = [t for t, w in zip((Qr, Kr, Vr), wants) if w]
+        grads = torch.autograd.grad(Yr, outs, dY, allow_unused=True) if outs else []
+    it = iter(grads)
+    return tuple(next(it) if w else None for w in wants)
+
+
+class _LinearAttnFn(torch.autograd.Function):
+    """Linear-attention op: native AVX1 kernel with reference fallback.
+
+    Forward runs the backend kernel (native when available). Backward runs the
+    backend two-pass kernel, or autograd through the reference recurrence when
+    native is unavailable. Q/K/V must already carry the elu+1 feature map; key
+    normalization happens inside the op. Tensors are saved for backward only
+    when grads are needed.
+    """
+
+    @staticmethod
+    def forward(ctx, Q, K, V, eps):
+        be = get_backend()
+        need = Q.requires_grad or K.requires_grad or V.requires_grad
+        Y, DEN = be.attn_forward(Q, K, V, eps, need)
+        if need:
+            ctx.save_for_backward(Q, K, V, Y, DEN) if DEN is not None else ctx.save_for_backward(Q, K, V, Y)
+            ctx.has_den = DEN is not None
+            ctx.eps = eps
+        return Y
+
+    @staticmethod
+    def backward(ctx, dY):
+        saved = ctx.saved_tensors
+        Q, K, V, Y = saved[0], saved[1], saved[2], saved[3]
+        DEN = saved[4] if ctx.has_den else None
+        be = get_backend()
+        dQ, dK, dV = be.attn_backward(dY, Q, K, V, Y, DEN, ctx.eps)
+        return (dQ if Q.requires_grad else None,
+                dK if K.requires_grad else None,
+                dV if V.requires_grad else None, None)
 
 class SwiFFN(nn.Module):
     def __init__(self, cfg: LinearConfig):
         super().__init__()
         h = int(cfg.d_model * cfg.ffn_mult)
-        self.gate = FP8Linear(cfg.d_model, h, cfg.tile)
-        self.up = FP8Linear(cfg.d_model, h, cfg.tile)
-        self.down = FP8Linear(h, cfg.d_model, cfg.tile)
+        self.gate = _linear(cfg, cfg.d_model, h)
+        self.up = _linear(cfg, cfg.d_model, h)
+        self.down = _linear(cfg, h, cfg.d_model)
     def forward(self, x):
         return self.down((F.silu(self.gate(x).float()) * self.up(x).float()).to(x.dtype if x.is_floating_point() else torch.float32))
 
