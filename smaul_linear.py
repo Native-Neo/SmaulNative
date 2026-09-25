@@ -1,5 +1,6 @@
 import json
 import math
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -30,15 +31,43 @@ class LinearConfig:
     def __post_init__(self):
         if self.precision not in ("fp8", "fp32"):
             raise ValueError(f"unknown precision {self.precision!r}; expected 'fp8' or 'fp32'")
+        for name in ("vocab_size", "d_model", "n_layer", "n_heads", "tile", "num_experts",
+                     "num_experts_per_tok"):
+            v = getattr(self, name)
+            if not isinstance(v, int) or v <= 0:
+                raise ValueError(f"{name} must be a positive int, got {v!r}")
+        if not isinstance(self.ffn_mult, (int, float)) or not math.isfinite(self.ffn_mult) \
+                or self.ffn_mult <= 0:
+            raise ValueError(f"ffn_mult must be positive finite, got {self.ffn_mult!r}")
+        if not isinstance(self.eps, float) or not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError(f"eps must be positive finite, got {self.eps!r}")
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
+        if self.is_moe and self.num_experts_per_tok > self.num_experts:
+            raise ValueError(
+                f"num_experts_per_tok ({self.num_experts_per_tok}) > num_experts ({self.num_experts})")
 
     def save(self, p: Path): Path(p).write_text(json.dumps(asdict(self), indent=2))
     @classmethod
-    def load(cls, p: Path): return cls(**json.loads(Path(p).read_text()))
+    def load(cls, p: Path):
+        try:
+            data = json.loads(Path(p).read_text())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"could not load config {p}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"config {p} must contain a JSON object")
+        try:
+            return cls(**data)
+        except TypeError as exc:
+            raise ValueError(f"invalid config {p}: {exc}") from exc
 
 def _linear(cfg: LinearConfig, in_f: int, out_f: int, bias: bool = False) -> nn.Module:
     """Precision-selected linear layer: tiled-E4M3 FP8 or plain FP32."""
+    if in_f <= 0 or out_f <= 0:
+        raise ValueError(f"in_f/out_f must be positive, got {in_f}/{out_f}")
     if cfg.precision == "fp8":
-        return FP8Linear(in_f, out_f, cfg.tile)
+        # FP8Linear supports bias; honor it so fp8/fp32 modes do not diverge.
+        return FP8Linear(in_f, out_f, cfg.tile, bias)
     if cfg.precision == "fp32":
         return _DenseLinear(in_f, out_f, bias=bias)
     raise ValueError(f"unknown precision {cfg.precision!r}; expected 'fp8' or 'fp32'")
@@ -60,6 +89,8 @@ class _DenseLinear(nn.Module):
 class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-6):
         super().__init__()
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError(f"RMSNorm eps must be positive finite, got {eps!r}")
         self.weight = nn.Parameter(torch.ones(d, dtype=torch.float32))
         self.eps = eps
     def forward(self, x):
@@ -71,7 +102,8 @@ class LinearAttention(nn.Module):
     def __init__(self, cfg: LinearConfig):
         super().__init__()
         d, self.nh = cfg.d_model, cfg.n_heads
-        assert d % self.nh == 0
+        if d % self.nh != 0:
+            raise ValueError(f"d_model ({d}) must be divisible by n_heads ({self.nh})")
         self.hd = d // self.nh
         self.eps = cfg.eps
         self.q = _linear(cfg, d, d)
@@ -172,9 +204,14 @@ class SwiFFN(nn.Module):
 class SwiFFN_MoE(nn.Module):
     def __init__(self, cfg: LinearConfig):
         super().__init__()
-        self.top_k = min(cfg.num_experts, cfg.num_experts_per_tok)
-        if self.top_k < 1:
-            raise ValueError("num_experts_per_tok must be >= 1")
+        if cfg.num_experts < 1 or cfg.num_experts_per_tok < 1:
+            raise ValueError("num_experts and num_experts_per_tok must be >= 1")
+        if cfg.num_experts_per_tok > cfg.num_experts:
+            raise ValueError(
+                f"num_experts_per_tok ({cfg.num_experts_per_tok}) > num_experts ({cfg.num_experts})")
+        # No silent clamp: misconfig must fail fast instead of training a
+        # different MoE than requested.
+        self.top_k = cfg.num_experts_per_tok
         self.experts = nn.ModuleList([SwiFFN(cfg) for _ in range(cfg.num_experts)])
         self.gate = nn.Linear(cfg.d_model, cfg.num_experts, bias=False)
     def forward(self, x):
@@ -218,8 +255,9 @@ class SmaulLinear(nn.Module):
         self.cfg = cfg
         self.emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         with torch.no_grad():
+            # Keep embedding in FP32 so Lion sign-steps (lr ~2e-4, below bf16
+            # eps at magnitude ~0.02) do not stagnate; cast to bf16 on forward.
             self.emb.weight.data.normal_(0, 0.02)
-            self.emb.weight.data = self.emb.weight.data.to(torch.bfloat16)
         self.n0 = RMSNorm(cfg.d_model, cfg.eps)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.nf = RMSNorm(cfg.d_model, cfg.eps)
@@ -242,13 +280,24 @@ class SmaulLinear(nn.Module):
         out = Path(out)
         out.mkdir(parents=True, exist_ok=True)
         sd = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()}
-        save_file(sd, str(out / "model.safetensors"))
+        tmp = out / "model.safetensors.tmp"
+        save_file(sd, str(tmp))
+        os.replace(tmp, out / "model.safetensors")
         self.cfg.save(out / "config.json")
 
     @classmethod
-    def from_pretrained(cls, d: Path):
+    def from_pretrained(cls, d: Path, device: str = "cpu"):
         from safetensors.torch import load_file
         d = Path(d)
         m = cls(LinearConfig.load(d / "config.json"))
-        m.load_state_dict(load_file(str(d / "model.safetensors")), strict=True)
+        try:
+            sd = load_file(str(d / "model.safetensors"), device=device)
+        except RuntimeError as exc:
+            raise RuntimeError(f"could not load checkpoint {d}: {exc}") from exc
+        try:
+            m.load_state_dict(sd, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"checkpoint incompatible with config (fp8<->fp32 key change w8/sc vs weight?): {exc}"
+            ) from exc
         return m
