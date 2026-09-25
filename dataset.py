@@ -93,6 +93,7 @@ def _looks_numeric(s: str) -> bool:
 
 _WARNED_FILES: set = set()
 _WARNED_COUNT: int = 0
+_WARNED_MAX_FILES = 1000
 
 
 def extract_text(obj: Any, source_path: Optional[str] = None, _depth: int = 0) -> str:
@@ -113,7 +114,7 @@ def extract_text(obj: Any, source_path: Optional[str] = None, _depth: int = 0) -
         candidates = [v for v in obj.values() if isinstance(v, str) and not _looks_numeric(v)]
         if candidates:
             global _WARNED_COUNT
-            if source_path and source_path not in _WARNED_FILES:
+            if source_path and source_path not in _WARNED_FILES and len(_WARNED_FILES) < _WARNED_MAX_FILES:
                 _WARNED_FILES.add(source_path)
                 _WARNED_COUNT += 1
                 if _WARNED_COUNT <= 5:
@@ -347,6 +348,8 @@ DEFAULT_STOP_TOKEN = "\n\n"
 
 
 def _add_speaker_and_signal(conversations: List[Dict]) -> List[Dict]:
+    # system/tool turns are context-only (masked in loss by design): the model
+    # learns to FOLLOW them, not to predict them.
     out = []
     for sentence in conversations:
         if not isinstance(sentence, dict):
