@@ -1,3 +1,1 @@
-# Keep the native Rust implementation visible to GitHub Linguist.
-rust/**/*.rs linguist-language=Rust
-rust/*.rs linguist-language=Rust
+# No language overrides needed (native kernels are C++; GitHub detects them).
