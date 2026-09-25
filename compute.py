@@ -73,13 +73,17 @@ class CpuBackend:
     def fp8_forward(self, x, w, s, in_f, out_f, tile):
         e = self._load()
         if e is not None and x.device.type == "cpu":
-            return e.fp8_forward(x, w.reshape(-1), s.reshape(-1), in_f, out_f, tile)
+            xc = x if x.is_contiguous() else x.contiguous()
+            wc = w.reshape(-1).contiguous()
+            sc = s.reshape(-1).contiguous()
+            return e.fp8_forward(xc, wc, sc, in_f, out_f, tile)
         return _torch_forward(x, w, s, in_f, out_f, tile)
 
     def fp8_backward_input(self, g, w, s, in_f, out_f, tile):
         e = self._load()
         if e is not None and g.device.type == "cpu":
-            return e.fp8_backward_input(g, w.reshape(-1).contiguous(), s.reshape(-1).contiguous(), in_f, out_f, tile)
+            gc = g if g.is_contiguous() else g.contiguous()
+            return e.fp8_backward_input(gc, w.reshape(-1).contiguous(), s.reshape(-1).contiguous(), in_f, out_f, tile)
         return _torch_backward_input(g, w, s, in_f, out_f, tile)
 
     def _load_attn(self):
