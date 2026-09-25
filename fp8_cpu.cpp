@@ -31,6 +31,19 @@ static const float* fp8_lut() {
   return g_lut_table;
 }
 
+// NOTE: native uses AVX mul+add (no FMA: -ffp-contract=off) while the torch
+// fallback may fuse multiply-add. Expect ~1e-7 relative divergence between
+// paths; both are exact vs the FP8 decode, just different FP32 rounding.
+// The exact-size fast path (MR==32/OB==64/Kr==64) uses AVX; all remainders
+// use the scalar path (slower, same math).
+static inline bool cpu_has_avx() {
+#if defined(__x86_64__) || defined(__i386__)
+  return __builtin_cpu_supports("avx");
+#else
+  return false;
+#endif
+}
+
 // Forward: block over rows (MR) x outputs (OB). Each [OB x K] weight tile is
 // decoded ONCE into a transposed stack buffer shared by all MR rows.
 static void fp8_forward_task(const float* xp, const uint8_t* wp, const float* sp, float* yp,
@@ -40,9 +53,10 @@ static void fp8_forward_task(const float* xp, const uint8_t* wp, const float* sp
   for (int64_t r = 0; r < MR; ++r)
     for (int64_t o = 0; o < OBR; ++o) acc[r][o] = 0.0f;
   float wt[64][64];
+  const bool use_avx = cpu_has_avx();
   for (int64_t kt = 0; kt < in_f; kt += 64) {
     const int64_t Kr = std::min<int64_t>(64, in_f - kt);
-    if (MR == 32 && OBR == 64 && Kr == 64) {
+    if (use_avx && MR == 32 && OBR == 64 && Kr == 64) {
       for (int64_t k2 = 0; k2 < 64; ++k2) {
         const int64_t st = (kt + k2) / tile;
         for (int64_t o2 = 0; o2 < 64; o2 += 8) {
@@ -136,9 +150,10 @@ static void fp8_backward_task(const float* gp, const uint8_t* wp, const float* s
   for (int64_t r = 0; r < RB; ++r)
     for (int64_t k = 0; k < IBR; ++k) acc[r][k] = 0.0f;
   float wsub[64][8];
+  const bool use_avx = cpu_has_avx();
   for (int64_t ob = 0; ob < out_f; ob += 64) {
     const int64_t OBR = std::min<int64_t>(64, out_f - ob);
-    if (RB == 16 && IBR == 8 && OBR == 64) {
+    if (use_avx && RB == 16 && IBR == 8 && OBR == 64) {
       for (int64_t o2 = 0; o2 < 64; ++o2) {
         const int64_t o = ob + o2;
         for (int64_t k2 = 0; k2 < 8; ++k2)
