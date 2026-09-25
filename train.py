@@ -168,7 +168,28 @@ def _tok(args, out: Path):
     if not files:
         raise RuntimeError(f"no training files found in {data_dir}")
     texts = (t for t, _, _ in iter_texts(files))
-    return ensure_tokenizer(tp, texts, args.vocab), tp
+    max_records = max(0, int(getattr(args, "tok_records", 0) or 0))
+    return ensure_tokenizer(tp, texts, args.vocab, max_records=max_records), tp
+
+
+def _sha_file(p: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _dataset_fingerprint(files) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for p in sorted(str(p) for p in files):
+        try:
+            h.update(f"{p}:{(Path(p).stat().st_size)}".encode())
+        except OSError:
+            h.update(p.encode())
+    return h.hexdigest()[:16]
 
 def main():
     a = argparse.ArgumentParser()
@@ -189,10 +210,13 @@ def main():
     a.add_argument("--grad_clip", type=float, default=1.0)
     a.add_argument("--log_every", type=int, default=10)
     a.add_argument("--save_every", type=int, default=200)
-    a.add_argument("--tok_records", type=int, default=200000)
+    a.add_argument("--tok_records", type=int, default=200000,
+                   help="Max records for automatic tokenizer training (0 = unlimited)")
     a.add_argument("--threads", type=int, default=2)
     args = a.parse_args()
     _validate_args(args)
+    if args.tok_records < 0:
+        raise ValueError(f"--tok_records must be non-negative, got {args.tok_records}")
     if args.grad_clip <= 0:
         raise ValueError(f"--grad_clip must be positive, got {args.grad_clip}")
     # Configure threads through the backend (sets OMP/MKL before torch init
@@ -206,8 +230,16 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     tok, tok_path = _tok(args, out)
     tok.save(str(tok_path))
+    try:
+        tok_sha = _sha_file(Path(tok_path))
+    except OSError:
+        tok_sha = ""
+    try:
+        ds_fp = _dataset_fingerprint(discover_files(Path(args.data)))
+    except (OSError, ValueError, RuntimeError):
+        ds_fp = ""
     cfg = LinearConfig(vocab_size=args.vocab, d_model=args.d, n_layer=args.layers, n_heads=args.heads,
-                       precision=args.precision)
+                       precision=args.precision, tokenizer_sha256=tok_sha, dataset_fingerprint=ds_fp)
     model = SmaulLinear(cfg)
     opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd, clip=args.grad_clip)
     wrap = load_tokenizer(str(tok_path))
