@@ -90,8 +90,9 @@ def convert(input_dir: Path, output: Path, dtype: str, overwrite: bool = False):
     tokens = _load_tokenizer(input_dir / "tokenizer.json")
     if len(tokens) != int(cfg["vocab_size"]):
         raise ValueError(f"tokenizer vocab is {len(tokens)}, checkpoint expects {cfg['vocab_size']}")
-    state = _dequant(load_file(str(input_dir / "model.safetensors"), device="cpu"),
-                     expected_tile=int(cfg.get("tile", 64)))
+    from fp8_tile import decode_tile
+    raw = load_file(str(input_dir / "model.safetensors"), device="cpu")
+    expected_tile = int(cfg.get("tile", 64))
     output.parent.mkdir(parents=True, exist_ok=True)
     cast = torch.float16 if dtype == "f16" else torch.float32
     tmp = output.with_suffix(output.suffix + ".tmp")
@@ -109,15 +110,38 @@ def convert(input_dir: Path, output: Path, dtype: str, overwrite: bool = False):
     writer.add_tokenizer_model("smaul")
     writer.add_token_list(tokens)
     writer.add_token_scores([0.0] * len(tokens))
-    for name, tensor in state.items():
+    # Stream tensors: dequant one FP8 weight at a time and free the source
+    # immediately, so peak RAM is ~1 tensor, not 2× the whole model.
+    count = 0
+    for orig in sorted(list(raw.keys())):
+        if orig.endswith(".sc"):
+            continue
+        tensor = raw.pop(orig)
+        name = orig
+        if orig.endswith(".w8"):
+            base = orig[:-3]
+            sc = raw.pop(base + ".sc", None)
+            if sc is None:
+                raise ValueError(f"FP8 weight {orig} has no matching {base}.sc")
+            out_f, in_f = tensor.shape
+            n_tiles = sc.shape[1]
+            tile = in_f // n_tiles
+            if tile != expected_tile:
+                raise ValueError(f"tile mismatch for {orig}: {tile} != {expected_tile}")
+            parts = [decode_tile(tensor, sc, 0, out_f, t, tile, torch.float32) for t in range(n_tiles)]
+            tensor = torch.cat(parts, 1)
+            del parts, sc
+            name = base + ".weight"
         t = tensor.to(cast).contiguous().numpy() if torch.is_floating_point(tensor) else tensor.numpy()
         writer.add_tensor(name, t)
+        count += 1
+        del tensor, t
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
     writer.close()
     os.replace(tmp, output)
-    print(f"[GGUF] wrote {output} | tensors: {len(state)} | dtype: {dtype}")
+    print(f"[GGUF] wrote {output} | tensors: {count} | dtype: {dtype}")
 
 
 def main():
