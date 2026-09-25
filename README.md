@@ -130,13 +130,14 @@ position via `start_dataset` / `start_file` / `start_record`.
 ## Resume
 
 Training checkpoints are resume-free: each save writes `model.safetensors` +
-`config.json`, the tokenizer, and `optimizer.pt` holding only the Lion
-hyperparameters (`lr`, `wd`, betas). No optimizer momentum, RNG state, or dataset
+`config.json` (with `tokenizer_sha256` + `dataset_fingerprint`), the tokenizer,
+and `optimizer.json` holding only the Lion hyperparameters (`lr`, `wd`, betas,
+`clip`). No optimizer momentum, RNG state, or dataset
 position is stored, so re-running a training command always starts from step 0.
 
 ## Testing
 
-Run the full suite (63 tests) with:
+Run the full suite (72 tests) with:
 
 ```bash
 python -m pytest -q
