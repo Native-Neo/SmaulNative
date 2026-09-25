@@ -8,78 +8,61 @@ Run commands from the repository root.
 python -m pip install -r requirements.txt
 ```
 
-For the native CPU WKV backend, `ninja` and a working C++ compiler are required.
+The native CPU FP8 extension needs `ninja` and a working C++ compiler; without them
+training still works via the torch fallback (see [cpu.md](cpu.md)).
 
-## Pretraining
+## Data
 
-Create or provide data under `./datasets`. The tokenizer is trained automatically when the configured
-`tokenizer_path` does not exist.
-
-```bash
-python train.py --cpu --mode pretrain \
-    --dataset_dir ./datasets \
-    --output_dir ./SmaulNative \
-    --ctx_len 512
-```
-
-The default model configuration is 832 hidden dimensions, 17 layers, 64-wide heads, and 3 MOBA layers.
-For CPU training, keep `ctx_len` modest because MOBA attention is quadratic in sequence length.
-
-## SFT
-
-Use conversation JSON/JSONL records shaped like:
-
-```json
-{"conversations":[{"from":"user","value":"Hello"},{"from":"assistant","value":"Hi!"}]}
-```
-
-Reuse the pretrained tokenizer:
+Download pre-tokenized shards or generate synthetic data into `./datasets`:
 
 ```bash
-python train.py --cpu --mode sft \
-    --dataset_dir ./sft_data \
-    --output_dir ./SmaulNative-SFT \
-    --tokenizer_path ./SmaulNative/tokenizer.json
+python download.py --languages hindi english --max_rows 100000
+# or: python syntheticdata.py --count 250000 --format both --output-dir ./datasets
 ```
-
-Only assistant response tokens contribute to SFT loss.
-
-## Streaming datasets
-
-For supported Hugging Face Parquet sources, pretraining can stream without storing the source dataset:
-
-```bash
-python train.py --cpu --mode pretrain \
-    --stream_dataset hindi \
-    --output_dir ./SmaulNative
-```
-
-Supported stream names are `hindi`, `english`, `openthoughts`, and `all`.
-
-## QAT
-
-```bash
-python train.py --mode sft \
-    --dataset_dir ./sft_data \
-    --output_dir ./SmaulNative-SFT \
-    --tokenizer_path ./SmaulNative/tokenizer.json \
-    --qat --qat_calib_batches 64 \
-    --qat_export_dir ./SmaulNative-int3
-```
-
-The training checkpoint remains fake-quantized FP32; `--qat_export_dir` writes the converted packed int3
-checkpoint.
 
 ## Tokenizer
 
-To train one manually:
+Train one explicitly (or let `train.py` build it automatically):
 
 ```bash
-python tokenizer.py train \
-    --fromdataset ./datasets \
-    --vocab-size 65536 \
-    --output ./tokenizer.json
+python tokenizer.py train --fromdataset ./datasets \
+    --vocab-size 8000 --output ./runs/linear/tokenizer.json
 ```
 
-The tokenizer is the project's custom word/grapheme/character vocabulary format, not a Hugging Face
-`tokenizers` BPE tokenizer.
+`--vocab-size` must equal the `--vocab` you pass to `train.py`.
+
+## Train
+
+```bash
+python train.py --data ./datasets --out ./runs/linear \
+    --tokenizer ./runs/linear/tokenizer.json \
+    --d 512 --layers 8 --heads 8 --vocab 8000 \
+    --ctx 256 --batch 2 --steps 1000 --threads 2
+```
+
+See [train.md](train.md) for all flags, the Lion optimizer, and the checkpoint format.
+
+## Inference
+
+Single prompt, interactive chat, or local server -- all load `./runs/linear` by default:
+
+```bash
+python infer_linear.py --model ./runs/linear --prompt "Hello world" --max 64
+python infer_cli.py --model ./runs/linear
+python infer_server.py --model ./runs/linear --port 8080
+```
+
+## MoE + export
+
+Merge dense checkpoints into a sparse MoE, and export a checkpoint to GGUF:
+
+```bash
+python merge_moe.py --base ./runs/base --branches ./runs/b1 ./runs/b2 --out ./runs/moe
+python convert_linear_to_gguf.py ./runs/linear ./runs/linear.gguf --dtype f16
+```
+
+## Benchmark
+
+```bash
+python cpu/benchmark_full.py --d 512 --layers 4 --ctx 256 --batch 2 --iters 10
+```
