@@ -1,80 +1,61 @@
 # train.py
 
-`train.py` is the main training entry point for pretraining and SFT.
+`train.py` is the SmaulLinear FP8 pretraining entry point: pretraining with tiled E4M3
+weights and an FP32 Lion optimizer, writing resume-free checkpoints.
 
-## Pretraining
-
-```bash
-python train.py --cpu --mode pretrain \
-    --dataset_dir ./datasets \
-    --output_dir ./SmaulNative \
-    --ctx_len 512
-```
-
-The default new-model configuration is:
-
-- hidden size: `832`
-- layers: `17`
-- head size: `64`
-- MOBA layers: `3`
-- batch size: `1`
-- learning rate: `1e-4`
-- optimizer: Lion
-
-`--cpu` enables the native CPU WKV backend and CPU thread configuration.
-
-## SFT
+## Run it
 
 ```bash
-python train.py --cpu --mode sft \
-    --dataset_dir ./sft_data \
-    --output_dir ./SmaulNative-SFT \
-    --tokenizer_path ./SmaulNative/tokenizer.json
+python train.py --data ./datasets --out ./runs/linear \
+    --tokenizer ./runs/linear/tokenizer.json \
+    --d 512 --layers 8 --heads 8 --vocab 8000 \
+    --ctx 256 --batch 2 --steps 1000 --threads 2
 ```
 
-SFT uses `SFTDataset` and masks every non-assistant token from the loss.
+| Flag | Default | What it does |
+|---|---|---|
+| `--data` | `./datasets` | dataset directory scanned by `dataset.discover_files` |
+| `--out` | `./runs/linear` | checkpoint directory |
+| `--tokenizer` | `./runs/linear/tokenizer.json` | tokenizer path (auto-trained if missing/mismatched) |
+| `--vocab` | `8000` | vocabulary size; must match the tokenizer |
+| `--d` | `512` | model width (`d_model`) |
+| `--layers` | `8` | block count (`n_layer`) |
+| `--heads` | `8` | linear-attention head count |
+| `--ctx` | `256` | training sequence length |
+| `--batch` | `2` | sequences per optimizer step |
+| `--steps` | `1000` | optimizer steps |
+| `--lr` | `2e-4` | Lion learning rate |
+| `--wd` | `0.01` | weight decay |
+| `--log_every` | `10` | log cadence (steps) |
+| `--save_every` | `200` | checkpoint cadence (steps) |
+| `--tok_records` | `200000` | reserved; currently unused |
+| `--threads` | `2` | CPU threads (`torch` + `OMP_NUM_THREADS`) |
 
-## RQT
+There are no SFT, streaming, precision, or resume flags: the trainer only pretrains.
 
-RQT is enabled separately from ordinary floating-point training:
+## Tokenizer
 
-```bash
-python train.py --cpu --mode sft --dataset_dir ./sft_data \
-    --output_dir ./SmaulNative-RQT --rqt --rqt_bits 6
-```
+The tokenizer is built automatically via `tokenizer.ensure_tokenizer`: an existing file is
+reused only when its vocabulary size equals `--vocab` and its format version is current
+(version 6); otherwise it is rebuilt from `--data` and saved to `--tokenizer`.
 
-Use `--rqt_bits 4`, `6`, or `8` for pure FP4, FP6, or FP8 RQT. Use `--mixed_rqt` for the mixed FP4/FP6/FP8 layout. RQT uses `RQTLion`; ordinary training uses the standard Lion optimizer.
+## Optimizer
 
-Unlike QAT, RQT does not retain an FP32 master weight for RQT linear layers. The packed weight is used for the forward pass and requantized after every optimizer step.
+`Lion` keeps FP32 momentum per parameter/FP8 module (betas `0.9`/`0.99`). Each step:
 
-See [rqt.md](rqt.md) for storage, checkpoint, and precision details.
+1. Clears parameter grads and per-module FP8 weight grads (`_gw`).
+2. Clips the global grad norm to `1.0`.
+3. Applies a sign update scaled by `--lr`, with decay `lr * wd` folded into the FP8
+   `requant` for quantized layers and multiplicative decay for the rest.
 
-## Streaming
+Steps with non-finite loss are skipped. `Ctrl-C` (`SIGINT`) finishes the current step,
+saves, and exits.
 
-`--stream_dataset` accepts `none`, `hindi`, `english`, `openthoughts`, or `all`. Streaming is available for pretraining only.
+## Checkpoints
 
-## Resume
+Each save writes `model.safetensors` + `config.json` (via `SmaulLinear.save_pretrained`),
+the tokenizer, and `optimizer.pt` holding only `{lr, wd, betas}`. No optimizer momentum
+or dataset position is stored, so every run trains forward from step 0 -- checkpoints are
+restart points for inference/continued training setups, not exact training resume.
 
-The checkpoint directory contains model state, optimizer state when scheduled, RNG state, and `resume_state.json`. Resume state includes the dataset position and the partially consumed token buffer. RQT optimizer state is keyed by stable module/parameter names and validates tensor shapes on restore.
-
-## Training controls
-
-Useful flags include:
-
-- `--batch_size`
-- `--epochs` (SFT)
-- `--lr`
-- `--weight_decay`
-- `--save_every`
-- `--optimizer_save_every`
-- `--precision fp32|fp16|bf16`
-- `--save_dtype fp32|fp16|bf16`
-- `--rqt`
-- `--rqt_bits 4|6|8`
-- `--rqt-state-dtype fp32|fp16|bf16`
-- `--mixed_rqt`
-- `--router_only`
-- `--compile`
-- `--cpu`
-
-Final partial pretraining batches are flushed at end-of-stream instead of being silently discarded.
+Progress lines report step, loss, tokens/sec, and stored parameter size in MiB.
