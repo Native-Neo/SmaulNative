@@ -106,7 +106,8 @@ before tuning -- see `python cpu/benchmark_full.py --help`.
 The default training configuration is `--d 512 --layers 8 --heads 8 --vocab 8000` with
 `--ctx 256 --batch 2`. `--d` controls width, `--layers` controls depth, `--vocab` must
 match the tokenizer, and `d_model` must be divisible by `n_heads`. `LinearConfig` also
-exposes `ffn_mult` (default `2.5`), `tile` (default `64`), and the MoE fields
+exposes `ffn_mult` (default `2.5`), `tile` (default `64`), `precision` (`fp8` or
+`fp32`, default `fp8`), and the MoE fields
 `is_moe`/`num_experts`/`num_experts_per_tok` (set via `merge_moe.py`, not training).
 
 For CPU training, start with a small `--ctx`: the linear-attention state is compact,
