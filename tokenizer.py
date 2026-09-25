@@ -10,7 +10,11 @@ from pathlib import Path
 SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"]
 CASE = ["<cap>", "<upper>"]
 CHATML_TAG = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>")
-TOKEN_RE = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>|\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F\u200C\u200D]+|\d+(?:\.\d+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]", re.UNICODE)
+# NOTE: Latin words split on hyphens/camelCase by design ("well-known" -> well,-,known;
+# "eBay" lowercases lossily, see case_type). Multi-char operators are single tokens.
+# Numbers cover ASCII + Devanagari digits (U+0966-096F).
+_DIGIT = r"(?:\d|[\u0966-\u096F])"
+TOKEN_RE = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>|\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F\u200C\u200D]+|" + _DIGIT + r"+(?:\." + _DIGIT + r"+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]", re.UNICODE)
 DEV_BASE = re.compile(r"[\u0900-\u097F]")
 TEXT_KEYS = ("text", "content", "document", "body", "code", "prompt", "completion", "input", "output", "question", "answer")
 VERSION = 7
@@ -240,6 +244,7 @@ def devanagari_units(text):
     out, i = [], 0
     ZWJ = "\u200d"
     ZWNJ = "\u200c"
+    cat = unicodedata.category
     while i < len(text):
         c = text[i]
         if not DEV_BASE.fullmatch(c):
@@ -253,14 +258,14 @@ def devanagari_units(text):
             if c == "्":
                 u += c
                 i += 1
-                while i < len(text) and (unicodedata.category(text[i]).startswith("M") or text[i] in (ZWJ, ZWNJ)):
+                while i < len(text) and (cat(text[i]).startswith("M") or text[i] in (ZWJ, ZWNJ)):
                     u += text[i]
                     i += 1
                 if i < len(text) and DEV_BASE.fullmatch(text[i]):
                     u += text[i]
                     i += 1
                 continue
-            if unicodedata.category(c).startswith("M") or c in (ZWJ, ZWNJ):
+            if cat(c).startswith("M") or c in (ZWJ, ZWNJ):
                 u += c
                 i += 1
                 continue
@@ -272,13 +277,17 @@ def canonical(x):
     return x.lower()
 
 def case_type(x):
-    if x.isupper(): return "upper"
-    if x[:1].isupper() and x[1:].islower(): return "cap"
+    # Lossy by design for mixed case (hELLO/eBay -> lowercase, no marker):
+    # vocab stays small at the cost of exact round-trip for odd casing.
+    if x.isupper():
+        return "upper"
+    if x[:1].isupper() and x[1:].islower():
+        return "cap"
     return None
 
 def _guaranteed():
     chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-    chars.update([" ", "\n", "\t", ".", ",", "!", "?", ";", ":", "-", "(", ")", "[", "]", "{", "}", "'", '"', "/", "\\", "|", "@", "#", "$", "%", "^", "&", "*", "+", "=", "<", ">", "~", "`"])
+    chars.update([" ", "\n", "\t", "  ", "   ", "\n\n", ".", ",", "!", "?", ";", ":", "-", "(", ")", "[", "]", "{", "}", "'", '"', "/", "\\", "|", "@", "#", "$", "%", "^", "&", "*", "+", "=", "<", ">", "~", "`"])
     for cp in range(0x0900, 0x0980):
         try:
             chars.add(chr(cp))
