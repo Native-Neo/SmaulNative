@@ -20,7 +20,8 @@
 // K arrives raw (post-elu); normalization stays inside the op so the backward
 // pass differentiates the true norm. No softmax, no QK^T materialization.
 // State is O(D^2) per (batch, head) task; nothing of sequence-length size
-// is ever stored.
+// is ever stored. Supported: D in (0, 2048] (16MB/task at D=2048). Larger D
+// raises a clear error instead of bad_alloc. T/B/H may be 0 (empty output).
 
 static inline int64_t qkv_off(int64_t b, int64_t t, int64_t h,
                               int64_t T, int64_t H, int64_t D) {
@@ -112,6 +113,10 @@ std::pair<torch::Tensor, torch::Tensor> attn_forward(torch::Tensor Q, torch::Ten
   TORCH_CHECK(B >= 0 && T >= 0 && H >= 0 && D > 0, "attn_forward: bad shape [", B, ",", T, ",", H, ",", D, "]");
   TORCH_CHECK(D <= 2048, "attn_forward: D=", D, " too large (per-task O(D^2) state would OOM); "
               "reduce d_model/n_heads");
+  if (B == 0 || T == 0 || H == 0) {
+    // Empty by design (e.g. zero-length prompt); return empty, not crash.
+    return {torch::empty_like(Q), torch::empty({0}, Q.options().dtype(torch::kFloat32))};
+  }
   auto Y = torch::empty_like(Q);
   // Always return a *defined* tensor: an undefined Tensor crashes pybind
   // conversion on the eval path (need_den==false). Callers discard this.
