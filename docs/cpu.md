@@ -1,54 +1,48 @@
-# Native CPU backend
+# Compute backend
 
-The CPU path provides a native C++ WKV forward/backward kernel and a fused C++ Lion update. The WKV
-kernel uses `at::parallel_for`; Lion uses AVX when supported by the host CPU. Both are compiled locally.
+The model (`smaul_linear.py`) and FP8 autograd (`fp8_tile.py`) never touch extensions
+directly. They call into a backend selected with `compute.get_backend()`; future backends
+register via `compute.register_backend()` without changing model code.
 
-## Enable native WKV
+## Backend selection
 
-The normal trainer uses the native backend with `--cpu`:
-
-```bash
-python train.py --cpu --mode pretrain --dataset_dir ./datasets --output_dir ./RWKV-X-256M
+```python
+from compute import get_backend
+be = get_backend()  # or get_backend("cpu")
+be.configure(threads=2)
 ```
 
-`--cpu` configures PyTorch CPU threading and replaces the Python/TorchScript WKV path with the native
-C++ implementation. The native kernel supports head sizes up to 128.
+- The name defaults to the `SMAUL_BACKEND` environment variable, falling back to `cpu`.
+- Unknown names raise `ValueError` -- there are no silent fake backends.
 
-## Thread configuration
+## CPU backend
 
-`SMAUL_CPU_THREADS` controls the configured CPU thread count. For CPUs with HyperThreading, fewer
-threads can be faster than using every logical CPU. Benchmark the value on your machine rather than
-assuming that the logical-core count is optimal.
+`CpuBackend` (`compute.py`) is the default: fully functional and independently testable.
 
-Example:
+- `configure(threads)`: defaults to `SMAUL_CPU_THREADS`, else half the logical CPUs;
+  sets `OMP_NUM_THREADS`/`MKL_NUM_THREADS` and the torch thread counts.
+- `has_native`: whether the compiled FP8 extension loaded.
+- `fp8_forward` / `fp8_backward_input`: route `(x, w8-codes, scales)` through the native
+  extension on CPU, else through the torch tiled fallback (output blocks of 64 rows,
+  one tile at a time).
 
-```bash
-SMAUL_CPU_THREADS=2 python train.py --cpu --mode pretrain --dataset_dir ./datasets --output_dir ./RWKV-X-256M
-```
+## Native extension
 
-## Benchmarks
+The extension (`smaul_fp8_ivb`, built from `fp8_cpu.cpp`) exposes `fp8_forward` and
+`fp8_backward_input` over CPU `float32` activations, `uint8` E4M3 codes, and `float32`
+scales. It is compiled for Ivy Bridge-era CPUs (`-mavx -mf16c`, explicitly *without*
+AVX2/AVX512) and loads lazily on first use; if compilation fails, a `RuntimeWarning`
+is issued once and the torch fallback is used. Do not copy a built extension between
+different CPU architectures.
 
-For a kernel-only test:
+## Benchmark
 
-```bash
-python cpu/benchmark_cpu.py --threads 2 --size 10000000
-```
-
-For packed RQT forward, backward, and fused Lion timings:
-
-```bash
-python cpu/benchmark_rqt.py --bits 6 --threads 2
-```
-
-For an end-to-end training-step benchmark:
+End-to-end training-step benchmark for the current pipeline:
 
 ```bash
-python cpu/benchmark_full.py --ctx_len 512 --steps 3
+python cpu/benchmark_full.py --d 512 --layers 4 --ctx 256 --batch 2 --iters 10 --threads 2
 ```
 
-The native WKV path parallelizes independent batch/head work while each recurrence remains sequential
-across time. MOBA attention on CPU still uses causal scaled-dot-product attention and is O(T²), so a
-smaller `--ctx_len` can have a large effect on training speed.
-
-The kernel is intentionally compiled for the host CPU. Do not copy a built extension between different
-CPU architectures.
+It prints FP8-vs-FP32 timings for linear forward/backward, attention, FFN, RMSNorms,
+residual adds, and requant, plus full-step milliseconds, tokens/sec, RSS, and stored
+FP8 vs FP32 size in MiB. Do not assume FP8 is faster; this script measures it.
