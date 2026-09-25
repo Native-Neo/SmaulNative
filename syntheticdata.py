@@ -147,29 +147,29 @@ _QUICKSORT_BY_LANG = {
             "    if (lo >= hi) return;\n"
             "    int pivot = a[(lo + hi) / 2], i = lo, j = hi;\n"
             "    while (i <= j) {\n"
-            "        while (a[i] < pivot) i++;\n"
-            "        while (a[j] > pivot) j--;\n"
+            "        while (i <= hi && a[i] < pivot) i++;\n"
+            "        while (j >= lo && a[j] > pivot) j--;\n"
             "        if (i <= j) std::swap(a[i++], a[j--]);\n"
             "    }\n"
-            "    quickSort(a, lo, j);\n"
-            "    quickSort(a, i, hi);\n"
+            "    if (lo < j) quickSort(a, lo, j);\n"
+            "    if (i < hi) quickSort(a, i, hi);\n"
             "}\n"),
     "Rust": ("fn quick_sort(arr: &mut [i32]) {\n"
              "    let len = arr.len();\n"
              "    if len <= 1 { return; }\n"
-             "    let pivot = arr[len / 2];\n"
-             "    let (mut i, mut j) = (0, len - 1);\n"
-             "    loop {\n"
-             "        while arr[i] < pivot { i += 1; }\n"
-             "        while arr[j] > pivot { j -= 1; }\n"
-             "        if i >= j { break; }\n"
-             "        arr.swap(i, j);\n"
-             "        i += 1;\n"
-             "        if j == 0 { break; } else { j -= 1; }\n"
+             "    // Lomuto partition (bounds-safe: no index ever leaves [0, len)).\n"
+             "    let pivot = arr[len - 1];\n"
+             "    let mut store = 0usize;\n"
+             "    for i in 0..len - 1 {\n"
+             "        if arr[i] < pivot {\n"
+             "            arr.swap(i, store);\n"
+             "            store += 1;\n"
+             "        }\n"
              "    }\n"
-             "    let (left, right) = arr.split_at_mut(j + 1);\n"
+             "    arr.swap(store, len - 1);\n"
+             "    let (left, right) = arr.split_at_mut(store);\n"
              "    quick_sort(left);\n"
-             "    quick_sort(right);\n"
+             "    quick_sort(&mut right[1..]);\n"
              "}\n"),
 }
 _LANG_FENCE = {"Python": "python", "JavaScript": "javascript", "C++": "cpp", "Rust": "rust"}
@@ -178,7 +178,14 @@ _LANG_FENCE = {"Python": "python", "JavaScript": "javascript", "C++": "cpp", "Ru
 def gen_sorting_algorithm_code() -> Dict[str, str]:
     algo = "Quick Sort"
     lang = random.choice(list(_QUICKSORT_BY_LANG))
-    prompt = f"Write a clean, optimized implementation of {algo} in {lang}."
+    # Combinatorial salt: random example array makes each prompt unique and
+    # raises the effective entropy from 4 variants to millions.
+    size = random.randint(5, 9)
+    example = [random.randint(0, 999) for _ in range(size)]
+    order = random.choice(["ascending", "descending"])
+    example_str = ", ".join(map(str, example))
+    prompt = (f"Write a clean, optimized implementation of {algo} in {lang} "
+              f"that sorts [{example_str}] in {order} order.")
     think = f"Demonstrate standard {algo} logic in {lang} with complexity analysis."
     code = _QUICKSORT_BY_LANG[lang]
     response = (f"Here is the implementation of **{algo}** in **{lang}**:\n\n"
@@ -266,7 +273,16 @@ _DS_FENCE = {"Python": "python", "C++": "cpp", "Java": "java"}
 def gen_data_structure_code() -> Dict[str, str]:
     ds, lang = random.choice(list(_DS_TEMPLATES))
     op_a, op_b = ("push", "pop") if ds == "Stack" else ("enqueue", "dequeue")
-    prompt = f"Implement a {ds} data structure in {lang} with {op_a}/{op_b} and an emptiness check."
+    # Combinatorial salt: capacity / thread-safety / example element.
+    capacity = random.randint(8, 4096)
+    extra = random.choice([
+        f"support up to {capacity} elements",
+        f"demonstrate with element {random.randint(1, 9999)}",
+        "make it generic over element type",
+        "include a size() method",
+    ])
+    prompt = (f"Implement a {ds} data structure in {lang} with {op_a}/{op_b}, "
+              f"an emptiness check, and {extra}.")
     think = f"Provide a standard class-based {ds} implementation in {lang}."
     response = (f"Here is a complete implementation of a **{ds}** in **{lang}**:\n\n"
                 f"```{_DS_FENCE[lang]}\n{_DS_TEMPLATES[(ds, lang)]}```\n\n"
@@ -283,7 +299,13 @@ def gen_cyber_security_qa() -> Dict[str, str]:
               ("Buffer Overflow", "Use memory-safe languages or bound-checked buffers (fgets vs gets)."),
               ("Password Hashing", "Use Argon2id or bcrypt with strong salt parameters.")]
     vuln, fix = random.choice(topics)
-    prompt = f"Explain what a {vuln} is and how software engineers can prevent it."
+    # Combinatorial salt: audience + scenario so prompts do not collide on 5 topics.
+    audience = random.choice(["a junior developer", "a code reviewer", "a backend engineer", "a student"])
+    scenario = random.choice([
+        "in a web login form", "in a REST API", "in a file-upload handler",
+        "in a session-cookie flow", f"with example id {random.randint(1000, 99999)}",
+    ])
+    prompt = f"Explain to {audience} what a {vuln} is {scenario} and how software engineers can prevent it."
     think = f"Detail threat vector for {vuln} and mitigation strategies."
     response = (f"### What is {vuln}?\n"
                 f"{vuln} is a security vulnerability where an attacker exploits system flaws to compromise confidentiality, integrity, or availability.\n\n"
@@ -294,7 +316,18 @@ def gen_cyber_security_qa() -> Dict[str, str]:
     return {"instruction": prompt, "response": response, "think": think, "domain": "cyber_security"}
 
 
+def _escape_chatml(text: str) -> str:
+    """Neutralize embedded ChatML control tags in model-generated content."""
+    return (text.replace("<|im_start|>", "<| im_start |>")
+                .replace("<|im_end|>", "<| im_end |>")
+                .replace("<think>", "< think >")
+                .replace("</think>", "< /think >"))
+
+
 def format_chatml(instruction: str, response: str, think: str = "") -> str:
+    instruction = _escape_chatml(instruction)
+    response = _escape_chatml(response)
+    think = _escape_chatml(think)
     text = f"<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n"
     if think.strip():
         text += f"<think>\n{think.strip()}\n</think>\n"
@@ -302,51 +335,131 @@ def format_chatml(instruction: str, response: str, think: str = "") -> str:
     return text
 
 
-def build_unique_dataset(target_count: int) -> List[Dict[str, str]]:
-    samples: List[Dict[str, str]] = []
-    seen_prompts: Set[str] = set()
+def iter_unique_dataset(target_count: int, seed: int | None = None, max_attempts: int | None = None):
+    """Yield ``target_count`` unique records without holding them all in RAM.
+
+    Deduplication uses a BLAKE2 hash of the normalized prompt (32 bytes per
+    entry) instead of the full prompt string. ``seed`` makes generation
+    reproducible via an isolated ``random.Random`` for generator choice
+    (global ``random`` is also seeded for the module-level generators).
+    """
+    import hashlib
+    from collections.abc import Iterator  # noqa: F401  (type hint only)
+    if target_count < 0:
+        raise ValueError("target_count must be non-negative")
+    if seed is not None:
+        random.seed(seed)
     generators = [gen_linear_equation, gen_quadratic_equation, gen_system_linear_equations,
                   gen_sorting_algorithm_code, gen_data_structure_code, gen_cyber_security_qa]
     print(f"[Generator] Synthesizing {target_count:,} 100% unique bilingual records...")
     start_t = time.time()
     attempts = 0
-    max_attempts = target_count * 10
-    while len(samples) < target_count and attempts < max_attempts:
+    limit = max_attempts if max_attempts is not None else target_count * 10
+    seen: Set[str] = set()
+    made = 0
+    while made < target_count and attempts < limit:
         attempts += 1
         item = random.choice(generators)()
         prompt_key = item["instruction"].strip().lower()
-        if prompt_key not in seen_prompts:
-            seen_prompts.add(prompt_key)
-            samples.append({"instruction": item["instruction"], "response": item["response"], "think": item.get("think", ""),
-                            "domain": item.get("domain", "general"),
-                            "text": format_chatml(item["instruction"], item["response"], item.get("think", ""))})
-            if len(samples) % 50000 == 0 or len(samples) == target_count:
-                print(f"  └─ Generated {len(samples):,} / {target_count:,} unique records ({time.time() - start_t:.2f}s)")
-    if len(samples) != target_count:
+        digest = hashlib.blake2b(prompt_key.encode("utf-8"), digest_size=16).hexdigest()
+        if digest not in seen:
+            seen.add(digest)
+            made += 1
+            yield {"instruction": item["instruction"], "response": item["response"], "think": item.get("think", ""),
+                   "domain": item.get("domain", "general"),
+                   "text": format_chatml(item["instruction"], item["response"], item.get("think", ""))}
+            if made % 50000 == 0 or made == target_count:
+                print(f"  └─ Generated {made:,} / {target_count:,} unique records ({time.time() - start_t:.2f}s)")
+    if made != target_count:
         raise RuntimeError(
             f"Could not generate {target_count:,} unique records after {attempts:,} attempts; "
-            f"generated {len(samples):,}."
+            f"generated {made:,}. Try a smaller --count or broaden the generators."
         )
-    print(f"[Generator] Uniqueness check: {len(seen_prompts):,} unique prompts out of {len(samples):,} generated.")
-    return samples
+    print(f"[Generator] Uniqueness check: {len(seen):,} unique prompts out of {made:,} generated.")
 
 
-def export_dataset(samples: List[Dict[str, str]], output_dir: Path, fmt: str = "both") -> None:
+def build_unique_dataset(target_count: int, seed: int | None = None) -> List[Dict[str, str]]:
+    if target_count < 0:
+        raise ValueError("target_count must be non-negative")
+    return list(iter_unique_dataset(target_count, seed=seed))
+
+
+def _check_overwrite(path: Path, overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Refusing to overwrite existing {path}; pass --overwrite to replace it."
+        )
+
+
+def export_dataset_iter(samples_iter, output_dir: Path, fmt: str = "both", overwrite: bool = False,
+                         total_hint: int | None = None) -> int:
+    """Stream records to disk without materializing them all in RAM.
+
+    Writes via ``*.tmp`` + atomic ``os.replace``. Returns record count.
+    """
+    from typing import Iterable  # local import to avoid cycle
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "synthetic_bilingual.jsonl"
     parquet_path = output_dir / "synthetic_bilingual.parquet"
-    print(f"\n[Export] Saving dataset files to '{output_dir}'...")
     if fmt in ["jsonl", "both"]:
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for item in samples:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        print(f"  └─ JSONL exported: {jsonl_path} ({os.path.getsize(jsonl_path) / (1024*1024):.2f} MB)")
+        _check_overwrite(jsonl_path, overwrite)
     if fmt in ["parquet", "both"]:
         if not HAVE_PYARROW:
             raise RuntimeError("Parquet export requires pyarrow; install it with 'pip install pyarrow'")
-        table = pa.Table.from_pylist(samples)
-        pq.write_table(table, parquet_path, compression="ZSTD")
+        _check_overwrite(parquet_path, overwrite)
+    print(f"\n[Export] Saving dataset files to '{output_dir}'...")
+    count = 0
+    jsonl_tmp = jsonl_path.with_suffix(".jsonl.tmp")
+    parquet_tmp = parquet_path.with_suffix(".parquet.tmp")
+    jsonl_f = open(jsonl_tmp, "w", encoding="utf-8") if fmt in ["jsonl", "both"] else None
+    pq_writer = None
+    parquet_schema = None
+    batch: List[Dict[str, str]] = []
+    PARQUET_BATCH = 10_000
+    try:
+        for item in samples_iter:
+            count += 1
+            if jsonl_f is not None:
+                jsonl_f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            if fmt in ["parquet", "both"]:
+                batch.append(item)
+                if len(batch) >= PARQUET_BATCH:
+                    table = pa.Table.from_pylist(batch)
+                    if pq_writer is None:
+                        parquet_schema = table.schema
+                        pq_writer = pq.ParquetWriter(parquet_tmp, parquet_schema, compression="zstd")
+                    pq_writer.write_table(table)
+                    batch.clear()
+        if fmt in ["parquet", "both"] and (batch or count == 0):
+            if batch:
+                table = pa.Table.from_pylist(batch)
+                if pq_writer is None:
+                    parquet_schema = table.schema
+                    pq_writer = pq.ParquetWriter(parquet_tmp, parquet_schema, compression="zstd")
+                pq_writer.write_table(table)
+                batch.clear()
+            elif count == 0:
+                # Empty dataset: still write a valid (empty) parquet with schema.
+                table = pa.Table.from_pylist([{"instruction": "", "response": "", "think": "",
+                                               "domain": "", "text": ""}]).slice(0, 0)
+                pq_writer = pq.ParquetWriter(parquet_tmp, table.schema, compression="zstd")
+    finally:
+        if jsonl_f is not None:
+            jsonl_f.close()
+        if pq_writer is not None:
+            pq_writer.close()
+    if jsonl_f is not None:
+        os.replace(jsonl_tmp, jsonl_path)
+        print(f"  └─ JSONL exported: {jsonl_path} ({os.path.getsize(jsonl_path) / (1024*1024):.2f} MB)")
+    if fmt in ["parquet", "both"]:
+        os.replace(parquet_tmp, parquet_path)
         print(f"  └─ Parquet exported: {parquet_path} ({os.path.getsize(parquet_path) / (1024*1024):.2f} MB)")
+    return count
+
+
+def export_dataset(samples: List[Dict[str, str]], output_dir: Path, fmt: str = "both",
+                   overwrite: bool = False) -> None:
+    export_dataset_iter(iter(samples), output_dir, fmt=fmt, overwrite=overwrite, total_hint=len(samples))
 
 
 def main():
@@ -354,15 +467,19 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./datasets", help="Output directory.")
     parser.add_argument("--count", type=int, default=250000, help="Number of unique synthetic samples.")
     parser.add_argument("--format", type=str, choices=["jsonl", "parquet", "both"], default="both", help="Export format.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation.")
+    parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing dataset files.")
     args = parser.parse_args()
     if args.count < 0:
         parser.error("--count must be non-negative")
     if args.format in ("parquet", "both") and not HAVE_PYARROW:
         parser.error("--format parquet/both requires pyarrow; install it with 'pip install pyarrow'")
     start_time = time.time()
-    samples = build_unique_dataset(args.count)
-    export_dataset(samples, Path(args.output_dir), fmt=args.format)
-    print(f"\n=== Dataset Generation Complete ({len(samples):,} Unique Records) in {time.time() - start_time:.2f}s! ===")
+    # Stream directly to disk so --count in the millions does not OOM.
+    count = export_dataset_iter(iter_unique_dataset(args.count, seed=args.seed),
+                                Path(args.output_dir), fmt=args.format, overwrite=args.overwrite,
+                                total_hint=args.count)
+    print(f"\n=== Dataset Generation Complete ({count:,} Unique Records) in {time.time() - start_time:.2f}s! ===")
 
 
 if __name__ == "__main__":
