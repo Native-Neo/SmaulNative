@@ -9,12 +9,16 @@ from compute import get_backend
 TILE = 64
 _OB = 64
 E4M3_MAX = 448.0
-_LUT_CACHE = {}
+_LUT_CACHE: dict = {}
+_LUT_MAX_ENTRIES = 32
 
 def _tables(device, dtype=torch.float32):
     key = (str(device), str(dtype))
     hit = _LUT_CACHE.get(key)
     if hit is not None:
+        # Refresh LRU order.
+        _LUT_CACHE.pop(key)
+        _LUT_CACHE[key] = hit
         return hit
     v = torch.empty(256, dtype=torch.float32)
     for c in range(256):
@@ -31,6 +35,8 @@ def _tables(device, dtype=torch.float32):
     out = (v.to(device=device, dtype=dtype), order.to(device),
            sval.to(device=device, dtype=dtype),
            ((sval[:-1] + sval[1:]) * 0.5).to(device=device, dtype=dtype))
+    if len(_LUT_CACHE) >= _LUT_MAX_ENTRIES:
+        _LUT_CACHE.pop(next(iter(_LUT_CACHE)))
     _LUT_CACHE[key] = out
     return out
 
@@ -38,13 +44,26 @@ def _lut(device, dtype=torch.float32):
     return _tables(device, dtype)[0]
 
 def quantize_tiles(w32, tile=TILE):
+    import warnings
+    if tile <= 0:
+        raise ValueError(f"tile must be > 0, got {tile}")
+    if w32.dim() != 2:
+        raise ValueError(f"w32 must be 2D [out_f, in_f], got dim={w32.dim()}")
+    out_f, in_f = w32.shape
+    if out_f <= 0 or in_f <= 0:
+        raise ValueError(f"out_f/in_f must be positive, got {out_f}/{in_f}")
     with torch.no_grad():
         w32 = w32.float().contiguous()
-        out_f, in_f = w32.shape
         nt = (in_f + tile - 1) // tile
         pad = nt * tile - in_f
         if pad:
             w32 = torch.cat([w32, torch.zeros(out_f, pad, dtype=w32.dtype, device=w32.device)], 1)
+        nonfinite = int((~torch.isfinite(w32)).sum())
+        if nonfinite:
+            # Previously silently saturated to max-finite with a tiny scale,
+            # hiding divergence. Warn so training issues surface.
+            warnings.warn(f"quantize_tiles: {nonfinite} non-finite weight(s) saturated to finite E4M3",
+                          RuntimeWarning, stacklevel=2)
         _, order, _, bounds = _tables(w32.device, torch.float32)
         blk = w32.reshape(out_f, nt, tile)
         amax = torch.where(torch.isfinite(blk), blk.abs(), 0.0).amax(dim=2).clamp_min(1e-12)
@@ -82,7 +101,12 @@ class _Fn(torch.autograd.Function):
         if mod.training:
             if mod._gw is None:
                 mod._gw = torch.zeros(out_f, in_f, dtype=torch.float32, device=g2.device)
+            elif mod._gw.device != g2.device:
+                # Device changed mid-training (e.g. .to(device)); migrate.
+                mod._gw = mod._gw.to(g2.device)
             gw = mod._gw
+            if gw.shape != (out_f, in_f):
+                raise RuntimeError(f"_gw shape {tuple(gw.shape)} != ({out_f}, {in_f})")
             for o0 in range(0, out_f, _OB):
                 o1 = min(o0 + _OB, out_f)
                 gw[o0:o1].add_(g2[:, o0:o1].T @ x2)
@@ -91,16 +115,19 @@ class _Fn(torch.autograd.Function):
 class FP8Linear(nn.Module):
     def __init__(self, in_f, out_f, tile=TILE, bias=False):
         super().__init__()
+        if in_f <= 0 or out_f <= 0:
+            raise ValueError(f"in_f/out_f must be positive, got {in_f}/{out_f}")
+        if tile <= 0:
+            raise ValueError(f"tile must be > 0, got {tile}")
         self.in_f, self.out_f, self.tile = in_f, out_f, tile
         nt = (in_f + tile - 1) // tile
-        w0 = torch.empty(out_f, in_f // 1 if in_f else 1, dtype=torch.float32)
+        w0 = torch.empty(out_f, in_f, dtype=torch.float32)
         nn.init.kaiming_uniform_(w0, a=math.sqrt(5))
         wq, sq = quantize_tiles(w0, tile)
         self.register_buffer("w8", wq)
         self.register_buffer("sc", sq)
         self.bias = nn.Parameter(torch.zeros(out_f)) if bias else None
         self._gw = None
-        self.trainable = True
 
     @classmethod
     def from_float(cls, lin, tile=TILE):
@@ -114,7 +141,8 @@ class FP8Linear(nn.Module):
         return m
 
     def forward(self, x):
-        return _Fn.apply(x, self.w8, self.sc, self.in_f, self.out_f, self.tile, self) + (0 if self.bias is None else self.bias)
+        out = _Fn.apply(x, self.w8, self.sc, self.in_f, self.out_f, self.tile, self)
+        return out if self.bias is None else out + self.bias
 
     @torch.no_grad()
     def _requant_block(self, o0, o1, update, decay):
@@ -130,6 +158,11 @@ class FP8Linear(nn.Module):
 
     @torch.no_grad()
     def requant(self, update=None, decay=0.0):
+        if update is not None:
+            if update.dim() != 2 or update.shape != (self.out_f, self.in_f):
+                raise ValueError(
+                    f"requant update must be [{self.out_f}, {self.in_f}], "
+                    f"got {tuple(update.shape)} (transposed [in_f, out_f] is a common bug)")
         for o0 in range(0, self.out_f, _OB):
             o1 = min(o0 + _OB, self.out_f)
             self._requant_block(o0, o1, update[o0:o1] if update is not None else None, decay)
