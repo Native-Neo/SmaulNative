@@ -26,9 +26,12 @@ for _sig in (signal.SIGINT, signal.SIGTERM):
         pass
 
 class Lion:
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), wd=0.01):
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), wd=0.01, clip=1.0):
         self.p = [p for p in params if p.requires_grad]
         self.lr, self.b1, self.b2, self.wd = lr, betas[0], betas[1], wd
+        if clip <= 0:
+            raise ValueError(f"clip must be positive, got {clip}")
+        self.clip = clip
         self.m = {}
     def zero_grad(self, model=None):
         for p in self.p:
@@ -66,32 +69,51 @@ class Lion:
     @torch.no_grad()
     def step(self, model):
         mods = fp8_modules(model)
-        norm = self._clip(mods)
+        norm = self._clip(mods, self.clip)
         if norm == float("inf"):
             # Non-finite grads would poison quantized weights via sign().
             # Clear them and skip the update; caller also guards loss.
             self.zero_grad(model)
             return norm
+        live = set()
         for _, m in mods:
             if m._gw is None:
                 continue
             g = m._gw.float().contiguous()
-            st = self.m.setdefault(m, torch.zeros_like(g))
+            st = self.m.get(m)
+            if st is None or st.shape != g.shape:
+                st = torch.zeros_like(g)
+                self.m[m] = st
+            elif st.device != g.device:
+                st = st.to(g.device)
+                self.m[m] = st
+            live.add(m)
             m.fused_lion_requant(g, st, self.lr, self.wd, self.b1, self.b2)
         for p in self.p:
             if p.grad is None:
                 continue
             g = p.grad.float()
-            st = self.m.setdefault(p, torch.zeros_like(p, dtype=torch.float32))
+            st = self.m.get(p)
+            if st is None or st.shape != tuple(p.shape):
+                st = torch.zeros_like(p, dtype=torch.float32)
+                self.m[p] = st
+            elif st.device != g.device:
+                st = st.to(g.device)
+                self.m[p] = st
+            live.add(p)
             upd = st.mul(self.b1).add(g, alpha=1 - self.b1).sign()
             if self.wd:
                 p.mul_(1 - self.lr * self.wd)
             p.add_(upd, alpha=-self.lr)
             st.mul_(self.b2).add_(g, alpha=1 - self.b2)
+        # Evict momentum for dead params/modules (e.g. architecture change).
+        for k in list(self.m):
+            if k not in live:
+                del self.m[k]
         return norm
     def state_dict(self):
         # Resume-free: momentum (self.m) is intentionally not saved.
-        return {"lr": self.lr, "wd": self.wd, "betas": [self.b1, self.b2]}
+        return {"lr": self.lr, "wd": self.wd, "betas": [self.b1, self.b2], "clip": self.clip}
     def load_state_dict(self, d):
         self.lr = d.get("lr", self.lr)
         self.wd = d.get("wd", self.wd)
@@ -99,6 +121,12 @@ class Lion:
         try:
             self.b1, self.b2 = float(betas[0]), float(betas[1])
         except (TypeError, IndexError, ValueError):
+            pass
+        try:
+            clip = float(d.get("clip", self.clip))
+            if clip > 0:
+                self.clip = clip
+        except (TypeError, ValueError):
             pass
 
 def _save_optimizer(out: Path, opt: "Lion") -> None:
@@ -158,12 +186,15 @@ def main():
     a.add_argument("--steps", type=int, default=1000)
     a.add_argument("--lr", type=float, default=2e-4)
     a.add_argument("--wd", type=float, default=0.01)
+    a.add_argument("--grad_clip", type=float, default=1.0)
     a.add_argument("--log_every", type=int, default=10)
     a.add_argument("--save_every", type=int, default=200)
     a.add_argument("--tok_records", type=int, default=200000)
     a.add_argument("--threads", type=int, default=2)
     args = a.parse_args()
     _validate_args(args)
+    if args.grad_clip <= 0:
+        raise ValueError(f"--grad_clip must be positive, got {args.grad_clip}")
     # Configure threads through the backend (sets OMP/MKL before torch init
     # where possible) instead of duplicating logic here.
     try:
@@ -178,7 +209,7 @@ def main():
     cfg = LinearConfig(vocab_size=args.vocab, d_model=args.d, n_layer=args.layers, n_heads=args.heads,
                        precision=args.precision)
     model = SmaulLinear(cfg)
-    opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd)
+    opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd, clip=args.grad_clip)
     wrap = load_tokenizer(str(tok_path))
     stream = PretrainStream(Path(args.data), wrap, args.ctx)
     model.train()
