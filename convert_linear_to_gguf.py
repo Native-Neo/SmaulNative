@@ -36,7 +36,7 @@ def _load_tokenizer(path: Path):
 
 
 def _dequant(state, expected_tile: int | None = None):
-    from fp8_tile import decode_tile
+    from kernel.fp8_tile import decode_tile
     out = {}
     for k, v in state.items():
         if k.endswith(".w8"):
@@ -90,7 +90,7 @@ def convert(input_dir: Path, output: Path, dtype: str, overwrite: bool = False):
     tokens = _load_tokenizer(input_dir / "tokenizer.json")
     if len(tokens) != int(cfg["vocab_size"]):
         raise ValueError(f"tokenizer vocab is {len(tokens)}, checkpoint expects {cfg['vocab_size']}")
-    from fp8_tile import decode_tile
+    from kernel.fp8_tile import decode_tile
     raw = load_file(str(input_dir / "model.safetensors"), device="cpu")
     expected_tile = int(cfg.get("tile", 64))
     output.parent.mkdir(parents=True, exist_ok=True)
