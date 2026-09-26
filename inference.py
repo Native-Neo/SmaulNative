@@ -101,7 +101,7 @@ class LinearInference:
             # bf16, which breaks the native kernel (expects f32) and degrades
             # the fallback. w8 (uint8) is unaffected; restore scales to f32.
             try:
-                from fp8_tile import fp8_modules
+                from kernel.fp8_tile import fp8_modules
                 for _, m in fp8_modules(self.model):
                     if m.sc.dtype != torch.float32:
                         m.sc.data = m.sc.data.float()
