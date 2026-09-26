@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -58,7 +59,7 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW,
         if not expected:
             return
         token = creds.credentials if creds else request.headers.get("X-API-Key", "")
-        if token != expected:
+        if not hmac.compare_digest(str(token), str(expected)):
             raise HTTPException(401, "invalid API token")
         return
 
