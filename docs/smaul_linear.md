@@ -40,7 +40,7 @@ Lion, inference, and export paths are shared.
   through an `elu + 1` feature map; the recurrent core (`_LinearAttnFn`) normalizes
   keys per step, then accumulates FP32 state `(S, z)` causally with no softmax and no
   QK^T materialization. The core runs a native AVX1 kernel when available
-  (`attn_cpu.cpp`, same Ivy Bridge-safe flags as the FP8 kernels) and falls back to
+  (`kernel/attn_cpu.cpp`, same Ivy Bridge-safe flags as the FP8 kernels) and falls back to
   the pure-torch `_attn_reference` otherwise; gradients flow through a native
   two-pass backward with the same fallback.
 - **`SwiFFN`** -- gated feed-forward (`silu(gate(x)) * up(x)` through `down`), all
