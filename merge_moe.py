@@ -29,7 +29,9 @@ def _tokenizer_bytes(d: Path) -> bytes | None:
 def merge(base_dir: Path, branch_dirs: list, out_dir: Path, top_k: int = 1, force: bool = False):
     if top_k < 1:
         raise ValueError(f"top_k must be >= 1, got {top_k}")
-    if out_dir.exists() and any(out_dir.iterdir()) and not force:
+    if out_dir.is_file():
+        raise NotADirectoryError(f"--out {out_dir} is a file, not a directory")
+    if out_dir.is_dir() and any(out_dir.iterdir()) and not force:
         raise FileExistsError(f"refusing to overwrite non-empty {out_dir}; pass --force")
     base_cfg, base_sd = _load(base_dir)
     branches = [_load(bd) for bd in branch_dirs]
