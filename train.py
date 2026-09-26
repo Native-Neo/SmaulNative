@@ -19,11 +19,16 @@ def _h(sig, fr):
     global STOP
     STOP = True
     print("\n[stop] finishing step then saving")
-for _sig in (signal.SIGINT, signal.SIGTERM):
-    try:
-        signal.signal(_sig, _h)
-    except (OSError, ValueError):
-        pass
+
+def install_handlers() -> None:
+    # Install SIGINT/SIGTERM handlers explicitly from main() only.
+    # Importing train (e.g. cpu/benchmark_full.py imports Lion) must not
+    # hijack process signals as a side effect.
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _h)
+        except (OSError, ValueError):
+            pass
 
 class Lion:
     def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), wd=0.01, clip=1.0):
@@ -186,12 +191,14 @@ def _dataset_fingerprint(files) -> str:
     h = hashlib.sha256()
     for p in sorted(str(p) for p in files):
         try:
-            h.update(f"{p}:{(Path(p).stat().st_size)}".encode())
+            st = Path(p).stat()
+            h.update(f"{p}:{st.st_size}:{st.st_mtime_ns}".encode())
         except OSError:
             h.update(p.encode())
     return h.hexdigest()[:16]
 
 def main():
+    install_handlers()
     a = argparse.ArgumentParser()
     a.add_argument("--data", default="./datasets")
     a.add_argument("--out", default="./runs/linear")
