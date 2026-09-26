@@ -3,7 +3,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from fp8_tile import fp8_modules
+from kernel.fp8_tile import fp8_modules
 from smaul_linear import LinearConfig, SmaulLinear
 from train import Lion
 
