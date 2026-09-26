@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from fp8_tile import FP8Linear, fp8_modules, quantize_tiles
+from kernel.fp8_tile import FP8Linear, fp8_modules, quantize_tiles
 from smaul_linear import LinearConfig, SmaulLinear
 
 
@@ -15,7 +15,7 @@ def test_quant_error_bounded():
     wq, sc = quantize_tiles(w)
     assert wq.dtype == torch.uint8
     assert sc.shape == (64, 2)
-    from fp8_tile import decode_tile
+    from kernel.fp8_tile import decode_tile
     rec = torch.cat([decode_tile(wq, sc, 0, 64, t) for t in range(2)], 1)
     rel = ((rec - w).abs().amax() / w.abs().amax()).item()
     assert rel < 0.08, rel
@@ -24,7 +24,7 @@ def test_quant_error_bounded():
 def test_overflow_underflow_saturate():
     w = torch.tensor([[1e30, 1e-30, 0.0, -1e30]])
     wq, sc = quantize_tiles(w)
-    from fp8_tile import decode_tile
+    from kernel.fp8_tile import decode_tile
     rec = decode_tile(wq, sc, 0, 1, 0)
     assert torch.isfinite(rec).all()
     assert rec[0, 2] == 0
@@ -130,7 +130,7 @@ def _ref_e4m3(c):
 
 
 def test_lut_matches_reference_e4m3():
-    from fp8_tile import _lut
+    from kernel.fp8_tile import _lut
     lut = _lut("cpu", torch.float64)
     errs = [abs(float(lut[c]) - _ref_e4m3(c)) for c in range(256)]
     assert max(errs) == 0.0
@@ -142,7 +142,7 @@ def test_lut_matches_reference_e4m3():
 
 def test_tile_scaling_is_dynamic():
     torch.manual_seed(11)
-    from fp8_tile import decode_tile
+    from kernel.fp8_tile import decode_tile
     w = torch.cat([torch.randn(4, 64) * 0.01, torch.randn(4, 64) * 100], 1)
     wq, sc = quantize_tiles(w)
     assert (sc[:, 1] / sc[:, 0] > 100).all()
@@ -155,7 +155,7 @@ def test_tile_scaling_is_dynamic():
 def test_nan_inf_inputs_stay_finite():
     w = torch.tensor([[float("nan"), float("inf"), float("-inf"), 1.0] * 16])
     wq, sc = quantize_tiles(w)
-    from fp8_tile import decode_tile
+    from kernel.fp8_tile import decode_tile
     rec = decode_tile(wq, sc, 0, 1, 0)
     assert torch.isfinite(rec).all(), rec
     m = FP8Linear(64, 8, tile=64).eval()
@@ -167,8 +167,8 @@ def test_nan_inf_inputs_stay_finite():
 
 
 def test_forward_matches_fp32_reference():
-    from compute import get_backend
-    from fp8_tile import decode_tile
+    from kernel.compute import get_backend
+    from kernel.fp8_tile import decode_tile
     be = get_backend()
     for in_f, out_f, rows in [(128, 64, 9), (100, 70, 5), (65, 65, 33), (512, 256, 64)]:
         torch.manual_seed(0)
@@ -183,7 +183,7 @@ def test_forward_matches_fp32_reference():
 
 
 def test_gradients_match_reference():
-    from fp8_tile import decode_tile
+    from kernel.fp8_tile import decode_tile
     for in_f, out_f, rows in [(64, 32, 7), (130, 97, 11)]:
         torch.manual_seed(1)
         m = FP8Linear(in_f, out_f).eval()
@@ -329,7 +329,7 @@ def test_merge_precision_rules(tmp_path):
 
 
 def test_attn_native_matches_reference():
-    from compute import get_backend
+    from kernel.compute import get_backend
     from smaul_linear import _attn_reference, _LinearAttnFn
     be = get_backend()
     torch.manual_seed(7)
@@ -366,7 +366,7 @@ def test_attn_backward_matches_autograd():
 
 
 def test_attn_fallback_matches_native():
-    from compute import get_backend
+    from kernel.compute import get_backend
     from smaul_linear import _attn_reference, _LinearAttnFn
     be = get_backend()
     if not be.has_attn_native:
@@ -394,7 +394,7 @@ def test_attn_fallback_matches_native():
 
 def test_block_checkpoint_matches_eager():
     import torch.utils.checkpoint as C
-    from fp8_tile import fp8_modules
+    from kernel.fp8_tile import fp8_modules
 
     def run(seed):
         torch.manual_seed(seed)
