@@ -53,6 +53,8 @@ PRESETS: dict = {
     "32K": {"vocab": 32, "d": 32, "layers": 3, "heads": 2, "ffn_mult": 2.0},
     # ~16.6K params (16K target).
     "16K": {"vocab": 96, "d": 32, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    # ~8.2K params (8K target).
+    "8K": {"vocab": 48, "d": 24, "layers": 1, "heads": 2, "ffn_mult": 2.0},
 }
 
 
