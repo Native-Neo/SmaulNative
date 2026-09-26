@@ -12,6 +12,10 @@ def main():
     p.add_argument("--model", default="./runs/linear")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--dtype", default="auto", choices=["auto", "fp32", "bf16"])
+    p.add_argument("--architecture", default=None, choices=["rawr", "plain"],
+                   help="Expected architecture (default: auto-detect from checkpoint)")
+    p.add_argument("--embedding-storage", default=None, choices=["ram", "mmap"],
+                   help="Embedding backend override (default: checkpoint's)")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--top-p", type=float, default=0.95)
@@ -20,14 +24,16 @@ def main():
     p.add_argument("--max-history", type=int, default=40,
                    help="Max chat turns kept (oldest dropped with notice)")
     args = p.parse_args()
-    if not 1 <= args.max_tokens <= 4096:
-        p.error("--max-tokens must be in [1, 4096]")
+    if not 1 <= args.max_tokens <= 65536:
+        p.error("--max-tokens must be in [1, 65536]")
     if args.temperature < 0 or args.top_k < 0 or not 0.0 < args.top_p <= 1.0 or args.repeat_penalty <= 0:
         p.error("invalid sampling args")
     if args.max_history < 2:
         p.error("--max-history must be >= 2")
 
-    engine = LinearInference(args.model, args.device, args.dtype)
+    engine = LinearInference(args.model, args.device, args.dtype,
+                             architecture=args.architecture,
+                             embedding_storage=args.embedding_storage)
     messages: list = []
     system = "You are a helpful local AI assistant. Be concise, accurate, and practical."
     print(f"SmaulLinear | {engine.vocab_size:,} vocab | {engine.device}")
