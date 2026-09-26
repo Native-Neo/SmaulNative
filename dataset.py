@@ -332,9 +332,11 @@ class PretrainStream(IterableDataset):
                 print(f"[WARN] truncating oversized document ({len(text)} chars) from {path}")
                 text = text[:max_doc_chars]
             ids = self.tokenizer.encode(text) + [self.tokenizer.eos_token_id]
-            # The buffer contains the remainder of this record after each
-            # yielded chunk, so resume must start at the following record.
-            self.last_pos = (path, rec_idx + 1)
+            # rec_idx is already the 1-based record number that iter_texts
+            # resumes from (it skips record <= resume_record / record < start).
+            # Storing rec_idx (not +1) resumes at the next record; +1 would
+            # skip one record on every resume.
+            self.last_pos = (path, rec_idx)
             for i in range(0, len(ids), subchunk):
                 buf.extend(ids[i:i + subchunk])
                 while len(buf) >= self.ctx_len + 1:
