@@ -136,6 +136,10 @@ def convert(input_dir: Path, output: Path, dtype: str, overwrite: bool = False):
         writer.add_tensor(name, t)
         count += 1
         del tensor, t
+    if raw:
+        # .sc files skipped above must have been consumed with their .w8;
+        # leftovers mean a corrupt checkpoint (orphan scales).
+        raise ValueError(f"unconverted tensors remain (orphan .sc?): {sorted(raw)}")
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
