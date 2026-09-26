@@ -5,7 +5,7 @@ A compact SmaulLinear training and inference repository with English-Hindi data 
 ## Overview
 
 - **SmaulLinear Architecture**: Linear-attention blocks with SwiGLU FFN/MoE and tiled E4M3 FP8 weights (`smaul_linear.py`, `fp8_tile.py`).
-- **Native CPU Backend**: Tiled FP8 kernels with a torch fallback plus a training-step benchmark (`compute.py`, `fp8_cpu.cpp`, `cpu/benchmark_full.py`).
+- **Native CPU Backend**: Tiled FP8 kernels with a torch fallback plus a training-step benchmark (`kernel/compute.py`, `kernel/fp8_tile.py`, `kernel/fp8_cpu.cpp`, `kernel/attn_cpu.cpp`, `benchmark.py`).
 - **Bilingual Tokenizer**: A custom word/character tokenizer with Devanagari grapheme fallback, case markers, and special tokens (`tokenizer.py`).
 - **Unified Training Pipeline**: `train.py` pretrains SmaulLinear with tiled FP8 weights, an FP32 Lion optimizer, automatic tokenizer builds, and resume-free checkpoints.
 - **MoE Upcycling**: Merge multiple dense SmaulLinear checkpoints into a sparse SwiGLU Mixture of Experts model (`merge_moe.py`).
@@ -14,14 +14,16 @@ A compact SmaulLinear training and inference repository with English-Hindi data 
 ## Project Layout
 
 ```
-├── cpu/benchmark_full.py  # SmaulLinear/FP8 training-step benchmark
+├── kernel/                # Compute backends and native CPU kernels
+│   ├── compute.py
+│   ├── fp8_tile.py
+│   ├── fp8_cpu.cpp
+│   └── attn_cpu.cpp
+├── benchmark.py           # CPU benchmark suite
 ├── docs/                  # Detailed guides and command references
 ├── tests/                 # Unit and optimization regression tests
 ├── USEME.md               # CLI cheat sheet
 ├── smaul_linear.py        # SmaulLinear model definition
-├── fp8_tile.py            # Tiled E4M3 FP8 linear layers
-├── compute.py             # Compute-backend boundary (CPU native + torch fallback)
-├── fp8_cpu.cpp            # Native AVX FP8 kernels
 ├── train.py               # SmaulLinear FP8 trainer
 ├── inference.py           # Inference engine for SmaulLinear checkpoints
 ├── infer_cli.py           # Interactive chat CLI
@@ -88,7 +90,7 @@ See [docs/rqt.md](docs/rqt.md) for the storage format, the training step, and GG
 
 ## CPU Training
 
-The CPU backend is the default compute backend (`compute.get_backend()`). Threading is
+The CPU backend is the default compute backend (`kernel.compute.get_backend()`). Threading is
 configured explicitly or via `SMAUL_CPU_THREADS`:
 
 ```bash
@@ -99,7 +101,7 @@ SMAUL_CPU_THREADS=2 python train.py --data ./datasets --out ./runs/linear
 native extension (`smaul_fp8_ivb`, built from `fp8_cpu.cpp` for Ivy Bridge-era CPUs)
 loads lazily; if the build fails, a warning is issued once and the torch tiled fallback
 takes over. Do not copy a built extension between different CPU architectures. Measure
-before tuning -- see `python cpu/benchmark_full.py --help`.
+before tuning -- see `python benchmark.py --help`.
 
 ## Configuration
 
@@ -147,5 +149,5 @@ This is the same command CI runs (`.github/workflows/test.yml`). For the FP8
 training-step benchmark instead of the test suite:
 
 ```bash
-python cpu/benchmark_full.py --d 512 --layers 4 --ctx 256 --batch 2 --iters 10
+python benchmark.py --d 512 --layers 4 --ctx 256 --batch 2 --iters 10
 ```
