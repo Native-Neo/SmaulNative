@@ -83,5 +83,5 @@ and refuses non-empty `--out` without `--force`. GGUF export refuses to overwrit
 ## Benchmark
 
 ```bash
-python cpu/benchmark_full.py --d 512 --layers 4 --ctx 256 --batch 2 --iters 10
+python benchmark.py --mode full --d 512 --layers 4 --ctx 256 --batch 2 --iters 10
 ```
