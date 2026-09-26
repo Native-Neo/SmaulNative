@@ -37,6 +37,8 @@ PRESETS: dict = {
     "8M": {"vocab": 2000, "d": 448, "layers": 3, "heads": 7, "ffn_mult": 2.0},
     # ~4.2M params (4M target).
     "4M": {"vocab": 512, "d": 256, "layers": 6, "heads": 4, "ffn_mult": 2.0},
+    # ~2.1M params (2M target).
+    "2M": {"vocab": 256, "d": 256, "layers": 3, "heads": 4, "ffn_mult": 2.0},
 }
 
 
