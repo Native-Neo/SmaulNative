@@ -8,7 +8,7 @@ the stored weight.
 
 ## Storage
 
-`fp8_tile.py` quantizes each `(out_f, in_f)` matrix in tiles of 64 columns (`TILE = 64`,
+`kernel/fp8_tile.py` quantizes each `(out_f, in_f)` matrix in tiles of 64 columns (`TILE = 64`,
 overridable per layer via `LinearConfig.tile` / `FP8Linear(..., tile)`):
 
 - `w8`: `uint8` E4M3 codes, shape `(out_f, in_f)`.
@@ -22,7 +22,7 @@ overridable per layer via `LinearConfig.tile` / `FP8Linear(..., tile)`):
 
 ## Forward / backward
 
-The forward pass calls `compute.get_backend()` (default `cpu`, see [cpu.md](cpu.md)):
+The forward pass calls `kernel.compute.get_backend()` (default `cpu`, see [cpu.md](cpu.md)):
 
 - With the native extension, tiled E4M3 forward accumulates from the codes in AVX.
 - Without it, the torch fallback decodes one bounded tile block at a time -- the full
