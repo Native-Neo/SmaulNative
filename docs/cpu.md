@@ -1,7 +1,7 @@
 # Compute backend
 
-The model (`smaul_linear.py`) and FP8 autograd (`compute.py`) never touch extensions
-directly. They call into a backend selected with `compute.get_backend()`; future backends
+The model (`smaul_linear.py`) and FP8 autograd (`kernel/compute.py`) never touch extensions
+directly. They call into a backend selected with `kernel.compute.get_backend()`; future backends
 register via `compute.register_backend()` without changing model code.
 
 ## Backend selection
@@ -17,7 +17,7 @@ be.configure(threads=2)
 
 ## CPU backend
 
-`CpuBackend` (`compute.py`) is the default: fully functional and independently testable.
+`CpuBackend` (`kernel/compute.py`) is the default: fully functional and independently testable.
 
 - `configure(threads)`: defaults to `SMAUL_CPU_THREADS`, else half the logical CPUs;
   sets `OMP_NUM_THREADS`/`MKL_NUM_THREADS` and the torch thread counts.
@@ -28,9 +28,9 @@ be.configure(threads=2)
 
 ## Native extension
 
-The extension (`smaul_fp8_ivb`, built from `fp8_cpu.cpp`) exposes `fp8_forward` and
+The extension (`smaul_fp8_ivb`, built from `kernel/fp8_cpu.cpp`) exposes `fp8_forward` and
 `fp8_backward_input` over CPU `float32` activations, `uint8` E4M3 codes, and `float32`
-scales. A second extension (`smaul_attn`, built from `attn_cpu.cpp` with the same
+scales. A second extension (`smaul_attn`, built from `kernel/attn_cpu.cpp` with the same
 flags) exposes `attn_forward` / `attn_backward` for the linear-attention recurrence
 (FP32 state, exact reference math, O(D^2) state, nothing sequence-sized stored). It is compiled for Ivy Bridge-era CPUs (`-mavx -mf16c`, explicitly *without*
 AVX2/AVX512) and loads lazily on first use; if compilation fails, a `RuntimeWarning`
@@ -42,7 +42,7 @@ different CPU architectures.
 End-to-end training-step benchmark for the current pipeline:
 
 ```bash
-python cpu/benchmark.py --mode full --d 512 --layers 4 --ctx 256 --batch 2 --iters 10 --threads 2
+python benchmark.py --mode full --d 512 --layers 4 --ctx 256 --batch 2 --iters 10 --threads 2
 ```
 
 It prints FP8-vs-FP32 timings for linear forward/backward, attention, FFN, RMSNorms,
@@ -54,5 +54,5 @@ FP8 vs FP32 size in MiB. Do not assume FP8 is faster; this script measures it.
 The Rawr/Plain x RAM/mmap experiment is also in `cpu/benchmark.py`:
 
 ```bash
-python cpu/benchmark.py --mode arch --out ./runs/arch_bench --steps 8
+python benchmark.py --mode arch --out ./runs/arch_bench --steps 8
 ```
