@@ -288,7 +288,17 @@ def process_dataset(name: str, config: dict, output_dir: Path, temp_dir: Path, m
         return
     repo_files = get_repo_files(config["repo_id"], config["path"])
     completed = set(manifest["completed_raw_files"])
-    writer = ShardWriter(output_dir, shard_rows, compression, name, config["repo_id"], len(manifest["shards"]))
+    # Orphan shards are kept by default (reconcile_output without prune), so
+    # len(shards) can collide with an on-disk shard_XXXX and os.replace would
+    # silently overwrite it. Start after the max on-disk index.
+    disk_idx = -1
+    for _p in output_dir.glob("shard_*.parquet"):
+        try:
+            disk_idx = max(disk_idx, int(_p.stem.split("_")[1]))
+        except (IndexError, ValueError):
+            continue
+    start_idx = max(len(manifest["shards"]), disk_idx + 1)
+    writer = ShardWriter(output_dir, shard_rows, compression, name, config["repo_id"], start_idx)
     last_file = manifest.get("last_raw_file")
     last_row = int(manifest.get("last_row_index", 0))
     try:
@@ -341,7 +351,17 @@ def process_dataset(name: str, config: dict, output_dir: Path, temp_dir: Path, m
         manifest["total_rows"] = total_rows
         save_manifest(output_dir, manifest)
     except BaseException:
-        writer.rows.clear()
+        # Flush (not discard) buffered rows on abort so a KeyboardInterrupt
+        # does not throw away up to shard_rows rows of progress.
+        if writer.rows:
+            try:
+                meta = writer.close()
+                if meta:
+                    manifest["shards"].append(meta)
+                manifest["total_rows"] = total_rows
+                save_manifest(output_dir, manifest)
+            except Exception as exc:
+                print(f"[WARN] could not flush partial shard: {exc}")
         raise
     print(f"[DONE] {name.upper()}: {total_rows:,} rows in {len(manifest['shards']):,} shards.")
 
