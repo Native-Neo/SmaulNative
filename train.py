@@ -18,7 +18,10 @@ from tokenizer import ensure_tokenizer
 # Effective fp32-equivalent params ~= 2*vocab*d + (5*layers+2)*d
 #   + layers*(4*d*d + 3*d*int(d*ffn_mult)). FP8 per-tile scales add ~1-2% on top.
 # Presets are added one per commit, largest first.
-PRESETS: dict = {}
+PRESETS: dict = {
+    # ~1,040M params (1.024B target).
+    "1B": {"vocab": 8000, "d": 2048, "layers": 24, "heads": 16, "ffn_mult": 2.0},
+}
 
 
 def list_presets() -> dict:
