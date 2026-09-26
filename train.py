@@ -21,6 +21,8 @@ from tokenizer import ensure_tokenizer
 PRESETS: dict = {
     # ~1,040M params (1.024B target).
     "1B": {"vocab": 8000, "d": 2048, "layers": 24, "heads": 16, "ffn_mult": 2.0},
+    # ~497M params (512M target).
+    "512M": {"vocab": 8000, "d": 1536, "layers": 20, "heads": 12, "ffn_mult": 2.0},
 }
 
 
