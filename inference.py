@@ -2,6 +2,7 @@
 """Inference engine for SmaulLinear FP8 checkpoints."""
 
 import random
+import threading
 import warnings
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -41,8 +42,12 @@ class _IncrementalDecoder:
         if token == "<upper>":
             self.case = "upper"
             return ""
-        if token in {"<pad>", "<bos>", "<eos>"} or token.startswith("<unused_"):
+        if token in {"<pad>", "<bos>", "<eos>"}:
             return ""
+        if token.startswith("<unused_"):
+            # Match tokenizer.decode(): invalid IDs surface as <unk>.
+            self.case = None
+            return "<unk>"
         if self.case == "cap":
             token = token[:1].upper() + token[1:]
         elif self.case == "upper":
@@ -74,10 +79,24 @@ class LinearInference:
         self.bos_id = self.tokenizer.bos_token_id
         self.last_prompt_tokens = 0
         self.truncated_prompt = False
+        # Serializes concurrent generate/stream calls sharing this engine
+        # (infer_server.py threads): _prepare mutates last_prompt_tokens and
+        # _seed_all touches global RNG, so unsynchronized sharing races.
+        self._gen_lock = threading.RLock()
         if dtype != "auto":
             if dtype not in {"fp32", "bf16"}:
                 raise ValueError(f"unsupported dtype: {dtype}")
             self.model = self.model.to(torch.bfloat16 if dtype == "bf16" else torch.float32)
+            # .to(bf16) also casts FP8 per-tile scales (float32 buffers) to
+            # bf16, which breaks the native kernel (expects f32) and degrades
+            # the fallback. w8 (uint8) is unaffected; restore scales to f32.
+            try:
+                from fp8_tile import fp8_modules
+                for _, m in fp8_modules(self.model):
+                    if m.sc.dtype != torch.float32:
+                        m.sc.data = m.sc.data.float()
+            except ImportError:
+                pass
         self.model.eval()
 
     @property
@@ -169,6 +188,20 @@ class LinearInference:
         return "".join(self.stream(prompt, max_new_tokens, temperature, top_k, top_p, repetition_penalty, stop, seed))
 
     def stream(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7,
+               top_k: int = 50, top_p: float = 0.95, repetition_penalty: float = 1.05,
+               stop: Optional[List[str]] = None, seed: Optional[int] = None) -> Iterable[str]:
+        # Held across yields: concurrent requests serialize instead of racing
+        # on _prepare state and global RNG. Callers must exhaust/close the
+        # iterator so the lock is released.
+        lock = getattr(self, "_gen_lock", None)
+        if lock is None:
+            # Tolerate __new__-constructed test doubles without __init__.
+            lock = self._gen_lock = threading.RLock()
+        with lock:
+            yield from self._stream_locked(prompt, max_new_tokens, temperature, top_k, top_p,
+                                           repetition_penalty, stop, seed)
+
+    def _stream_locked(self, prompt: str, max_new_tokens: int = 256, temperature: float = 0.7,
                top_k: int = 50, top_p: float = 0.95, repetition_penalty: float = 1.05,
                stop: Optional[List[str]] = None, seed: Optional[int] = None) -> Iterable[str]:
         self._validate(max_new_tokens, temperature, top_k, top_p, repetition_penalty)
