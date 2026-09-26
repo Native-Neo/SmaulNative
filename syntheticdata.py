@@ -347,6 +347,9 @@ def iter_unique_dataset(target_count: int, seed: int | None = None, max_attempts
     from collections.abc import Iterator  # noqa: F401  (type hint only)
     if target_count < 0:
         raise ValueError("target_count must be non-negative")
+    # Isolated RNG for generator choice (as documented); global random is
+    # still seeded for the module-level generators' inner randomness.
+    rng = random.Random(seed) if seed is not None else random
     if seed is not None:
         random.seed(seed)
     generators = [gen_linear_equation, gen_quadratic_equation, gen_system_linear_equations,
@@ -359,7 +362,7 @@ def iter_unique_dataset(target_count: int, seed: int | None = None, max_attempts
     made = 0
     while made < target_count and attempts < limit:
         attempts += 1
-        item = random.choice(generators)()
+        item = rng.choice(generators)()
         prompt_key = item["instruction"].strip().lower()
         digest = hashlib.blake2b(prompt_key.encode("utf-8"), digest_size=16).hexdigest()
         if digest not in seen:
