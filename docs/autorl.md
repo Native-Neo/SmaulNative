@@ -1,10 +1,10 @@
-# rl.py --auto
+# autorl.py
 
 Verified automatic RL: a small reward model (`PreferenceModel`) ranks candidates, GRPO trains
 the policy, and the reward model retrains on each confirmed label.
 
 ```bash
-python rl.py --auto --model_dir ./runs/linear --work_dir ./rl \
+python autorl.py --model_dir ./runs/linear --work_dir ./rl \
     --prompt "Explain gravity" --responses 8 --max_new_tokens 256 \
     --temperature 0.8 --top_k 50 --top_p 0.95 \
     --preference_epochs 3 --preference_lr 1e-3 \

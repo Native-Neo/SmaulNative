@@ -3,7 +3,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from rl import AutoRL, PreferenceModel
+from autorl import AutoRL, PreferenceModel
 
 
 def test_preference_model_changes_with_prompt():

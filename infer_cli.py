@@ -23,21 +23,9 @@ def main():
     p.add_argument("--max-tokens", type=int, default=256)
     p.add_argument("--max-history", type=int, default=40,
                    help="Max chat turns kept (oldest dropped with notice)")
-    p.add_argument("--prompt", default=None, help="Run one prompt and exit instead of interactive chat")
-    p.add_argument("--max", type=int, default=64, help="Max new tokens in single-prompt mode")
-    p.add_argument("--temp", type=float, default=0.7, help="Temperature in single-prompt mode")
-    p.add_argument("--topk", type=int, default=50, help="Top-k in single-prompt mode")
-    p.add_argument("--topp", type=float, default=0.95, help="Top-p in single-prompt mode")
-    p.add_argument("--rep", type=float, default=1.05, help="Repetition penalty in single-prompt mode")
     args = p.parse_args()
     if not 1 <= args.max_tokens <= 65536:
         p.error("--max-tokens must be in [1, 65536]")
-    if not 1 <= args.max <= 65536:
-        p.error("--max must be in [1, 65536]")
-    if args.temp < 0 or args.topk < 0 or not 0.0 < args.topp <= 1.0 or args.rep <= 0:
-        p.error("invalid single-prompt sampling args")
-    if args.prompt is not None and len(args.prompt) > 200_000:
-        p.error("--prompt too long")
     if args.temperature < 0 or args.top_k < 0 or not 0.0 < args.top_p <= 1.0 or args.repeat_penalty <= 0:
         p.error("invalid sampling args")
     if args.max_history < 2:
@@ -49,17 +37,6 @@ def main():
     messages: list = []
     system = "You are a helpful local AI assistant. Be concise, accurate, and practical."
     print(f"SmaulLinear | {engine.vocab_size:,} vocab | {engine.device}")
-    if args.prompt is not None:
-        started = time.perf_counter()
-        text = engine.generate(args.prompt, max_new_tokens=args.max, temperature=args.temp,
-                               top_k=args.topk, top_p=args.topp,
-                               repetition_penalty=args.rep)
-        elapsed = time.perf_counter() - started
-        tokens = len(engine.encode(text))
-        print(text)
-        print(f"[{tokens} tokens | {elapsed:.2f}s | {tokens / max(elapsed, 1e-6):.2f} tok/s]")
-        return
-
     print("Commands: /clear, /system <text>, /exit")
 
     while True:

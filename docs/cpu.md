@@ -1,6 +1,6 @@
 # Compute backend
 
-The model (`smaul_linear.py`) and FP8 autograd (`fp8_tile.py`) never touch extensions
+The model (`smaul_linear.py`) and FP8 autograd (`compute.py`) never touch extensions
 directly. They call into a backend selected with `compute.get_backend()`; future backends
 register via `compute.register_backend()` without changing model code.
 
@@ -42,9 +42,17 @@ different CPU architectures.
 End-to-end training-step benchmark for the current pipeline:
 
 ```bash
-python cpu/benchmark_full.py --d 512 --layers 4 --ctx 256 --batch 2 --iters 10 --threads 2
+python cpu/benchmark.py --mode full --d 512 --layers 4 --ctx 256 --batch 2 --iters 10 --threads 2
 ```
 
 It prints FP8-vs-FP32 timings for linear forward/backward, attention, FFN, RMSNorms,
 residual adds, and requant, plus full-step milliseconds, tokens/sec, RSS, and stored
 FP8 vs FP32 size in MiB. Do not assume FP8 is faster; this script measures it.
+
+## Architecture benchmark
+
+The Rawr/Plain x RAM/mmap experiment is also in `cpu/benchmark.py`:
+
+```bash
+python cpu/benchmark.py --mode arch --out ./runs/arch_bench --steps 8
+```
