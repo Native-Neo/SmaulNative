@@ -35,7 +35,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     model: str = "smaul-linear"
     messages: List[Message] = Field(min_length=1, max_length=100)
-    max_tokens: int = Field(256, ge=1, le=4096)
+    max_tokens: int = Field(256, ge=1, le=65536)
     temperature: float = Field(0.7, ge=0, le=5)
     top_p: float = Field(0.95, gt=0, le=1)
     top_k: int = Field(50, ge=0)
@@ -48,8 +48,8 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW,
                api_token: Optional[str] = None):
     if max_prompt_tokens < 1:
         raise ValueError("max_prompt_tokens must be positive")
-    if max_prompt_tokens > 4096:
-        raise ValueError("max_prompt_tokens must be <= 4096")
+    if max_prompt_tokens > 262144:
+        raise ValueError("max_prompt_tokens must be <= 262144")
     app = FastAPI(title="SmaulLinear", version="0.2.0")
     bearer = HTTPBearer(auto_error=False)
 
@@ -161,6 +161,10 @@ def main():
     p.add_argument("--model", default="./runs/linear")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--dtype", default="auto", choices=["auto", "fp32", "bf16"])
+    p.add_argument("--architecture", default=None, choices=["rawr", "plain"],
+                   help="Expected architecture (default: auto-detect from checkpoint)")
+    p.add_argument("--embedding-storage", default=None, choices=["ram", "mmap"],
+                   help="Embedding backend override (default: checkpoint's)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--api-token", default=None,
@@ -170,7 +174,9 @@ def main():
     args = p.parse_args()
     if args.host not in ("127.0.0.1", "localhost", "::1") and not (args.api_token or os.environ.get("SMAUL_API_TOKEN")):
         print(f"[WARN] binding to {args.host} without --api-token exposes open inference to the network")
-    engine = LinearInference(args.model, args.device, args.dtype)
+    engine = LinearInference(args.model, args.device, args.dtype,
+                             architecture=args.architecture,
+                             embedding_storage=args.embedding_storage)
     uvicorn.run(create_app(engine, args.max_prompt_tokens, api_token=args.api_token), host=args.host, port=args.port)
 
 
