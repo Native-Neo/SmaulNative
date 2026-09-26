@@ -14,6 +14,34 @@ from fp8_tile import fp8_modules
 from smaul_linear import LinearConfig, SmaulLinear
 from tokenizer import ensure_tokenizer
 
+# Named model-size presets: preset name -> dict(vocab, d, layers, heads, ffn_mult).
+# Effective fp32-equivalent params ~= 2*vocab*d + (5*layers+2)*d
+#   + layers*(4*d*d + 3*d*int(d*ffn_mult)). FP8 per-tile scales add ~1-2% on top.
+# Presets are added one per commit, largest first.
+PRESETS: dict = {}
+
+
+def list_presets() -> dict:
+    return dict(PRESETS)
+
+
+def estimate_params(vocab: int, d: int, layers: int, ffn_mult: float) -> int:
+    h = int(d * ffn_mult)
+    return 2 * vocab * d + (5 * layers + 2) * d + layers * (4 * d * d + 3 * d * h)
+
+
+def apply_preset(args) -> None:
+    name = getattr(args, "preset", None)
+    if not name:
+        return
+    try:
+        p = PRESETS[name]
+    except KeyError:
+        raise ValueError(f"unknown --preset {name!r}; use --list-presets (have {sorted(PRESETS)})") from None
+    for k in ("vocab", "d", "layers", "heads", "ffn_mult"):
+        if k in p:
+            setattr(args, k, p[k])
+
 STOP = False
 def _h(sig, fr):
     global STOP
@@ -150,6 +178,10 @@ def _validate_args(args) -> None:
         raise ValueError(f"--lr looks invalid: {args.lr}")
     if not 0 <= args.wd < 10:
         raise ValueError(f"--wd looks invalid: {args.wd}")
+    ff = getattr(args, "ffn_mult", 2.5)
+    import math as _math
+    if not isinstance(ff, (int, float)) or not _math.isfinite(ff) or ff <= 0:
+        raise ValueError(f"--ffn_mult must be positive finite, got {ff!r}")
 
 def _tok(args, out: Path):
     from tokenizer import VERSION as _TOK_VERSION
@@ -204,10 +236,14 @@ def main():
     a.add_argument("--out", default="./runs/linear")
     a.add_argument("--tokenizer", default=None,
                    help="Tokenizer path (default: <out>/tokenizer.json)")
+    a.add_argument("--preset", default=None,
+                   help="Named size preset (overrides --vocab/--d/--layers/--heads/--ffn_mult); see --list-presets")
+    a.add_argument("--list-presets", action="store_true", help="List size presets with estimated params and exit")
     a.add_argument("--vocab", type=int, default=8000)
     a.add_argument("--d", type=int, default=512)
     a.add_argument("--layers", type=int, default=8)
     a.add_argument("--heads", type=int, default=8)
+    a.add_argument("--ffn_mult", type=float, default=2.5)
     a.add_argument("--precision", choices=("fp8", "fp32"), default="fp8")
     a.add_argument("--ctx", type=int, default=256)
     a.add_argument("--batch", type=int, default=2)
@@ -221,6 +257,14 @@ def main():
                    help="Max records for automatic tokenizer training (0 = unlimited)")
     a.add_argument("--threads", type=int, default=2)
     args = a.parse_args()
+    if args.list_presets:
+        for _name in sorted(PRESETS):
+            _p = PRESETS[_name]
+            _est = estimate_params(_p["vocab"], _p["d"], _p["layers"], _p.get("ffn_mult", 2.5))
+            print(f"{_name}: vocab={_p['vocab']} d={_p['d']} layers={_p['layers']} "
+                  f"heads={_p['heads']} ffn_mult={_p.get('ffn_mult', 2.5)} ~{_est:,} params")
+        return
+    apply_preset(args)
     _validate_args(args)
     if args.tok_records < 0:
         raise ValueError(f"--tok_records must be non-negative, got {args.tok_records}")
@@ -246,6 +290,7 @@ def main():
     except (OSError, ValueError, RuntimeError):
         ds_fp = ""
     cfg = LinearConfig(vocab_size=args.vocab, d_model=args.d, n_layer=args.layers, n_heads=args.heads,
+                       ffn_mult=getattr(args, "ffn_mult", 2.5),
                        precision=args.precision, tokenizer_sha256=tok_sha, dataset_fingerprint=ds_fp)
     model = SmaulLinear(cfg)
     opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd, clip=args.grad_clip)
