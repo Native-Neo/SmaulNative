@@ -19,12 +19,12 @@ from tokenizer import ensure_tokenizer
 #   + layers*(4*d*d + 3*d*int(d*ffn_mult)). FP8 per-tile scales add ~1-2% on top.
 # Presets are added one per commit, largest first.
 PRESETS: dict = {
-    # ~1,040M params (1.024B target).
-    "1B": {"vocab": 8000, "d": 2048, "layers": 24, "heads": 16, "ffn_mult": 2.0},
-    # ~497M params (512M target).
-    "512M": {"vocab": 8000, "d": 1536, "layers": 20, "heads": 12, "ffn_mult": 2.0},
-    # ~250M params (256M target).
-    "256M": {"vocab": 8000, "d": 1280, "layers": 14, "heads": 10, "ffn_mult": 2.0},
+    # ~1,024M params (1.024B target, 64K vocab).
+    "1B": {"vocab": 65536, "d": 2048, "layers": 18, "heads": 16, "ffn_mult": 2.0},
+    # ~508M params (512M target, 64K vocab).
+    "512M": {"vocab": 65536, "d": 1536, "layers": 13, "heads": 12, "ffn_mult": 2.0},
+    # ~260M params (256M target, 64K vocab).
+    "256M": {"vocab": 65536, "d": 1024, "layers": 12, "heads": 8, "ffn_mult": 2.0},
     # ~132M params (128M target).
     "128M": {"vocab": 8000, "d": 1024, "layers": 11, "heads": 8, "ffn_mult": 2.0},
     # ~65M params (64M target).
@@ -287,6 +287,21 @@ def main():
     a.add_argument("--layers", type=int, default=8)
     a.add_argument("--heads", type=int, default=8)
     a.add_argument("--ffn_mult", type=float, default=2.5)
+    a.add_argument("--architecture", choices=("rawr", "plain"), default="rawr",
+                   help="Model architecture: Rawr sparse (default) or plain dense baseline")
+    a.add_argument("--embedding-storage", choices=("ram", "mmap"), default="ram",
+                   help="Embedding table storage (default ram)")
+    a.add_argument("--rawr-sparsity", type=float, default=0.5,
+                   help="Rawr: fraction of hidden/head connections omitted [0, 1)")
+    a.add_argument("--rawr-min-degree", type=int, default=4,
+                   help="Rawr: fallback connectivity floor per token (>= 1)")
+    a.add_argument("--rawr-dict", default=None,
+                   help="Rawr: extra dictionary file (one word per line) on top of built-ins")
+    a.add_argument("--rawr-graph-out", default=None,
+                   help="Rawr: also export the connectivity graph JSON here")
+    a.add_argument("--rawr-max-docs", type=int, default=2000,
+                   help="Rawr: max corpus docs sampled for graph edges (0 = unlimited)")
+    a.add_argument("--rawr-max-tokens-per-doc", type=int, default=1024)
     a.add_argument("--precision", choices=("fp8", "fp32"), default="fp8")
     a.add_argument("--ctx", type=int, default=256)
     a.add_argument("--batch", type=int, default=2)
@@ -332,10 +347,40 @@ def main():
         ds_fp = _dataset_fingerprint(discover_files(Path(args.data)))
     except (OSError, ValueError, RuntimeError):
         ds_fp = ""
+    arch = getattr(args, "architecture", "rawr") or "rawr"
+    storage = getattr(args, "embedding_storage", "ram") or "ram"
+    if arch not in ("rawr", "plain"):
+        raise ValueError(f"--architecture must be rawr/plain, got {arch!r}")
+    if storage not in ("ram", "mmap"):
+        raise ValueError(f"--embedding-storage must be ram/mmap, got {storage!r}")
+    rawr_graph = None
+    if arch == "rawr":
+        from rawr_graph import build_graph, print_stats, save_graph
+
+        extra_words = None
+        if getattr(args, "rawr_dict", None):
+            extra_words = [ln.strip() for ln in Path(args.rawr_dict).read_text(
+                encoding="utf-8-sig", errors="replace").splitlines() if ln.strip()]
+        data_files = discover_files(Path(args.data))
+        max_docs = int(getattr(args, "rawr_max_docs", 2000) or 0)
+        max_tpd = int(getattr(args, "rawr_max_tokens_per_doc", 1024) or 0)
+        corpus = (t for t, _, _ in iter_texts(data_files))
+        rawr_graph = build_graph(tok, corpus_texts=corpus, dict_words=extra_words,
+                                 window=1, min_degree=int(args.rawr_min_degree),
+                                 max_docs=max_docs, max_tokens_per_doc=max_tpd or 4096)
+        print(f"[rawr] graph digest={rawr_graph.digest} "
+              f"edges={len(rawr_graph.edges)} min_deg={args.rawr_min_degree}")
+        print_stats(rawr_graph)
+        if getattr(args, "rawr_graph_out", None):
+            save_graph(rawr_graph, Path(args.rawr_graph_out))
     cfg = LinearConfig(vocab_size=args.vocab, d_model=args.d, n_layer=args.layers, n_heads=args.heads,
                        ffn_mult=getattr(args, "ffn_mult", 2.5),
-                       precision=args.precision, tokenizer_sha256=tok_sha, dataset_fingerprint=ds_fp)
-    model = SmaulLinear(cfg)
+                       precision=args.precision, tokenizer_sha256=tok_sha, dataset_fingerprint=ds_fp,
+                       architecture=arch, embedding_storage=storage,
+                       rawr_sparsity=float(getattr(args, "rawr_sparsity", 0.5)),
+                       rawr_min_degree=int(getattr(args, "rawr_min_degree", 4)))
+    emb_path = (out / "embeddings.dat") if storage == "mmap" else None
+    model = SmaulLinear(cfg, rawr_graph=rawr_graph, emb_path=emb_path)
     opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd, clip=args.grad_clip)
     wrap = load_tokenizer(str(tok_path))
     stream = PretrainStream(Path(args.data), wrap, args.ctx)
