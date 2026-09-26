@@ -87,8 +87,12 @@ class CpuBackend:
         except (TypeError, ValueError):
             raise ValueError(f"threads must be an integer, got {threads!r}")
         threads = max(1, threads)
-        os.environ.setdefault("OMP_NUM_THREADS", str(threads))
-        os.environ.setdefault("MKL_NUM_THREADS", str(threads))
+        # Explicit assignment (not setdefault): an explicit --threads / configure()
+        # call must win over a stale exported OMP/MKL value, otherwise torch
+        # runs at `threads` while native OpenMP runs at the old value.
+        # Call configure() before the first backend load for this to affect OpenMP.
+        os.environ["OMP_NUM_THREADS"] = str(threads)
+        os.environ["MKL_NUM_THREADS"] = str(threads)
         torch.set_num_threads(threads)
         try:
             torch.set_num_interop_threads(1)
