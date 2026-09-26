@@ -124,7 +124,9 @@ def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str, min_c
     pf_info = None
     for attempt in range(1, meta_attempts + 1):
         try:
-            with fs.open(remote, "rb") as handle:
+            # Use live token (not import-time global fs): HF_TOKEN set after
+            # import must work for private repos.
+            with _fs().open(remote, "rb") as handle:
                 pf = pq.ParquetFile(handle)
                 column, conversation = _text_column(pf)
                 schema_names = pf.schema_arrow.names
