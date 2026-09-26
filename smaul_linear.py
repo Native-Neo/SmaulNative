@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from compute import get_backend
-from fp8_tile import FP8Linear
+from kernel.compute import get_backend
+from kernel.fp8_tile import FP8Linear
 
 @dataclass
 class LinearConfig:
