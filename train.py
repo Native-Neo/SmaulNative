@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 from dataset import PretrainStream, discover_files, iter_texts, load_tokenizer
-from fp8_tile import fp8_modules
+from kernel.fp8_tile import fp8_modules
 from smaul_linear import LinearConfig, SmaulLinear
 from tokenizer import ensure_tokenizer
 
@@ -331,7 +331,7 @@ def main():
     # Configure threads through the backend (sets OMP/MKL before torch init
     # where possible) instead of duplicating logic here.
     try:
-        from compute import get_backend
+        from kernel.compute import get_backend
         get_backend().configure(args.threads)
     except (ValueError, RuntimeError) as exc:
         raise ValueError(f"invalid --threads {args.threads}: {exc}") from exc
