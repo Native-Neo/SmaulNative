@@ -236,7 +236,9 @@ class SmaulRL:
             raise ValueError(f"non-finite GRPO loss {float(loss):.3f}; checkpoint NOT saved")
         opt.zero_grad(self.model)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([p for p in self.model.parameters() if p.requires_grad], 1.0)
+        # No explicit clip_grad_norm_ here: Lion.step() already applies global
+        # norm clipping over dense grads AND FP8 _gw. Pre-clipping dense-only
+        # would double-clip dense params while leaving _gw single-clipped.
         opt.step(self.model)
         policy_dir = self.work_dir / "policy"
         policy_dir.mkdir(parents=True, exist_ok=True)
