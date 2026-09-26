@@ -12,8 +12,8 @@ import torch
 from smaul_linear import SmaulLinear
 from tokenizer import SmaulTokenizer
 
-MODEL_WINDOW = 512
-MAX_PROMPT_TOKENS = 4096
+MODEL_WINDOW = 262144
+MAX_PROMPT_TOKENS = 65536
 _ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
 
@@ -57,7 +57,15 @@ class _IncrementalDecoder:
 
 
 class LinearInference:
-    def __init__(self, model_dir: str = "./runs/linear", device: str = "auto", dtype: str = "auto"):
+    def __init__(self, model_dir: str = "./runs/linear", device: str = "auto", dtype: str = "auto",
+                 architecture: Optional[str] = None, embedding_storage: Optional[str] = None):
+        # architecture/embedding_storage default to None = auto-detect from the
+        # checkpoint. An explicit value is validated and mismatches fail
+        # clearly instead of silently misinterpreting weights.
+        if architecture is not None and architecture not in ("rawr", "plain"):
+            raise ValueError(f"architecture must be rawr/plain, got {architecture!r}")
+        if embedding_storage is not None and embedding_storage not in ("ram", "mmap"):
+            raise ValueError(f"embedding_storage must be ram/mmap, got {embedding_storage!r}")
         self.model_dir = Path(model_dir)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,7 +74,9 @@ class LinearInference:
         if device not in {"cpu", "cuda"}:
             raise ValueError(f"unsupported device: {device}")
         self.device = torch.device(device)
-        self.model = SmaulLinear.from_pretrained(self.model_dir).to(self.device)
+        self.model = SmaulLinear.from_pretrained(
+            self.model_dir, architecture=architecture,
+            embedding_storage=embedding_storage).to(self.device)
         self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
         # Fail fast on checkpoint/tokenizer mismatch (silent wrong-tokenization).
         cfg_vocab = self.model.cfg.vocab_size
@@ -152,7 +162,10 @@ class LinearInference:
     @torch.inference_mode()
     def _forward(self, tokens: List[int]):
         ids = torch.tensor([tokens], dtype=torch.long, device=self.device)
-        logits, _ = self.model(ids)
+        # Last-token-only: the sampler reads logits[0, -1], so the full
+        # [1, T, V] head projection (e.g. ~64GiB at 256K x 64K vocab) is
+        # never materialized. Returned shape is [1, 1, V].
+        logits, _ = self.model(ids, last_only=True)
         return logits, None
 
     def _prepare(self, prompt: str):
@@ -171,8 +184,8 @@ class LinearInference:
         return tokens
 
     def _validate(self, max_new_tokens: int, temperature: float, top_k: int, top_p: float, repetition_penalty: float):
-        if not 1 <= max_new_tokens <= 4096:
-            raise ValueError(f"max_new_tokens must be in [1, 4096], got {max_new_tokens}")
+        if not 1 <= max_new_tokens <= 65536:
+            raise ValueError(f"max_new_tokens must be in [1, 65536], got {max_new_tokens}")
         if temperature < 0:
             raise ValueError("temperature must be non-negative")
         if top_k < 0:
