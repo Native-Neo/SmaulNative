@@ -27,10 +27,28 @@ class LinearConfig:
     precision: str = "fp8"
     tokenizer_sha256: str = ""
     dataset_fingerprint: str = ""
+    # Architecture selector: "plain" (dense baseline, historical behavior) or
+    # "rawr" (sparse structural variant; both use Linear Attention).
+    # Code-level default stays "plain" so existing checkpoints/tests that
+    # build LinearConfig without this field keep historical behavior; the
+    # train/infer CLIs default to "rawr" explicitly.
+    architecture: str = "plain"
+    # Embedding storage: "ram" (nn.Embedding) or "mmap" (file-backed).
+    embedding_storage: str = "ram"
+    # Rawr structural sparsity: fraction of hidden/head connections omitted.
+    rawr_sparsity: float = 0.5
+    rawr_min_degree: int = 4
+    rawr_graph_hash: str = ""
+    rawr_edge_count: int = 0
 
     def __post_init__(self):
         if self.precision not in ("fp8", "fp32"):
             raise ValueError(f"unknown precision {self.precision!r}; expected 'fp8' or 'fp32'")
+        if self.architecture not in ("plain", "rawr"):
+            raise ValueError(f"unknown architecture {self.architecture!r}; expected 'plain' or 'rawr'")
+        if self.embedding_storage not in ("ram", "mmap"):
+            raise ValueError(
+                f"unknown embedding_storage {self.embedding_storage!r}; expected 'ram' or 'mmap'")
         for name in ("vocab_size", "d_model", "n_layer", "n_heads", "tile", "num_experts",
                      "num_experts_per_tok"):
             v = getattr(self, name)
@@ -46,6 +64,15 @@ class LinearConfig:
         if self.is_moe and self.num_experts_per_tok > self.num_experts:
             raise ValueError(
                 f"num_experts_per_tok ({self.num_experts_per_tok}) > num_experts ({self.num_experts})")
+        if self.is_moe and self.architecture == "rawr":
+            raise ValueError("MoE upcycling is only supported with architecture='plain'")
+        if not isinstance(self.rawr_sparsity, (int, float)) \
+                or not 0.0 <= float(self.rawr_sparsity) < 1.0:
+            raise ValueError(f"rawr_sparsity must be in [0, 1), got {self.rawr_sparsity!r}")
+        if not isinstance(self.rawr_min_degree, int) or self.rawr_min_degree < 1:
+            raise ValueError(f"rawr_min_degree must be a positive int, got {self.rawr_min_degree!r}")
+        if not isinstance(self.rawr_edge_count, int) or self.rawr_edge_count < 0:
+            raise ValueError(f"rawr_edge_count must be non-negative, got {self.rawr_edge_count!r}")
 
     def save(self, p: Path): Path(p).write_text(json.dumps(asdict(self), indent=2))
     @classmethod
@@ -201,6 +228,75 @@ class SwiFFN(nn.Module):
     def forward(self, x):
         return self.down((F.silu(self.gate(x).float()) * self.up(x).float()).to(x.dtype if x.is_floating_point() else torch.float32))
 
+
+class SparseLinear(nn.Module):
+    """Fixed fan-in sparse FP32 linear driven by the Rawr graph.
+
+    Only ``values`` (out_f x K) are stored as parameters; column indices come
+    from the shared Rawr graph (kept as a non-persistent buffer, rebuilt from
+    ``rawr_graph.json`` on load, so per-layer storage is values-only).
+    Omitted connections consume neither storage nor FLOPs.
+    """
+
+    def __init__(self, in_f: int, out_f: int, cols):
+        super().__init__()
+        import torch as _torch
+
+        if in_f <= 0 or out_f <= 0:
+            raise ValueError(f"in_f/out_f must be positive, got {in_f}/{out_f}")
+        cols = _torch.as_tensor(cols, dtype=_torch.long)
+        if cols.dim() != 2 or cols.shape[0] != out_f:
+            raise ValueError(f"cols must be [out_f, K], got {tuple(cols.shape)}")
+        if int(cols.min()) < 0 or int(cols.max()) >= in_f:
+            raise ValueError("cols indices out of range")
+        self.in_f, self.out_f = in_f, out_f
+        self.register_buffer("cols", cols, persistent=False)
+        self.values = nn.Parameter(torch.empty(out_f, cols.shape[1], dtype=torch.float32))
+        nn.init.kaiming_uniform_(self.values, a=math.sqrt(5))
+
+    # Cap per-block transient (~128MB): x[..., cols[o0:o1]] materializes
+    # (rows, b, K), which at long contexts would otherwise blow up RAM.
+    _TRANSIENT_BUDGET = 134217728
+
+    def forward(self, x):
+        rows = x.shape[:-1].numel()
+        k = self.values.shape[1]
+        b = max(1, min(self.out_f, self._TRANSIENT_BUDGET // max(1, rows * k * 8)))
+        if b >= self.out_f:
+            gathered = x[..., self.cols]
+            out = (gathered.float() * self.values).sum(-1)
+        else:
+            outs = []
+            for o0 in range(0, self.out_f, b):
+                o1 = min(self.out_f, o0 + b)
+                outs.append((x[..., self.cols[o0:o1]].float()
+                             * self.values[o0:o1]).sum(-1))
+            out = torch.cat(outs, -1)
+        return out.to(x.dtype if x.is_floating_point() else torch.float32)
+
+
+class RawrFFN(nn.Module):
+    """SwiGLU FFN with graph-sparse projections (Rawr architecture)."""
+
+    def __init__(self, cfg: LinearConfig, graph):
+        super().__init__()
+        if graph is None:
+            raise ValueError("RawrFFN needs a Rawr graph (pass rawr_graph=)")
+        from rawr_graph import hidden_cols
+
+        h = int(cfg.d_model * cfg.ffn_mult)
+        d = cfg.d_model
+        mp = max(1, min(cfg.rawr_min_degree, d))
+        mp_h = max(1, min(cfg.rawr_min_degree, h))
+        self.gate = SparseLinear(d, h, hidden_cols(h, d, graph, cfg.rawr_sparsity, mp))
+        self.up = SparseLinear(d, h, hidden_cols(h, d, graph, cfg.rawr_sparsity, mp))
+        self.down = SparseLinear(h, d, hidden_cols(d, h, graph, cfg.rawr_sparsity, mp_h))
+
+    def forward(self, x):
+        return self.down(
+            (F.silu(self.gate(x).float()) * self.up(x).float()).to(
+                x.dtype if x.is_floating_point() else torch.float32))
+
 class SwiFFN_MoE(nn.Module):
     def __init__(self, cfg: LinearConfig):
         super().__init__()
@@ -244,14 +340,19 @@ class SwiFFN_MoE(nn.Module):
         return out.to(x.dtype if x.is_floating_point() else torch.float32)
 
 class Block(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, rawr_graph=None):
         super().__init__()
         d = cfg.d_model
         self.n1 = RMSNorm(d, cfg.eps)
         self.att = LinearAttention(cfg)
         self.n2 = RMSNorm(d, cfg.eps)
         self.n3 = RMSNorm(d, cfg.eps)
-        self.ffn = SwiFFN_MoE(cfg) if cfg.is_moe else SwiFFN(cfg)
+        if cfg.is_moe:
+            self.ffn = SwiFFN_MoE(cfg)
+        elif cfg.architecture == "rawr":
+            self.ffn = RawrFFN(cfg, rawr_graph)
+        else:
+            self.ffn = SwiFFN(cfg)
         self.n4 = RMSNorm(d, cfg.eps)
         self.n5 = RMSNorm(d, cfg.eps)
     def forward(self, x):
@@ -265,29 +366,62 @@ class Block(nn.Module):
         return self.n5((x.float() + f.float()).to(x.dtype))
 
 class SmaulLinear(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, rawr_graph=None, emb_path=None):
         super().__init__()
         if isinstance(cfg, dict):
             cfg = LinearConfig(**cfg)
         self.cfg = cfg
-        self.emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        with torch.no_grad():
-            # Keep embedding in FP32 so Lion sign-steps (lr ~2e-4, below bf16
-            # eps at magnitude ~0.02) do not stagnate; cast to bf16 on forward.
-            self.emb.weight.data.normal_(0, 0.02)
-        self.n0 = RMSNorm(cfg.d_model, cfg.eps)
-        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
-        self.nf = RMSNorm(cfg.d_model, cfg.eps)
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        with torch.no_grad():
-            nn.init.normal_(self.head.weight, 0, 0.02 / math.sqrt(2 * cfg.n_layer))
+        if cfg.architecture == "rawr" and rawr_graph is None:
+            from rawr_graph import fallback_graph
 
-    def forward(self, idx, labels=None):
+            rawr_graph = fallback_graph(cfg.vocab_size, cfg.rawr_min_degree)
+        if rawr_graph is not None and rawr_graph.vocab_size != cfg.vocab_size:
+            raise ValueError(
+                f"Rawr graph vocab {rawr_graph.vocab_size} != config vocab {cfg.vocab_size}")
+        self.rawr_graph = rawr_graph
+        from embeddings import create_embedding
+
+        # Common embedding interface: RAM (nn.Embedding behavior) or mmap
+        # (file-backed, OS-paged). FP32 table in both cases so Lion steps
+        # do not stagnate; cast to bf16 on forward.
+        self.emb = create_embedding(cfg.vocab_size, cfg.d_model,
+                                    cfg.embedding_storage, emb_path)
+        self.n0 = RMSNorm(cfg.d_model, cfg.eps)
+        self.blocks = nn.ModuleList([Block(cfg, rawr_graph) for _ in range(cfg.n_layer)])
+        self.nf = RMSNorm(cfg.d_model, cfg.eps)
+        if cfg.architecture == "rawr":
+            from rawr_graph import hidden_cols
+
+            mp = max(1, min(cfg.rawr_min_degree, cfg.d_model))
+            self.head = SparseLinear(cfg.d_model, cfg.vocab_size,
+                                     hidden_cols(cfg.vocab_size, cfg.d_model, rawr_graph,
+                                                 cfg.rawr_sparsity, mp))
+        else:
+            self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+            with torch.no_grad():
+                nn.init.normal_(self.head.weight, 0, 0.02 / math.sqrt(2 * cfg.n_layer))
+
+    def forward(self, idx, labels=None, last_only=False):
+        """Full-sequence forward (training) or last-token-only (inference).
+
+        ``last_only=True`` runs the identical trunk (embedding, norms, Linear
+        Attention blocks) over the whole context but projects only the final
+        position through the LM head, returning ``[B, 1, V]`` instead of
+        ``[B, T, V]``. Head math is position-independent (dense ``nn.Linear``
+        or ``SparseLinear`` row gather), so the returned row matches the last
+        row of the full computation. Training (``labels=...``) always uses
+        the full path; combining it with ``last_only`` is rejected.
+        """
+        if last_only and labels is not None:
+            raise ValueError("last_only inference cannot compute a loss (labels given)")
         x = self.emb(idx).to(torch.bfloat16)
         x = self.n0(x.float()).to(torch.bfloat16)
         for b in self.blocks:
             x = b(x)
         x = self.nf(x.float())
+        if last_only:
+            # Keep the dim so downstream [0, -1] indexing is unchanged.
+            x = x[:, -1:, :]
         logits = self.head(x.float())
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100) if labels is not None else None
         return logits, loss
@@ -296,25 +430,113 @@ class SmaulLinear(nn.Module):
         from safetensors.torch import save_file
         out = Path(out)
         out.mkdir(parents=True, exist_ok=True)
-        sd = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()}
+        if self.cfg.architecture == "rawr" and self.rawr_graph is not None:
+            self.cfg.rawr_graph_hash = self.rawr_graph.digest
+            self.cfg.rawr_edge_count = len(self.rawr_graph.edges)
+            from rawr_graph import save_graph
+
+            save_graph(self.rawr_graph, out / "rawr_graph.json")
+        if self.cfg.embedding_storage == "mmap":
+            from embeddings import EMBEDDING_FILE
+
+            emb = self.emb
+            dest = out / EMBEDDING_FILE
+            if getattr(emb, "path", None) is not None and Path(emb.path) == dest:
+                emb.flush()
+            else:
+                # Chunked file-to-file copy; never holds two full tables.
+                import numpy as np
+
+                src = np.memmap(str(emb.path), dtype=np.float32, mode="r",
+                                shape=(self.cfg.vocab_size, self.cfg.d_model)) \
+                    if hasattr(emb, "path") else emb.weight.detach().cpu().float().numpy()
+                import numpy as _np
+
+                tmp_e = dest.with_suffix(".dat.tmp")
+                dst = _np.memmap(str(tmp_e), dtype=_np.float32, mode="w+",
+                                 shape=(self.cfg.vocab_size, self.cfg.d_model))
+                for r0 in range(0, self.cfg.vocab_size, 1024):
+                    r1 = min(self.cfg.vocab_size, r0 + 1024)
+                    dst[r0:r1] = src[r0:r1]
+                dst.flush()
+                del dst
+                try:
+                    del src
+                except Exception:
+                    pass
+                os.replace(tmp_e, dest)
+            sd = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()
+                  if not k.startswith("emb.")}
+        else:
+            sd = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()}
         tmp = out / "model.safetensors.tmp"
         save_file(sd, str(tmp))
         os.replace(tmp, out / "model.safetensors")
         self.cfg.save(out / "config.json")
 
     @classmethod
-    def from_pretrained(cls, d: Path, device: str = "cpu"):
+    def from_pretrained(cls, d: Path, device: str = "cpu", architecture=None,
+                        embedding_storage=None):
         from safetensors.torch import load_file
         d = Path(d)
-        m = cls(LinearConfig.load(d / "config.json"))
+        cfg = LinearConfig.load(d / "config.json")
+        if architecture is not None and architecture != cfg.architecture:
+            raise ValueError(
+                f"checkpoint architecture is {cfg.architecture!r}, "
+                f"but {architecture!r} was requested; refusing to misinterpret "
+                f"(rawr <-> plain weights are not interchangeable)")
+        storage = embedding_storage or cfg.embedding_storage
+        if storage not in ("ram", "mmap"):
+            raise ValueError(f"unknown embedding_storage {storage!r}")
+        graph = None
+        if cfg.architecture == "rawr":
+            from rawr_graph import load_graph
+
+            gp = d / "rawr_graph.json"
+            if not gp.exists():
+                raise FileNotFoundError(
+                    f"Rawr checkpoint {d} is missing rawr_graph.json")
+            graph = load_graph(gp)
+            if graph.vocab_size != cfg.vocab_size:
+                raise ValueError(
+                    f"Rawr graph vocab {graph.vocab_size} != config vocab {cfg.vocab_size}")
+            if cfg.rawr_graph_hash and graph.digest != cfg.rawr_graph_hash:
+                raise ValueError(
+                    f"Rawr graph hash {graph.digest} != checkpoint record "
+                    f"{cfg.rawr_graph_hash}; refusing to load mismatched graph")
+        if storage == "mmap":
+            from embeddings import EMBEDDING_FILE
+
+            ep = d / EMBEDDING_FILE
+            if not ep.exists():
+                raise FileNotFoundError(
+                    f"mmap checkpoint {d} is missing {EMBEDDING_FILE}")
+            m = cls(cfg, rawr_graph=graph, emb_path=ep)
+        else:
+            m = cls(cfg, rawr_graph=graph)
         try:
             sd = load_file(str(d / "model.safetensors"), device=device)
         except RuntimeError as exc:
             raise RuntimeError(f"could not load checkpoint {d}: {exc}") from exc
         try:
-            m.load_state_dict(sd, strict=True)
+            if storage == "mmap":
+                missing, unexpected = m.load_state_dict(sd, strict=False)
+                missing = set(missing)
+                if unexpected:
+                    raise RuntimeError(f"unexpected keys: {sorted(unexpected)}")
+                # emb.weight lives in embeddings.dat, not the safetensors file.
+                ok_missing = {k for k in missing if k.startswith("emb.")}
+                if missing - ok_missing:
+                    raise RuntimeError(
+                        f"checkpoint {d} ({cfg.architecture}) missing keys: "
+                        f"{sorted(missing - ok_missing)}")
+            else:
+                m.load_state_dict(sd, strict=True)
         except RuntimeError as exc:
             raise RuntimeError(
-                f"checkpoint incompatible with config (fp8<->fp32 key change w8/sc vs weight?): {exc}"
+                f"checkpoint incompatible with config (arch={cfg.architecture} "
+                f"fp8<->fp32 key change w8/sc vs weight?): {exc}"
             ) from exc
+        # A rawr checkpoint loaded as plain (or vice versa) can never reach
+        # here: key shapes/names differ and strict/explicit checks fail first.
         return m
