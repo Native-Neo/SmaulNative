@@ -7,7 +7,7 @@ A compact SmaulLinear training and inference repository with English-Hindi data 
 - **SmaulLinear Architecture**: Linear-attention blocks with SwiGLU FFN/MoE and tiled E4M3 FP8 weights (`smaul_linear.py`, `fp8_tile.py`).
 - **Native CPU Backend**: Tiled FP8 kernels with a torch fallback plus a training-step benchmark (`kernel/compute.py`, `kernel/fp8_tile.py`, `kernel/fp8_cpu.cpp`, `kernel/attn_cpu.cpp`, `benchmark.py`).
 - **Bilingual Tokenizer**: A custom word/character tokenizer with Devanagari grapheme fallback, case markers, and special tokens (`tokenizer.py`).
-- **Unified Training Pipeline**: `train.py` pretrains SmaulLinear with tiled FP8 weights, an FP32 Lion optimizer, automatic tokenizer builds, and resume-free checkpoints.
+- **Unified Training Pipeline**: `train.py` pretrains SmaulLinear with tiled FP8 weights, an FP32 Lion (default) or SmaulOpt optimizer (`--optimizer smaul`), automatic tokenizer builds, and resume-free (Lion) / resumable (SmaulOpt) checkpoints.
 - **MoE Upcycling**: Merge multiple dense SmaulLinear checkpoints into a sparse SwiGLU Mixture of Experts model (`merge_moe.py`).
 - **RQT**: Real Quantized Training with tiled E4M3 FP8 weights and per-tile scales, requantized in place after every optimizer step. No FP32 master copy of an FP8 weight is kept; optimizer momentum stays FP32.
 
@@ -131,11 +131,21 @@ position via `start_dataset` / `start_file` / `start_record`.
 
 ## Resume
 
-Training checkpoints are resume-free: each save writes `model.safetensors` +
-`config.json` (with `tokenizer_sha256` + `dataset_fingerprint`), the tokenizer,
-and `optimizer.json` holding only the Lion hyperparameters (`lr`, `wd`, betas,
-`clip`). No optimizer momentum, RNG state, or dataset
-position is stored, so re-running a training command always starts from step 0.
+Lion (the default optimizer) checkpoints are resume-free: each save writes
+`model.safetensors` + `config.json` (with `tokenizer_sha256` + `dataset_fingerprint`), the
+tokenizer, and `optimizer.json` holding only the Lion hyperparameters (`lr`, `wd`, betas,
+`clip`). No optimizer momentum, RNG state, or dataset position is stored, so re-running a
+Lion training command always starts from step 0.
+
+SmaulOpt (`--optimizer smaul`) checkpoints are resumable: `optimizer.json` additionally
+records the step counter, `beta_m`, `beta_v`, `epsilon`, weight decay, and
+`state_dtype`, and `optimizer_state.safetensors` stores the `m`/`v` states at that width,
+so `train._load_optimizer(dir, opt, model)` continues training from the saved step.
+`--state-dtype {bf16,fp16,fp32}` controls the optimizer's own state width while the update
+math stays FP32: `bf16` (2 B/param) is the **default**, costing a measured ~0.07% error
+against `fp32`, and `fp32` (4 B/param) reproduces the v1 lossless behavior. A 1-byte
+integer state was tried and removed: ~5x slower per step, ~18% error, and it diverged on
+heavy-tailed gradients.
 
 ## Testing
 
