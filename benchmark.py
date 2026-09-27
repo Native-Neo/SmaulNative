@@ -204,14 +204,19 @@ def run_opt(argv=None):
     cfg = LinearConfig(vocab_size=2000, d_model=args.d, n_layer=args.layers,
                        n_heads=args.heads)
     ids = torch.randint(0, 2000, (args.batch, args.ctx))
-    # Identical shapes/grads/clip/threads for every entry; the only difference
-    # is the optimizer (and, for smaul_*, the state storage width). bf16 is the
-    # default; fp32 is the lossless reference it is compared against.
-    cases = [("lion", None), ("smaul", "bf16"), ("smaul", "fp16"), ("smaul", "fp32")]
+    # Identical shapes/grads/clip/threads for every entry; the only difference is
+    # the optimizer. SmaulOpt is compared across state storage width and across
+    # factored vs full v, since that is the memory/latency tradeoff.
+    cases = [
+        ("lion", None, None),
+        ("smaul", "bf16", True), ("smaul", "bf16", False),
+        ("smaul", "fp16", True), ("smaul", "fp16", False),
+        ("smaul", "fp32", True), ("smaul", "fp32", False),
+    ]
     _note = {"bf16": "default", "fp32": "reference"}
     results = {}
-    for name, sdt in cases:
-        key = name if sdt is None else f"{name}_{sdt}"
+    for name, sdt, fv in cases:
+        key = name if sdt is None else f"{name}_{sdt}" + ("_factored" if fv else "_fullv")
         torch.manual_seed(1234)
         model = SmaulLinear(cfg)
         model.train()
@@ -219,7 +224,7 @@ def run_opt(argv=None):
             opt = Lion(list(model.parameters()), lr=2e-4, clip=1.0)
         else:
             opt = SmaulOpt(list(model.parameters()), lr=2e-4, clip=1.0,
-                           state_dtype=sdt)
+                           state_dtype=sdt, factor_v=bool(fv))
         holder = model  # both optimizers walk fp8_modules(model)
 
         def one_step():
@@ -237,12 +242,13 @@ def run_opt(argv=None):
             ts.append((time.perf_counter() - t0) * 1e3)
         step_ms = statistics.median(ts)
         # Persistent optimizer state only (no params, no grads, no transients).
-        state_bytes = sum(t.numel() * t.element_size() for t in opt.m.values())
-        if hasattr(opt, "v"):
-            state_bytes += sum(t.numel() * t.element_size() for t in opt.v.values())
+        m_bytes = sum(t.numel() * t.element_size() for t in opt.m.values())
+        v_bytes = 0
+        for store in ("v", "v_row", "v_col"):
+            v_bytes += sum(t.numel() * t.element_size()
+                           for t in getattr(opt, store, {}).values())
+        state_bytes = m_bytes + v_bytes
         n_state = sum(t.numel() for t in opt.m.values())
-        if hasattr(opt, "v"):
-            n_state += sum(t.numel() for t in opt.v.values())
         # CPU throughput: identical work per step, so tok/s tracks step cost.
         reps = max(1, args.iters)
         t0 = time.perf_counter()
@@ -251,22 +257,31 @@ def run_opt(argv=None):
         wall = max(time.perf_counter() - t0, 1e-9)
         tok_s = ids.numel() * reps / wall
         results[key] = {"step_ms": step_ms, "state_bytes": state_bytes,
+                        "m_bytes": m_bytes, "v_bytes": v_bytes,
                         "state_values": n_state, "tok_s": tok_s}
         print(f"{key:11s} step {step_ms:8.2f} ms | state {state_bytes / 1048576:7.2f} MiB "
               f"({n_state} values) | {tok_s:8.1f} tok/s")
 
-    base = results["smaul_fp32"]
-    print(f"\n{'optimizer':11s} {'step ms':>9s} {'state MiB':>10s} {'B/param':>9s} "
-          f"{'vs fp32':>9s} {'tok/s':>9s}  note")
+    base = results["smaul_fp32_fullv"]
+    fullv = results["smaul_bf16_fullv"]
+    print(f"\n{'optimizer':20s} {'step ms':>9s} {'m MiB':>8s} {'v MiB':>8s} "
+          f"{'total MiB':>10s} {'vs fullv':>9s} {'tok/s':>8s}  note")
     for name, v in results.items():
-        bpp = v["state_bytes"] / max(v["state_values"] // 2, 1)
-        rel = v["state_bytes"] / max(base["state_bytes"], 1)
-        note = _note.get(name.split("_", 1)[1] if "_" in name else "", "")
-        print(f"{name:11s} {v['step_ms']:9.2f} {v['state_bytes'] / 1048576:10.2f} "
-              f"{bpp:9.2f} {rel:8.2f}x {v['tok_s']:9.1f}  {note}")
-    print("\n(measurement only: no claim that smaul converges better than lion. "
-          "Per-step ms is dominated by forward/backward and is noisy; the state "
-          "MiB and B/param columns are exact.)")
+        parts = name.split("_")
+        sdt = parts[1] if len(parts) > 1 else ""
+        note = _note.get(sdt, "")
+        if name.endswith("_fullv"):
+            note = (note + " full-v").strip()
+        elif name.endswith("_factored"):
+            note = (note + " factored-v").strip()
+        rel = v["state_bytes"] / max(fullv["state_bytes"], 1)
+        print(f"{name:20s} {v['step_ms']:9.2f} {v['m_bytes'] / 1048576:8.2f} "
+              f"{v['v_bytes'] / 1048576:8.2f} {v['state_bytes'] / 1048576:10.2f} "
+              f"{rel:8.2f}x {v['tok_s']:8.1f}  {note}")
+    f_rel = fullv["state_bytes"] / max(results["smaul_bf16_factored"]["state_bytes"], 1)
+    print(f"\nbf16 factored-v vs full-v: {f_rel:.2f}x less optimizer state")
+    print("(measurement only. Per-step ms is dominated by forward/backward and is "
+          "noisy on this machine; the m/v/total MiB columns are exact.)")
 
 
 # !/usr/bin/env python3
