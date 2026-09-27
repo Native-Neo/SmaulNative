@@ -10,6 +10,22 @@ from kernel.compute import get_backend
 TILE = 64
 _OB = 64
 E4M3_MAX = 448.0
+
+# Storage dtype for accumulated FP8 weight gradients (`FP8Linear._gw`).
+#
+# These buffers are the single largest optimizer-side allocation in the model:
+# one [out_f, in_f] tensor per FP8 module, ~480 MiB for the 256M preset. BF16
+# halves that. Precision: the block product `g2.T @ x2` is computed in FP32 and
+# added into the narrower buffer, so the gradient is rounded exactly once, and
+# `_gw` is cleared every step (`zero_grad`), so there is no long accumulation
+# chain to drift. Under *gradient accumulation* (several backwards per step)
+# this would round on every add and should be revisited.
+#
+# Consumers must therefore read `_gw` blockwise and must not call `.float()` on
+# the whole tensor -- that would allocate an FP32 copy the same size as the
+# buffer it replaced, leaving peak memory unchanged.
+GW_DTYPE = torch.bfloat16
+
 _LUT_CACHE: dict = {}
 _LUT_MAX_ENTRIES = 32
 
@@ -102,7 +118,7 @@ class _Fn(torch.autograd.Function):
         if mod.training:
             with mod._gw_lock:
                 if mod._gw is None:
-                    mod._gw = torch.zeros(out_f, in_f, dtype=torch.float32, device=g2.device)
+                    mod._gw = torch.zeros(out_f, in_f, dtype=GW_DTYPE, device=g2.device)
                 elif mod._gw.device != g2.device:
                     # Device changed mid-training (e.g. .to(device)); migrate.
                     mod._gw = mod._gw.to(g2.device)
@@ -111,6 +127,9 @@ class _Fn(torch.autograd.Function):
                     raise RuntimeError(f"_gw shape {tuple(gw.shape)} != ({out_f}, {in_f})")
                 for o0 in range(0, out_f, _OB):
                     o1 = min(o0 + _OB, out_f)
+                    # RHS is FP32; the destination may be narrower, so this rounds
+                    # the block product exactly once. Opt.step() must therefore
+                    # consume _gw blockwise and never materialize a full FP32 copy.
                     gw[o0:o1].add_(g2[:, o0:o1].T @ x2)
         return gx, None, None, None, None, None, None
 
