@@ -1111,8 +1111,15 @@ def main():
                    help="Model architecture: Rawr sparse (default) or plain dense baseline")
     a.add_argument("--embedding-storage", choices=("ram", "mmap"), default="ram",
                    help="Embedding table storage (default ram)")
-    a.add_argument("--rawr-sparsity", type=float, default=0.5,
-                   help="Rawr: fraction of hidden/head connections omitted [0, 1)")
+    a.add_argument("--rawr-sparsity", type=float, default=0.9,
+                   help="Rawr: fraction of hidden/head connections omitted [0, 1). "
+                        "This sets K = d_model * (1 - sparsity) columns kept per "
+                        "SparseLinear row, so it is really a column-count knob: at the "
+                        "old 0.5 default (K = d/2) the [B,T,out_f,K] gather moved 7.7 GiB "
+                        "per forward vs 15.3 GiB dense -- half the compute cut while "
+                        "still paying every rawr overhead. 0.9 (K ~ d/20) is 5x less "
+                        "traffic. Note LinearConfig keeps 0.5 as its code-level default "
+                        "so library callers and legacy checkpoints are unaffected.")
     a.add_argument("--rawr-min-degree", type=int, default=4,
                    help="Rawr: fallback connectivity floor per token (>= 1)")
     a.add_argument("--rawr-dict", default=None,
@@ -1129,8 +1136,8 @@ def main():
     a.add_argument("--lr", type=float, default=2e-4,
                    help="Learning rate (--lr is learning_rate; --wd is weight_decay)")
     a.add_argument("--wd", type=float, default=0.01)
-    a.add_argument("--optimizer", choices=("lion", "smaul"), default="lion",
-                   help="Optimizer: lion (default) or smaul (SmaulOpt v1)")
+    a.add_argument("--optimizer", choices=("lion", "smaul"), default="smaul",
+                   help="Optimizer: lion (default) or smaul (SmaulOpt v2.1)")
     a.add_argument("--beta-m", dest="beta_m", type=float, default=0.9,
                    help="SmaulOpt beta_m (momentum decay); Lion keeps its built-in betas")
     a.add_argument("--beta-v", dest="beta_v", type=float, default=0.999,
@@ -1221,7 +1228,7 @@ def main():
                        ffn_mult=getattr(args, "ffn_mult", 2.5),
                        precision=args.precision, tokenizer_sha256=tok_sha, dataset_fingerprint=ds_fp,
                        architecture=arch, embedding_storage=storage,
-                       rawr_sparsity=float(getattr(args, "rawr_sparsity", 0.5)),
+                       rawr_sparsity=float(getattr(args, "rawr_sparsity", 0.9)),
                        rawr_min_degree=int(getattr(args, "rawr_min_degree", 4)))
     emb_path = (out / "embeddings.dat") if storage == "mmap" else None
     model = SmaulLinear(cfg, rawr_graph=rawr_graph, emb_path=emb_path)
