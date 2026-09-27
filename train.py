@@ -323,7 +323,7 @@ class SmaulOpt:
 
     def __init__(self, params, lr=1e-4, beta_m=0.9, beta_v=0.999, epsilon=1e-8,
                  weight_decay=0.01, clip=1.0, state_dtype="bf16", update_clip=10.0,
-                 factor_v=True):
+                 factor_v=True, grad_dtype="bf16"):
         import math as _math
         try:
             _lr = float(lr)
@@ -371,6 +371,13 @@ class SmaulOpt:
                 f"update_clip must be a positive finite float, got {update_clip!r}") from None
         if not _math.isfinite(_uclip) or _uclip <= 0:
             raise ValueError(f"update_clip must be positive finite, got {update_clip!r}")
+        if grad_dtype not in (None, "bf16", "fp16", "fp32"):
+            raise ValueError(
+                f"grad_dtype must be None, 'bf16', 'fp16' or 'fp32', got {grad_dtype!r}")
+        # "fp32" is spelled as None internally: keep the gradients as autograd left
+        # them and do not narrow them.
+        if grad_dtype == "fp32":
+            grad_dtype = None
         factor_v = bool(factor_v)
         self.p = [p for p in params if p.requires_grad]
         self.lr = _lr
@@ -396,6 +403,7 @@ class SmaulOpt:
         self.v_row: dict = {}
         self.v_col: dict = {}
         self.factor_v = factor_v
+        self.grad_dtype = grad_dtype
         # Set from a checkpoint when one is loaded; the default assumes full-v.
         self.checkpoint_factor_v = bool(factor_v)
         # Global step for bias correction. Named step_count (not step) so it
@@ -407,6 +415,34 @@ class SmaulOpt:
     # decide how wide the persisted m/v buffers are. They are no-ops for
     # state_dtype fp32, which keeps the lossless path allocation-identical.
     # ------------------------------------------------------------------
+    def narrow_grads_(self, model=None):
+        """Cast dense ``p.grad`` to ``grad_dtype`` after ``backward()``.
+
+        Called by the training loop between ``backward()`` and ``step()``. The
+        FP32 gradient produced by autograd is rounded exactly once, on a value
+        that is already fully summed over the batch and context, so this is the
+        benign case -- not an accumulation in reduced precision. The FP32
+        temporary is released immediately, which is the point: dense gradients
+        are the largest remaining allocation after ``_gw`` (~512 MiB for the
+        256M preset).
+
+        No-op when ``grad_dtype`` is None. FP8 ``_gw`` is already stored at
+        ``kernel.fp8_tile.GW_DTYPE`` and needs nothing here.
+        """
+        if self.grad_dtype is None:
+            return self
+        dt = torch.bfloat16 if self.grad_dtype == "bf16" else torch.float16
+        for p in self.p:
+            if p.grad is None or not p.grad.is_floating_point():
+                continue
+            # PyTorch refuses a grad whose dtype differs from the parameter's
+            # grad_dtype (which defaults to the param dtype); None is the
+            # documented opt-out that allows any floating dtype.
+            p.grad_dtype = None
+            if p.grad.dtype != dt:
+                p.grad = p.grad.to(dt)
+        return self
+
     def _storage_dtype(self, signed):
         if self.state_dtype == "bf16":
             return torch.bfloat16
@@ -482,7 +518,13 @@ class SmaulOpt:
         """Bias-corrected marginals and grand mean for the reconstruction."""
         r_hat = r32 / bc
         c_hat = c32 / bc
-        return r_hat, c_hat, r_hat.mean()
+        # The grand mean is 0 only when v is 0 everywhere, i.e. every gradient
+        # seen so far was 0. Unguarded, R*C/0 would be 0/0 = NaN, and the NaN
+        # would then make u non-finite and skip the block -- silently dropping
+        # that block's weight decay. A tiny positive floor keeps the
+        # reconstruction at 0 so u = m_hat/(0+eps) = 0, matching full-v, which
+        # applies decay and no gradient step.
+        return r_hat, c_hat, r_hat.mean().clamp_min(1e-30)
 
     @staticmethod
     def _reconstruct_block(r_hat, c_hat, g_mean, o0, o1):
@@ -546,41 +588,46 @@ class SmaulOpt:
         if bc2 <= 0.0:
             bc2 = 1e-12
         live = set()
-        # FP8 weights: state handled per 64-row block (dequant -> FP32 EMA ->
-        # FP32 normalized update -> requant weight -> requant state), so no
-        # full-matrix FP32 state or update transient is ever built.
+        decay = self.lr * self.weight_decay
+        # FP8 weights: the accumulated _gw may be narrower than FP32 (see
+        # kernel.fp8_tile.GW_DTYPE). It is read blockwise and NEVER widened whole
+        # -- a full .float() would allocate an FP32 copy the size of the buffer it
+        # replaced, cancelling the saving. Elementwise promotion inside the FP32
+        # accumulators handles the widening per block instead.
         for _, mod in mods:
             if mod._gw is None:
                 continue
-            g = mod._gw.float().contiguous()
-            st_m = self.m.get(mod)
-            if st_m is None or st_m.shape != g.shape:
-                st_m = self._empty_state(g.shape, g.device, signed=True)
-                self.m[mod] = st_m
-            elif st_m.device != g.device:
-                st_m = st_m.to(g.device)
-                self.m[mod] = st_m
+            gw = mod._gw
+            shape = tuple(gw.shape)
             live.add(mod)
-            decay = self.lr * self.weight_decay
-            out_f = int(g.shape[0])
-            if self._factor_shape(tuple(g.shape)):
+            st_m = self.m.get(mod)
+            if st_m is None or st_m.shape != shape:
+                st_m = self._empty_state(shape, gw.device, signed=True)
+                self.m[mod] = st_m
+            elif st_m.device != gw.device:
+                st_m = st_m.to(gw.device)
+                self.m[mod] = st_m
+            if self._factor_shape(shape):
                 # ---- factored v: maintain the exact marginals of EMA(|g|) ----
-                st_r, st_c = self._v_marginal_state(mod, g.shape, g.device)
+                st_r, st_c = self._v_marginal_state(mod, shape, gw.device)
                 r32 = st_r.float()
                 c32 = st_c.float()
-                r32.mul_(self.beta_v).add_(self._mean_abs(g, 1), alpha=1.0 - self.beta_v)
-                c32.mul_(self.beta_v).add_(self._mean_abs(g, 0), alpha=1.0 - self.beta_v)
+                r32.mul_(self.beta_v).add_(self._mean_abs(gw, 1), alpha=1.0 - self.beta_v)
+                c32.mul_(self.beta_v).add_(self._mean_abs(gw, 0), alpha=1.0 - self.beta_v)
                 r_hat, c_hat, g_mean = self._factored_hat(r32, c32, bc2)
                 for _b, o0, o1 in self._row_blocks(st_m):
                     m_b = st_m[o0:o1] if self.state_dtype == "fp32" else st_m[o0:o1].float()
-                    m_b.mul_(self.beta_m).add_(g[o0:o1], alpha=1.0 - self.beta_m)
+                    m_b.mul_(self.beta_m).add_(gw[o0:o1], alpha=1.0 - self.beta_m)
                     v_hat = self._reconstruct_block(r_hat, c_hat, g_mean, o0, o1)
                     u_b = (m_b / bc1) / (v_hat + self.epsilon)
-                    if not bool(torch.isfinite(u_b).all()):
-                        continue
-                    if self.state_dtype != "fp32":
-                        u_b.clamp_(-self.update_clip, self.update_clip)
-                    mod._requant_block(o0, o1, u_b * self.lr, decay)
+                    # The weight write is gated on a finite u, but the m state is
+                    # not: m is just an EMA of a (already finite-checked) gradient,
+                    # so skipping it would leave m stale while the step counter
+                    # advanced and bias correction desynchronized.
+                    if bool(torch.isfinite(u_b).all()):
+                        if self.state_dtype != "fp32":
+                            u_b.clamp_(-self.update_clip, self.update_clip)
+                        mod._requant_block(o0, o1, u_b * self.lr, decay)
                     if self.state_dtype != "fp32":
                         st_m[o0:o1].copy_(m_b)
                 if self.state_dtype != "fp32":
@@ -589,13 +636,12 @@ class SmaulOpt:
                 self.v.pop(mod, None)
             else:
                 st_v = self.v.get(mod)
-                if st_v is None or st_v.shape != g.shape:
-                    st_v = self._empty_state(g.shape, g.device, signed=False)
+                if st_v is None or st_v.shape != shape:
+                    st_v = self._empty_state(shape, gw.device, signed=False)
                     self.v[mod] = st_v
-                elif st_v.device != g.device:
-                    st_v = st_v.to(g.device)
+                elif st_v.device != gw.device:
+                    st_v = st_v.to(gw.device)
                     self.v[mod] = st_v
-                g_abs = g.abs()
                 for _b, o0, o1 in self._row_blocks(st_m):
                     # ---- FP32 state arithmetic for this block ----
                     if self.state_dtype == "fp32":
@@ -604,11 +650,9 @@ class SmaulOpt:
                     else:
                         m_b = st_m[o0:o1].float()
                         v_b = st_v[o0:o1].float()
-                    m_b.mul_(self.beta_m).add_(g[o0:o1], alpha=1.0 - self.beta_m)
-                    v_b.mul_(self.beta_v).add_(g_abs[o0:o1], alpha=1.0 - self.beta_v)
-                    m_hat = m_b / bc1
-                    v_hat = v_b / bc2
-                    u_b = m_hat / (v_hat + self.epsilon)
+                    m_b.mul_(self.beta_m).add_(gw[o0:o1], alpha=1.0 - self.beta_m)
+                    v_b.mul_(self.beta_v).add_(gw[o0:o1].abs(), alpha=1.0 - self.beta_v)
+                    u_b = (m_b / bc1) / (v_b / bc2 + self.epsilon)
                     if not bool(torch.isfinite(u_b).all()):
                         # Safe guard: skip this block's weight update rather than
                         # propagating non-finite values into quantized storage.
@@ -628,7 +672,10 @@ class SmaulOpt:
         for p in self.p:
             if p.grad is None:
                 continue
-            g = p.grad.float()
+            # p.grad may be narrower than FP32 (see narrow_grads_). Use it as-is:
+            # the FP32 state accumulators promote per block, so no full-size FP32
+            # copy of the gradient is ever built.
+            g = p.grad
             st_m = self.m.get(p)
             if st_m is None or st_m.shape != tuple(p.shape):
                 st_m = self._empty_state(tuple(p.shape), g.device, signed=True)
@@ -650,13 +697,14 @@ class SmaulOpt:
                     m_b.mul_(self.beta_m).add_(g[o0:o1], alpha=1.0 - self.beta_m)
                     v_hat = self._reconstruct_block(r_hat, c_hat, g_mean, o0, o1)
                     u = (m_b / bc1) / (v_hat + self.epsilon)
-                    if not bool(torch.isfinite(u).all()):
-                        continue
-                    if self.state_dtype != "fp32":
-                        u.clamp_(-self.update_clip, self.update_clip)
-                    if self.weight_decay:
-                        p[o0:o1].mul_(1.0 - self.lr * self.weight_decay)
-                    p[o0:o1].add_(u.to(p.dtype), alpha=-self.lr)
+                    # Gate only the weight write; m always advances (see the FP8
+                    # path above for why).
+                    if bool(torch.isfinite(u).all()):
+                        if self.state_dtype != "fp32":
+                            u.clamp_(-self.update_clip, self.update_clip)
+                        if self.weight_decay:
+                            p[o0:o1].mul_(1.0 - self.lr * self.weight_decay)
+                        p[o0:o1].add_(u.to(p.dtype), alpha=-self.lr)
                     if self.state_dtype != "fp32":
                         st_m[o0:o1].copy_(m_b)
                 if self.state_dtype != "fp32":
@@ -1094,6 +1142,11 @@ def main():
                    help="SmaulOpt state storage width; update math is always FP32. "
                         "bf16 (2B, default: ~0.07%% error vs fp32) | fp16 (2B) | "
                         "fp32 (4B, lossless reference)")
+    a.add_argument("--grad-dtype", dest="grad_dtype", choices=("bf16", "fp16", "fp32"),
+                   default="bf16",
+                   help="SmaulOpt: dtype gradients are stored in after backward. "
+                        "bf16 (default) halves gradient memory; fp32 keeps them "
+                        "wide. Update math is FP32 either way. Lion ignores this.")
     a.add_argument("--factor-v", dest="factor_v", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="SmaulOpt: store v factored (row/col marginals) for 2-D "
@@ -1180,7 +1233,8 @@ def main():
                        epsilon=getattr(args, "epsilon", 1e-8),
                        weight_decay=args.wd, clip=args.grad_clip,
                        state_dtype=getattr(args, "state_dtype", "bf16"),
-                       factor_v=getattr(args, "factor_v", True))
+                       factor_v=getattr(args, "factor_v", True),
+                       grad_dtype=getattr(args, "grad_dtype", "bf16"))
     else:
         opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd, clip=args.grad_clip)
     wrap = load_tokenizer(str(tok_path))
@@ -1208,6 +1262,10 @@ def main():
                 break
             continue
         loss.backward()
+        # Release the FP32 gradient buffers before the step; the update math is
+        # still FP32 (it widens per block). No-op for Lion.
+        if hasattr(opt, "narrow_grads_"):
+            opt.narrow_grads_(model)
         norm = opt.step(model)
         if norm == float("inf"):
             bad_steps += 1
