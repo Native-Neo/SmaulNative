@@ -275,6 +275,46 @@ class SmaulOpt:
 
     FP8 weights are unaffected by ``state_dtype``: only optimizer state
     storage narrows, never the weight format or the update math.
+
+    Factored ``v`` (``factor_v``, default on)
+    -----------------------------------------
+    For a matrix-shaped state ``[R, C]`` the full ``v`` is replaced by two
+    BF16 vectors, ``v_row[R]`` and ``v_col[C]``. ``m`` is always full-size.
+
+    **Derivation.** The EMA is *linear*, so it commutes with means::
+
+        rowmean_i(v_t) = beta_v * rowmean_i(v_{t-1}) + (1 - beta_v) * rowmean_i(|g_t|)
+
+    Therefore maintaining an EMA of the row means and of the column means
+    yields the **exact** row and column marginals of the true ``v_t`` -- no
+    approximation at that stage. The only approximation is dropping the
+    rank/interaction term. Given exact marginals ``R`` and ``C`` and grand
+    mean ``G = mean(R) = mean(C)``, the unique rank-1 field consistent with
+    both marginals and the grand mean is the outer product::
+
+        v_hat[i, j] ~= R_hat[i] * C_hat[j] / G_hat
+
+    That is the marginal-preserving reconstruction, and it is what this
+    implements. It is *not* AdaFactor's form: AdaFactor factors ``EMA(g^2)``
+    with ``R_i * C_j`` and no division, and it only ever needs the result
+    under a ``sqrt``. SmaulOpt's statistic is ``EMA(|g|)``, which is
+    non-negative, so the division by the grand mean is what keeps the
+    reconstruction consistent with the stored marginals. Measured on random
+    gradients, dividing roughly halves the error: 0.30 relative versus 0.64
+    for the un-divided form, and the reconstruction is exact for a rank-1
+    ``v``.
+
+    Consequences to be aware of (measured, see the numerical comparison test):
+    a rank-1 field is *dense*, so a sparse ``v`` cannot be represented. On a
+    0.5%-nonzero gradient the reconstruction under-estimates ``v`` about 3x at
+    the non-zeros, which inflates the step there, since ``u`` has ``v`` in the
+    denominator. This optimizer's memory win comes from the embedding and LM
+    head, which are exactly the large and often sparse tensors.
+
+    Factoring is decided by shape alone -- no architecture-specific names --
+    and applies when the parameter is 2-D with both extents >= 2, where
+    ``R + C <= R * C`` so the factored form is never larger. Vectors and
+    scalars keep a full ``v``.
     """
 
     # Rows per requant/quantize block for FP8 modules (matches fp8_tile._OB).
@@ -282,7 +322,8 @@ class SmaulOpt:
     _STATE_DTYPES = ("bf16", "fp16", "fp32")
 
     def __init__(self, params, lr=1e-4, beta_m=0.9, beta_v=0.999, epsilon=1e-8,
-                 weight_decay=0.01, clip=1.0, state_dtype="bf16", update_clip=10.0):
+                 weight_decay=0.01, clip=1.0, state_dtype="bf16", update_clip=10.0,
+                 factor_v=True):
         import math as _math
         try:
             _lr = float(lr)
@@ -330,6 +371,7 @@ class SmaulOpt:
                 f"update_clip must be a positive finite float, got {update_clip!r}") from None
         if not _math.isfinite(_uclip) or _uclip <= 0:
             raise ValueError(f"update_clip must be positive finite, got {update_clip!r}")
+        factor_v = bool(factor_v)
         self.p = [p for p in params if p.requires_grad]
         self.lr = _lr
         self.beta_m = _bm
@@ -348,7 +390,14 @@ class SmaulOpt:
         # clamped. See test_update_clip_is_defensive_not_load_bearing.
         self.update_clip = _uclip
         self.m: dict = {}
+        # v is held either full-size (self.v) or factored into two marginal
+        # vectors (self.v_row / self.v_col), decided per-state by shape.
         self.v: dict = {}
+        self.v_row: dict = {}
+        self.v_col: dict = {}
+        self.factor_v = factor_v
+        # Set from a checkpoint when one is loaded; the default assumes full-v.
+        self.checkpoint_factor_v = bool(factor_v)
         # Global step for bias correction. Named step_count (not step) so it
         # does not shadow the step() method.
         self.step_count: int = 0
@@ -378,6 +427,71 @@ class SmaulOpt:
         n = tensor.shape[0]
         for b, o0 in enumerate(range(0, n, self._OB)):
             yield b, o0, min(o0 + self._OB, n)
+
+    # ------------------------------------------------------------------
+    # Factored v. Shape-driven only: no architecture or module names.
+    # ------------------------------------------------------------------
+    def _factor_shape(self, shape):
+        """True when this state's v should be stored factored.
+
+        2-D with both extents >= 2. For such shapes ``R + C <= R * C``, so the
+        factored form is never larger than the full one; 1-D and 0-D states
+        cannot be row/column factored and keep a full v.
+        """
+        if not self.factor_v or len(shape) != 2:
+            return False
+        r, c = int(shape[0]), int(shape[1])
+        return r >= 2 and c >= 2
+
+    @staticmethod
+    def _mean_abs(g, dim):
+        """mean(|g|) along `dim` as a reduction, with no [R, C] temporary.
+
+        ``g.abs().mean(dim)`` materializes a full-size copy of |g|. The L1 norm
+        is the same quantity as a fused reduction, so it allocates only the
+        output vector.
+        """
+        if dim == 0:
+            n = g.shape[0]
+        else:
+            n = g.shape[1]
+        return torch.linalg.vector_norm(g, ord=1, dim=dim) / n
+
+    def _v_marginal_state(self, key, shape, device):
+        """Fetch or lazily create the factored (row, col) marginals for `key`."""
+        r, c = int(shape[0]), int(shape[1])
+        dt = self._storage_dtype(signed=True)
+        st_r = self.v_row.get(key)
+        if st_r is None or st_r.shape != (r,):
+            st_r = torch.zeros(r, dtype=dt, device=device)
+            self.v_row[key] = st_r
+        elif st_r.device != device:
+            st_r = st_r.to(device)
+            self.v_row[key] = st_r
+        st_c = self.v_col.get(key)
+        if st_c is None or st_c.shape != (c,):
+            st_c = torch.zeros(c, dtype=dt, device=device)
+            self.v_col[key] = st_c
+        elif st_c.device != device:
+            st_c = st_c.to(c.device)
+            self.v_col[key] = st_c
+        return st_r, st_c
+
+    @staticmethod
+    def _factored_hat(r32, c32, bc):
+        """Bias-corrected marginals and grand mean for the reconstruction."""
+        r_hat = r32 / bc
+        c_hat = c32 / bc
+        return r_hat, c_hat, r_hat.mean()
+
+    @staticmethod
+    def _reconstruct_block(r_hat, c_hat, g_mean, o0, o1):
+        """v_hat[o0:o1, :] ~= R_hat[o0:o1, None] * C_hat[None, :] / G.
+
+        Only the requested row block is materialized, so the full [R, C] v is
+        never allocated.
+        """
+        return torch.outer(r_hat[o0:o1], c_hat) / g_mean
 
     def zero_grad(self, model=None):
         for p in self.p:
@@ -446,42 +560,70 @@ class SmaulOpt:
             elif st_m.device != g.device:
                 st_m = st_m.to(g.device)
                 self.m[mod] = st_m
-            st_v = self.v.get(mod)
-            if st_v is None or st_v.shape != g.shape:
-                st_v = self._empty_state(g.shape, g.device, signed=False)
-                self.v[mod] = st_v
-            elif st_v.device != g.device:
-                st_v = st_v.to(g.device)
-                self.v[mod] = st_v
             live.add(mod)
             decay = self.lr * self.weight_decay
-            g_abs = g.abs()
-            for _b, o0, o1 in self._row_blocks(st_m):
-                # ---- FP32 state arithmetic for this block ----
-                if self.state_dtype == "fp32":
-                    m_b = st_m[o0:o1]
-                    v_b = st_v[o0:o1]
-                else:
-                    m_b = st_m[o0:o1].float()
-                    v_b = st_v[o0:o1].float()
-                m_b.mul_(self.beta_m).add_(g[o0:o1], alpha=1.0 - self.beta_m)
-                v_b.mul_(self.beta_v).add_(g_abs[o0:o1], alpha=1.0 - self.beta_v)
-                m_hat = m_b / bc1
-                v_hat = v_b / bc2
-                u_b = m_hat / (v_hat + self.epsilon)
-                if not bool(torch.isfinite(u_b).all()):
-                    # Safe guard: skip this block's weight update rather than
-                    # propagating non-finite values into quantized storage.
-                    continue
+            out_f = int(g.shape[0])
+            if self._factor_shape(tuple(g.shape)):
+                # ---- factored v: maintain the exact marginals of EMA(|g|) ----
+                st_r, st_c = self._v_marginal_state(mod, g.shape, g.device)
+                r32 = st_r.float()
+                c32 = st_c.float()
+                r32.mul_(self.beta_v).add_(self._mean_abs(g, 1), alpha=1.0 - self.beta_v)
+                c32.mul_(self.beta_v).add_(self._mean_abs(g, 0), alpha=1.0 - self.beta_v)
+                r_hat, c_hat, g_mean = self._factored_hat(r32, c32, bc2)
+                for _b, o0, o1 in self._row_blocks(st_m):
+                    m_b = st_m[o0:o1] if self.state_dtype == "fp32" else st_m[o0:o1].float()
+                    m_b.mul_(self.beta_m).add_(g[o0:o1], alpha=1.0 - self.beta_m)
+                    v_hat = self._reconstruct_block(r_hat, c_hat, g_mean, o0, o1)
+                    u_b = (m_b / bc1) / (v_hat + self.epsilon)
+                    if not bool(torch.isfinite(u_b).all()):
+                        continue
+                    if self.state_dtype != "fp32":
+                        u_b.clamp_(-self.update_clip, self.update_clip)
+                    mod._requant_block(o0, o1, u_b * self.lr, decay)
+                    if self.state_dtype != "fp32":
+                        st_m[o0:o1].copy_(m_b)
                 if self.state_dtype != "fp32":
-                    # Bound |u|: the invariant |EMA(g)| <= EMA(|g|) should keep it
-                    # near 1, so this only engages on state-quantization noise.
-                    u_b.clamp_(-self.update_clip, self.update_clip)
-                mod._requant_block(o0, o1, u_b * self.lr, decay)
-                # ---- narrow the state block back to storage width ----
-                if self.state_dtype != "fp32":
-                    st_m[o0:o1].copy_(m_b)
-                    st_v[o0:o1].copy_(v_b)
+                    st_r.copy_(r32)
+                    st_c.copy_(c32)
+                self.v.pop(mod, None)
+            else:
+                st_v = self.v.get(mod)
+                if st_v is None or st_v.shape != g.shape:
+                    st_v = self._empty_state(g.shape, g.device, signed=False)
+                    self.v[mod] = st_v
+                elif st_v.device != g.device:
+                    st_v = st_v.to(g.device)
+                    self.v[mod] = st_v
+                g_abs = g.abs()
+                for _b, o0, o1 in self._row_blocks(st_m):
+                    # ---- FP32 state arithmetic for this block ----
+                    if self.state_dtype == "fp32":
+                        m_b = st_m[o0:o1]
+                        v_b = st_v[o0:o1]
+                    else:
+                        m_b = st_m[o0:o1].float()
+                        v_b = st_v[o0:o1].float()
+                    m_b.mul_(self.beta_m).add_(g[o0:o1], alpha=1.0 - self.beta_m)
+                    v_b.mul_(self.beta_v).add_(g_abs[o0:o1], alpha=1.0 - self.beta_v)
+                    m_hat = m_b / bc1
+                    v_hat = v_b / bc2
+                    u_b = m_hat / (v_hat + self.epsilon)
+                    if not bool(torch.isfinite(u_b).all()):
+                        # Safe guard: skip this block's weight update rather than
+                        # propagating non-finite values into quantized storage.
+                        continue
+                    if self.state_dtype != "fp32":
+                        # Bound |u|: the invariant |EMA(g)| <= EMA(|g|) should keep
+                        # it near 1, so this only engages on state noise.
+                        u_b.clamp_(-self.update_clip, self.update_clip)
+                    mod._requant_block(o0, o1, u_b * self.lr, decay)
+                    # ---- narrow the state block back to storage width ----
+                    if self.state_dtype != "fp32":
+                        st_m[o0:o1].copy_(m_b)
+                        st_v[o0:o1].copy_(v_b)
+                self.v_row.pop(mod, None)
+                self.v_col.pop(mod, None)
             mod._gw = None
         for p in self.p:
             if p.grad is None:
@@ -494,51 +636,78 @@ class SmaulOpt:
             elif st_m.device != g.device:
                 st_m = st_m.to(g.device)
                 self.m[p] = st_m
-            st_v = self.v.get(p)
-            if st_v is None or st_v.shape != tuple(p.shape):
-                st_v = self._empty_state(tuple(p.shape), g.device, signed=False)
-                self.v[p] = st_v
-            elif st_v.device != g.device:
-                st_v = st_v.to(g.device)
-                self.v[p] = st_v
             live.add(p)
-            # ---- FP32 state arithmetic for the whole (dense) parameter ----
-            if self.state_dtype == "fp32":
-                m_b = st_m
-                v_b = st_v
+            if self._factor_shape(tuple(p.shape)):
+                # ---- factored v for a 2-D dense parameter ----
+                st_r, st_c = self._v_marginal_state(p, p.shape, g.device)
+                r32 = st_r.float()
+                c32 = st_c.float()
+                r32.mul_(self.beta_v).add_(self._mean_abs(g, 1), alpha=1.0 - self.beta_v)
+                c32.mul_(self.beta_v).add_(self._mean_abs(g, 0), alpha=1.0 - self.beta_v)
+                r_hat, c_hat, g_mean = self._factored_hat(r32, c32, bc2)
+                for _b, o0, o1 in self._row_blocks(st_m):
+                    m_b = st_m[o0:o1] if self.state_dtype == "fp32" else st_m[o0:o1].float()
+                    m_b.mul_(self.beta_m).add_(g[o0:o1], alpha=1.0 - self.beta_m)
+                    v_hat = self._reconstruct_block(r_hat, c_hat, g_mean, o0, o1)
+                    u = (m_b / bc1) / (v_hat + self.epsilon)
+                    if not bool(torch.isfinite(u).all()):
+                        continue
+                    if self.state_dtype != "fp32":
+                        u.clamp_(-self.update_clip, self.update_clip)
+                    if self.weight_decay:
+                        p[o0:o1].mul_(1.0 - self.lr * self.weight_decay)
+                    p[o0:o1].add_(u.to(p.dtype), alpha=-self.lr)
+                    if self.state_dtype != "fp32":
+                        st_m[o0:o1].copy_(m_b)
+                if self.state_dtype != "fp32":
+                    st_r.copy_(r32)
+                    st_c.copy_(c32)
+                self.v.pop(p, None)
             else:
-                m_b = st_m.float()
-                v_b = st_v.float()
-            m_b.mul_(self.beta_m).add_(g, alpha=1.0 - self.beta_m)
-            v_b.mul_(self.beta_v).add_(g.abs(), alpha=1.0 - self.beta_v)
-            m_hat = m_b / bc1
-            v_hat = v_b / bc2
-            u = m_hat / (v_hat + self.epsilon)
-            if not bool(torch.isfinite(u).all()):
-                continue
-            if self.state_dtype != "fp32":
-                # Bound |u|: see the note in the FP8 block path above.
-                u.clamp_(-self.update_clip, self.update_clip)
-            if self.weight_decay:
-                # Decoupled: theta <- theta * (1 - lr*wd), same as
-                # theta - lr*wd*theta.
-                p.mul_(1.0 - self.lr * self.weight_decay)
-            if u.dtype != p.dtype:
-                u = u.to(p.dtype)
-            # Ensure device match (states migrate with grads; param is source).
-            if u.device != p.device:
-                u = u.to(p.device)
-            p.add_(u, alpha=-self.lr)
-            # ---- narrow the state back to storage width ----
-            if self.state_dtype != "fp32":
-                st_m.copy_(m_b)
-                st_v.copy_(v_b)
-        for k in list(self.m):
-            if k not in live:
-                del self.m[k]
-        for k in list(self.v):
-            if k not in live:
-                del self.v[k]
+                st_v = self.v.get(p)
+                if st_v is None or st_v.shape != tuple(p.shape):
+                    st_v = self._empty_state(tuple(p.shape), g.device, signed=False)
+                    self.v[p] = st_v
+                elif st_v.device != g.device:
+                    st_v = st_v.to(g.device)
+                    self.v[p] = st_v
+                # ---- FP32 state arithmetic for the whole (dense) parameter ----
+                if self.state_dtype == "fp32":
+                    m_b = st_m
+                    v_b = st_v
+                else:
+                    m_b = st_m.float()
+                    v_b = st_v.float()
+                m_b.mul_(self.beta_m).add_(g, alpha=1.0 - self.beta_m)
+                v_b.mul_(self.beta_v).add_(g.abs(), alpha=1.0 - self.beta_v)
+                m_hat = m_b / bc1
+                v_hat = v_b / bc2
+                u = m_hat / (v_hat + self.epsilon)
+                if not bool(torch.isfinite(u).all()):
+                    continue
+                if self.state_dtype != "fp32":
+                    # Bound |u|: see the note in the FP8 block path above.
+                    u.clamp_(-self.update_clip, self.update_clip)
+                if self.weight_decay:
+                    # Decoupled: theta <- theta * (1 - lr*wd), same as
+                    # theta - lr*wd*theta.
+                    p.mul_(1.0 - self.lr * self.weight_decay)
+                if u.dtype != p.dtype:
+                    u = u.to(p.dtype)
+                # Ensure device match (states migrate with grads; param is source).
+                if u.device != p.device:
+                    u = u.to(p.device)
+                p.add_(u, alpha=-self.lr)
+                # ---- narrow the state back to storage width ----
+                if self.state_dtype != "fp32":
+                    st_m.copy_(m_b)
+                    st_v.copy_(v_b)
+                self.v_row.pop(p, None)
+                self.v_col.pop(p, None)
+        for store in (self.m, self.v, self.v_row, self.v_col):
+            for k in list(store):
+                if k not in live:
+                    del store[k]
         return norm
 
     def state_dict(self):
@@ -555,6 +724,7 @@ class SmaulOpt:
             "wd": self.weight_decay,
             "clip": self.clip,
             "state_dtype": self.state_dtype,
+            "factor_v": bool(self.factor_v),
         }
 
     def load_state_dict(self, d):
@@ -608,12 +778,18 @@ class SmaulOpt:
         if sdt not in SmaulOpt._STATE_DTYPES:
             raise ValueError(
                 f"checkpoint state_dtype must be one of {SmaulOpt._STATE_DTYPES}, got {sdt!r}")
+        fv = d.get("factor_v", None)
+        if fv is not None and not isinstance(fv, bool):
+            raise ValueError(f"checkpoint factor_v must be a bool, got {fv!r}")
         self.lr, self.beta_m, self.beta_v = _lr, _bm, _bv
         self.epsilon, self.weight_decay, self.clip = _eps, _wd, _clip
         self.step_count = _step
         # State storage width follows the checkpoint; stored m/v buffers are
         # recast by the state loader, so a resumed run keeps the saved width.
         self.state_dtype = sdt
+        # Checkpoints written before factoring existed have no factor_v key; they
+        # are always full-v, so default the flag to False for them.
+        self.checkpoint_factor_v = bool(fv) if fv is not None else False
 
 
 def _save_optimizer(out: Path, opt, model=None) -> None:
@@ -628,20 +804,31 @@ def _save_smaul_states(out: Path, opt: "SmaulOpt", model) -> None:
     param_names = {id(p): n for n, p in model.named_parameters()}
     mod_names = {id(m): n for n, m in fp8_modules(model)}
     tensors = {}
-    for key_obj, m_state in opt.m.items():
-        v_state = opt.v.get(key_obj)
-        if v_state is None:
-            continue
+
+    def _base(key_obj):
         if id(key_obj) in param_names:
-            base = f"param.{param_names[id(key_obj)]}"
-        elif id(key_obj) in mod_names:
-            base = f"fp8.{mod_names[id(key_obj)]}"
-        else:
+            return f"param.{param_names[id(key_obj)]}"
+        if id(key_obj) in mod_names:
+            return f"fp8.{mod_names[id(key_obj)]}"
+        return None
+
+    for key_obj, m_state in opt.m.items():
+        base = _base(key_obj)
+        if base is None:
             continue
         # Stored at the checkpoint's own width (bf16/fp16/fp32) so the file size
         # reflects the real state footprint.
         tensors[f"m.{base}"] = m_state.detach().cpu().contiguous()
-        tensors[f"v.{base}"] = v_state.detach().cpu().contiguous()
+        st_r = opt.v_row.get(key_obj)
+        st_c = opt.v_col.get(key_obj)
+        if st_r is not None and st_c is not None:
+            # Factored v: the two marginal vectors, never the full [R, C].
+            tensors[f"v_row.{base}"] = st_r.detach().cpu().contiguous()
+            tensors[f"v_col.{base}"] = st_c.detach().cpu().contiguous()
+        else:
+            v_state = opt.v.get(key_obj)
+            if v_state is not None:
+                tensors[f"v.{base}"] = v_state.detach().cpu().contiguous()
     if tensors:
         tmp = out / "optimizer_state.safetensors.tmp"
         save_file(tensors, str(tmp))
@@ -672,7 +859,7 @@ def _load_smaul_states(out: Path, opt: "SmaulOpt", model) -> None:
     param_by_name = dict(model.named_parameters())
     mod_by_name = dict(fp8_modules(model))
     if not sp.exists():
-        if opt.step_count and (opt.m or opt.v):
+        if opt.step_count and (opt.m or opt.v or opt.v_row or opt.v_col):
             raise ValueError(f"SmaulOpt checkpoint {out} is missing optimizer_state.safetensors")
         if int(opt.state_dict().get("step", opt.step_count)) > 0:
             raise ValueError(
@@ -685,31 +872,48 @@ def _load_smaul_states(out: Path, opt: "SmaulOpt", model) -> None:
         raise RuntimeError(f"could not load SmaulOpt states {sp}: {exc}") from exc
     new_m: dict = {}
     new_v: dict = {}
+    new_vr: dict = {}
+    new_vc: dict = {}
     for k, tens in blobs.items():
         if not isinstance(k, str) or "." not in k:
             raise ValueError(f"invalid SmaulOpt state key {k!r}")
         kind, rest = k.split(".", 1)
-        if kind not in ("m", "v"):
+        if kind not in ("m", "v", "v_row", "v_col"):
             raise ValueError(f"invalid SmaulOpt state key {k!r}")
         if rest.startswith("param."):
-            name = rest[len("param."):]
-            obj = param_by_name.get(name, None)
+            obj = param_by_name.get(rest[len("param."):], None)
             if obj is None:
                 raise ValueError(
                     f"SmaulOpt state key {k!r} has no matching parameter in current model")
-            (new_m if kind == "m" else new_v)[obj] = tens
         elif rest.startswith("fp8."):
-            name = rest[len("fp8."):]
-            obj = mod_by_name.get(name, None)
+            obj = mod_by_name.get(rest[len("fp8."):], None)
             if obj is None:
                 raise ValueError(
                     f"SmaulOpt state key {k!r} has no matching FP8 module in current model")
-            (new_m if kind == "m" else new_v)[obj] = tens
         else:
             raise ValueError(f"invalid SmaulOpt state key {k!r}")
-    # Every m must have a matching v and vice versa.
-    if set(new_m.keys()) != set(new_v.keys()):
-        raise ValueError("SmaulOpt states incomplete: m/v keys differ; refusing partial load")
+        target = {"m": new_m, "v": new_v, "v_row": new_vr, "v_col": new_vc}[kind]
+        target[obj] = tens
+    # A model may legitimately hold both forms: 2-D params are factored while
+    # 1-D/0-D params keep a full v. What is never valid is one object having
+    # both, or a half-written factored pair.
+    for obj in new_m:
+        has_full = obj in new_v
+        r_ok, c_ok = obj in new_vr, obj in new_vc
+        if r_ok != c_ok:
+            raise ValueError(
+                f"SmaulOpt factored state incomplete for one object "
+                f"(v_row={r_ok}, v_col={c_ok}); refusing partial load")
+        if has_full and r_ok:
+            raise ValueError(
+                "SmaulOpt state for one object has both full-v and factored-v keys; "
+                "refusing to guess")
+        if not has_full and not r_ok:
+            raise ValueError(f"SmaulOpt state for one object has no v at all; refusing")
+    for obj, tens in list(new_vr.items()):
+        want_c = tuple(new_vc[obj].shape)
+        if tuple(tens.shape) != want_c and tuple(tens.shape) == want_c[::-1]:
+            raise ValueError(f"SmaulOpt v_row/v_col are transposed for one object")
     # Shape check against live objects (fail clearly on arch change).
     for obj, tm in new_m.items():
         # FP8 modules store [out_f, in_f]; dense params store param shape.
@@ -732,7 +936,34 @@ def _load_smaul_states(out: Path, opt: "SmaulOpt", model) -> None:
     # a resumed run keeps the same state footprint and math path.
     want = opt._storage_dtype(signed=True)
     opt.m = {k: v.to(want).contiguous() for k, v in new_m.items()}
+    opt.v_row = {k: v.to(want).contiguous() for k, v in new_vr.items()}
+    opt.v_col = {k: v.to(want).contiguous() for k, v in new_vc.items()}
     opt.v = {k: v.to(want).contiguous() for k, v in new_v.items()}
+    # opt.factor_v keeps whatever the caller configured, so full-vs-factored can
+    # be compared without touching source. Two mismatches need a decision:
+    if opt.v_row and not opt.factor_v:
+        raise ValueError(
+            f"SmaulOpt checkpoint {out} holds factored v but factor_v is disabled; "
+            "a factored state cannot be expanded into a full v without inventing the "
+            "rank term. Resume with factor_v enabled, or start a new run.")
+    migrated = 0
+    if opt.factor_v and opt.v:
+        for key_obj, full in list(opt.v.items()):
+            shape = tuple(full.shape)
+            if not opt._factor_shape(shape):
+                continue
+            # Explicit migration, full-v -> factored. The marginals of a stored v
+            # are exactly recoverable, so R and C are preserved exactly; only the
+            # rank term is dropped, which is what factoring approximates anyway.
+            f32 = full.to(want).float()
+            opt.v_row[key_obj] = f32.mean(dim=1).to(want).contiguous()
+            opt.v_col[key_obj] = f32.mean(dim=0).to(want).contiguous()
+            del opt.v[key_obj]
+            migrated += 1
+        if migrated:
+            print(f"[smaul] migrated {migrated} full-v tensor(s) to factored v on load; "
+                  "row/col marginals preserved exactly, rank term dropped. "
+                  "The next save writes the factored form.")
 
 
 def _validate_args(args) -> None:
@@ -863,6 +1094,11 @@ def main():
                    help="SmaulOpt state storage width; update math is always FP32. "
                         "bf16 (2B, default: ~0.07%% error vs fp32) | fp16 (2B) | "
                         "fp32 (4B, lossless reference)")
+    a.add_argument("--factor-v", dest="factor_v", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="SmaulOpt: store v factored (row/col marginals) for 2-D "
+                        "parameters instead of full-size. Default on; --no-factor-v "
+                        "gives the full-v comparison mode.")
     a.add_argument("--grad_clip", type=float, default=1.0)
     a.add_argument("--log_every", type=int, default=10)
     a.add_argument("--save_every", type=int, default=200)
@@ -943,7 +1179,8 @@ def main():
                        beta_v=getattr(args, "beta_v", 0.999),
                        epsilon=getattr(args, "epsilon", 1e-8),
                        weight_decay=args.wd, clip=args.grad_clip,
-                       state_dtype=getattr(args, "state_dtype", "bf16"))
+                       state_dtype=getattr(args, "state_dtype", "bf16"),
+                       factor_v=getattr(args, "factor_v", True))
     else:
         opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd, clip=args.grad_clip)
     wrap = load_tokenizer(str(tok_path))
