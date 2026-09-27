@@ -46,8 +46,10 @@ temporaries are never built. `_gw` is cleared afterwards.
 applies the normalized update `lr * m_hat / (v_hat + epsilon)` and the decoupled decay
 `lr * wd`, and re-quantizes in place. No FP32 master weight copy, no new quantization
 format, and no changes to the FP8 storage semantics. `--state-dtype` narrows only the
-optimizer's own `m`/`v` storage (4/2/1 bytes per element); the update math stays FP32 and
-the FP8 weight format is untouched.
+optimizer's own `m`/`v` storage (4 or 2 bytes per element); the update math stays FP32 and
+the FP8 weight format is untouched. SmaulOpt additionally stores `v` factored (row/column
+marginals) for 2-D states by default; those marginals are still updated and reconstructed
+inside the same 64-row blocks, so the requant path is unchanged.
 
 ## Export
 
