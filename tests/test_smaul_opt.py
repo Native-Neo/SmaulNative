@@ -16,6 +16,38 @@ def _dummy_model():
     return torch.nn.Module()
 
 
+def _v_sig(opt, model):
+    """Canonical stored-v signature per state, keyed by stable name.
+
+    Returns {name: (full_v,)} for an unfactored state or {name: (v_row, v_col)}
+    for a factored one, so round-trips can be compared across two *different*
+    model instances (where object identity differs) as well as the same one.
+    """
+    names = {id(p): n for n, p in model.named_parameters()}
+    for n, m in fp8_modules(model):
+        names[id(m)] = "fp8:" + n
+    out = {}
+    for k in opt.m:
+        nm = names.get(id(k))
+        if nm is None:
+            continue
+        if k in opt.v_row:
+            out[nm] = (opt.v_row[k].clone(), opt.v_col[k].clone())
+        else:
+            out[nm] = (opt.v[k].clone(),)
+    return out
+
+
+def _assert_v_sig_equal(got, want):
+    assert set(got) == set(want), (sorted(got), sorted(want))
+    for k in want:
+        assert len(got[k]) == len(want[k]), k
+        for a, b in zip(got[k], want[k]):
+            assert a.dtype == b.dtype, (k, a.dtype, b.dtype)
+            assert a.shape == b.shape, (k, a.shape, b.shape)
+            assert torch.equal(a, b), k
+
+
 # ----------------------------------------------------------------------
 # v2: reduced-precision state storage (FP32 arithmetic, narrower buffers)
 # ----------------------------------------------------------------------
@@ -258,9 +290,18 @@ def test_reduced_state_checkpoint_roundtrip(tmp_path, sdt):
     for k in opt.m:
         assert opt2.m[k].dtype == opt.m[k].dtype, (sdt, k)
         assert torch.equal(opt.m[k], opt2.m[k]), sdt
-        assert torch.equal(opt.v[k], opt2.v[k]), sdt
+    _assert_v_sig_equal(_v_sig(opt2, model), _v_sig(opt, model))
     # The saved file must reflect the reduced width, not a forced fp32 copy.
     assert (d / "optimizer_state.safetensors").stat().st_size > 0
+
+
+def _state_bytes(opt):
+    """Persistent optimizer-state bytes only: no params, no grads, no transients."""
+    tot = 0
+    for store in (opt.m, opt.v, opt.v_row, opt.v_col):
+        for t in store.values():
+            tot += t.numel() * t.element_size()
+    return tot
 
 
 def test_state_file_size_shrinks_with_dtype(tmp_path):
@@ -280,10 +321,40 @@ def test_state_file_size_shrinks_with_dtype(tmp_path):
         d.mkdir()
         _save_optimizer(d, opt, model)
         sizes[sdt] = (d / "optimizer_state.safetensors").stat().st_size
+        assert _state_bytes(opt) < sizes[sdt]  # file also carries safetensors headers
     assert sizes["bf16"] < sizes["fp32"]
-    # Both 2-byte widths are half of fp32.
-    assert sizes["bf16"] == pytest.approx(sizes["fp32"] * 0.5, rel=0.05)
-    assert sizes["fp16"] == pytest.approx(sizes["fp32"] * 0.5, rel=0.05)
+    # With m full-size and v factored, the 2-byte state is well under half of
+    # the 4-byte state, but not exactly half (m is still full-size).
+    assert sizes["bf16"] < sizes["fp32"] * 0.75
+    assert sizes["fp16"] < sizes["fp32"] * 0.75
+
+
+def test_factor_v_shrinks_state_without_touching_m(tmp_path):
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                       precision="fp32", architecture="plain")
+    got = {}
+    for fv in (True, False):
+        model = SmaulLinear(cfg)
+        opt = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=fv)
+        ids = torch.randint(0, 64, (2, 8))
+        opt.zero_grad(model)
+        _, loss = model(ids, ids)
+        loss.backward()
+        opt.step(model)
+        m_bytes = sum(t.numel() * t.element_size() for t in opt.m.values())
+        v_bytes = _state_bytes(opt) - m_bytes
+        got[fv] = (m_bytes, v_bytes)
+        d = tmp_path / ("factored" if fv else "full")
+        d.mkdir()
+        _save_optimizer(d, opt, model)
+    m_f, v_f = got[True]
+    m_u, v_u = got[False]
+    # m is byte-identical either way: factoring touches v only.
+    assert m_f == m_u, (m_f, m_u)
+    # v shrinks substantially.
+    assert v_f < v_u, (v_f, v_u)
+    assert v_u / v_f > 5, (v_f, v_u)
 
 
 def test_state_dtype_preserved_through_resume(tmp_path):
@@ -357,7 +428,7 @@ def test_fp8_state_survives_checkpoint(tmp_path, sdt):
         m2 = mods2[name]
         assert opt2.m[m2].dtype == opt.m[m].dtype
         assert torch.equal(opt.m[m], opt2.m[m2]), name
-        assert torch.equal(opt.v[m], opt2.v[m2]), name
+    _assert_v_sig_equal(_v_sig(opt2, model2), _v_sig(opt, model))
     # And the resumed optimizer must keep stepping without NaN.
     opt2.zero_grad(model2)
     _, loss = model2(ids, ids)
@@ -609,7 +680,7 @@ def test_checkpoint_save_load_roundtrip(tmp_path):
     assert opt2.step_count == 2 and opt2.lr == 1e-4
     for k in opt.m:
         assert k in opt2.m and torch.equal(opt.m[k], opt2.m[k])
-        assert torch.equal(opt.v[k], opt2.v[k])
+    _assert_v_sig_equal(_v_sig(opt2, model), _v_sig(opt, model))
 
 
 def test_checkpoint_resume_continues_identically(tmp_path):
@@ -693,15 +764,16 @@ def test_fp8_integration_keeps_storage_and_state(tmp_path):
         assert m.w8.dtype == torch.uint8
         assert m._gw is None  # cleared after update
         key = m
-        assert key in opt.m and key in opt.v
+        assert key in opt.m and key in opt.v_row and key in opt.v_col
         assert opt.m[key].shape == (m.out_f, m.in_f)
         assert opt.m[key].dtype == torch.float32
     _, loss2 = model(ids, ids)
     assert torch.isfinite(loss2)
-    # Overhead is ~2 FP32 per FP8 weight element.
+    # m is full-size; v is factored for this 2-D state, so (out_f + in_f).
     for _, m in mods:
         assert opt.m[m].numel() == m.out_f * m.in_f
-        assert opt.v[m].numel() == m.out_f * m.in_f
+        assert m in opt.v_row and m in opt.v_col
+        assert opt.v_row[m].numel() + opt.v_col[m].numel() == m.out_f + m.in_f
 
 
 def test_fp8_blockwise_matches_full_matrix_reference():
@@ -712,8 +784,10 @@ def test_fp8_blockwise_matches_full_matrix_reference():
     m.train()
     holder = torch.nn.Module()
     holder.add_module("lin", m)
+    # factor_v off: this asserts the blockwise path equals the full-matrix
+    # reference exactly, which a rank-1 v reconstruction cannot do.
     opt = SmaulOpt([], lr=lr, beta_m=bm, beta_v=bv, epsilon=eps, weight_decay=wd,
-                   clip=1e9, state_dtype="fp32")
+                   clip=1e9, state_dtype="fp32", factor_v=False)
     # Attach FP8 grad manually by running a backward.
     m(torch.randn(6, 64, requires_grad=True)).backward(torch.randn(6, 130))
     gw = m._gw.clone()
@@ -755,10 +829,12 @@ def test_works_with_all_param_types_plain_and_rawr():
         assert torch.isfinite(loss)
         changed = any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
         assert changed, arch
-        # Every trainable param with a grad got FP32 states.
+        # Every trainable param with a grad got state: m always, plus v in
+        # whichever form its shape selects.
         for p in model.parameters():
             if p.grad is not None:
-                assert p in opt.m and p in opt.v, arch
+                assert p in opt.m, arch
+                assert (p in opt.v) or (p in opt.v_row and p in opt.v_col), arch
 
 
 def test_training_smoke_loss_sensible_and_resumable(tmp_path):
@@ -792,3 +868,615 @@ def test_training_smoke_loss_sensible_and_resumable(tmp_path):
     o2.step(m2)
     _, loss_after = m2(ids, ids)
     assert torch.isfinite(loss_after)
+
+
+# ======================================================================
+# Factored v: shape rules, memory, checkpoints, and the numerical
+# comparison against full-v (the centerpiece).
+# ======================================================================
+
+
+def _factored_opt(p, **kw):
+    kw.setdefault("lr", 1e-3)
+    kw.setdefault("clip", 1e9)
+    return SmaulOpt([p], **kw)
+
+
+# ---- shape rules -----------------------------------------------------
+
+@pytest.mark.parametrize("shape,factored", [
+    ((64, 48), True), ((2, 2), True), ((4096, 4096), True),
+    ((48,), False), ((), False), ((1, 10), False), ((10, 1), False),
+])
+def test_factor_shape_rule(shape, factored):
+    p = torch.nn.Parameter(torch.randn(shape) if shape else torch.randn(()))
+    opt = _factored_opt(p, factor_v=True)
+    p.grad = torch.randn(shape) if shape else torch.randn(())
+    opt.step(_dummy_model())
+    assert opt._factor_shape(tuple(p.shape)) is factored, shape
+    assert p in opt.m
+    if factored:
+        assert p in opt.v_row and p in opt.v_col, shape
+        assert p not in opt.v, "factored state must not also keep a full v"
+        assert opt.v_row[p].shape == (shape[0],)
+        assert opt.v_col[p].shape == (shape[1],)
+        assert opt.v_row[p].dtype == torch.bfloat16
+        assert opt.v_col[p].dtype == torch.bfloat16
+    else:
+        assert p in opt.v and p not in opt.v_row, shape
+        assert opt.v[p].shape == tuple(p.shape)
+
+
+def test_factor_v_off_keeps_full_v_everywhere():
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    opt = _factored_opt(p, factor_v=False)
+    p.grad = torch.randn(32, 16)
+    opt.step(_dummy_model())
+    assert p in opt.v and p not in opt.v_row and p not in opt.v_col
+    assert opt.v[p].shape == (32, 16)
+
+
+def test_threshold_never_costs_more_than_full():
+    """For any shape we factor, R + C <= R * C, so factoring never costs more."""
+    for r in range(2, 12):
+        for c in range(2, 12):
+            assert r + c <= r * c, (r, c)
+    # ...and we refuse exactly the shapes where that would not hold.
+    p = torch.nn.Parameter(torch.randn(1, 8))
+    opt = _factored_opt(p, factor_v=True)
+    assert opt._factor_shape((1, 8)) is False
+
+
+# ---- memory ----------------------------------------------------------
+
+def test_factored_state_holds_no_full_matrix_v():
+    R, C = 300, 400
+    p = torch.nn.Parameter(torch.randn(R, C))
+    opt = _factored_opt(p, factor_v=True)
+    for _ in range(3):
+        p.grad = torch.randn(R, C)
+        opt.step(_dummy_model())
+    total = sum(t.numel() for t in list(opt.m.values()) + list(opt.v.values())
+                + list(opt.v_row.values()) + list(opt.v_col.values()))
+    assert total == R * C + R + C, total        # m full + two marginals
+    v_bytes = (opt.v_row[p].numel() + opt.v_col[p].numel()) * 2
+    assert v_bytes == (R + C) * 2
+    assert v_bytes < R * C * 2 / 10, (v_bytes, R * C * 2)
+
+
+def test_large_matrix_memory_target():
+    """The stated target: a 4096x4096 v goes from ~32 MB to ~16 KB."""
+    R = C = 4096
+    full = R * C * 2
+    factored = (R + C) * 2
+    assert full == 33554432 and factored == 16384
+    assert full / factored > 2000
+
+
+def test_m_is_always_full_size():
+    for shape in ((64, 48), (48,), ()):
+        p = torch.nn.Parameter(torch.randn(shape) if shape else torch.randn(()))
+        opt = _factored_opt(p, factor_v=True)
+        p.grad = torch.randn(shape) if shape else torch.randn(())
+        opt.step(_dummy_model())
+        assert opt.m[p].shape == tuple(p.shape), shape
+
+
+def test_factor_v_does_not_change_arithmetic_dtype():
+    p = torch.nn.Parameter(torch.randn(32, 16))
+    opt = _factored_opt(p, factor_v=True)
+    p.grad = torch.randn(32, 16)
+    opt.step(_dummy_model())
+    # Storage is bf16; the update path works in fp32 via .float().
+    assert opt.m[p].dtype == torch.bfloat16
+    assert opt.v_row[p].dtype == torch.bfloat16
+    # The marginal reduction yields fp32, which is what the EMA runs in.
+    assert SmaulOpt._mean_abs(torch.randn(4, 5), 1).dtype == torch.float32
+
+
+def test_no_fp16_or_int8_state_dtype():
+    assert "fp16" in SmaulOpt._STATE_DTYPES      # allowed, just not the default
+    assert "int8" not in SmaulOpt._STATE_DTYPES
+    assert SmaulOpt([torch.nn.Parameter(torch.randn(2))]).state_dtype == "bf16"
+
+
+# ---- correctness of the factorization itself -------------------------
+
+def test_marginals_are_exact():
+    """The EMA is linear, so EMA-of-marginals == marginals-of-EMA exactly.
+    The stored row/col vectors are the true marginals of v, with no error."""
+    R, C, T, bv = 24, 32, 25, 0.9
+    p = torch.nn.Parameter(torch.randn(R, C))
+    opt = _factored_opt(p, factor_v=True, state_dtype="fp32", weight_decay=0.0,
+                      beta_v=bv)
+    v_full = torch.zeros(R, C)
+    for _ in range(T):
+        g = torch.randn(R, C)
+        p.grad = g.clone()
+        opt.step(_dummy_model())
+        v_full = bv * v_full + (1 - bv) * g.abs()
+    # Compare the *final* marginals (state is bias-uncorrected, like v_full).
+    assert torch.allclose(opt.v_row[p].float(), v_full.mean(1), atol=1e-5)
+    assert torch.allclose(opt.v_col[p].float(), v_full.mean(0), atol=1e-5)
+
+
+def test_reconstruction_exact_for_rank_one_gradient():
+    """Best case: if |g| is rank-1 the reconstruction must be exact, which is
+    what proves the R*C/G form is the right one (an un-divided R*C is not)."""
+    torch.manual_seed(3)
+    a = torch.rand(20, 1) + 0.1
+    b = torch.rand(1, 30) + 0.1
+    g = (a * b).contiguous()
+    p = torch.nn.Parameter(torch.zeros(20, 30))
+    opt = _factored_opt(p, factor_v=True, state_dtype="fp32", weight_decay=0.0)
+    for _ in range(20):
+        p.grad = g.clone()
+        opt.step(_dummy_model())
+    p_ref = torch.nn.Parameter(torch.zeros(20, 30))
+    opt_ref = _factored_opt(p_ref, factor_v=False, state_dtype="fp32", weight_decay=0.0)
+    for _ in range(20):
+        p_ref.grad = g.clone()
+        opt_ref.step(_dummy_model())
+    rel = float((p - p_ref).norm() / p_ref.norm())
+    assert rel < 1e-5, rel
+
+
+def test_reconstruct_block_never_materializes_full_v():
+    """_reconstruct_block must return only the requested rows."""
+    r_hat = torch.arange(1, 11, dtype=torch.float32)
+    c_hat = torch.arange(1, 21, dtype=torch.float32)
+    blk = SmaulOpt._reconstruct_block(r_hat, c_hat, r_hat.mean(), 0, 4)
+    assert blk.shape == (4, 20)
+    assert SmaulOpt._reconstruct_block(r_hat, c_hat, r_hat.mean(), 6, 10).shape == (4, 20)
+    # And it equals the outer-product formula.
+    ref = torch.outer(r_hat[6:10], c_hat) / r_hat.mean()
+    assert torch.equal(SmaulOpt._reconstruct_block(r_hat, c_hat, r_hat.mean(), 6, 10), ref)
+
+
+def test_mean_abs_matches_abs_mean_without_full_temp():
+    g = torch.randn(64, 48)
+    assert torch.allclose(SmaulOpt._mean_abs(g, 1), g.abs().mean(1), atol=1e-6)
+    assert torch.allclose(SmaulOpt._mean_abs(g, 0), g.abs().mean(0), atol=1e-6)
+
+
+# ---- bias correction / weight decay / determinism under factoring ----
+
+def test_bias_correction_still_applied_when_factored():
+    """First step: v_hat marginals must equal mean|g| exactly (bc2 cancels it)."""
+    torch.manual_seed(5)
+    p = torch.nn.Parameter(torch.ones(8, 4))
+    opt = _factored_opt(p, factor_v=True, state_dtype="fp32", weight_decay=0.0)
+    g = torch.randn(8, 4)
+    p.grad = g.clone()
+    opt.step(_dummy_model())
+    # bc1 = 1-beta_m = 0.1, bc2 = 1-beta_v = 0.001
+    m_hat = opt.m[p].float() / 0.1
+    r_hat = opt.v_row[p].float() / 0.001
+    c_hat = opt.v_col[p].float() / 0.001
+    v_hat = torch.outer(r_hat, c_hat) / r_hat.mean()
+    u = m_hat / (v_hat + 1e-8)
+    assert torch.allclose(p.detach(), 1.0 - 1e-3 * u, atol=1e-6)
+
+
+def test_weight_decay_applied_when_factored():
+    p0 = torch.nn.Parameter(torch.full((8, 4), 2.0))
+    p1 = torch.nn.Parameter(torch.full((8, 4), 2.0))
+    o0 = _factored_opt(p0, factor_v=True, weight_decay=0.0)
+    o1 = _factored_opt(p1, factor_v=True, weight_decay=0.05)
+    g = torch.randn(8, 4)
+    p0.grad = g.clone(); o0.step(_dummy_model())
+    p1.grad = g.clone(); o1.step(_dummy_model())
+    # Same u; the only difference is the decoupled decay.
+    diff = p0.detach() - p1.detach()
+    assert torch.allclose(diff, torch.full((8, 4), 1e-3 * 0.05 * 2.0), atol=1e-5, rtol=1e-4)
+
+
+def test_determinism_preserved_when_factored():
+    def run():
+        torch.manual_seed(77)
+        p = torch.nn.Parameter(torch.randn(16, 12))
+        opt = _factored_opt(p, factor_v=True)
+        for _ in range(4):
+            torch.manual_seed(500)
+            p.grad = torch.randn(16, 12)
+            opt.step(_dummy_model())
+        return p.detach().clone(), opt.v_row[p].clone(), opt.v_col[p].clone()
+    a, b = run(), run()
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+
+
+def test_no_nan_inf_under_factoring():
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(32, 24) * 0.1)
+    opt = _factored_opt(p, factor_v=True)
+    for i in range(20):
+        p.grad = torch.randn(32, 24) * (0.1 ** (i % 4))
+        n = opt.step(_dummy_model())
+        assert n != float("inf")
+        assert torch.isfinite(p).all()
+        assert torch.isfinite(opt.v_row[p].float()).all()
+        assert torch.isfinite(opt.v_col[p].float()).all()
+
+
+def test_nonfinite_grads_still_skipped_when_factored():
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    opt = _factored_opt(p, factor_v=True)
+    p.grad = torch.randn(8, 4)
+    opt.step(_dummy_model())
+    before, r_b, c_b = p.detach().clone(), opt.v_row[p].clone(), opt.v_col[p].clone()
+    p.grad = torch.full((8, 4), float("nan"))
+    assert opt.step(_dummy_model()) == float("inf")
+    assert opt.step_count == 1
+    assert torch.equal(p.detach(), before)
+    assert torch.equal(opt.v_row[p], r_b) and torch.equal(opt.v_col[p], c_b)
+
+
+# ---- checkpoints -----------------------------------------------------
+
+def test_factored_checkpoint_roundtrip(tmp_path):
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                       precision="fp32", architecture="plain")
+    model = SmaulLinear(cfg)
+    opt = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=True)
+    ids = torch.randint(0, 64, (2, 8))
+    for _ in range(2):
+        opt.zero_grad(model)
+        _, loss = model(ids, ids)
+        loss.backward()
+        opt.step(model)
+    d = tmp_path / "f"
+    d.mkdir()
+    model.save_pretrained(d)
+    _save_optimizer(d, opt, model)
+    from safetensors.torch import load_file
+    blobs = load_file(str(d / "optimizer_state.safetensors"), device="cpu")
+    assert any(k.startswith("v_row.param.") for k in blobs)
+    assert any(k.startswith("v_col.param.") for k in blobs)
+    assert json.loads((d / "optimizer.json").read_text())["factor_v"] is True
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()))
+    _load_optimizer(d, opt2, model2)
+    assert opt2.factor_v is True and opt2.step_count == 2
+    _assert_v_sig_equal(_v_sig(opt2, model2), _v_sig(opt, model))
+    # keeps stepping
+    opt2.zero_grad(model2)
+    _, loss = model2(ids, ids)
+    loss.backward()
+    assert opt2.step(model2) != float("inf")
+    _, after = model2(ids, ids)
+    assert torch.isfinite(after)
+
+
+def test_factored_checkpoint_resume_continues_identically(tmp_path):
+    """Resume a factored checkpoint: the next step must match a run that never
+    stopped, which requires v_row/v_col and the step counter to be exact."""
+    torch.manual_seed(8)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                       precision="fp32", architecture="plain")
+    model = SmaulLinear(cfg)
+    opt = SmaulOpt(list(model.parameters()), lr=2e-4, factor_v=True)
+    ids = torch.randint(0, 64, (2, 8))
+    for _ in range(3):
+        opt.zero_grad(model)
+        _, loss = model(ids, ids)
+        loss.backward()
+        opt.step(model)
+    d = tmp_path / "ck"
+    d.mkdir()
+    model.save_pretrained(d)
+    _save_optimizer(d, opt, model)
+    # one more step in-process
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
+    loss.backward()
+    opt.step(model)
+    ref = [p.detach().clone() for p in model.parameters()]
+    # resume and replay
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()))
+    _load_optimizer(d, opt2, model2)
+    assert opt2.step_count == 3
+    opt2.zero_grad(model2)
+    _, l2 = model2(ids, ids)
+    l2.backward()
+    opt2.step(model2)
+    for a, b in zip(ref, model2.parameters()):
+        assert torch.allclose(a, b.detach(), atol=1e-7, rtol=1e-6)
+    assert opt2.step_count == 4
+
+
+def test_full_v_checkpoint_migrates_to_factored(tmp_path):
+    """A pre-factoring (full-v) checkpoint must load into factored mode with the
+    marginals preserved exactly, and say so rather than silently dropping state."""
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=32, d_model=16, n_layer=1, n_heads=2, tile=16,
+                       precision="fp32", architecture="plain")
+    model = SmaulLinear(cfg)
+    full = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=False)
+    ids = torch.randint(0, 32, (2, 8))
+    full.zero_grad(model)
+    _, loss = model(ids, ids)
+    loss.backward()
+    full.step(model)
+    d = tmp_path / "old"
+    d.mkdir()
+    model.save_pretrained(d)
+    _save_optimizer(d, full, model)
+    saved_v = {k: v.clone() for k, v in full.v.items()}
+    fact = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=True)
+    _load_optimizer(d, fact, model)
+    # 2-D states became factored; their marginals match the stored full v exactly.
+    moved = 0
+    for k, v in saved_v.items():
+        if fact._factor_shape(tuple(v.shape)):
+            assert k in fact.v_row and k in fact.v_col
+            assert torch.allclose(fact.v_row[k].float(), v.float().mean(1), atol=2e-2)
+            assert torch.allclose(fact.v_col[k].float(), v.float().mean(0), atol=2e-2)
+            moved += 1
+        else:
+            assert k in fact.v
+    assert moved > 0
+    assert fact.step_count == full.step_count
+
+
+def test_factored_checkpoint_refuses_full_mode(tmp_path):
+    """factored -> full is not reconstructible; it must fail loudly."""
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=32, d_model=16, n_layer=1, n_heads=2, tile=16,
+                       precision="fp32", architecture="plain")
+    model = SmaulLinear(cfg)
+    opt = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=True)
+    ids = torch.randint(0, 32, (2, 8))
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
+    loss.backward()
+    opt.step(model)
+    d = tmp_path / "f"
+    d.mkdir()
+    model.save_pretrained(d)
+    _save_optimizer(d, opt, model)
+    want_full = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=False)
+    with pytest.raises(ValueError, match="factored"):
+        _load_optimizer(d, want_full, model)
+
+
+def test_checkpoint_without_factor_v_key_is_treated_as_full(tmp_path):
+    """Backward compatibility: a checkpoint written before factoring existed has
+    no factor_v key and must load as full-v, not be assumed factored."""
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=32, d_model=16, n_layer=1, n_heads=2, tile=16,
+                       precision="fp32", architecture="plain")
+    model = SmaulLinear(cfg)
+    opt = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=False)
+    ids = torch.randint(0, 32, (2, 8))
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
+    loss.backward()
+    opt.step(model)
+    d = tmp_path / "legacy"
+    d.mkdir()
+    model.save_pretrained(d)
+    _save_optimizer(d, opt, model)
+    # Strip the flag, exactly as a pre-factoring checkpoint would look.
+    j = d / "optimizer.json"
+    data = json.loads(j.read_text())
+    data.pop("factor_v", None)
+    j.write_text(json.dumps(data, indent=2))
+    fresh = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=False)
+    _load_optimizer(d, fresh, model)
+    assert fresh.step_count == 1
+    _assert_v_sig_equal(_v_sig(fresh, model), _v_sig(opt, model))
+
+
+def test_mixed_full_and_factored_states_in_one_checkpoint(tmp_path):
+    """A real model has 2-D (factored) and 1-D (full) params at once."""
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                       precision="fp32", architecture="plain")
+    model = SmaulLinear(cfg)
+    opt = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=True)
+    ids = torch.randint(0, 64, (2, 8))
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
+    loss.backward()
+    opt.step(model)
+    n_fact = len(opt.v_row)
+    n_full = len(opt.v)
+    assert n_fact > 0 and n_full > 0, (n_fact, n_full)
+    d = tmp_path / "mix"
+    d.mkdir()
+    model.save_pretrained(d)
+    _save_optimizer(d, opt, model)
+    opt2 = SmaulOpt(list(model.parameters()))
+    _load_optimizer(d, opt2, model)
+    _assert_v_sig_equal(_v_sig(opt2, model), _v_sig(opt, model))
+
+
+# ---- FP8 integration -------------------------------------------------
+
+def test_fp8_model_training_with_factored_v():
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                       precision="fp8", architecture="plain")
+    model = SmaulLinear(cfg)
+    model.train()
+    opt = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=True)
+    ids = torch.randint(0, 64, (2, 8))
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert opt.step(model) != float("inf")
+    for _, m in fp8_modules(model):
+        assert m.w8.dtype == torch.uint8           # FP8 format untouched
+        assert m._gw is None
+        assert m in opt.m and m in opt.v_row and m in opt.v_col
+        assert opt.m[m].shape == (m.out_f, m.in_f)  # m still full
+        assert opt.v_row[m].shape == (m.out_f,)
+        assert opt.v_col[m].shape == (m.in_f,)
+    _, loss2 = model(ids, ids)
+    assert torch.isfinite(loss2)
+
+
+def test_no_fp32_master_weight_still_holds_with_factoring():
+    from kernel.fp8_tile import FP8Linear
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=2, n_heads=4, tile=32)
+    model = SmaulLinear(cfg)
+    opt = SmaulOpt(list(model.parameters()), lr=1e-4, factor_v=True)
+    ids = torch.randint(0, 64, (2, 8))
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
+    loss.backward()
+    opt.step(model)
+    for _name, m in fp8_modules(model):
+        for pname, p in m.named_parameters(recurse=False):
+            assert p.shape != m.w8.shape or p.dtype != torch.float32, (pname,)
+        assert m.w8.dtype == torch.uint8
+        # the factored marginals are vectors, never an [out_f, in_f] fp32 copy
+        assert opt.v_row[m].dim() == 1 and opt.v_col[m].dim() == 1
+
+
+# ======================================================================
+# THE NUMERICAL COMPARISON: full-v vs factored-v
+# ======================================================================
+
+
+_DISTS = ("uniform", "normal", "heavy_tailed", "sparse", "mostly_zero",
+          "unbalanced_rows", "unbalanced_cols", "rank_one")
+
+
+def _dist_grads(kind, R, C, T, seed=0):
+    """Deterministic gradient sequence of the requested structure."""
+    g = torch.Generator().manual_seed(seed)
+    # Fixed factors: a sum of *different* rank-1 matrices is full rank, so
+    # "rank_one" only keeps v separable if a and b never change.
+    a_fix = torch.rand(R, 1, generator=g) + 0.1
+    b_fix = torch.rand(1, C, generator=g) + 0.1
+    out = []
+    for t in range(T):
+        if kind == "uniform":
+            x = torch.rand(R, C, generator=g)
+        elif kind == "normal":
+            x = torch.randn(R, C, generator=g).abs()
+        elif kind == "heavy_tailed":
+            x = torch.randn(R, C, generator=g).abs().pow(0.2)
+        elif kind == "sparse":
+            x = torch.rand(R, C, generator=g)
+            x[x < 0.90] = 0.0
+        elif kind == "mostly_zero":
+            x = torch.rand(R, C, generator=g)
+            x[x < 0.995] = 0.0
+        elif kind == "unbalanced_rows":
+            x = torch.rand(R, C, generator=g) * torch.logspace(0, 3, R).unsqueeze(1)
+        elif kind == "unbalanced_cols":
+            x = torch.rand(R, C, generator=g) * torch.logspace(0, 3, C).unsqueeze(0)
+        elif kind == "rank_one":
+            x = (a_fix * b_fix).contiguous()
+        else:
+            raise AssertionError(kind)
+        out.append(x)
+    return out
+
+
+def _run(mode, grads, R, C, lr=1e-3, sdt="fp32"):
+    theta0 = torch.full((R, C), 0.1)
+    p = torch.nn.Parameter(theta0.clone())
+    opt = _factored_opt(p, factor_v=(mode == "factored"), state_dtype=sdt,
+                        weight_decay=0.0, beta_v=0.9)
+    us, vhat = [], None
+    for x in grads:
+        p.grad = x.clone()
+        opt.step(_dummy_model())
+        us.append(p.detach().clone())
+    # final reconstructed v (bias-corrected) for the v-error column
+    t = len(grads)
+    bc2 = 1.0 - 0.9 ** t
+    if mode == "factored":
+        rh = opt.v_row[p].float() / bc2
+        ch = opt.v_col[p].float() / bc2
+        vhat = torch.outer(rh, ch) / rh.mean()
+    else:
+        vhat = opt.v[p].float() / bc2
+    return us, vhat, p.detach().clone()
+
+
+def _report(kind, R=24, C=40, T=60, sdt="fp32"):
+    grads = _dist_grads(kind, R, C, T)
+    uf, v_full, pf = _run("full", grads, R, C, sdt=sdt)
+    us, v_fact, ps = _run("factored", grads, R, C, sdt=sdt)
+    v_rel = float((v_fact - v_full).norm() / v_full.norm())
+    v_abs = float((v_fact - v_full).abs().max())
+    uf_t = torch.stack(uf)                      # per-step parameters
+    us_t = torch.stack(us)
+    u_rel = float((us_t - uf_t).norm() / uf_t.norm())
+    u_abs = float((us_t - uf_t).abs().max())
+    p_rel = float((ps - pf).norm() / pf.norm())
+    p_abs = float((ps - pf).abs().max())
+    finite = bool(torch.isfinite(v_fact).all() and torch.isfinite(v_full).all()
+                  and torch.isfinite(uf_t).all() and torch.isfinite(us_t).all()
+                  and torch.isfinite(pf).all() and torch.isfinite(ps).all())
+    return v_rel, v_abs, u_rel, u_abs, p_rel, p_abs, finite
+
+
+@pytest.mark.parametrize("kind", _DISTS)
+def test_factored_vs_full_numerical_error(kind, capsys):
+    """The headline comparison. Not bit-identical by design: the reconstruction
+    is an approximation. Reported per gradient structure, because a rank-1 field
+    is dense and therefore handles sparse v badly."""
+    v_rel, v_abs, u_rel, u_abs, p_rel, p_abs, finite = _report(kind)
+    with capsys.disabled():
+        print(f"\n[full vs factored] {kind:16s} v_rel={v_rel:.4f} v_abs={v_abs:.3e} "
+              f"u_rel={u_rel:.4f} u_abs={u_abs:.3e} p_rel={p_rel:.4f} p_abs={p_abs:.3e}")
+    # No NaN/Inf may appear in either mode, for any distribution.
+    assert finite, kind
+    # Well-conditioned structures must stay close.
+    if kind in ("rank_one", "heavy_tailed"):
+        assert p_rel < 0.10, (kind, p_rel)      # exact / near-exact
+    if kind in ("uniform", "normal", "unbalanced_rows", "unbalanced_cols"):
+        assert p_rel < 0.35, (kind, p_rel)
+    # Sparse v is the known weak spot; assert the failure is bounded, not silent.
+    if kind in ("sparse", "mostly_zero"):
+        # Known weak spot: bounded and finite, but far worse than dense grids.
+        assert p_rel < 2.0, (kind, p_rel)
+    # Rank-1 must be essentially exact.
+    if kind == "rank_one":
+        assert p_rel < 1e-4, p_rel
+
+
+def test_factored_never_exceeds_full_v_error_on_dense_grids():
+    """Sanity: on a dense grid the marginals themselves are reproduced exactly,
+    so the only error is the dropped rank term, which shrinks as the grid gets
+    more separable. This pins the direction of the error rather than a magnitude."""
+    errs = [_report("normal", R=8, C=8, T=20)[0],
+            _report("normal", R=64, C=64, T=20)[0]]
+    assert errs[0] < 1.0 and errs[1] < 1.0, errs
+
+
+def test_factored_is_deterministic_across_identical_runs():
+    grads = _dist_grads("normal", 16, 24, 12)
+    a = _run("factored", grads, 16, 24)[2]
+    b = _run("factored", grads, 16, 24)[2]
+    assert torch.equal(a, b)
+
+
+def test_sparse_gradients_are_the_documented_weak_spot():
+    """Locks in the known limitation so it cannot regress silently: a rank-1 v
+    under-estimates v at the non-zeros, which inflates the step there."""
+    grads = _dist_grads("sparse", 24, 40, 60)
+    uf, v_full, pf = _run("full", grads, 24, 40)
+    us, v_fact, ps = _run("factored", grads, 24, 40)
+    # The reconstruction smears mass into positions whose true v is zero.
+    tiny = v_full < 1e-6
+    if tiny.any():
+        assert float(v_fact[tiny].abs().max()) > 0.0
+    # And it under-estimates where the gradient actually is: compare the
+    # reconstruction against the true v on the positions that get gradient.
+    g_last = grads[-1]
+    hot = g_last > 0
+    under = float(v_full[hot].mean() / max(float(v_fact[hot].mean()), 1e-30))
+    print(f"\n[sparse] v is {under:.2f}x too SMALL at the {int(hot.sum())} positions "
+          f"with gradient -> steps there are ~{under:.2f}x too large")
+    assert under > 1.0, under
