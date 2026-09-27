@@ -794,11 +794,17 @@ def test_fp8_blockwise_matches_full_matrix_reference():
     w8_before, sc_before = m.w8.clone(), m.sc.clone()
     opt.step(holder)
     assert m._gw is None
-    # Reference full-matrix computation.
-    st_m = torch.zeros_like(gw)
-    st_v = torch.zeros_like(gw)
-    st_m_ref = (st_m * bm + gw * (1 - bm))
-    st_v_ref = (st_v * bv + gw.abs() * (1 - bv))
+    # Reference full-matrix computation, in FP32. `gw` may be bf16 (_gw storage),
+    # but the EMA is evaluated in FP32, so the reference must widen the gradient
+    # rather than inherit its dtype -- the optimizer promotes bf16 -> fp32
+    # exactly, so this stays bit-comparable.
+    st_m = torch.zeros(gw.shape, dtype=torch.float32)
+    st_v = torch.zeros(gw.shape, dtype=torch.float32)
+    # Widen explicitly: a Python float scalar is weakly typed, so `bf16 * 0.1`
+    # would round in bf16 instead of promoting to fp32 like `m_b.add_(g, alpha=)`.
+    gwf = gw.float()
+    st_m_ref = st_m * bm + gwf * (1 - bm)
+    st_v_ref = st_v * bv + gwf.abs() * (1 - bv)
     bc1, bc2 = 1 - bm, 1 - bv
     u_ref = (st_m_ref / bc1) / (st_v_ref / bc2 + eps)
     upd_ref = u_ref * lr
@@ -1480,3 +1486,182 @@ def test_sparse_gradients_are_the_documented_weak_spot():
     print(f"\n[sparse] v is {under:.2f}x too SMALL at the {int(hot.sum())} positions "
           f"with gradient -> steps there are ~{under:.2f}x too large")
     assert under > 1.0, under
+
+
+# ---- factored-v regressions found during the 256M validation ----------
+
+def test_zero_gradients_apply_weight_decay_when_factored():
+    """Regression: the grand mean is 0 when every gradient is 0, so R*C/G was
+    0/0 = NaN, u came out non-finite, and the block was skipped -- which silently
+    dropped that block's weight decay. Factored must match full-v here."""
+    for fv in (False, True):
+        p = torch.nn.Parameter(torch.full((8, 4), 2.0))
+        opt = _factored_opt(p, factor_v=fv, weight_decay=0.05)
+        p.grad = torch.zeros(8, 4)
+        assert opt.step(_dummy_model()) != float("inf")
+        want = 2.0 * (1 - 1e-3 * 0.05)
+        assert torch.allclose(p.detach(), torch.full((8, 4), want), atol=1e-6), fv
+        # v is 0 and m is 0, so no gradient step happened
+        if fv:
+            assert torch.equal(opt.v_row[p].float(), torch.zeros(8))
+        assert torch.equal(opt.m[p].float(), torch.zeros(8, 4)), fv
+
+
+def test_zero_then_nonzero_gradients_do_not_stale_the_state():
+    """Regression: m's write-back sat behind the finite-u check, so a block whose
+    u went non-finite never advanced its m while the step counter did. m must
+    track the gradient EMA regardless."""
+    for fv in (False, True):
+        p = torch.nn.Parameter(torch.ones(8, 4))
+        opt = _factored_opt(p, factor_v=fv, weight_decay=0.0)
+        for _ in range(3):
+            p.grad = torch.zeros(8, 4)
+            opt.step(_dummy_model())
+        p.grad = torch.ones(8, 4)
+        opt.step(_dummy_model())
+        # After 3 zero steps and one unit gradient, m = 0.1 * 1
+        assert torch.allclose(opt.m[p].float(), torch.full((8, 4), 0.1), atol=1e-3), fv
+
+
+def test_factored_matches_full_v_on_all_zero_gradients_exactly():
+    a = torch.nn.Parameter(torch.full((16, 8), 1.5))
+    b = torch.nn.Parameter(torch.full((16, 8), 1.5))
+    oa = _factored_opt(a, factor_v=False, weight_decay=0.02)
+    ob = _factored_opt(b, factor_v=True, weight_decay=0.02)
+    for _ in range(5):
+        for t in (a, b):
+            t.grad = torch.zeros(16, 8)
+        oa.step(_dummy_model())
+        ob.step(_dummy_model())
+    assert torch.allclose(a.detach(), b.detach(), atol=1e-7), float((a - b).abs().max())
+
+
+# ---- BF16 gradients (_gw + dense p.grad) ------------------------------
+
+def test_gw_is_bf16_by_default():
+    from kernel.fp8_tile import FP8Linear, GW_DTYPE
+    assert GW_DTYPE is torch.bfloat16
+    m = FP8Linear(32, 96, tile=32)
+    m.train()
+    m(torch.randn(8, 32, requires_grad=True)).backward(torch.randn(8, 96))
+    assert m._gw.dtype is torch.bfloat16
+    assert m._gw.numel() * m._gw.element_size() == m._gw.numel() * 2
+
+
+def test_gw_bf16_halves_the_persistent_gradient_buffer():
+    """The persistent win: _gw is the largest optimizer-side buffer, and it now
+    costs 2 bytes/element instead of 4 for the same tensor.
+
+    (The step's *transient* allocations are dominated by the FP8 requant path,
+    which allocates far more than the gradient does, so the blockwise read in
+    step() is hygiene rather than what makes the run fit. The property that must
+    not regress is the buffer width, checked here and by test_gw_is_bf16_by_default.)
+    """
+    from kernel.fp8_tile import FP8Linear
+    torch.manual_seed(0)
+    out_f, in_f = 256, 256
+    mod = FP8Linear(in_f, out_f, tile=32)
+    mod.train()
+    mod(torch.randn(8, in_f, requires_grad=True)).backward(torch.randn(8, out_f))
+    assert mod._gw is not None
+    got = mod._gw.numel() * mod._gw.element_size()
+    assert got == out_f * in_f * 2, got
+    assert got * 2 == out_f * in_f * 4      # exactly half of the old fp32 buffer
+
+
+def test_step_never_widens_the_whole_gw():
+    """Guard against reintroducing a whole-matrix FP32 copy of _gw.
+
+    `m._gw.float()` in step() would allocate an FP32 tensor as large as the BF16
+    buffer it replaced, i.e. give back the entire saving. The block loop must
+    read row slices and let the FP32 state accumulators promote.
+    """
+    import inspect
+    from train import SmaulOpt as _S
+    src = inspect.getsource(_S.step)
+    assert "_gw.float()" not in src, "step() must not widen the whole _gw to FP32"
+    assert "_gw.float()" not in inspect.getsource(_S)
+
+
+def test_narrow_grads_casts_dense_grads():
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    opt = _factored_opt(p, grad_dtype="bf16")
+    p.grad = torch.randn(8, 4)
+    assert p.grad.dtype is torch.float32
+    opt.narrow_grads_()
+    assert p.grad.dtype is torch.bfloat16
+    assert p.grad.shape == (8, 4)
+
+
+@pytest.mark.parametrize("gd,expect", [("bf16", torch.bfloat16),
+                                       ("fp16", torch.float16),
+                                       ("fp32", torch.float32)])
+def test_grad_dtype_option(gd, expect):
+    p = torch.nn.Parameter(torch.randn(8, 4))
+    opt = _factored_opt(p, grad_dtype=gd)
+    p.grad = torch.randn(8, 4)
+    opt.narrow_grads_()
+    assert p.grad.dtype is expect, (gd, p.grad.dtype)
+
+
+def test_grad_dtype_validation():
+    p = torch.nn.Parameter(torch.randn(2))
+    for bad in ("int8", "fp8", "bfloat32", 1):
+        with pytest.raises(ValueError, match="grad_dtype"):
+            _factored_opt(p, grad_dtype=bad)
+
+
+def test_narrowed_grads_still_train_and_stay_finite():
+    """End-to-end: a bf16 gradient must produce a finite, decreasing loss, and
+    the update must stay close to the same run with FP32 gradients."""
+    def run(gd):
+        torch.manual_seed(0)
+        cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                           precision="fp32", architecture="plain")
+        model = SmaulLinear(cfg)
+        model.train()
+        opt = SmaulOpt(list(model.parameters()), lr=1e-3, grad_dtype=gd)
+        torch.manual_seed(1)
+        ids = torch.randint(0, 64, (2, 16))
+        out = []
+        for _ in range(6):
+            opt.zero_grad(model)
+            _, loss = model(ids, ids)
+            loss.backward()
+            opt.narrow_grads_()
+            assert opt.step(model) != float("inf")
+            out.append(float(loss.detach()))
+        return out
+    l32 = run("fp32")
+    l16 = run("bf16")
+    assert all(torch.isfinite(torch.tensor(x)) for x in l16)
+    assert l16[-1] < l16[0], (l16[0], l16[-1])
+    rel = abs(l16[-1] - l32[-1]) / max(abs(l32[-1]), 1e-12)
+    print(f"\n[bf16 grads] fp32 final={l32[-1]:.6f} bf16 final={l16[-1]:.6f} rel={rel:.2e}")
+    assert rel < 0.05, (l32[-1], l16[-1])
+
+
+def test_fp8_training_with_bf16_gw_and_narrowed_grads():
+    torch.manual_seed(0)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                       precision="fp8", architecture="plain")
+    model = SmaulLinear(cfg)
+    model.train()
+    opt = SmaulOpt(list(model.parameters()), lr=1e-4)
+    ids = torch.randint(0, 64, (2, 8))
+    losses = []
+    for _ in range(4):
+        opt.zero_grad(model)
+        _, loss = model(ids, ids)
+        assert torch.isfinite(loss)
+        loss.backward()
+        opt.narrow_grads_()
+        assert opt.step(model) != float("inf")
+        losses.append(float(loss.detach()))
+    for _, m in fp8_modules(model):
+        assert m.w8.dtype is torch.uint8          # FP8 format untouched
+    for p in model.parameters():
+        if p.grad is not None:
+            assert p.grad.dtype is torch.bfloat16, p.dtype
+    assert losses[-1] < losses[0], losses
+    print(f"\n[fp8 + bf16 grads] losses {[round(x, 4) for x in losses]}")
