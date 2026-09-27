@@ -22,6 +22,9 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--d` | `512` | model width (`d_model`) |
 | `--layers` | `8` | block count (`n_layer`) |
 | `--heads` | `8` | linear-attention head count |
+| `--architecture` | `rawr` | `rawr` (sparse, default) or `plain` (dense baseline) |
+| `--rawr-sparsity` | `0.9` | Rawr: fraction of connections omitted; see the warning below |
+| `--rawr-min-degree` | `4` | Rawr: connectivity floor per token (>= 1) |
 | `--precision` | `fp8` | weight precision: tiled-E4M3 `fp8` or plain `fp32` |
 | `--ctx` | `256` | training sequence length |
 | `--batch` | `2` | sequences per optimizer step |
@@ -46,8 +49,32 @@ In `fp32` mode every projection is a plain FP32 linear (`fp8_modules` is empty) 
 optimizers run their standard parameter path; checkpoints, inference, and GGUF export work
 identically, with `.weight` tensors instead of packed `w8`/`sc` pairs.
 
-## Tokenizer
+## `--rawr-sparsity` is a column-count knob, not a compression ratio
 
+`hidden_cols` keeps `K = d_model * (1 - rawr_sparsity)` columns per `SparseLinear` row, and
+`SparseLinear.forward` gathers `x[..., cols]` into `[B, T, out_f, K]`. So cost and memory
+scale with `K`, and a "modest" sparsity fraction buys very little while still paying all of
+Rawr's overhead (int64 `cols` index buffers, the 4-D gather, blockwise requant).
+
+Measured gather traffic per forward pass, defaults (`d=512`, `ctx=256`, `batch=2`, 8 layers,
+vocab 8000):
+
+| `--rawr-sparsity` | K | traffic / forward | observed tok/s |
+|---|---|---|---|
+| `0.0` | 512 | 15.31 GiB (dense) | — |
+| `0.5` (old default) | 256 | 7.66 GiB | 2.3–3.5, and peak RSS 4.44 GiB |
+| **`0.9` (default now)** | **51** | **1.53 GiB** | **9.6–11.9**, peak RSS 1.62 GiB |
+| `0.99` | 5 | 0.15 GiB | 62–78 |
+
+The old `0.5` default was the worst of both worlds: half the compute of dense at full sparse
+overhead, and on a ~4 GiB-class machine it sat close enough to the OOM kill line to be
+intermittently killed during the first steps. Raising it to `0.9` cut peak RSS 2.7x.
+
+`LinearConfig` keeps `rawr_sparsity=0.5` as its code-level default so library callers and
+legacy checkpoints (which record the value they were built with) are unaffected -- same
+pattern as `architecture` defaulting to `plain` in code but `rawr` on the CLI.
+
+## Tokenizer
 The tokenizer is built automatically via `tokenizer.ensure_tokenizer`: an existing file is
 reused only when its vocabulary size equals `--vocab` and its format version is current
 (version 7, `tokenizer.VERSION`); otherwise it is rebuilt from `--data` (up to
