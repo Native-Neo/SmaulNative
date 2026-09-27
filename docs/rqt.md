@@ -41,6 +41,14 @@ computed from the FP32 momentum slice, the block's tiles are decoded, decay and 
 are applied in FP32, and the block is re-quantized in place. Full-matrix `upd`
 temporaries are never built. `_gw` is cleared afterwards.
 
+`train.SmaulOpt` (`--optimizer smaul`) reuses the same blockwise requant path: its FP32
+`m`/`v` states are updated over the full matrix, then each 64-row block decodes its tiles,
+applies the normalized update `lr * m_hat / (v_hat + epsilon)` and the decoupled decay
+`lr * wd`, and re-quantizes in place. No FP32 master weight copy, no new quantization
+format, and no changes to the FP8 storage semantics. `--state-dtype` narrows only the
+optimizer's own `m`/`v` storage (4/2/1 bytes per element); the update math stays FP32 and
+the FP8 weight format is untouched.
+
 ## Export
 
 `convert_linear_to_gguf.py` dequantizes each tile at export time and writes plain
