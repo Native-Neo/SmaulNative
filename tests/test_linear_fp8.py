@@ -210,20 +210,60 @@ def test_batch_seq_sweep_finite():
 
 
 def test_blockwise_grad_accumulation():
+    """The blockwise accumulation math, verified exactly at FP32 storage.
+
+    `_gw` is stored at `GW_DTYPE` (bf16 by default), which rounds the block
+    product, so exactness is only checkable with the storage dtype overridden.
+    The bf16 case is asserted separately below.
+    """
+    import kernel.fp8_tile as ft
+    real = ft.GW_DTYPE
+    ft.GW_DTYPE = torch.float32
+    try:
+        torch.manual_seed(5)
+        for in_f, out_f, rows in [(128, 130, 6), (65, 65, 9)]:
+            m = FP8Linear(in_f, out_f, tile=32)
+            m.train()
+            x1 = torch.randn(rows, in_f, requires_grad=True)
+            g1 = torch.randn(rows, out_f)
+            x2 = torch.randn(rows, in_f, requires_grad=True)
+            g2 = torch.randn(rows, out_f)
+            m(x1).backward(g1)
+            m(x2).backward(g2)
+            expected = g1.T @ x1 + g2.T @ x2
+            e = _err(m._gw, expected)
+            print(f"\n[gwacc fp32 {in_f}x{out_f}r{rows}] max={e['max']:.3g} rel={e['rel']:.3g}")
+            assert e["rel"] < 1e-5
+    finally:
+        ft.GW_DTYPE = real
+
+
+def test_gw_is_bf16_and_accurate_to_bf16():
+    """Default `_gw` storage is bf16: half the memory, one rounding per add.
+    bf16 carries 8 mantissa bits, so a single product rounds to ~2^-8 relative;
+    two accumulations must stay within a small multiple of that, not 1e-5."""
+    import kernel.fp8_tile as ft
+    assert ft.GW_DTYPE is torch.bfloat16, ft.GW_DTYPE
     torch.manual_seed(5)
-    for in_f, out_f, rows in [(128, 130, 6), (65, 65, 9)]:
-        m = FP8Linear(in_f, out_f, tile=32)
-        m.train()
-        x1 = torch.randn(rows, in_f, requires_grad=True)
-        g1 = torch.randn(rows, out_f)
-        x2 = torch.randn(rows, in_f, requires_grad=True)
-        g2 = torch.randn(rows, out_f)
-        m(x1).backward(g1)
-        m(x2).backward(g2)
-        expected = g1.T @ x1 + g2.T @ x2
-        e = _err(m._gw, expected)
-        print(f"\n[gwacc {in_f}x{out_f}r{rows}] max={e['max']:.3g} rel={e['rel']:.3g}")
-        assert e["rel"] < 1e-5
+    in_f, out_f, rows = 128, 130, 6
+    m = FP8Linear(in_f, out_f, tile=32)
+    m.train()
+    x1 = torch.randn(rows, in_f, requires_grad=True)
+    g1 = torch.randn(rows, out_f)
+    m(x1).backward(g1)
+    assert m._gw.dtype is torch.bfloat16
+    single = _err(m._gw, g1.T @ x1)
+    print(f"\n[gw bf16 single add] max={single['max']:.3g} rel={single['rel']:.3g}")
+    assert single["rel"] < 2 ** -7, single["rel"]
+    # memory: half of fp32 for the same tensor
+    assert m._gw.numel() * m._gw.element_size() == m._gw.numel() * 2
+    # two accumulations stay within a few bf16 roundings
+    x2 = torch.randn(rows, in_f, requires_grad=True)
+    g2 = torch.randn(rows, out_f)
+    m(x2).backward(g2)
+    two = _err(m._gw, g1.T @ x1 + g2.T @ x2)
+    print(f"[gw bf16 two adds]   max={two['max']:.3g} rel={two['rel']:.3g}")
+    assert two["rel"] < 4 * 2 ** -8, two["rel"]
 
 
 def test_fused_lion_requant_matches_full_matrix():
