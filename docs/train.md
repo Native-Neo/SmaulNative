@@ -33,6 +33,7 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--beta-v` | `0.999` | SmaulOpt `beta_v` (magnitude-EMA decay) |
 | `--epsilon` | `1e-8` | SmaulOpt `epsilon` (must be positive) |
 | `--state-dtype` | `bf16` | SmaulOpt state storage: `bf16` (2 B, default), `fp16` (2 B), `fp32` (4 B, lossless) |
+| `--factor-v` / `--no-factor-v` | on | SmaulOpt: store `v` factored (row/col marginals) for 2-D parameters |
 | `--grad_clip` | `1.0` | global grad-norm clip |
 | `--log_every` | `10` | log cadence (steps) |
 | `--save_every` | `200` | checkpoint cadence (steps) |
@@ -165,6 +166,97 @@ path is bit-identical with or without it.
 Checkpoints record `state_dtype` in `optimizer.json` and store `m`/`v` at that width, so a
 resumed run keeps the same width. A checkpoint that names a removed width is rejected rather
 than silently reinterpreted.
+
+#### Factored `v` (`--factor-v`, on by default)
+
+For a 2-D state `[R, C]`, the full `v` is replaced by two BF16 vectors `v_row[R]` and
+`v_col[C]`. `m` is always full-size, and the update equations are unchanged.
+
+**The equation**
+
+```
+v_hat[i, j]  ~=  R_hat[i] * C_hat[j] / G_hat        G_hat = mean(R_hat)
+```
+
+**Why that form.** The EMA is linear, so it commutes with means:
+
+```
+rowmean_i(v_t) = beta_v * rowmean_i(v_{t-1}) + (1 - beta_v) * rowmean_i(|g_t|)
+```
+
+So maintaining an EMA of the row means and of the column means gives the **exact** row and
+column marginals of the true `v_t` -- no approximation at that stage. The only approximation
+is dropping the rank/interaction term. Given exact marginals `R`, `C` and grand mean
+`G = mean(R) = mean(C)`, the unique rank-1 field consistent with both marginals and the
+grand mean is exactly `R_i C_j / G`.
+
+This is **not** AdaFactor's form. AdaFactor factors `EMA(g^2)` as `R_i * C_j` with no
+division, because it only ever needs the result under a `sqrt`. SmaulOpt's statistic is
+`EMA(|g|)` -- non-negative, and used directly as a denominator -- so the division is what
+keeps the reconstruction consistent with the stored marginals. Measured on random gradients,
+dividing roughly halves the reconstruction error: 0.30 relative versus 0.64 un-divided, and
+the reconstruction is exact (2e-7) for a rank-1 `v`.
+
+**Which tensors get factored** -- by shape only, no module or architecture names:
+
+| shape | form | reason |
+|---|---|---|
+| `[R, C]`, `R,C >= 2` | factored | `R + C <= R * C`, so it is never larger |
+| `[C]`, `[]` | full `v` | cannot be row/column factored |
+| `[1, C]`, `[R, 1]` | full `v` | `R + C > R * C` |
+
+**Memory.** For a 4096x4096 state, `v` goes from `R*C*2` = 32 MB to `(R+C)*2` = 16 KB.
+Since `m` is full-size, the *total* optimizer state shrinks by less: on a 128-wide 2-layer
+model, bf16 total state goes 3.40 MiB -> 1.72 MiB (1.98x), with `v` itself 1.70 MiB ->
+0.02 MiB (~85x). The saving grows with model size, since the largest tensors (embedding and
+LM head) are exactly the 2-D ones.
+
+**Cost.** No full `[R, C] v` is ever allocated. Marginal means are computed with an L1
+reduction (`torch.linalg.vector_norm(..., ord=1, dim)`), which is a fused reduction -- the
+profiler shows 0.000 MiB allocated versus a full-size temporary for `g.abs().mean(dim)`. The
+reconstruction is materialized one 64-row block at a time, matching the existing requant
+blocking. Isolated `opt.step()` latency is unchanged within noise: 1.03x (bf16) and 0.95x
+(fp32) versus full `v`.
+
+**Accuracy: the measured tradeoff.** Factored `v` is an approximation and is *not* equivalent
+to full `v`. Relative error of factored versus full, after 60 steps on a 24x40 grid:
+
+| gradient distribution | `v` rel err | update rel err | parameter rel err |
+|---|---|---|---|
+| rank-1 (separable) | 0.0000 | 0.0000 | 0.0000 |
+| heavy-tailed | 0.043 | 0.017 | 0.040 |
+| uniform | 0.126 | 0.050 | 0.121 |
+| unbalanced columns | 0.111 | 0.052 | 0.126 |
+| unbalanced rows | 0.119 | 0.054 | 0.131 |
+| normal | 0.167 | 0.066 | 0.159 |
+| **sparse (10% nonzero)** | 0.542 | 0.211 | **0.458** |
+| **mostly-zero (0.5% nonzero)** | 0.922 | 0.938 | **1.436** |
+
+The update error runs ~2.5-3x *below* the `v` error on dense grids, because `u` is
+scale-invariant in `v` and the marginals are preserved exactly. But **a rank-1 field is
+dense, so sparse `v` is the weak spot**: on a 10%-nonzero gradient the reconstruction puts
+`v` about 1.8x too *small* at the positions that actually have gradient, which makes the step
+about 1.8x too large there, and smears non-zero mass into positions whose true `v` is zero.
+On a 0.5%-nonzero gradient the parameter error exceeds 1.0. Since LLM gradients are often
+sparse -- and the tensors that dominate memory here are the embedding and head -- this is a
+real risk, not a corner case. AdaFactor, for the same reason, does not factor embedding
+matrices; this implementation factors by shape only, so it *will* factor them. If sparse
+gradients turn out to dominate a real run, `--no-factor-v` is the switch back, and excluding
+particular tensors is a shape/threshold decision rather than a name-based rule.
+
+**Checkpoints.** `factor_v` is recorded in `optimizer.json`. Factored states are stored under
+`v_row.*` / `v_col.*` keys, full states under `v.*`. A model holding both forms at once (2-D
+plus 1-D parameters) round-trips normally. Loading rules:
+
+- factored checkpoint + `factor_v` on -> loads the marginals.
+- factored checkpoint + `--no-factor-v` -> **refused**; a factored state cannot be expanded
+  into a full one without inventing the rank term.
+- full checkpoint + `factor_v` on -> **migrated explicitly**, with a printed notice. The
+  marginals of a stored `v` are exactly recoverable, so `R` and `C` are preserved exactly;
+  only the rank term is dropped, which is what factoring approximates anyway.
+- checkpoint with no `factor_v` key (written before factoring existed) -> treated as full-v.
+
+Nothing is ever silently reinterpreted or discarded.
 
 Steps with non-finite loss or grads are skipped (50 consecutive failures stop training
 instead of looping forever). `Ctrl-C` (`SIGINT`) or `SIGTERM` finishes the current step,
