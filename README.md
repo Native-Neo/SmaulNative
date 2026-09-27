@@ -145,7 +145,10 @@ so `train._load_optimizer(dir, opt, model)` continues training from the saved st
 math stays FP32: `bf16` (2 B/param) is the **default**, costing a measured ~0.07% error
 against `fp32`, and `fp32` (4 B/param) reproduces the v1 lossless behavior. A 1-byte
 integer state was tried and removed: ~5x slower per step, ~18% error, and it diverged on
-heavy-tailed gradients.
+heavy-tailed gradients. `--no-factor-v` disables SmaulOpt's factored `v` (row/column
+marginals instead of a full `[R, C]` state, on by default for 2-D parameters): `v` shrinks
+~85x with no measurable step-latency cost, at the cost of an approximation that is exact for
+rank-1 gradients and weakest on sparse ones.
 
 ## Testing
 
