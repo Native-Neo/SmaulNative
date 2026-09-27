@@ -174,6 +174,102 @@ def run_full(argv=None):
           f"stored FP8 {fp8b/1048576:.1f}MiB vs FP32 {fpb/1048576:.1f}MiB (+other {other/1048576:.1f}MiB)")
 
 #!/usr/bin/env python3
+"""Optimizer comparison: Lion vs SmaulOpt on identical tensors/conditions.
+
+Measures update time, persistent optimizer-state bytes, and CPU throughput.
+Same shapes, same gradients, same clipping, same thread count for every
+optimizer; no per-optimizer tuning. This is a v1 measurement, not a claim
+about convergence quality.
+
+Usage: python benchmark.py --mode opt [--d 512] [--layers 4] [--iters 10]
+"""
+def run_opt(argv=None):
+    _root = str(Path(__file__).resolve().parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    args = parse_args(argv)
+
+    import torch
+
+    from kernel.compute import get_backend
+    from smaul_linear import LinearConfig, SmaulLinear  # noqa: F401
+    from train import Lion, SmaulOpt
+
+    be = get_backend()
+    be.configure(args.threads)
+    torch.manual_seed(42)
+
+    print(f"backend={be.name} native={be.has_native} threads={args.threads} d={args.d} "
+          f"layers={args.layers} ctx={args.ctx} batch={args.batch}")
+    cfg = LinearConfig(vocab_size=2000, d_model=args.d, n_layer=args.layers,
+                       n_heads=args.heads)
+    ids = torch.randint(0, 2000, (args.batch, args.ctx))
+    # Identical shapes/grads/clip/threads for every entry; the only difference
+    # is the optimizer (and, for smaul_*, the state storage width). bf16 is the
+    # default; fp32 is the lossless reference it is compared against.
+    cases = [("lion", None), ("smaul", "bf16"), ("smaul", "fp16"), ("smaul", "fp32")]
+    _note = {"bf16": "default", "fp32": "reference"}
+    results = {}
+    for name, sdt in cases:
+        key = name if sdt is None else f"{name}_{sdt}"
+        torch.manual_seed(1234)
+        model = SmaulLinear(cfg)
+        model.train()
+        if name == "lion":
+            opt = Lion(list(model.parameters()), lr=2e-4, clip=1.0)
+        else:
+            opt = SmaulOpt(list(model.parameters()), lr=2e-4, clip=1.0,
+                           state_dtype=sdt)
+        holder = model  # both optimizers walk fp8_modules(model)
+
+        def one_step():
+            opt.zero_grad(holder)
+            _, loss = model(ids, ids)
+            loss.backward()
+            return float(opt.step(holder))
+
+        for _ in range(3):
+            one_step()
+        ts = []
+        for _ in range(args.iters):
+            t0 = time.perf_counter()
+            one_step()
+            ts.append((time.perf_counter() - t0) * 1e3)
+        step_ms = statistics.median(ts)
+        # Persistent optimizer state only (no params, no grads, no transients).
+        state_bytes = sum(t.numel() * t.element_size() for t in opt.m.values())
+        if hasattr(opt, "v"):
+            state_bytes += sum(t.numel() * t.element_size() for t in opt.v.values())
+        n_state = sum(t.numel() for t in opt.m.values())
+        if hasattr(opt, "v"):
+            n_state += sum(t.numel() for t in opt.v.values())
+        # CPU throughput: identical work per step, so tok/s tracks step cost.
+        reps = max(1, args.iters)
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            one_step()
+        wall = max(time.perf_counter() - t0, 1e-9)
+        tok_s = ids.numel() * reps / wall
+        results[key] = {"step_ms": step_ms, "state_bytes": state_bytes,
+                        "state_values": n_state, "tok_s": tok_s}
+        print(f"{key:11s} step {step_ms:8.2f} ms | state {state_bytes / 1048576:7.2f} MiB "
+              f"({n_state} values) | {tok_s:8.1f} tok/s")
+
+    base = results["smaul_fp32"]
+    print(f"\n{'optimizer':11s} {'step ms':>9s} {'state MiB':>10s} {'B/param':>9s} "
+          f"{'vs fp32':>9s} {'tok/s':>9s}  note")
+    for name, v in results.items():
+        bpp = v["state_bytes"] / max(v["state_values"] // 2, 1)
+        rel = v["state_bytes"] / max(base["state_bytes"], 1)
+        note = _note.get(name.split("_", 1)[1] if "_" in name else "", "")
+        print(f"{name:11s} {v['step_ms']:9.2f} {v['state_bytes'] / 1048576:10.2f} "
+              f"{bpp:9.2f} {rel:8.2f}x {v['tok_s']:9.1f}  {note}")
+    print("\n(measurement only: no claim that smaul converges better than lion. "
+          "Per-step ms is dominated by forward/backward and is noisy; the state "
+          "MiB and B/param columns are exact.)")
+
+
+# !/usr/bin/env python3
 """Reproducible Rawr-vs-Plain x RAM-vs-mmap comparison (experimental).
 
 Runs all four combos with IDENTICAL dims, tokenizer, dataset, optimizer and
@@ -388,16 +484,17 @@ def main():
     if "--mode" in sys.argv:
         i = sys.argv.index("--mode")
         if i + 1 >= len(sys.argv):
-            raise SystemExit("--mode requires full or arch")
+            raise SystemExit("--mode requires full, opt, or arch")
         mode = sys.argv[i + 1]
         del sys.argv[i:i + 2]
     if mode == "full":
         run_full(sys.argv[1:])
+    elif mode == "opt":
+        run_opt(sys.argv[1:])
     elif mode == "arch":
         run_arch(sys.argv[1:])
     else:
-        raise SystemExit(f"unknown --mode {mode!r}; expected full or arch")
-
+        raise SystemExit(f"unknown --mode {mode!r}; expected full, opt, or arch")
 
 if __name__ == "__main__":
     main()
