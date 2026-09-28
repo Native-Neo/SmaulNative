@@ -321,7 +321,30 @@ def _build(texts, vocab_size, word_budget=40000, max_records=0):
     if seen == 0 or total_tokens == 0:
         raise RuntimeError("no usable text records found for tokenizer training")
     tokens, seen_tokens = SPECIAL + CASE, set(SPECIAL + CASE)
-    for g in _guaranteed():
+    # The guaranteed single-char set (227 entries: 62 ASCII + 128 Devanagari +
+    # whitespace/punctuation) is emitted *first* and unconditionally, so it was
+    # never bounded by vocab_size. At vocab_size < 237 that silently overshot:
+    # asking for 48 produced a 237-entry vocabulary, and the failure surfaced
+    # far downstream as SmaulLinear's "Rawr graph vocab 237 != config vocab 48"
+    # -- which reads like a graph problem and is not one. The sub-256K train
+    # presets (vocab 24-96) all hit it.
+    #
+    # Bound it by the budget that is actually left. vocab_size >= 237 is
+    # unchanged -- the cap cannot bite, so every existing tokenizer.json and
+    # every tokenizer_sha256 in a checkpoint stays byte-identical. Below that,
+    # _guaranteed() is already sorted and deduped, so keeping a prefix is
+    # deterministic; the notice is printed rather than truncating silently,
+    # because a truncated guaranteed set is a real reduction in coverage.
+    guaranteed = _guaranteed()
+    if len(tokens) + len(guaranteed) > vocab_size:
+        keep = max(0, vocab_size - len(tokens))
+        print(f"[TOKENIZER] vocab_size={vocab_size} cannot hold the full "
+              f"{len(guaranteed)}-entry guaranteed character set "
+              f"({len(tokens)} reserved + {len(guaranteed)} = "
+              f"{len(tokens) + len(guaranteed)} needed); keeping the first {keep}. "
+              f"Use --vocab >= {len(tokens) + len(guaranteed)} for full coverage.")
+        guaranteed = guaranteed[:keep]
+    for g in guaranteed:
         if g not in seen_tokens:
             tokens.append(g); seen_tokens.add(g)
     whitespace = [(x, n) for x, n in chars.most_common() if x.isspace() and x not in seen_tokens]
