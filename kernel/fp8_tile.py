@@ -158,7 +158,17 @@ def decode_block(w, s, o0, o1, in_f, tile=TILE, dtype=torch.float32):
     vals = vals.view(o1 - o0, in_f)
     # Per-tile scale expanded to columns. repeat_interleave then slice rather
     # than a per-tile loop, so the scale is materialized once.
-    return vals * s[o0:o1, :nt].to(dtype).repeat_interleave(tile, 1)[:, :in_f]
+    scales = s[o0:o1, :nt]
+    if scales.dtype != dtype:
+        # The native forward already rejects this loudly
+        # ("fp8_forward: expected dtypes f32/u8/f32"), but this path is pure
+        # torch and would not: decoding bf16 scales in bf16 measured a 3.4e-03
+        # relative error with no exception, i.e. silently different stored
+        # weights. `Model.to(torch.bfloat16)` casts every buffer including `sc`,
+        # which is exactly how it happens; inference.py has a guard for it, and
+        # this is the invariant underneath, so it is worth enforcing here too.
+        scales = scales.to(dtype)
+    return vals * scales.repeat_interleave(tile, 1)[:, :in_f]
 
 class _Fn(torch.autograd.Function):
     @staticmethod
@@ -186,6 +196,13 @@ class _Fn(torch.autograd.Function):
                 elif mod._gw.device != g2.device:
                     # Device changed mid-training (e.g. .to(device)); migrate.
                     mod._gw = mod._gw.to(g2.device)
+                # Note: `_gw` is a plain attribute, so `Model.to(dtype)` leaves it
+                # alone and a caller that seeds it FP32 keeps FP32 accumulation.
+                # That is deliberate on their part -- narrower than GW_DTYPE is
+                # what they would get, and the note at the top of this file says
+                # reduced-precision accumulation is unsound under gradient
+                # accumulation -- so the width is respected, not enforced. It
+                # only costs memory (2x), never correctness.
                 gw = mod._gw
                 if gw.shape != (out_f, in_f):
                     raise RuntimeError(f"_gw shape {tuple(gw.shape)} != ({out_f}, {in_f})")
