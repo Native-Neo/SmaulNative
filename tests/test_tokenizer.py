@@ -40,7 +40,16 @@ def test_csv_prompt_completion_records_are_read(tmp_path):
 
 
 def test_tiny_tokenizer_preserves_whitespace():
-    data = _build(["a b"], vocab_size=16, word_budget=8)
+    # vocab_size has to be able to hold the guaranteed character set (8 special +
+    # 2 case + 227 guaranteed = 237) for the letters to be in the vocabulary at
+    # all. This used to ask for 16 and passed only because the guaranteed set
+    # was emitted unbounded, so the real vocabulary was 237 anyway; the fix that
+    # honours --vocab truncates the set instead, and at 16 there is no room left
+    # for "a" or "b" and the round trip below would be <unk> <unk>. The point of
+    # the test is that whitespace survives and text round-trips, and that holds
+    # from 237 up. The truncation itself is covered by
+    # test_vocab_size_below_the_guaranteed_set_is_truncated.
+    data = _build(["a b"], vocab_size=240, word_budget=8)
     tok = SmaulTokenizer(data)
     assert " " in tok.vocab
     assert tok.decode(tok.encode("a b")) == "a b"
