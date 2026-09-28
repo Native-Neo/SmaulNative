@@ -375,7 +375,12 @@ class SmaulOpt:
     """
 
     # Rows per requant/quantize block for FP8 modules (matches fp8_tile._OB).
+    # Must stay 64: the block is requantized as a unit, so this is part of the
+    # weight-update granularity, not just a cache hint.
     _OB = 64
+    # Rows per block for *dense* 2-D parameters. Unconstrained by requantization
+    # (they are not quantized), so it is picked for speed: see _row_blocks.
+    _DENSE_OB = 256
     _STATE_DTYPES = ("bf16", "fp16", "fp32")
 
     def __init__(self, params, lr=1e-4, beta_m=0.9, beta_v=0.999, epsilon=1e-8,
@@ -510,16 +515,34 @@ class SmaulOpt:
     def _empty_state(self, ref_shape, ref_device, signed):
         return torch.zeros(ref_shape, dtype=self._storage_dtype(signed), device=ref_device)
 
-    def _row_blocks(self, tensor):
-        """Yield (block_index, o0, o1) for a 2-D state, one block per _OB rows.
+    def _row_blocks(self, tensor, block=None):
+        """Yield (block_index, o0, o1) for a 2-D state, one block per ``block`` rows.
 
-        Dense parameters are handled whole-tensor in ``step``; this is only for
-        the 2-D FP8 module states, which are widened to FP32 a block at a time so
-        no full-matrix FP32 state transient is ever built.
+        Blocks are independent -- each computes its own slice of the update from
+        that slice of the gradient and writes back to it -- so the block *count*
+        is a pure performance knob and cannot change the result. Verified: the
+        dense factored-v update below is bit-identical at 64, 128, 256, 512, 1000
+        and 8000 rows per block.
+
+        Two sizes, because the two callers want different things:
+
+        - ``_OB`` (64) for the 2-D FP8 module states. It has to match
+          ``kernel.fp8_tile._OB`` because the block is requantized as a unit:
+          ``_requant_block`` decodes and re-encodes exactly the rows it is
+          given. Any other size would change the requantization granularity.
+        - ``_DENSE_OB`` (256) for dense 2-D parameters, whose only per-block
+          transient is the row block itself. They were sharing ``_OB``, which
+          meant the 8000x512 embedding -- 95% of the trainable values at
+          ``--rawr-sparsity 0.99`` -- ran 125 Python iterations of ~13 elementwise
+          ops for 108 ms. At 256 rows it is 31 iterations and 78 ms, with a 512
+          KiB transient that still fits L2. It goes back up past that (8000 rows
+          in one block is 124 ms and a 16 MiB transient), so 256 is measured, not
+          assumed.
         """
+        step = self._OB if block is None else block
         n = tensor.shape[0]
-        for b, o0 in enumerate(range(0, n, self._OB)):
-            yield b, o0, min(o0 + self._OB, n)
+        for b, o0 in enumerate(range(0, n, step)):
+            yield b, o0, min(o0 + step, n)
 
     # ------------------------------------------------------------------
     # Factored v. Shape-driven only: no architecture or module names.
@@ -753,7 +776,7 @@ class SmaulOpt:
                 r32.mul_(self.beta_v).add_(self._mean_abs(g, 1), alpha=1.0 - self.beta_v)
                 c32.mul_(self.beta_v).add_(self._mean_abs(g, 0), alpha=1.0 - self.beta_v)
                 r_hat, c_hat, g_mean = self._factored_hat(r32, c32, bc2)
-                for _b, o0, o1 in self._row_blocks(st_m):
+                for _b, o0, o1 in self._row_blocks(st_m, self._DENSE_OB):
                     m_b = st_m[o0:o1] if self.state_dtype == "fp32" else st_m[o0:o1].float()
                     m_b.mul_(self.beta_m).add_(g[o0:o1], alpha=1.0 - self.beta_m)
                     v_hat = self._reconstruct_block(r_hat, c_hat, g_mean, o0, o1)
