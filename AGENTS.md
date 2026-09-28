@@ -3,6 +3,21 @@
 SmaulNative: a CPU-first FP8 ("RQT") language-model trainer. Flat root-level scripts, no
 install step, no package to import-install. **Run every command from the repo root.**
 
+## Commits
+
+**Only one file should be in each commit!** One file per commit, no exceptions -- not even
+for a one-line typo, a doc fix, or a mechanical rename that happens to touch three files in
+the same directory. This is the single hard rule on this repository.
+
+- Do not batch unrelated changes, and do not batch related ones.
+- If a change genuinely cannot be expressed as one file per commit (a rename that must land
+  with its call sites, a generated artifact), stop and ask before committing.
+- Commit messages are prose describing *why*; the file list should be self-explanatory.
+- Verify each commit leaves the tree working where that is possible: `python -m pytest -q
+  --ignore=tests/test_rl.py` after anything touching a kernel, `smaul_linear.py`, `train.py`
+  or `rawr_graph.py`.
+- Nothing is pushed unless asked.
+
 ## Commands
 
 ```bash
