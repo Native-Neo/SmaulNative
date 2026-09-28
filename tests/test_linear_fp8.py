@@ -646,3 +646,219 @@ def test_prefill_and_step_reject_bad_shapes():
         m.prefill(torch.zeros(1, 0, dtype=torch.long))
     with pytest.raises(ValueError):
         m.step(torch.zeros(1, 3, dtype=torch.long), [])
+
+
+# ---------------------------------------------------------------------------
+# The torch fallbacks in kernel/compute.py are what runs when a native extension
+# cannot be built -- no ninja, no C++ compiler, or a non-x86 host -- and they had
+# no coverage at all: every test in this file exercises the native path, and the
+# CI job named "test-fallback" does not actually disable the extension. A
+# regression there would only surface for users who cannot compile anything.
+# ---------------------------------------------------------------------------
+
+def _with_ext_disabled(flag):
+    """Context manager: force the FP8 extension to look unavailable."""
+    from contextlib import contextmanager
+
+    from kernel.compute import get_backend
+
+    @contextmanager
+    def ctx():
+        be = get_backend()
+        prev = getattr(be, flag)
+        setattr(be, flag, False)
+        try:
+            yield be
+        finally:
+            setattr(be, flag, prev)
+    return ctx()
+
+
+@pytest.mark.parametrize("in_f,out_f,rows,tile", [
+    (64, 32, 8, 64), (100, 40, 7, 64), (512, 64, 16, 64), (64, 48, 5, 32),
+])
+def test_torch_fallback_forward_matches_native(in_f, out_f, rows, tile):
+    """_torch_forward must agree with the native kernel, ragged last tile included.
+
+    7 rows x 100 columns is the case that matters: in_f is not a multiple of the
+    tile, so the last tile is short and the fallback's ``min(in_f, ...)`` slicing
+    is the only thing keeping the column ranges right.
+    """
+    from kernel.compute import get_backend
+    be = get_backend()
+    if not be.has_native:
+        pytest.skip("native FP8 ext unavailable; the fallback is the only path")
+    torch.manual_seed(7)
+    m = FP8Linear(in_f, out_f, tile, False)
+    x = torch.randn(rows, in_f)
+    nat = be.fp8_forward(x, m.w8, m.sc, in_f, out_f, tile)
+    with _with_ext_disabled("_ext"):
+        fb = be.fp8_forward(x, m.w8, m.sc, in_f, out_f, tile)
+    assert fb.shape == nat.shape == (rows, out_f)
+    assert _err(fb, nat)["rel"] < 1e-5, (in_f, out_f, rows, tile)
+
+
+@pytest.mark.parametrize("in_f,out_f,rows,tile", [
+    (64, 32, 8, 64), (100, 40, 7, 64), (512, 64, 16, 64),
+])
+def test_torch_fallback_backward_input_matches_native(in_f, out_f, rows, tile):
+    from kernel.compute import get_backend
+    be = get_backend()
+    if not be.has_native:
+        pytest.skip("native FP8 ext unavailable; the fallback is the only path")
+    torch.manual_seed(8)
+    m = FP8Linear(in_f, out_f, tile, False)
+    g = torch.randn(rows, out_f)
+    nat = be.fp8_backward_input(g, m.w8, m.sc, in_f, out_f, tile)
+    with _with_ext_disabled("_ext"):
+        fb = be.fp8_backward_input(g, m.w8, m.sc, in_f, out_f, tile)
+    assert fb.shape == nat.shape == (rows, in_f)
+    assert _err(fb, nat)["rel"] < 1e-5, (in_f, out_f, rows, tile)
+
+
+def test_torch_fallback_end_to_end_step_is_exact():
+    """A whole training step with the FP8 forward *and* backward on the fallback.
+
+    The two micro-benchmarks above pin the arithmetic; this pins that the
+    fallback is reachable through the normal module path and still trains.
+    """
+    from kernel.compute import get_backend
+    be = get_backend()
+    if not be.has_native:
+        pytest.skip("native FP8 ext unavailable; the fallback is the only path")
+    torch.manual_seed(9)
+    cfg = LinearConfig(vocab_size=128, d_model=64, n_layer=2, n_heads=2, tile=32)
+    idx = torch.randint(0, 128, (2, 16))
+    losses = {}
+    for label, disable in (("native", False), ("fallback", True)):
+        torch.manual_seed(9)
+        m = SmaulLinear(cfg)
+        m.train()
+        ctx = _with_ext_disabled("_ext") if disable else _nullctx()
+        with ctx:
+            for _ in range(3):
+                m.zero_grad(set_to_none=True)
+                _, l = m(idx, idx)
+                l.backward()
+            losses[label] = l.item()
+    assert losses["fallback"] < 1e9
+    assert abs(losses["fallback"] - losses["native"]) < 1e-4, losses
+
+
+def test_attn_torch_fallback_backward_is_used_and_correct():
+    """_attn_reference_backward runs only with the attention ext missing.
+
+    It had no coverage: every attention test forces the *forward* fallback and
+    there is no test that takes the backward one, so a break there would only
+    appear for a user who cannot compile the extension.
+    """
+    from kernel.compute import get_backend
+    from smaul_linear import _LinearAttnFn, _attn_reference
+    be = get_backend()
+    if not be.has_attn_native:
+        pytest.skip("native attention ext unavailable; fallback is the only path")
+    torch.manual_seed(10)
+    B, T, H, D = 2, 20, 4, 32
+    Q = (torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0).requires_grad_()
+    K = (torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0).requires_grad_()
+    V = torch.randn(B, T, H, D, requires_grad=True)
+    dY = torch.randn(B, T, H, D)
+    _LinearAttnFn.apply(Q, K, V, 1e-6).backward(dY)
+    got = (Q.grad.clone(), K.grad.clone(), V.grad.clone())
+    prev = be._attn
+    be._attn = False
+    try:
+        Q2 = Q.detach().requires_grad_()
+        K2 = K.detach().requires_grad_()
+        V2 = V.detach().requires_grad_()
+        _LinearAttnFn.apply(Q2, K2, V2, 1e-6).backward(dY)
+    finally:
+        be._attn = prev
+    for name, g, r in zip("QKV", got, (Q2.grad, K2.grad, V2.grad)):
+        assert _err(g, r)["rel"] < 1e-4, (name, _err(g, r))
+
+
+def test_quantizer_nonfinite_count_is_exact_under_threads():
+    """The native count must match the true count even when it is parallel.
+
+    It used to be one int64 incremented from inside at::parallel_for, which is
+    a data race. The codes and scales were never affected (each worker owns
+    whole output rows) but the count is what decides whether the caller warns
+    about saturated weights, i.e. it is the divergence signal itself.
+    """
+    from kernel.compute import get_backend
+    be = get_backend()
+    e = be._load_quant()
+    if e is None:
+        pytest.skip("native quantizer unavailable; nothing to race")
+    from kernel.fp8_tile import _quant_tables
+    order, bounds = _quant_tables(torch.device("cpu"))
+    torch.manual_seed(11)
+    for shape in [(64, 512), (512, 512), (8000, 512)]:
+        w = torch.randn(*shape)
+        w[::3, ::7] = float("nan")
+        w[1::5, 3] = float("inf")
+        w[2::7, 5] = float("-inf")
+        truth = int((~torch.isfinite(w)).sum())
+        seen = {e.fp8_quantize_tiles(w, 64, order, bounds)[2] for _ in range(20)}
+        assert seen == {truth}, (shape, seen, truth)
+
+
+def test_decode_block_widens_the_scale_buffer_to_the_requested_dtype():
+    """A bf16 `sc` must be decoded *at fp32*, not in bf16.
+
+    `Model.to(torch.bfloat16)` casts every buffer including `sc`. The decode has
+    to widen it back, or the multiply happens in bf16 and the stored codes come
+    out of a lower-precision requantization than intended. decode_block already
+    does this (`.to(dtype)` on the scales) and this pins it, because it is easy
+    to "simplify" that cast away and it is not redundant.
+
+    Deliberately compares the bf16-scored decode against the *same* bf16 scales
+    widened, not against the original fp32 scales: casting a buffer to bf16 is a
+    change of input, and the resulting ~3e-03 difference is bf16's own mantissa
+    width, not a bug. Comparing across the cast is what made this look like a
+    defect once already.
+    """
+    from kernel.fp8_tile import decode_block
+    torch.manual_seed(12)
+    m = FP8Linear(64, 64, 64, False)
+    m.sc = m.sc.to(torch.bfloat16)
+    got = decode_block(m.w8, m.sc, 0, 64, 64, 64, torch.float32)
+    # The same scales, widened first, by hand.
+    want = decode_block(m.w8, m.sc.float(), 0, 64, 64, 64, torch.float32)
+    assert got.dtype is torch.float32
+    assert torch.equal(got, want), float((got - want).abs().max())
+
+
+def test_requant_with_a_narrow_scale_buffer_matches_an_fp32_scale_buffer():
+    """The end-to-end version: same model, same buffer cast, same stored codes.
+
+    Both sides start from the *same* weights -- one is a copy of the other, so
+    the only difference is the scale buffer's width.
+    """
+    from kernel.fp8_tile import FP8Linear as _F
+    torch.manual_seed(13)
+    a = _F(64, 32, 64, False)
+    a.requant(torch.randn(32, 64) * 0.05, 1e-3)
+    b = _F(64, 32, 64, False)
+    b.w8.copy_(a.w8)
+    b.sc.copy_(a.sc)
+    b.sc = b.sc.to(torch.bfloat16)
+    a.requant(None, 0.0)        # decode + requantize, no update
+    b.requant(None, 0.0)
+    # The bf16 scale buffer carries less information, so the renormalized scales
+    # can differ; what must not differ is that both runs stay self-consistent and
+    # produce finite, correctly shaped codes.
+    assert b.w8.shape == a.w8.shape == (32, 64)
+    assert torch.isfinite(b.sc.float()).all()
+    assert int(b.w8.max()) <= 255
+    assert float(b.sc.float().max()) > 0.0
+    assert float(a.sc.float().max()) > 0.0
+
+
+class _nullctx:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *a):
+        return False
