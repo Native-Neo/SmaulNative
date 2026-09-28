@@ -262,9 +262,16 @@ class CpuBackend:
     def attn_forward(self, Q, K, V, eps, need_den, need_state=False):
         """Returns (Y, DEN, S, z).
 
-        S and z are the final recurrent state, computed only when
-        ``need_state`` is set (an inference caller decodes from it instead of
-        re-running the prefix); they are None otherwise.
+        S and z are the final recurrent state. With the native extension they
+        are ``[B, H, D, D]`` / ``[B, H, D]`` **only when ``need_state`` is
+        set**; otherwise they are zero-element placeholders, because the
+        training path never reads them and materializing them costs
+        ``B*H*D*D*4`` bytes of memset per call (4 MiB at B4/H16/D128, so
+        32 MiB/step over 8 layers). The torch reference fallback has no state
+        to hand back and returns ``None, None``.
+
+        Callers that want the state must pass ``need_state=True``; treat the
+        return value as usable only in that case.
         """
         e = self._load_attn()
         if (e is not None and Q.device.type == "cpu" and Q.dtype == torch.float32

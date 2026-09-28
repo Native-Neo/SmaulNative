@@ -5,9 +5,10 @@ A compact SmaulLinear training and inference repository with English-Hindi data 
 ## Overview
 
 - **SmaulLinear Architecture**: Linear-attention blocks with SwiGLU FFN/MoE and tiled E4M3 FP8 weights (`smaul_linear.py`, `fp8_tile.py`).
-- **Native CPU Backend**: Tiled FP8 kernels with a torch fallback plus a training-step benchmark (`kernel/compute.py`, `kernel/fp8_tile.py`, `kernel/fp8_cpu.cpp`, `kernel/attn_cpu.cpp`, `kernel/sparse_cpu.cpp`, `benchmark.py`).
+- **Native CPU Backend**: Tiled FP8 kernels with a torch fallback plus a training-step benchmark (`kernel/compute.py`, `kernel/fp8_tile.py`, `kernel/fp8_cpu.cpp`, `kernel/attn_cpu.cpp`, `kernel/sparse_cpu.cpp`, `kernel/quant_cpu.cpp`, `benchmark.py`).
 - **Bilingual Tokenizer**: A custom word/character tokenizer with Devanagari grapheme fallback, case markers, and special tokens (`tokenizer.py`).
-- **Unified Training Pipeline**: `train.py` pretrains SmaulLinear with tiled FP8 weights, an FP32 Lion (default) or SmaulOpt optimizer (`--optimizer smaul`), automatic tokenizer builds, and resume-free (Lion) / resumable (SmaulOpt) checkpoints.
+- **Unified Training Pipeline**: `train.py` pretrains SmaulLinear with tiled FP8 weights, an FP32 Lion or SmaulOpt optimizer (`--optimizer smaul`, default), automatic tokenizer builds, and resume-free (Lion) / resumable (SmaulOpt) checkpoints.
+- **Incremental decoding**: `inference.py` decodes one token at a time from the linear-attention state instead of re-running the prompt per token (2.4x-21.5x for generation; see [docs/inference.md](docs/inference.md)).
 - **MoE Upcycling**: Merge multiple dense SmaulLinear checkpoints into a sparse SwiGLU Mixture of Experts model (`merge_moe.py`).
 - **RQT**: Real Quantized Training with tiled E4M3 FP8 weights and per-tile scales, requantized in place after every optimizer step. No FP32 master copy of an FP8 weight is kept; optimizer momentum stays FP32.
 
@@ -19,7 +20,8 @@ A compact SmaulLinear training and inference repository with English-Hindi data 
 │   ├── fp8_tile.py
 │   ├── fp8_cpu.cpp
 │   ├── attn_cpu.cpp
-│   └── sparse_cpu.cpp
+│   ├── sparse_cpu.cpp
+│   └── quant_cpu.cpp
 ├── benchmark.py           # CPU benchmark suite
 ├── docs/                  # Detailed guides and command references
 ├── tests/                 # Unit and optimization regression tests
@@ -28,11 +30,9 @@ A compact SmaulLinear training and inference repository with English-Hindi data 
 ├── train.py               # SmaulLinear FP8 trainer
 ├── inference.py           # Inference engine for SmaulLinear checkpoints
 ├── infer_cli.py           # Interactive chat CLI
-├── infer_linear.py        # Single-prompt CLI
 ├── infer_server.py        # Local server with chat UI
 ├── merge_moe.py           # Dense-to-MoE upcycling
 ├── convert_linear_to_gguf.py  # Checkpoint export to GGUF
-├── autorl.py              # Automated preference learning + RL
 ├── rl.py                  # Human preference collection + GRPO training
 ├── dataset.py             # Dataset loaders
 ├── download.py            # Dataset downloader

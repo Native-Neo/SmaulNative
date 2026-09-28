@@ -1296,6 +1296,14 @@ def main():
                        rawr_min_degree=int(getattr(args, "rawr_min_degree", 4)))
     emb_path = (out / "embeddings.dat") if storage == "mmap" else None
     model = SmaulLinear(cfg, rawr_graph=rawr_graph, emb_path=emb_path)
+    if arch == "rawr":
+        # The graph stats printed above describe the token graph, not the
+        # model. Print what the built model actually executes, so the headline
+        # sparsity figure is not read as the model's. See
+        # rawr_graph.print_model_compute.
+        from rawr_graph import print_model_compute
+
+        print_model_compute(model.compute_profile())
     opt_name = getattr(args, "optimizer", "lion") or "lion"
     if opt_name == "smaul":
         opt = SmaulOpt(list(model.parameters()), lr=args.lr,

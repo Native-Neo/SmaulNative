@@ -40,6 +40,22 @@ python benchmark.py --mode full|opt|arch --d 512 --layers 4 --ctx 256 --batch 2 
 - `architecture` `rawr` vs `plain` changes state_dict keys (`SparseLinear.values` vs
   `head.weight`). `from_pretrained` is `strict=True` and refuses mismatched architecture —
   intentional, do not loosen it.
+- **The graph's sparsity is not the model's.** `RawrGraph.stats()` reports the fraction of the
+  `vocab x vocab` token-edge space, and the graph only drives the **FFN and the LM head**. The
+  attention q/k/v/o projections stay dense `FP8Linear`, and at the 32M preset they are 81% of
+  the per-token MACs at `--rawr-sparsity 0.9` (98% at 0.99). So the graph prints 99.91% while
+  the model is 63% sparse. `SmaulLinear.compute_profile()` walks the built model and reports the
+  real split; `train.py` prints both. Never quote `stats()["sparsity"]` as model sparsity.
+- `SparseLinear.cols` is a **non-persistent** buffer, so it is rebuilt from `rawr_graph.json` on
+  load. `hidden_cols` must therefore stay byte-identical across versions — it is pinned against
+  a verbatim copy of the original full-sort implementation in `tests/test_rawr.py`.
+- `SparseLinear.forward`/`d/dx` are CSR **sparse products**, not gathers: exactly `out_f*K`
+  nonzeros. The earlier gather was measured 23x slower than the dense GEMM it replaced.
+- Inference decodes one token at a time: `SmaulLinear.prefill`/`step` carry the O(D^2)
+  linear-attention state, and `inference.py` re-prefills whenever the window would slide
+  (stepping then would be wrong — the state would still hold evicted tokens). **A per-token step
+  is not bit-identical to a batched forward and cannot be**: torch picks a different GEMM/SpMM
+  kernel for `[1,d]` than `[T,d]`, worth ~5e-07 relative. Test logits, not generated text.
 - Model forward returns `(logits, loss)`; loss is cross-entropy with `ignore_index=-100`.
 - `kernel/` has no `__init__.py` (implicit namespace package); imports are
   `from kernel.compute import get_backend`.
@@ -82,8 +98,26 @@ Any optimizer added here must satisfy this, because the training loop depends on
 - Docs still reference files that do not exist: `infer_linear.py`, `autorl.py`,
   `cpu/benchmark_full.py`, `cpu/benchmark_arch.py` (benchmarks were consolidated into
   `benchmark.py` behind `--mode`).
+- Docs that reference files which do not exist: `autorl.py` (in `docs/quickstart.md`),
+  `cpu/benchmark_full.py`, `cpu/benchmark_arch.py` (benchmarks were consolidated into
+  `benchmark.py` behind `--mode`; `docs/cpu.md` is fixed, `quickstart.md` is not).
 - **JIT lock hang:** a stale `~/.cache/torch_extensions/py*/smaul_fp8_ivb/lock` left by a
   killed process makes every FP8 test hang forever inside `file_baton.wait()`. Symptom is
   pytest producing *no output* on the first FP8 test. Fix: delete that lock file.
+- Editing a `kernel/*.cpp` file forces a ~90 s recompile on the next test run, which looks like
+  a hang. It is not.
+
+## The FP8 quantizer is a correctness trap
+
+`quantize_tiles` is on the requant path, so its output *is* the persisted weight. The native
+kernel (`kernel/quant_cpu.cpp`) must match the torch path **exactly**. It takes the codebook
+permutation and midpoints as arguments from `kernel.fp8_tile._tables` for precisely this
+reason: E4M3 has two codes for +448 (126/127) and two for -448 (254/255), so a C++-re-derived
+`std::sort` picks the other code for every weight saturating to exactly 448 — invisible in the
+loss, but it silently rewrote stored weights once. Do not re-derive the codebook in C++.
+
+It is also a known perf dead end, measured: 45 ns/element, 1.05x from 1->2 threads, and
+`std::lower_bound` / branchless / 4-way / SIMD-count searches all land within noise of each
+other. The only remaining lever is re-deriving the mapping — i.e. the bug above. Don't.
 - Per-step wall-clock timings on this machine swing 450–700 ms run to run and are
   dominated by forward/backward, not the optimizer. Trust byte/state counts over ms.

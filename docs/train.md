@@ -37,6 +37,7 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--epsilon` | `1e-8` | SmaulOpt `epsilon` (must be positive) |
 | `--state-dtype` | `bf16` | SmaulOpt state storage: `bf16` (2 B, default), `fp16` (2 B), `fp32` (4 B, lossless) |
 | `--factor-v` / `--no-factor-v` | on | SmaulOpt: store `v` factored (row/col marginals) for 2-D parameters |
+| `--grad-dtype` | `bf16` | SmaulOpt: dtype `p.grad` is stored at after `backward()`; `fp32` keeps them wide. Lion ignores it. |
 | `--grad_clip` | `1.0` | global grad-norm clip |
 | `--log_every` | `10` | log cadence (steps) |
 | `--save_every` | `200` | checkpoint cadence (steps) |
@@ -51,28 +52,64 @@ identically, with `.weight` tensors instead of packed `w8`/`sc` pairs.
 
 ## `--rawr-sparsity` is a column-count knob, not a compression ratio
 
-`hidden_cols` keeps `K = d_model * (1 - rawr_sparsity)` columns per `SparseLinear` row, and
-`SparseLinear.forward` gathers `x[..., cols]` into `[B, T, out_f, K]`. So cost and memory
-scale with `K`, and a "modest" sparsity fraction buys very little while still paying all of
-Rawr's overhead (int64 `cols` index buffers, the 4-D gather, blockwise requant).
+`hidden_cols` keeps `K = d_model * (1 - rawr_sparsity)` columns per `SparseLinear` row, so
+`K` -- not the sparsity fraction -- is what sets the cost. `SparseLinear` now dispatches its
+forward and `d/dx` as CSR sparse products (`_SparseLinearFn`), so it visits exactly the
+`out_f * K` nonzeros and allocates only the output; the earlier `x[..., cols]` gather
+materialised a `[B, T, out_f, K]` block and was measured **23x slower than the dense FP32
+GEMM it replaced**, despite doing 10x less arithmetic. At the 32M preset that gather was 41%
+of a 35.5 s step (8.3 tok/s).
 
-Measured gather traffic per forward pass, defaults (`d=512`, `ctx=256`, `batch=2`, 8 layers,
-vocab 8000):
+The graph-derived part of the sparsity is real, but the headline number is not the model's.
+`RawrGraph.stats()` reports the fraction of the `vocab x vocab` token-edge space the graph
+occupies; the graph only drives the **FFN and the LM head**. The attention q/k/v/o
+projections stay dense `FP8Linear`, and at the 32M preset they dominate. So `train.py` prints
+both: `SmaulLinear.compute_profile()` walks the built model and reports what is actually
+executed. V8000, d512, 8 layers, ffn 2.5, batch 2, ctx 256, 2 threads:
 
-| `--rawr-sparsity` | K | traffic / forward | observed tok/s |
-|---|---|---|---|
-| `0.0` | 512 | 15.31 GiB (dense) | — |
-| `0.5` (old default) | 256 | 7.66 GiB | 2.3–3.5, and peak RSS 4.44 GiB |
-| **`0.9` (default now)** | **51** | **1.53 GiB** | **9.6–11.9**, peak RSS 1.62 GiB |
-| `0.99` | 5 | 0.15 GiB | 62–78 |
+| `--rawr-sparsity` | K | model sparsity | dense share of per-token MAC | graph reports | full step | tok/s |
+|---|---|---|---|---|---|---|
+| `plain` (dense) | -- | 0.0% | 100% | 99.91% | 10726 ms | 47.7 |
+| `0.5` | 256 | 35.1% | 45.8% | 99.91% | 9487 ms | 54.0 |
+| **`0.9` (default)** | **51** | **63.3%** | **80.9%** | 99.91% | **5244 ms** | **97.6** |
+| `0.99` | 5 | 69.6% | 97.7% | 99.91% | 3619 ms | 141.5 |
 
-The old `0.5` default was the worst of both worlds: half the compute of dense at full sparse
-overhead, and on a ~4 GiB-class machine it sat close enough to the OOM kill line to be
-intermittently killed during the first steps. Raising it to `0.9` cut peak RSS 2.7x.
+Read that as: the 99.91% "sparsity" buys 2.2x over dense, because 81-98% of the arithmetic
+is dense attention regardless. Going from `0.5` to `0.9` is the change that mattered -- at
+`0.5` the "sparse" model stored *more* trainable values than the dense one (14.0M vs 8.2M)
+while doing only half the compute, i.e. the worst of both.
 
 `LinearConfig` keeps `rawr_sparsity=0.5` as its code-level default so library callers and
 legacy checkpoints (which record the value they were built with) are unaffected -- same
 pattern as `architecture` defaulting to `plain` in code but `rawr` on the CLI.
+
+Deriving the columns used to cost 20.6 s per 8-layer model build (160 s at the 256M preset):
+`hidden_cols` scored all `in_f` columns per row and sorted. It now takes only the answer
+(adjacency + the nearest non-edges, merged), which is **15-22x faster** and produces
+byte-identical columns -- which matters, because `cols` is what every existing Rawr
+checkpoint is interpreted through. `tests/test_rawr.py` pins it against a verbatim copy of
+the old implementation.
+
+## Where the time goes
+
+Measured with `torch.profiler` and component timings, 32M preset, batch 2, ctx 256, 2 threads,
+`--rawr-sparsity 0.99` (4005 ms/step, 128 tok/s):
+
+| phase | share |
+|---|---|
+| linear attention forward+backward (dense FP8 q/k/v/o + the O(D^2) recurrence) | **~44%** |
+| FP8 requantization in the optimizer step (`decode_tile` + `quantize_tiles`, 256 calls) | ~16% |
+| everything else in the optimizer step (dense embedding update, SparseLinear values) | ~14% |
+| Rawr FFN + LM head, sparse | ~7% |
+| logits + cross-entropy | ~1% |
+| global grad norm | ~0.02% |
+
+The Rawr sparse layers are now ~1% of the step; the dense FP8 attention is the cost. On this
+CPU the FP8 kernels are *slower* than a plain MKL FP32 GEMM of the same shape
+(`benchmark.py` measures 1.92x forward and 2.20x backward), because AVX1 without FMA
+sustains 7-13 GFLOP/s where MKL SGEMM sustains 39-48. Memory is not the constraint at this
+scale: peak RSS 615 MB, live gradients 32.5 MiB, checkpoint 25.0 MiB, optimizer `m` 24.2 MiB,
+`cols` index RAM 1.5 MiB.
 
 ## Tokenizer
 The tokenizer is built automatically via `tokenizer.ensure_tokenizer`: an existing file is
@@ -90,7 +127,16 @@ Two optimizers are selectable with `--optimizer`; the default is unchanged.
 
 1. Clears parameter grads and per-module FP8 weight grads (`_gw`).
 2. Rejects non-finite grads (they would poison quantized weights via `sign()`).
-3. Clips the global grad norm (float64 accumulation) to `--grad_clip`.
+3. Clips the global grad norm to `--grad_clip`. The norm is accumulated in **float64**, in
+   `_NORM_BLOCK` (2^19) element blocks so no full-size float32/float64 copy of any gradient
+   is ever built -- the old form built an FP32 copy of every gradient and held them all,
+   ~10x the gradient bytes in transients (314 MiB for one 31 MiB bf16 gradient). float32 is
+   *not* a drop-in here: `torch.linalg.vector_norm` accumulates linearly, so on a 16M-element
+   tensor its float32 result is 6.4e-4 relative off (bf16 3.5e-4) -- and this number *is* the
+   clip threshold. Measured 0.196 s / 314 MiB -> 0.081 s / 10.7 MiB for one 8000x2048 bf16
+   gradient, at 1.1e-16 relative error. A non-finite gradient propagates through the norm, so
+   `_clip` needs no separate `isfinite` scan over every gradient (that scan was 0.130 s,
+   149% of the norm computation itself, because it re-reads all the bytes).
 4. Applies a sign update scaled by `--lr`, with decay `lr * wd` folded into the FP8
    `requant` for quantized layers and multiplicative decay for the rest.
 

@@ -438,14 +438,26 @@ class SparseLinear(nn.Module):
         Keyed on the buffer identity so ``.to(device)`` (which gives a new
         ``cols`` tensor) is picked up rather than silently reusing a stale
         layout on the wrong device.
+
+        The cache additionally refuses to cross the inference-mode boundary.
+        ``SmaulLinear.prefill``/``step`` run under ``torch.inference_mode()``,
+        so a prefill builds the layout out of *inference* tensors and caches
+        them here; a later training forward would then reuse inference tensors,
+        which are rejected in places normal tensors are accepted
+        (``create_graph=True``, saved-for-backward, version-counter bumps). The
+        ordinary forward/backward path happens to tolerate them, so this fails
+        far from its cause -- hence an explicit check. Rebuilding is cheap
+        relative to a step (measured 1.1 ms for the 8000x512 head) and only
+        happens on the first forward after a mode change.
         """
         c = self.cols
         key = (c.data_ptr(), tuple(c.shape), c.device, c.dtype)
         cache = getattr(self, "_csr_t", None)
-        if cache is not None and cache[0] == key:
+        if cache is not None and cache[0] == key and \
+                cache[3] == torch.is_inference_mode_enabled():
             return cache[1], cache[2]
         parts = _csr_T_parts(c, self.in_f)
-        self._csr_t = (key, parts[0], parts[1])
+        self._csr_t = (key, parts[0], parts[1], torch.is_inference_mode_enabled())
         return parts
 
     def forward(self, x):
@@ -644,14 +656,20 @@ class SmaulLinear(nn.Module):
     # Linear attention's state is O(D^2) per (batch, head) and independent of
     # the sequence length, so a prefill plus one step per generated token
     # replaces re-running the entire prefix for every token. Without this,
-    # generating N tokens is quadratic: each token cost a full forward
-    # (measured 0.18 / 0.36 / 0.74 s at 128 / 256 / 512 tokens for a 1-layer
-    # d=512 rawr model).
+    # generating N tokens costs N full forwards over the whole window, i.e.
+    # quadratic in N. Measured end to end through inference.py, 2 threads, 32
+    # generated tokens after a 1024-token prompt: 74.2 s -> 3.45 s (21.5x) at
+    # V8000 d512 L8.
     #
     # Semantics are unchanged: prefill consumes the same window
     # (ids[-MODEL_WINDOW:]) that the old re-forward path used, and the caller
     # re-prefills if the window would slide, which is what the old code did by
     # simply truncating. Training never calls these.
+    #
+    # A step is not bit-identical to a batched forward, and cannot be: torch
+    # picks a different GEMM/SpMM kernel for a [1, d] input than a [T, d] one,
+    # so the same row of an activation sums in a different order (~5e-07
+    # relative, measured). Test the logits against a tolerance, never the text.
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def prefill(self, idx):
@@ -669,7 +687,17 @@ class SmaulLinear(nn.Module):
 
     @torch.inference_mode()
     def step(self, idx, states):
-        """One token: returns (logits [B,1,V], states) with states advanced."""
+        """One token: returns (logits [B,1,V], states) with states advanced.
+
+        Every block must be stepped before the final norm and head: the loop
+        body has to be the *whole* body. It briefly did not -- the norm, head
+        and return were indented inside the loop, so this ran block 0 only and
+        advanced the remaining states never. It is not a rounding bug: the
+        result was uncorrelated with the equivalent full forward (~1.0 relative,
+        against ~1e-7 for the fp32 kernel-selection noise a per-token step
+        legitimately introduces). The equivalence tests in tests/test_last_token.py
+        pin it, and they caught it when the loop body was briefly wrong.
+        """
         if idx.shape[1] != 1:
             raise ValueError(f"step takes exactly one token, got {idx.shape[1]}")
         if len(states) != len(self.blocks):
@@ -680,6 +708,84 @@ class SmaulLinear(nn.Module):
             x, states[i] = b.step(x, states[i])
         x = self.nf(x.float())
         return self.head(x.float()), states
+
+    def compute_profile(self) -> dict:
+        """Per-token multiply-accumulates actually executed, by layer class.
+
+        Counterpart to ``RawrGraph.stats()``, which reports the *graph's*
+        sparsity: how many of the ``vocab**2`` possible token-to-token edges
+        exist. That number is real but it is not the model's sparsity, and
+        quoting it as one is badly misleading -- at the 32M preset
+        (vocab 8000, d 512, 8 layers, ffn 2.5) the graph reports 99.9 % while
+        97.7 % of the arithmetic the model performs is *dense*, because the
+        graph only drives the FFN and the LM head.
+
+        Everything is measured by walking the built model, so this cannot
+        drift from the architecture: the counts are the actual ``in_f *
+        out_f`` of a dense ``FP8Linear`` and the actual ``out_f * K`` of a
+        ``SparseLinear``.
+
+        Keys (all per token; ``*_dense_equiv`` is what the same layers would
+        cost with no sparsity at all):
+
+        ==================  ==================================================
+        key                 meaning
+        ==================  ==================================================
+        fp8_dense_mac       dense FP8Linear MAC (attention q/k/v/o, and the
+                            SwiFFN projections on architecture='plain')
+        sparse_nnz_mac      nonzero MAC of every SparseLinear
+        sparse_dense_mac    what those SparseLinears would cost dense
+        dense_head_mac      a dense LM head (architecture='plain' uses a
+                            plain nn.Linear, which is dense work too and must
+                            not fall through the cracks)
+        emb_dense_mac       embedding table entries, reported for context
+                            only: a lookup reads rows, it does not multiply,
+                            so it is deliberately NOT part of the sparsity
+                            ratio below (it does dominate gradient and
+                            optimizer memory)
+        mac_per_token       dense MAC + sparse_nnz_mac
+        dense_share         dense MAC / mac_per_token
+        model_sparsity      1 - (nnz + dense) / (dense_equiv of every
+                            projection), so 0 for a fully dense model
+        trainable_values    total ``p.numel()`` with requires_grad
+        ==================  ==================================================
+        """
+        fp8 = [(n, m) for n, m in self.named_modules() if isinstance(m, FP8Linear)]
+        sp = [(n, m) for n, m in self.named_modules() if isinstance(m, SparseLinear)]
+        fp8_dense = sum(m.in_f * m.out_f for _, m in fp8)
+        sparse_nnz = sum(m.out_f * m.cols.shape[1] for _, m in sp)
+        sparse_dense = sum(m.out_f * m.in_f for _, m in sp)
+        # A head that is neither of the above is a plain dense nn.Linear and is
+        # real arithmetic, so it belongs in the dense bucket. (SparseLinear and
+        # FP8Linear heads are already counted above; this must not double count
+        # them, hence the isinstance checks rather than a shape comparison.)
+        dense_head = 0
+        if not isinstance(self.head, (SparseLinear, FP8Linear)):
+            dense_head = int(self.head.in_features * self.head.out_features)
+        emb = 0
+        w = getattr(self.emb, "weight", None)
+        if w is not None:
+            emb = int(w.numel())
+        dense = fp8_dense + dense_head
+        mac = dense + sparse_nnz
+        # Projections only -- see the emb_dense_mac note above.
+        total_dense = sparse_dense + dense
+        return {
+            "fp8_modules": len(fp8),
+            "sparse_modules": len(sp),
+            "fp8_dense_mac": fp8_dense,
+            "sparse_nnz_mac": sparse_nnz,
+            "sparse_dense_mac": sparse_dense,
+            "dense_head_mac": dense_head,
+            "emb_dense_mac": emb,
+            "mac_per_token": mac,
+            "dense_share": (dense / mac) if mac else 0.0,
+            "model_sparsity": (1.0 - mac / total_dense) if total_dense else 0.0,
+            "trainable_values": sum(p.numel() for p in self.parameters()
+                                    if p.requires_grad),
+            "rawr_sparsity": self.cfg.rawr_sparsity,
+        }
+
 
     def save_pretrained(self, out: Path):
         from safetensors.torch import save_file

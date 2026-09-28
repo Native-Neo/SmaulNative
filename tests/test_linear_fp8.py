@@ -541,3 +541,108 @@ def test_quantize_tiles_fallback_matches_when_extension_absent():
     a = quantize_tiles(w.clone(), 64)
     b = _force_torch_quantizer(lambda: quantize_tiles(w.clone(), 64))
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+
+# ---------------------------------------------------------------------------
+# attn_forward's carried state, and the incremental decoder built on it.
+# The state is O(D^2) per (batch, head) and independent of T, so prefill + one
+# step per generated token replaces re-running the whole prefix. It is only
+# correct if the state handed back by a prefix is exactly the state the
+# recurrence would have reached -- so both properties are pinned here.
+# ---------------------------------------------------------------------------
+
+def test_attn_state_is_only_materialized_when_requested():
+    """need_state=False must not allocate the [B,H,D,D] state.
+
+    It is O(B*H*D^2) and the training path never reads it: 4 MiB/call at
+    B4/H16/D128, i.e. 32 MiB per step over 8 layers, for nothing.
+    """
+    from kernel.compute import get_backend
+    be = get_backend()
+    if not be.has_attn_native:
+        pytest.skip("native attention ext unavailable; no state to request")
+    B, T, H, D = 2, 33, 4, 40
+    Q = torch.randn(B, T, H, D)
+    K = torch.randn(B, T, H, D)
+    V = torch.randn(B, T, H, D)
+    _, _, S_off, z_off = be.attn_forward(Q, K, V, 1e-6, False)
+    _, _, S_on, z_on = be.attn_forward(Q, K, V, 1e-6, False, need_state=True)
+    assert S_off.numel() == 0 and z_off.numel() == 0, (S_off.shape, z_off.shape)
+    assert tuple(S_on.shape) == (B, H, D, D), S_on.shape
+    assert tuple(z_on.shape) == (B, H, D), z_on.shape
+    # Y must not depend on whether the state was asked for.
+    Y_off, _, _, _ = be.attn_forward(Q, K, V, 1e-6, False)
+    Y_on, _, _, _ = be.attn_forward(Q, K, V, 1e-6, False, need_state=True)
+    assert torch.equal(Y_off, Y_on)
+
+
+def test_attn_step_from_carried_state_reproduces_the_full_recurrence():
+    """One step from the prefix state == that token's row of a full forward."""
+    from kernel.compute import get_backend
+    be = get_backend()
+    if not be.has_attn_native:
+        pytest.skip("native attention ext unavailable; no state to step from")
+    torch.manual_seed(11)
+    B, T, H, D = 2, 40, 4, 32
+    Q = torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0
+    K = torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0
+    V = torch.randn(B, T, H, D)
+    qn, kn, vn = (torch.randn(B, H, D) for _ in range(3))
+    qn = torch.nn.functional.elu(qn) + 1.0
+    kn = torch.nn.functional.elu(kn) + 1.0
+
+    _, _, S, z = be.attn_forward(Q, K, V, 1e-6, False, need_state=True)
+    y_step, S2, z2 = be.attn_step(S, z, qn, kn, vn, 1e-6)
+
+    Y_all, _, S_all, z_all = be.attn_forward(
+        torch.cat([Q, qn[:, None]], 1), torch.cat([K, kn[:, None]], 1),
+        torch.cat([V, vn[:, None]], 1), 1e-6, False, need_state=True)
+    # The state is advanced in place, so S_all is the *same* buffer as S.
+    assert _err(y_step, Y_all[:, -1])["rel"] < 1e-5
+    assert _err(z2, z_all)["rel"] < 1e-5
+    # Two independent runs must agree exactly: no accumulated state on entry.
+    _, _, S_b, z_b = be.attn_forward(Q, K, V, 1e-6, False, need_state=True)
+    y_b, _, _ = be.attn_step(S_b, z_b, qn, kn, vn, 1e-6)
+    assert torch.equal(y_step, y_b)
+    assert torch.equal(S2, S_all)
+
+
+def test_incremental_decode_matches_a_full_forward_every_step():
+    """prefill + N steps == the last N rows of one full forward.
+
+    This is the property SmaulLinear.prefill/step exist to provide; without it
+    the per-step path could silently drift and generation would quietly go
+    off-distribution.
+    """
+    from smaul_linear import LinearConfig, SmaulLinear
+    torch.manual_seed(12)
+    for arch in ("rawr", "plain"):
+        cfg = LinearConfig(vocab_size=96, d_model=32, n_layer=2, n_heads=2,
+                           ffn_mult=2.0, architecture=arch, rawr_sparsity=0.5)
+        m = SmaulLinear(cfg).eval()
+        ids = torch.randint(0, 96, (1, 11))
+        new = torch.randint(0, 96, (1, 5))
+        with torch.inference_mode():
+            prefill_logits, states = m.prefill(ids)
+            got = [m.step(new[:, i:i + 1], states)[0] for i in range(new.shape[1])]
+        # Reference: one full forward over the concatenation. prefill's logits
+        # are the last *prefix* position; step i's are the i-th new position.
+        full, _ = m(torch.cat([ids, new], 1))
+        assert prefill_logits.shape == (1, 1, cfg.vocab_size)
+        assert _err(prefill_logits, full[:, ids.shape[1] - 1:ids.shape[1], :])["rel"] < 1e-4, \
+            (arch, "prefill")
+        for i, g in enumerate(got):
+            pos = ids.shape[1] + i
+            assert g.shape == (1, 1, cfg.vocab_size), g.shape
+            assert _err(g, full[:, pos:pos + 1, :])["rel"] < 1e-4, (arch, i)
+
+
+def test_prefill_and_step_reject_bad_shapes():
+    from smaul_linear import LinearConfig, SmaulLinear
+    m = SmaulLinear(LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2,
+                                 ffn_mult=2.0, architecture="rawr",
+                                 rawr_sparsity=0.5)).eval()
+    with pytest.raises(ValueError):
+        m.prefill(torch.zeros(1, 0, dtype=torch.long))
+    with pytest.raises(ValueError):
+        m.step(torch.zeros(1, 3, dtype=torch.long), [])

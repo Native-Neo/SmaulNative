@@ -432,3 +432,144 @@ def test_sparse_grad_v_fallback_handles_degenerate_shapes():
             assert out.shape == (out_f, K) and torch.isfinite(out).all()
     finally:
         be._sparse = None
+
+
+def test_sparse_linear_csr_cache_is_rebuilt_after_an_inference_mode_forward():
+    """An inference-mode prefill must not leave inference tensors cached.
+
+    ``SmaulLinear.prefill``/``step`` run under ``torch.inference_mode()``, and
+    ``SparseLinear._csr_t_parts`` caches the transposed index layout on the
+    module. Without the inference bit in the cache key, a later training
+    forward reuses inference tensors -- which are rejected by
+    ``create_graph=True``/saved-for-backward even though the ordinary
+    forward/backward happens to tolerate them, so the failure would surface
+    far from its cause.
+    """
+    from smaul_linear import SparseLinear
+    torch.manual_seed(21)
+    sl = SparseLinear(32, 48, torch.stack([torch.randperm(32)[:6] for _ in range(48)]))
+    x = torch.randn(4, 32)
+
+    with torch.inference_mode():
+        sl(x)
+    assert sl._csr_t[3] is True, "expected the cache to record inference mode"
+    assert sl._csr_t[1].is_inference(), "prefill should have built inference tensors"
+
+    # Back in normal mode the cache must be rebuilt rather than reused.
+    out = sl(x)
+    assert sl._csr_t[3] is False
+    assert not sl._csr_t[1].is_inference()
+    assert sl._csr_t[1].shape[0] == 32 + 1
+
+    # And a second ordinary forward is a genuine cache hit (no rebuild).
+    before = sl._csr_t
+    sl(x)
+    assert sl._csr_t is before
+
+    # The guard does not change results: same values either way.
+    with torch.inference_mode():
+        ref = sl(x)
+    assert torch.equal(out, ref)
+
+
+def test_sparse_linear_csr_cache_tracks_a_replaced_cols_buffer():
+    """A new ``cols`` tensor (e.g. from .to(device)) must invalidate the cache."""
+    from smaul_linear import SparseLinear
+    torch.manual_seed(22)
+    sl = SparseLinear(16, 24, torch.stack([torch.randperm(16)[:4] for _ in range(24)]))
+    x = torch.randn(3, 16)
+    sl(x)
+    first = sl._csr_t
+    # Replace the buffer in place, as a device migration or a graph swap would.
+    sl.cols = torch.stack([torch.randperm(16)[:4] for _ in range(24)])
+    sl(x)
+    assert sl._csr_t is not first, "stale S^T layout reused for a new cols buffer"
+
+
+# ---------------------------------------------------------------------------
+# The graph's `sparsity` / `est_compute_reduction` describe the vocab x vocab
+# token-edge space, not the model. `compute_profile` exists so the model's real
+# split can be reported next to it, and these tests pin that the two really do
+# disagree -- i.e. that quoting the graph number as the model's is wrong.
+# ---------------------------------------------------------------------------
+
+def test_graph_sparsity_is_not_the_model_sparsity():
+    from smaul_linear import LinearConfig, SmaulLinear
+    g = fallback_graph(64, 4)
+    cfg = LinearConfig(vocab_size=64, d_model=64, n_layer=4, n_heads=4, ffn_mult=2.0,
+                       architecture="rawr", rawr_sparsity=0.99)
+    m = SmaulLinear(cfg, rawr_graph=g)
+    p = m.compute_profile()
+    assert p["dense_share"] > 0.9, p
+    # The graph claims near-total sparsity ...
+    assert g.stats()["sparsity"] > 0.85
+    # ... but the attention projections are dense and dominate the arithmetic.
+    assert p["fp8_modules"] == 4 * 4            # 4 layers x q/k/v/o
+    assert p["sparse_modules"] == 4 * 3 + 1      # 4 layers x (gate,up,down) + head
+    assert p["fp8_dense_mac"] == 4 * 4 * 64 * 64
+    assert p["dense_head_mac"] == 0        # rawr head is a SparseLinear
+    assert p["dense_share"] == p["fp8_dense_mac"] / p["mac_per_token"]
+    assert p["model_sparsity"] < 0.95, p
+
+
+def test_compute_profile_counts_are_the_real_layer_shapes():
+    from smaul_linear import LinearConfig, SmaulLinear
+    g = fallback_graph(48, 4)
+    for sp in (0.5, 0.9, 0.99):
+        cfg = LinearConfig(vocab_size=48, d_model=32, n_layer=2, n_heads=2, ffn_mult=2.0,
+                           architecture="rawr", rawr_sparsity=sp)
+        m = SmaulLinear(cfg, rawr_graph=g)
+        p = m.compute_profile()
+        assert p["rawr_sparsity"] == sp
+        assert p["mac_per_token"] == (p["fp8_dense_mac"] + p["sparse_nnz_mac"]
+                                      + p["dense_head_mac"])
+        # Every SparseLinear contributes exactly out_f * K.
+        nnz = sum(mm.out_f * mm.cols.shape[1] for mm in m.modules()
+                  if isinstance(mm, SparseLinear))
+        assert p["sparse_nnz_mac"] == nnz
+        assert p["trainable_values"] == sum(q.numel() for q in m.parameters()
+                                            if q.requires_grad)
+
+
+def test_compute_profile_on_plain_has_no_sparse_layers():
+    from smaul_linear import LinearConfig, SmaulLinear
+    cfg = LinearConfig(vocab_size=48, d_model=32, n_layer=2, n_heads=2, ffn_mult=2.0,
+                       architecture="plain")
+    p = SmaulLinear(cfg).compute_profile()
+    assert p["sparse_modules"] == 0 and p["sparse_nnz_mac"] == 0
+    # The plain head is a plain nn.Linear and is dense work, so it must land in
+    # the dense bucket rather than being dropped from the accounting.
+    assert p["dense_head_mac"] == 48 * 32, p
+    assert p["dense_share"] == 1.0 and p["model_sparsity"] == 0.0, p
+
+
+def test_print_stats_labels_the_graph_number(capsys):
+    from rawr_graph import print_model_compute, print_stats
+    g = fallback_graph(32, 4)
+    print_stats(g)
+    out = capsys.readouterr().out
+    assert "graph_sparsity" in out
+    assert "NOT the model" in out
+    # A bare "sparsity:" line would be the misleading form.
+    assert "\nsparsity:" not in out and not out.startswith("sparsity:")
+    print_model_compute({"rawr_sparsity": 0.9, "fp8_modules": 4, "sparse_modules": 7,
+                         "fp8_dense_mac": 10, "sparse_nnz_mac": 5,
+                         "sparse_dense_mac": 50, "dense_head_mac": 0,
+                         "emb_dense_mac": 3,
+                         "mac_per_token": 15, "dense_share": 10 / 15,
+                         "model_sparsity": 0.6, "trainable_values": 99})
+    out2 = capsys.readouterr().out
+    assert "dense share of MAC" in out2 and "model_sparsity" in out2
+
+
+def test_rawr_graph_json_roundtrip_tolerates_the_new_stats_keys(tmp_path):
+    """Old and new graph files must both load; load_graph ignores extras."""
+    g = fallback_graph(16, 4)
+    save_graph(g, tmp_path / "g.json")
+    import json
+    p = json.loads((tmp_path / "g.json").read_text())
+    # stats() keys are display-only; load_graph reads a known subset.
+    p["stats"]["some_future_key"] = 12345
+    (tmp_path / "g.json").write_text(json.dumps(p))
+    g2 = load_graph(tmp_path / "g.json")
+    assert g2.edges == g.edges and g2.digest == g.digest

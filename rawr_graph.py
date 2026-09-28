@@ -481,12 +481,16 @@ def load_graph(path: Path) -> RawrGraph:
     return graph
 
 
-def print_stats(graph: RawrGraph) -> None:
+def print_stats(graph: RawrGraph, profile: dict | None = None) -> None:
     s = graph.stats()
     print(f"vocab_size:            {s['vocab_size']:,}")
     print(f"dense_connections:     {s['dense_connection_count']:,}")
     print(f"rawr_connections:      {s['rawr_connection_count']:,}")
-    print(f"sparsity:              {s['sparsity'] * 100:.2f}%")
+    # Labelled "graph_" on purpose. This is the fraction of the vocab x vocab
+    # token-to-token edge space the graph occupies, NOT the model's sparsity:
+    # the graph only drives the FFN and the LM head, so the attention
+    # projections and the embedding stay dense regardless of this number.
+    print(f"graph_sparsity:        {s['sparsity'] * 100:.2f}%  (of the vocab x vocab edge space, NOT the model)")
     print(f"avg_conns_per_token:   {s['avg_connections_per_token']:.2f}")
     print(f"min_connections:       {s['min_connections']}")
     print(f"max_connections:       {s['max_connections']}")
@@ -497,8 +501,32 @@ def print_stats(graph: RawrGraph) -> None:
     print(f"corpus_bigram_types:   {s['corpus_bigram_types']:,}")
     print(f"corpus_coverage:       {s['corpus_coverage'] * 100:.2f}%")
     print(f"estimated_graph_bytes: {s['estimated_graph_bytes']:,}")
-    print(f"est_compute_reduction: {s['estimated_compute_reduction'] * 100:.2f}%")
+    print(f"graph_est_reduction:   {s['estimated_compute_reduction'] * 100:.2f}%  (of that edge space, NOT the model)")
     print(f"digest:                {s['digest']}")
+    if profile is not None:
+        print_model_compute(profile)
+
+
+def print_model_compute(p: dict) -> None:
+    """Print what the model actually executes, per token.
+
+    Pass ``SmaulLinear.compute_profile()``. The graph's own ``sparsity`` and
+    ``est_compute_reduction`` describe the token graph; these describe the
+    arithmetic, and they disagree sharply whenever the attention projections
+    are a large share of the model.
+    """
+    print(f"-- model compute (per token, from the built model) --")
+    print(f"rawr_sparsity:         {p['rawr_sparsity']:.4f}")
+    print(f"fp8_dense layers:      {p['fp8_modules']:>12,}   (attention q/k/v/o -- NOT sparsified)")
+    print(f"sparse layers:         {p['sparse_modules']:>12,}   (Rawr FFN + LM head)")
+    print(f"fp8_dense MAC:         {p['fp8_dense_mac']:>12,}   (attention q/k/v/o, + SwiFFN on plain)")
+    print(f"sparse_nnz MAC:        {p['sparse_nnz_mac']:>12,}   of {p['sparse_dense_mac']:,} dense-equivalent")
+    print(f"dense_head MAC:        {p.get('dense_head_mac', 0):>12,}   (plain nn.Linear head)")
+    print(f"embedding entries:     {p['emb_dense_mac']:>12,}   (dense lookup table)")
+    print(f"MAC per token:         {p['mac_per_token']:>12,}")
+    print(f"dense share of MAC:    {p['dense_share'] * 100:11.2f}%")
+    print(f"model_sparsity:        {p['model_sparsity'] * 100:11.2f}%   (true, vs graph_sparsity above)")
+    print(f"trainable values:      {p['trainable_values']:>12,}")
 
 
 def main() -> None:

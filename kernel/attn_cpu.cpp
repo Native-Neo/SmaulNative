@@ -168,8 +168,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> attn_forw
     // Empty by design (e.g. zero-length prompt); return empty, not crash.
     auto eY = torch::empty_like(Q);
     auto eD = torch::empty({0}, Q.options().dtype(torch::kFloat32));
-    auto eS = torch::zeros({B, H, D, D}, Q.options().dtype(torch::kFloat32));
-    auto ez = torch::zeros({B, H, D}, Q.options().dtype(torch::kFloat32));
+    // Real zeros when the caller wants the state (so a caller can index it
+    // unconditionally), empty otherwise -- see the note on S_out below.
+    auto eS = need_state ? torch::zeros({B, H, D, D}, Q.options().dtype(torch::kFloat32))
+                         : torch::empty({0}, Q.options().dtype(torch::kFloat32));
+    auto ez = need_state ? torch::zeros({B, H, D}, Q.options().dtype(torch::kFloat32))
+                         : torch::empty({0}, Q.options().dtype(torch::kFloat32));
     return {eY, eD, eS, ez};
   }
   auto Y = torch::empty_like(Q);
@@ -186,10 +190,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> attn_forw
   const float* Vp = V.data_ptr<float>();
   float* Yp = Y.data_ptr<float>();
   const float ef = (float)eps;
-  auto S_out = torch::zeros({B, H, D, D}, Q.options().dtype(torch::kFloat32));
-  auto z_out = torch::zeros({B, H, D}, Q.options().dtype(torch::kFloat32));
-  float* Sp = S_out.data_ptr<float>();
-  float* zp = z_out.data_ptr<float>();
+  // S/z are the O(D^2) recurrence state. They are ONLY materialized when the
+  // caller asked for them: allocating and zeroing them unconditionally cost
+  // B*H*D*D*4 bytes of memset on every training forward, for a result the
+  // training path never reads (it needs nothing sequence-sized stored, so the
+  // state deliberately lives in the task-local std::vector and is discarded).
+  // Measured 4 MiB/call at B4/H16/D128, i.e. 32 MiB/step wasted over 8 layers.
+  //
+  // torch::empty({0}) rather than an undefined Tensor: pybind conversion
+  // crashes on undefined, and a 0-element allocation costs nothing. Callers
+  // that need the state (LinearAttention.prefill) see a real [B,H,D,D] tensor.
+  auto S_out = need_state
+      ? torch::zeros({B, H, D, D}, Q.options().dtype(torch::kFloat32))
+      : torch::empty({0}, Q.options().dtype(torch::kFloat32));
+  auto z_out = need_state
+      ? torch::zeros({B, H, D}, Q.options().dtype(torch::kFloat32))
+      : torch::empty({0}, Q.options().dtype(torch::kFloat32));
+  float* Sp = need_state ? S_out.data_ptr<float>() : nullptr;
+  float* zp = need_state ? z_out.data_ptr<float>() : nullptr;
   at::parallel_for(0, B * H, 1, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
       if (need_state) {

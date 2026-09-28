@@ -15,10 +15,9 @@ repo root.
 - [RQT](docs/rqt.md) -- tiled E4M3 FP8 training
 - [smaul_linear.py](docs/smaul_linear.md)
 - [merge_moe.py](docs/merge_moe.md)
-- [inference.py + infer_linear.py](docs/inference.md)
+- [inference.py](docs/inference.md) -- `LinearInference`, used by infer_cli.py / infer_server.py
 - [infer_cli.py](docs/infer_cli.md)
 - [infer_server.py](docs/infer_server.md)
 - [rl.py](docs/rl.md)
-- [autorl.py](docs/autorl.md)
 - [convert_linear_to_gguf.py](docs/convert_gguf.md)
 - [CPU Optimizations](docs/cpu.md)
