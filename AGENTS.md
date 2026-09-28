@@ -134,5 +134,54 @@ loss, but it silently rewrote stored weights once. Do not re-derive the codebook
 It is also a known perf dead end, measured: 45 ns/element, 1.05x from 1->2 threads, and
 `std::lower_bound` / branchless / 4-way / SIMD-count searches all land within noise of each
 other. The only remaining lever is re-deriving the mapping — i.e. the bug above. Don't.
+
+## Where the FP8 kernels' time actually goes
+
+`benchmark.py` measures FP8 as ~1.9x slower forward and ~2.2x slower backward than plain
+FP32 at d=512, and the linear attention projections (dense FP8 q/k/v/o) are ~44% of a
+32M-preset step. Diagnosis, so it does not have to be repeated:
+
+- **This class of CPU (family 6, model 58) has no FMA and no AVX2** — only
+  `avx f16c sse4_2 xsave`. `-mno-avx2` in `_native_cflags` is correct, and an
+  FMA/AVX2 code path would be *dead code here*; it could only help Haswell+. Do not
+  add one expecting a local speedup.
+- **It is not the accumulate loop.** Holding the forward's `acc` in 8 registers
+  instead of a stack array measured 0.99x — no change, bit-identical.
+- **It is not thread count.** `fp8_backward_input` sustains 13.4 GFLOP/s at 1, 2
+  *and* 4 threads while MKL SGEMM goes 24.2 -> 46.8. `fp8_forward` goes
+  17.0 -> 14.5 -> 21.7. A kernel that is flat in thread count is bound by
+  something shared between cores (a cache level), not by arithmetic.
+- **The prime suspect is the codebook expansion, not the math.** Each task
+  re-decodes the weights (`lut[wp[...]] * sp[...]`) for every `MR=32` rows
+  (forward) or `RB=16` rows (backward). For the forward that is ~32768 decodes per
+  1.05M MACs, and the isolated accumulate loop runs at 35.8 GFLOP/s against the
+  kernel's 17.9 — consistent with roughly half the time being decode. The
+  backward is worse (3.9 GFLOP/s at 8000x512) and `RB == 16` is baked into its
+  AVX fast path by the `reduce8` accumulator layout.
+
+Two decode micro-optimizations were tried and **both failed**; don't repeat them:
+
+1. Reordering the decode to walk each output row's 64 codes contiguously. The
+   loads do become sequential, but the `wt` stores become 64 scattered one-float
+   writes, and that costs more than the reads it saves: measured **2x slower**
+   (29.5 ms vs 15.0 ms at 512x512x512).
+2. Hoisting the 64 per-output scales into L1. No speedup, and the first attempt
+   indexed them by `j` instead of `o2 + j` and produced wrong weights (3.7e-02
+   relative error) — an easy mistake to repeat, since the naive version looks
+   right and the tests do catch it.
+
+The remaining lever is raising `MR` / `RB` (fewer weight decodes per row) or
+restructuring the task loop so the decode is hoisted out of the row loop. Both
+trade against parallelism and register pressure — `acc[32][64]` is already 8 KiB,
+and the backward's `RB == 16` is fixed by `reduce8`. Treat that as a kernel
+project, not an incremental fix, and budget for measurement noise: on this
+2-core box under load, the *backward* source -- unchanged in all three runs --
+measured 23.1, 30.1 and 771.6 ms for the same 512x512x512 shape, so a
+sub-20% claim from three samples means nothing here. `benchmark.py` is the
+only harness that has ever been quiet enough to compare against.
+
+Note also that the PyTorch torch-fallback path is now covered by tests
+(`tests/test_linear_fp8.py`), because it is what runs when these extensions
+cannot be built at all.
 - Per-step wall-clock timings on this machine swing 450–700 ms run to run and are
   dominated by forward/backward, not the optimizer. Trust byte/state counts over ms.
