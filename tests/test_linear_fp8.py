@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
 import torch
 
 from kernel.fp8_tile import FP8Linear, fp8_modules, quantize_tiles
@@ -456,3 +457,87 @@ def test_block_checkpoint_matches_eager():
     assert l1 == l2
     assert max((a - b).abs().amax().item() for a, b in zip(g1, g2)) == 0.0
     assert max((a - b).abs().amax().item() for a, b in zip(w1, w2)) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# quantize_tiles: the codes ARE the persistent FP8 weights, so the native
+# quantizer must agree with the torch path bit-for-bit. It was originally
+# written with its own E4M3 codebook sort and silently emitted a different
+# code for every weight that saturated to exactly 448, because E4M3 has two
+# codes for +448 (126/127) and two for -448 (254/255) and the tie order comes
+# from torch.argsort. Tests the tie, the midpoints and the non-finite path.
+# ---------------------------------------------------------------------------
+
+def _force_torch_quantizer(fn):
+    """Run fn() with the native quantizer disabled, then re-enable it."""
+    from kernel.compute import get_backend
+    be = get_backend()
+    prev = be._quant
+    be._quant = False
+    try:
+        return fn()
+    finally:
+        be._quant = prev
+
+
+def _quant_case_inputs():
+    from kernel.fp8_tile import _tables
+    sval = _tables(torch.device("cpu"), torch.float32)[2].tolist()
+    mid = [(sval[i] + sval[i + 1]) * 0.5 for i in range(len(sval) - 1)]
+    n = 64 * 512
+    cases = {
+        "uniform": torch.randn(64, 512),
+        "tiny": torch.randn(64, 512) * 1e-30,
+        "huge": torch.randn(64, 512) * 1e30,
+        "zeros": torch.zeros(64, 512),
+        "half_zero": torch.cat([torch.zeros(32, 512), torch.randn(32, 512)]),
+        # every codebook value, and every midpoint (the search's tie points)
+        "codebook": torch.tensor((sval * 128)[:n]).view(64, 512),
+        "midpoints": torch.tensor((mid * 130)[:n]).view(64, 512),
+        # saturation, where the duplicate 448 codes are selected
+        "saturating": torch.tensor(
+            ([448.0, -448.0, 447.9, 0.0, -0.0, 1e-45] * 6000)[:n]).view(64, 512),
+        "subnormal": torch.randint(0, 8, (64, 512)).float() * 2.0 ** -9,
+        "odd_shape": torch.randn(7, 13),
+        "padded_tile": torch.randn(5, 100),
+    }
+    w = cases["saturating"].clone()
+    w[0, 0] = float("nan")
+    w[1, 1] = float("inf")
+    w[2, 2] = float("-inf")
+    cases["nonfinite"] = w
+    return cases
+
+
+@pytest.mark.parametrize("name", sorted(_quant_case_inputs()))
+@pytest.mark.parametrize("tile", [64, 32, 128])
+def test_quantize_tiles_native_matches_torch_exactly(name, tile):
+    w = _quant_case_inputs()[name]
+    native_codes, native_sc = quantize_tiles(w.clone(), tile)
+    torch_codes, torch_sc = _force_torch_quantizer(
+        lambda: quantize_tiles(w.clone(), tile))
+    assert native_codes.dtype is torch.uint8
+    assert torch.equal(native_codes, torch_codes), (
+        name, tile, int((native_codes != torch_codes).sum()), "codes differ")
+    assert torch.equal(native_sc, torch_sc), (name, tile, "scales differ")
+
+
+def test_quantize_tiles_nonfinite_warning_still_fires():
+    w = torch.zeros(8, 64)
+    w[0, 0] = float("nan")
+    w[1, 1] = float("inf")
+    with pytest.warns(RuntimeWarning, match="non-finite"):
+        codes, sc = quantize_tiles(w, 64)
+    assert torch.isfinite(sc).all()
+    # NaN/Inf saturate rather than propagate into the stored codes.
+    assert codes.dtype is torch.uint8
+
+
+def test_quantize_tiles_fallback_matches_when_extension_absent():
+    from kernel.compute import get_backend
+    if get_backend()._load_quant() is None:
+        pytest.skip("native quantizer unavailable; fallback is the only path")
+    w = torch.randn(32, 128)
+    a = quantize_tiles(w.clone(), 64)
+    b = _force_torch_quantizer(lambda: quantize_tiles(w.clone(), 64))
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])

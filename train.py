@@ -6,6 +6,7 @@ Checkpoints are resume-free for Lion (hyperparams only); SmaulOpt
 """
 import argparse
 import json
+import math
 import os
 import signal
 import time
@@ -95,6 +96,62 @@ def _h(sig, fr):
     STOP = True
     print("\n[stop] finishing step then saving")
 
+# Elements per block in the global grad-norm reduction (see _grad_norm).
+# 2**19 x 4B = 2 MiB FP32 upcast, which is small enough to stay resident in
+# cache and large enough that the Python-level loop is not the bottleneck.
+_NORM_BLOCK = 1 << 19
+
+
+def _grad_norm(grads) -> float:
+    """L2 norm of the concatenated gradients, accumulated in float64.
+
+    Two things this deliberately does NOT do.
+
+    1. It does not widen a whole gradient to the accumulator dtype first.
+       The previous form built a full FP32 copy of *every* gradient and held
+       them in a list for the whole call, then made two FP64 copies of one of
+       them -- ~10x the gradient bytes in transients (measured 314 MiB for a
+       single 31 MiB bf16 gradient). That is precisely the allocation
+       ``SmaulOpt.narrow_grads_`` exists to avoid, two lines later in the
+       same call. Upcasting one block at a time bounds the transient to
+       _NORM_BLOCK elements instead.
+
+    2. It does not accumulate in float32 or bfloat16. This is not a stylistic
+       choice and float32 is NOT a drop-in: ``torch.linalg.vector_norm``
+       accumulates linearly, so on a 16M-element tensor its float32 result is
+       6.4e-4 relative off (bfloat16 3.5e-4, since the squares are formed in
+       the input dtype) -- far worse than float32's own ~6e-8 capability.
+       These gradients *are* the clip threshold, so that error would be a
+       silent change in clipping behaviour. Blocking the upcast keeps the
+       exact float64 result at a fraction of the memory and time.
+
+    Measured on this repo, one 8000x2048 bf16 gradient, 2 threads::
+
+        form                            transient      time    rel err
+        .float() in list + .double()   314.2 MiB    0.196 s   0
+        vector_norm(dtype=float32)        ~0 MiB    0.042 s   6.4e-4
+        this function                  10.7 MiB    0.081 s   1.1e-16
+
+    Non-finite entries propagate: a NaN gradient yields a NaN norm and an
+    infinite one an infinite norm, so callers no longer need a separate
+    ``isfinite`` scan over every gradient (that scan measured 0.130 s, i.e.
+    149% of the norm computation itself, because it re-reads all the bytes).
+    """
+    total = torch.zeros((), dtype=torch.float64)
+    for g in grads:
+        n = int(g.numel())
+        if n == 0:
+            continue
+        # reshape(-1) is a free view for the contiguous gradients autograd
+        # produces; a non-contiguous gradient costs one bf16 copy, which is
+        # still no worse than the FP32 copy the old form always made.
+        flat = g.reshape(-1)
+        for i in range(0, n, _NORM_BLOCK):
+            blk = flat[i:i + _NORM_BLOCK].float()
+            total += torch.linalg.vector_norm(blk, ord=2,
+                                              dtype=torch.float64).pow(2)
+    return float(total.sqrt().item())
+
 def install_handlers() -> None:
     # Install SIGINT/SIGTERM handlers explicitly from main() only.
     # Importing train (e.g. cpu/benchmark_full.py imports Lion) must not
@@ -128,15 +185,15 @@ class Lion:
                           stacklevel=2)
     @torch.no_grad()
     def _clip(self, mods, mx=1.0):
-        gs = [m._gw for _, m in mods if m._gw is not None] + [p.grad.float() for p in self.p if p.grad is not None]
-        if not gs:
+        grads = [m._gw for _, m in mods if m._gw is not None] + \
+                [p.grad for p in self.p if p.grad is not None]
+        if not grads:
             return 0.0
-        # Filter non-finite grads: NaN never satisfies `t > mx`, so check first.
-        for g in gs:
-            if not bool(torch.isfinite(g).all()):
-                return float("inf")
-        # Accumulate in float64 to avoid fp32 overflow on large models.
-        t = torch.stack([g.double().pow(2).sum() for g in gs]).sum().sqrt()
+        # Non-finite grads (or a non-finite norm) would poison quantized
+        # weights via sign(); report inf so the caller skips the step.
+        t = _grad_norm(grads)
+        if not math.isfinite(t):
+            return float("inf")
         if t > mx:
             s = mx / (t + 1e-6)
             for _, m in mods:
@@ -145,7 +202,7 @@ class Lion:
             for p in self.p:
                 if p.grad is not None:
                     p.grad.mul_(s)
-        return float(t.item())
+        return t
     @torch.no_grad()
     def step(self, model):
         mods = fp8_modules(model)
@@ -548,16 +605,15 @@ class SmaulOpt:
 
     @torch.no_grad()
     def _clip(self, mods, mx=1.0):
-        # Identical semantics to Lion._clip: global norm in float64,
-        # non-finite grads -> inf (caller skips the step).
-        gs = [m._gw for _, m in mods if m._gw is not None] + \
-             [p.grad.float() for p in self.p if p.grad is not None]
-        if not gs:
+        # Identical semantics to Lion._clip: global norm in float64 (see
+        # _grad_norm), non-finite grads -> inf (caller skips the step).
+        grads = [m._gw for _, m in mods if m._gw is not None] + \
+                [p.grad for p in self.p if p.grad is not None]
+        if not grads:
             return 0.0
-        for g in gs:
-            if not bool(torch.isfinite(g).all()):
-                return float("inf")
-        t = torch.stack([g.double().pow(2).sum() for g in gs]).sum().sqrt()
+        t = _grad_norm(grads)
+        if not math.isfinite(t):
+            return float("inf")
         if t > mx:
             s = mx / (t + 1e-6)
             for _, m in mods:
@@ -566,7 +622,7 @@ class SmaulOpt:
             for p in self.p:
                 if p.grad is not None:
                     p.grad.mul_(s)
-        return float(t.item())
+        return t
 
     @torch.no_grad()
     def step(self, model):
@@ -653,15 +709,20 @@ class SmaulOpt:
                     m_b.mul_(self.beta_m).add_(gw[o0:o1], alpha=1.0 - self.beta_m)
                     v_b.mul_(self.beta_v).add_(gw[o0:o1].abs(), alpha=1.0 - self.beta_v)
                     u_b = (m_b / bc1) / (v_b / bc2 + self.epsilon)
-                    if not bool(torch.isfinite(u_b).all()):
-                        # Safe guard: skip this block's weight update rather than
-                        # propagating non-finite values into quantized storage.
-                        continue
-                    if self.state_dtype != "fp32":
-                        # Bound |u|: the invariant |EMA(g)| <= EMA(|g|) should keep
-                        # it near 1, so this only engages on state noise.
-                        u_b.clamp_(-self.update_clip, self.update_clip)
-                    mod._requant_block(o0, o1, u_b * self.lr, decay)
+                    # Gate only the weight write. A non-finite u must not be
+                    # folded into quantized storage, but the m/v EMAs still
+                    # have to be persisted: m_b/v_b are temporaries in the
+                    # narrow-state case, so `continue`-ing past the copy_()
+                    # below would silently discard them while step_count has
+                    # already advanced, desynchronizing bias correction. (The
+                    # factored branch above has always done it this way.)
+                    finite = bool(torch.isfinite(u_b).all())
+                    if finite:
+                        if self.state_dtype != "fp32":
+                            # Bound |u|: the invariant |EMA(g)| <= EMA(|g|) should
+                            # keep it near 1, so this only engages on state noise.
+                            u_b.clamp_(-self.update_clip, self.update_clip)
+                        mod._requant_block(o0, o1, u_b * self.lr, decay)
                     # ---- narrow the state block back to storage width ----
                     if self.state_dtype != "fp32":
                         st_m[o0:o1].copy_(m_b)
@@ -731,21 +792,24 @@ class SmaulOpt:
                 m_hat = m_b / bc1
                 v_hat = v_b / bc2
                 u = m_hat / (v_hat + self.epsilon)
-                if not bool(torch.isfinite(u).all()):
-                    continue
-                if self.state_dtype != "fp32":
-                    # Bound |u|: see the note in the FP8 block path above.
-                    u.clamp_(-self.update_clip, self.update_clip)
-                if self.weight_decay:
-                    # Decoupled: theta <- theta * (1 - lr*wd), same as
-                    # theta - lr*wd*theta.
-                    p.mul_(1.0 - self.lr * self.weight_decay)
-                if u.dtype != p.dtype:
-                    u = u.to(p.dtype)
-                # Ensure device match (states migrate with grads; param is source).
-                if u.device != p.device:
-                    u = u.to(p.device)
-                p.add_(u, alpha=-self.lr)
+                # As in the FP8 block path: gate only the parameter update, and
+                # always persist m/v, or a narrow-state tensor would lose its
+                # EMA for this step while step_count still advanced.
+                finite = bool(torch.isfinite(u).all())
+                if finite:
+                    if self.state_dtype != "fp32":
+                        # Bound |u|: see the note in the FP8 block path above.
+                        u.clamp_(-self.update_clip, self.update_clip)
+                    if self.weight_decay:
+                        # Decoupled: theta <- theta * (1 - lr*wd), same as
+                        # theta - lr*wd*theta.
+                        p.mul_(1.0 - self.lr * self.weight_decay)
+                    if u.dtype != p.dtype:
+                        u = u.to(p.dtype)
+                    # Ensure device match (states migrate with grads; param is source).
+                    if u.device != p.device:
+                        u = u.to(p.device)
+                    p.add_(u, alpha=-self.lr)
                 # ---- narrow the state back to storage width ----
                 if self.state_dtype != "fp32":
                     st_m.copy_(m_b)
@@ -1273,6 +1337,13 @@ def main():
         # still FP32 (it widens per block). No-op for Lion.
         if hasattr(opt, "narrow_grads_"):
             opt.narrow_grads_(model)
+        # Sampled here, not at log time: opt.step() clears every FP8 _gw, so
+        # afterwards the live-gradient figure would only see p.grad and
+        # understate the peak by the largest single allocation in the model.
+        grad_bytes = (sum(p.grad.numel() * p.grad.element_size()
+                          for p in model.parameters() if p.grad is not None)
+                      + sum(m._gw.numel() * m._gw.element_size()
+                            for _, m in fp8_modules(model) if m._gw is not None))
         norm = opt.step(model)
         if norm == float("inf"):
             bad_steps += 1
@@ -1291,9 +1362,15 @@ def main():
             mem += sum(b.numel() * b.element_size() for b in model.buffers())
             # Include optimizer state: otherwise the metric understates OOM risk.
             mem += sum(v.numel() * v.element_size() for v in opt.m.values())
-            if hasattr(opt, "v"):
-                mem += sum(v.numel() * v.element_size() for v in opt.v.values())
-            print(f"step {step} loss {loss.item():.4f} {since / max(el, 1e-9):.1f} tok/s stored {mem / 1048576:.1f}MiB")
+            for _store in ("v", "v_row", "v_col"):
+                # v is the full-size form; v_row/v_col are the factored
+                # marginals, and with --factor-v (the default) v is empty, so
+                # counting only v reported almost none of the state.
+                _s = getattr(opt, _store, None)
+                if _s:
+                    mem += sum(v.numel() * v.element_size() for v in _s.values())
+            print(f"step {step} loss {loss.item():.4f} {since / max(el, 1e-9):.1f} tok/s "
+                  f"stored {mem / 1048576:.1f}MiB (+{grad_bytes / 1048576:.1f}MiB live grads)")
             t0, since = time.perf_counter(), 0
         if step % args.save_every == 0:
             model.save_pretrained(out)

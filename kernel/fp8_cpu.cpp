@@ -140,9 +140,30 @@ torch::Tensor fp8_forward(torch::Tensor x, torch::Tensor w, torch::Tensor s,
   return out;
 }
 
+// Reduce the 8 per-output-group accumulators. Lane k of the result is the
+// total over all 64 output columns for input column ib0+k, so the eight
+// accumulators are summed ELEMENTWISE (not horizontally -- a horizontal sum
+// would collapse the 8 input columns into one scalar).
+static inline __m256 reduce8(__m256 a0, __m256 a1, __m256 a2, __m256 a3,
+                             __m256 a4, __m256 a5, __m256 a6, __m256 a7) {
+  return _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)),
+                       _mm256_add_ps(_mm256_add_ps(a4, a5), _mm256_add_ps(a6, a7)));
+}
+
 // Backward-input: block over rows (RB) x input-cols (IB). Each [OBlock x IB]
 // weight sub-tile is decoded ONCE and reused across all RB rows
 // (previously re-decoded per row: rows x fewer gathers now).
+//
+// The AVX path keeps EIGHT independent accumulators, one per group of 8
+// output columns, rather than one. The original single accumulator made the
+// 64-iteration inner loop a 64-deep serial vaddps chain: at ~4 cycles of
+// addps latency on a FMA-less Ivy Bridge that is 256 cycles per (row, ib)
+// no matter how much ILP the rest of the loop had, which measured 1.9x
+// SLOWER than the MKL SGEMM it was written to replace (48.4 ms vs 26.0 ms
+// for a 512x512x512 backward). Eight chains run concurrently, so the loop
+// becomes throughput-bound instead of latency-bound. The math is unchanged
+// apart from FP32 summation order, the same caveat the rest of this file
+// documents.
 static void fp8_backward_task(const float* gp, const uint8_t* wp, const float* sp, float* dxp,
                               const float* lut, int64_t in_f, int64_t out_f, int64_t nt, int64_t tile,
                               int64_t r0, int64_t RB, int64_t ib0, int64_t IBR) {
@@ -161,12 +182,24 @@ static void fp8_backward_task(const float* gp, const uint8_t* wp, const float* s
       }
       for (int64_t r = 0; r < 16; ++r) {
         const float* gr = gp + (r0 + r) * out_f + ob;
-        __m256 av = _mm256_loadu_ps(acc[r]);
-        for (int64_t o2 = 0; o2 < 64; ++o2) {
-          const __m256 gv = _mm256_set1_ps(gr[o2]);
-          av = _mm256_add_ps(av, _mm256_mul_ps(gv, _mm256_loadu_ps(wsub[o2])));
+        // a0 carries the running total from previous output blocks; the rest
+        // start fresh. (acc[] is accumulated over the ob loop, not replaced.)
+        __m256 a0 = _mm256_loadu_ps(acc[r]);
+        __m256 a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
+        __m256 a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+        for (int64_t o2 = 0; o2 < 64; o2 += 8) {
+          a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_set1_ps(gr[o2 + 0]), _mm256_loadu_ps(wsub[o2 + 0])));
+          a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_set1_ps(gr[o2 + 1]), _mm256_loadu_ps(wsub[o2 + 1])));
+          a2 = _mm256_add_ps(a2, _mm256_mul_ps(_mm256_set1_ps(gr[o2 + 2]), _mm256_loadu_ps(wsub[o2 + 2])));
+          a3 = _mm256_add_ps(a3, _mm256_mul_ps(_mm256_set1_ps(gr[o2 + 3]), _mm256_loadu_ps(wsub[o2 + 3])));
+          a4 = _mm256_add_ps(a4, _mm256_mul_ps(_mm256_set1_ps(gr[o2 + 4]), _mm256_loadu_ps(wsub[o2 + 4])));
+          a5 = _mm256_add_ps(a5, _mm256_mul_ps(_mm256_set1_ps(gr[o2 + 5]), _mm256_loadu_ps(wsub[o2 + 5])));
+          a6 = _mm256_add_ps(a6, _mm256_mul_ps(_mm256_set1_ps(gr[o2 + 6]), _mm256_loadu_ps(wsub[o2 + 6])));
+          a7 = _mm256_add_ps(a7, _mm256_mul_ps(_mm256_set1_ps(gr[o2 + 7]), _mm256_loadu_ps(wsub[o2 + 7])));
         }
-        _mm256_storeu_ps(acc[r], av);
+        _mm256_storeu_ps(acc[r], reduce8(a0, a1, a2, a3, a4, a5, a6, a7));
       }
     } else {
       for (int64_t o2 = 0; o2 < OBR; ++o2) {

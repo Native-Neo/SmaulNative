@@ -3,13 +3,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import json
+import math
 
 import pytest
 import torch
 
 from kernel.fp8_tile import fp8_modules
 from smaul_linear import LinearConfig, SmaulLinear
-from train import Lion, SmaulOpt, _load_optimizer, _save_optimizer
+from train import Lion, SmaulOpt, _load_optimizer, _save_optimizer, _grad_norm
 
 
 def _dummy_model():
@@ -1665,3 +1666,152 @@ def test_fp8_training_with_bf16_gw_and_narrowed_grads():
             assert p.grad.dtype is torch.bfloat16, p.dtype
     assert losses[-1] < losses[0], losses
     print(f"\n[fp8 + bf16 grads] losses {[round(x, 4) for x in losses]}")
+
+
+# ---------------------------------------------------------------------------
+# Global grad norm (train._grad_norm, used by Lion._clip and SmaulOpt._clip)
+# ---------------------------------------------------------------------------
+
+def _exact_norm(grads):
+    """Reference: concatenate and sum squares in float64, one tensor at a time."""
+    return float(torch.stack([g.double().pow(2).sum() for g in grads]).sum().sqrt())
+
+
+def test_grad_norm_matches_float64_reference_across_dtypes_and_shapes():
+    torch.manual_seed(0)
+    for dt in (torch.float32, torch.bfloat16, torch.float64):
+        for shape in ((7,), (33, 41), (1024, 512), (2, 3, 5)):
+            grads = [torch.randn(shape, dtype=dt) for _ in range(3)]
+            got, want = _grad_norm(grads), _exact_norm(grads)
+            assert got == pytest.approx(want, rel=1e-6, abs=1e-12), (dt, shape)
+
+
+def test_grad_norm_is_exact_enough_to_not_regress_toward_float32():
+    """The accumulation must stay in float64.
+
+    torch.linalg.vector_norm accumulates linearly, so a float32 accumulation
+    is ~6e-4 relative off on a 16M-element tensor. This pins the result to
+    the float64 reference so a future "optimization" to float32/bfloat16
+    cannot land silently: the clip threshold is this number.
+    """
+    torch.manual_seed(1)
+    big = torch.randn(1 << 24, dtype=torch.bfloat16)
+    assert _grad_norm([big]) == pytest.approx(_exact_norm([big]), rel=1e-12)
+    # And it is demonstrably not the float32 answer.
+    f32 = float(torch.linalg.vector_norm(big.float(), ord=2,
+                                         dtype=torch.float32).item())
+    assert abs(f32 - _grad_norm([big])) / _grad_norm([big]) > 1e-6
+
+
+def test_grad_norm_blocks_large_tensors_without_changing_the_result():
+    """Crossing _NORM_BLOCK must not perturb the value."""
+    import train as _train
+    torch.manual_seed(2)
+    base = torch.randn(_train._NORM_BLOCK + 7, dtype=torch.bfloat16)
+    want = _exact_norm([base])
+    assert _grad_norm([base]) == pytest.approx(want, rel=1e-9)
+    for n in (0, 1, 2, _train._NORM_BLOCK - 1, _train._NORM_BLOCK,
+              _train._NORM_BLOCK + 1, 4 * _train._NORM_BLOCK):
+        g = torch.randn(n, dtype=torch.bfloat16)
+        assert _grad_norm([g]) == pytest.approx(_exact_norm([g]), rel=1e-6, abs=1e-9), n
+
+
+def test_grad_norm_skips_empty_and_matches_a_known_value():
+    assert _grad_norm([]) == 0.0
+    assert _grad_norm([torch.zeros(0), torch.zeros(0, dtype=torch.bfloat16)]) == 0.0
+    # 3-4-5 triangle, exactly 1.0 in float64 and 1.0 in float32 too.
+    assert _grad_norm([torch.tensor([3.0, 4.0])]) == pytest.approx(5.0, rel=1e-9)
+    # Per-tensor norms combine in quadrature: sqrt(1 + 4 + 9) == sqrt(14).
+    grads = [torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])]
+    assert _grad_norm(grads) == pytest.approx(14.0 ** 0.5, rel=1e-12)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_grad_norm_propagates_non_finite(bad):
+    """Non-finite must surface through the norm, so _clip needs no isfinite scan."""
+    g = torch.randn(1 << 12, dtype=torch.bfloat16)
+    g[123] = bad
+    assert not math.isfinite(_grad_norm([g]))
+    # ...and the non-finite entry is detected even when it sits in a block
+    # other than the first.
+    g2 = torch.randn(1 << 12, dtype=torch.bfloat16)
+    g2[-1] = bad
+    assert not math.isfinite(_grad_norm([g2]))
+
+
+def test_grad_norm_handles_non_contiguous_gradients():
+    torch.manual_seed(3)
+    base = torch.randn(64, 128, dtype=torch.bfloat16)
+    view = base.t()            # non-contiguous, same values
+    assert not view.is_contiguous()
+    assert _grad_norm([view]) == pytest.approx(_exact_norm([view]), rel=1e-6)
+
+
+@pytest.mark.parametrize("opt_cls", [Lion, SmaulOpt])
+def test_clip_contract_preserved(opt_cls):
+    """Both optimizers keep the documented _clip contract."""
+    # no gradients at all -> 0.0
+    p = torch.nn.Parameter(torch.zeros(3))
+    assert opt_cls([p])._clip([], 1.0) == 0.0
+
+    # pre-clip norm is reported, and the grads are actually rescaled
+    p = torch.nn.Parameter(torch.ones(4))
+    opt = opt_cls([p], clip=1.0)
+    p.grad = torch.full((4,), 10.0)          # norm 20
+    n = opt._clip([], 1.0)
+    assert n == pytest.approx(20.0, rel=1e-6)
+    assert float(p.grad.norm()) <= 1.0 + 1e-6
+
+    # no rescale when under the threshold
+    p = torch.nn.Parameter(torch.ones(4))
+    opt = opt_cls([p], clip=1.0)
+    p.grad = torch.full((4,), 0.1)          # norm 0.2
+    n = opt._clip([], 1.0)
+    assert n == pytest.approx(0.2, rel=1e-6)
+    assert float(p.grad.norm()) == pytest.approx(0.2, rel=1e-6)
+
+
+@pytest.mark.parametrize("opt_cls", [Lion, SmaulOpt])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_clip_reports_inf_and_does_not_rescale_on_non_finite(opt_cls, bad):
+    p = torch.nn.Parameter(torch.ones(4))
+    opt = opt_cls([p], clip=1.0)
+    p.grad = torch.tensor([1.0, 1.0, 1.0, bad])
+    before = p.grad.detach().clone()
+    assert opt._clip([], 1.0) == float("inf")
+    # Untouched: the old code returned before any scaling, and so must this.
+    # Bitwise, because torch.equal is False whenever NaN is present.
+    assert torch.equal(p.grad.detach().view(torch.int32),
+                       before.view(torch.int32))
+
+
+def test_lion_and_smaul_clip_agree_on_the_same_gradients():
+    """_clip sees exactly the grads reachable from the params it was given.
+
+    Lion leaves grads in FP32; SmaulOpt defaults to --grad-dtype bf16, which
+    only works because narrow_grads_ clears p.grad_dtype. Both widths must
+    produce the same norm as the float64 reference.
+    """
+    torch.manual_seed(4)
+    unused = torch.randn(5000, dtype=torch.bfloat16)   # must not be counted
+    src = torch.randn(97)
+
+    p0 = torch.nn.Parameter(torch.zeros(97))
+    lion = Lion([p0], clip=1.0)
+    p0.grad = src.clone()                               # FP32, Lion's path
+    fp32_norm = lion._clip([], 1.0)
+    assert fp32_norm == pytest.approx(_exact_norm([src]), rel=1e-12)
+    assert fp32_norm < _exact_norm([src, unused])
+
+    # Same values, stored bf16 the way SmaulOpt actually receives them.
+    p1 = torch.nn.Parameter(torch.zeros(97))
+    sm = SmaulOpt([p1], lr=1e-4, clip=1.0, grad_dtype="bf16")
+    p1.grad = src.clone()
+    sm.narrow_grads_()
+    assert p1.grad.dtype is torch.bfloat16
+    # _clip rescales in place, so keep a copy of the pre-clip values.
+    pre = p1.grad.detach().clone()
+    bf16_norm = sm._clip([], 1.0)
+    assert bf16_norm == pytest.approx(_exact_norm([pre]), rel=1e-9)
+    assert bf16_norm == pytest.approx(fp32_norm, rel=1e-3)   # bf16 input rounding
+    assert float(p1.grad.float().norm()) <= 1.0 + 1e-3      # and it did rescale

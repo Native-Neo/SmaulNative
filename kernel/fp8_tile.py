@@ -60,6 +60,26 @@ def _tables(device, dtype=torch.float32):
 def _lut(device, dtype=torch.float32):
     return _tables(device, dtype)[0]
 
+_QUANT_TABLE_CACHE: dict = {}
+
+
+def _quant_tables(device):
+    """(order uint8[256], bounds float32[255]) for the native quantizer.
+
+    Derived from the same cached ``_tables`` the torch path uses, so the
+    native and torch quantizers cannot disagree about the codebook -- which
+    matters because E4M3 has two codes for +448 and two for -448, and the tie
+    order comes from torch.argsort.
+    """
+    key = str(device)
+    hit = _QUANT_TABLE_CACHE.get(key)
+    if hit is None:
+        _, order, _, bounds = _tables(device, torch.float32)
+        hit = (order.to(torch.uint8).contiguous(), bounds.contiguous())
+        _QUANT_TABLE_CACHE[key] = hit
+    return hit
+
+
 def quantize_tiles(w32, tile=TILE):
     import warnings
     if tile <= 0:
@@ -72,24 +92,32 @@ def quantize_tiles(w32, tile=TILE):
     with torch.no_grad():
         w32 = w32.float().contiguous()
         nt = (in_f + tile - 1) // tile
-        pad = nt * tile - in_f
-        if pad:
-            w32 = torch.cat([w32, torch.zeros(out_f, pad, dtype=w32.dtype, device=w32.device)], 1)
-        nonfinite = int((~torch.isfinite(w32)).sum())
+        # The native kernel returns codes padded to a whole number of tiles;
+        # both paths are truncated here so the contract is identical.
+        native = get_backend().fp8_quantize_tiles(w32, tile)
+        if native is not None:
+            codes, sc, nonfinite = native
+        else:
+            pad = nt * tile - in_f
+            if pad:
+                w32 = torch.cat([w32, torch.zeros(out_f, pad, dtype=w32.dtype,
+                                                 device=w32.device)], 1)
+            nonfinite = int((~torch.isfinite(w32)).sum())
+            _, order, _, bounds = _tables(w32.device, torch.float32)
+            blk = w32.reshape(out_f, nt, tile)
+            amax = torch.where(torch.isfinite(blk), blk.abs(), 0.0).amax(dim=2).clamp_min(1e-12)
+            sc = (amax / E4M3_MAX).clamp_min(1e-12)
+            n = torch.nan_to_num(blk / sc[..., None], nan=0.0).clamp(-E4M3_MAX, E4M3_MAX)
+            nf = n.reshape(-1)
+            codes = order[torch.bucketize(nf, bounds).clamp(0, 255)].reshape(out_f, nt, tile)
+            codes = codes.reshape(out_f, nt * tile)
+            codes.reshape(-1)[nf == 0] = 0
         if nonfinite:
             # Previously silently saturated to max-finite with a tiny scale,
             # hiding divergence. Warn so training issues surface.
             warnings.warn(f"quantize_tiles: {nonfinite} non-finite weight(s) saturated to finite E4M3",
                           RuntimeWarning, stacklevel=2)
-        _, order, _, bounds = _tables(w32.device, torch.float32)
-        blk = w32.reshape(out_f, nt, tile)
-        amax = torch.where(torch.isfinite(blk), blk.abs(), 0.0).amax(dim=2).clamp_min(1e-12)
-        sc = (amax / E4M3_MAX).clamp_min(1e-12)
-        n = torch.nan_to_num(blk / sc[..., None], nan=0.0).clamp(-E4M3_MAX, E4M3_MAX)
-        nf = n.reshape(-1)
-        code = order[torch.bucketize(nf, bounds).clamp(0, 255)].reshape(out_f, nt, tile)
-        code.reshape(-1)[nf == 0] = 0
-        return code.reshape(out_f, nt * tile)[:, :in_f].to(torch.uint8), sc
+        return codes[:, :in_f].contiguous().to(torch.uint8), sc
 
 def decode_tile(w, s, o0, o1, t, tile=TILE, dtype=torch.float32):
     lut = _lut(w.device, dtype)

@@ -32,7 +32,12 @@ The extension (`smaul_fp8_ivb`, built from `kernel/fp8_cpu.cpp`) exposes `fp8_fo
 `fp8_backward_input` over CPU `float32` activations, `uint8` E4M3 codes, and `float32`
 scales. A second extension (`smaul_attn`, built from `kernel/attn_cpu.cpp` with the same
 flags) exposes `attn_forward` / `attn_backward` for the linear-attention recurrence
-(FP32 state, exact reference math, O(D^2) state, nothing sequence-sized stored). It is compiled for Ivy Bridge-era CPUs (`-mavx -mf16c`, explicitly *without*
+(FP32 state, exact reference math, O(D^2) state, nothing sequence-sized stored). A third
+extension (`smaul_sparse`, built from `kernel/sparse_cpu.cpp`) exposes `sparse_grad_v`,
+the fused `d/dvalues` of the Rawr sparse projection: for every nonzero it does one
+length-`rows` dot product with `x` kept cache-resident, instead of materialising the
+`rows * out_f * K` gathered activation in torch (836 MiB for an 8000x512 head at
+rows=512, K=51, and ~13x slower). All three are compiled for Ivy Bridge-era CPUs (`-mavx -mf16c`, explicitly *without*
 AVX2/AVX512) and loads lazily on first use; if compilation fails, a `RuntimeWarning`
 is issued once and the torch fallback is used. Do not copy a built extension between
 different CPU architectures.

@@ -96,9 +96,60 @@ static void attn_forward_task(const float* Q, const float* K, const float* V,
   }
 }
 
-std::pair<torch::Tensor, torch::Tensor> attn_forward(torch::Tensor Q, torch::Tensor K,
-                                                     torch::Tensor V, double eps,
-                                                     bool need_den) {
+// need_state additionally returns the final (S, z) so an inference caller can
+// keep decoding one step at a time instead of re-running the whole prefix.
+// Same recurrence as attn_forward_task, but also writes out the final S and z.
+static void attn_forward_state_task(const float* Q, const float* K, const float* V,
+                                    float* Y, float* DEN, float* S_out, float* z_out,
+                                    int64_t T, int64_t H, int64_t D, float eps,
+                                    int64_t b, int64_t h) {
+  std::vector<float> S((size_t)D * D, 0.0f), z(D, 0.0f), num(D), kn(D);
+  const int64_t den_base = b * T * H + h;
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t o = qkv_off(b, t, h, T, H, D);
+    normalize_key(K + o, kn.data(), D);
+    const float* k = kn.data();
+    for (int64_t i = 0; i < D; ++i) {
+      const float ki = k[i];
+      z[i] += ki;
+      float* Sr = S.data() + (size_t)i * D;
+      const __m256 kv = _mm256_set1_ps(ki);
+      int64_t j = 0;
+      for (; j + 8 <= D; j += 8) {
+        __m256 sv = _mm256_add_ps(_mm256_loadu_ps(Sr + j),
+                                  _mm256_mul_ps(kv, _mm256_loadu_ps(V + o + j)));
+        _mm256_storeu_ps(Sr + j, sv);
+      }
+      for (; j < D; ++j) Sr[j] += ki * V[o + j];
+    }
+    float den = 0.0f;
+    for (int64_t j = 0; j < D; ++j) num[j] = 0.0f;
+    for (int64_t i = 0; i < D; ++i) {
+      const __m256 qv = _mm256_set1_ps(Q[o + i]);
+      const float* Sr = S.data() + (size_t)i * D;
+      int64_t j = 0;
+      for (; j + 8 <= D; j += 8) {
+        __m256 n = _mm256_add_ps(_mm256_loadu_ps(num.data() + j),
+                                 _mm256_mul_ps(qv, _mm256_loadu_ps(Sr + j)));
+        _mm256_storeu_ps(num.data() + j, n);
+      }
+      for (; j < D; ++j) num[j] += Q[o + i] * Sr[j];
+      den += Q[o + i] * z[i];
+    }
+    const float denc = den < eps ? eps : den;
+    if (DEN) DEN[den_base + t * H] = denc;
+    float* yt = Y + o;
+    for (int64_t j = 0; j < D; ++j) yt[j] = num[j] / denc;
+  }
+  const int64_t s_base = (b * H + h) * D * D;
+  const int64_t z_base = (b * H + h) * D;
+  for (int64_t i = 0; i < D * D; ++i) S_out[s_base + i] = S[i];
+  for (int64_t i = 0; i < D; ++i) z_out[z_base + i] = z[i];
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> attn_forward(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V, double eps,
+    bool need_den, bool need_state) {
   TORCH_CHECK(Q.device().is_cpu() && K.device().is_cpu() && V.device().is_cpu(),
               "attn_forward: all tensors must be CPU");
   TORCH_CHECK(Q.dtype() == torch::kFloat32 && K.dtype() == torch::kFloat32 &&
@@ -115,7 +166,11 @@ std::pair<torch::Tensor, torch::Tensor> attn_forward(torch::Tensor Q, torch::Ten
               "reduce d_model/n_heads");
   if (B == 0 || T == 0 || H == 0) {
     // Empty by design (e.g. zero-length prompt); return empty, not crash.
-    return {torch::empty_like(Q), torch::empty({0}, Q.options().dtype(torch::kFloat32))};
+    auto eY = torch::empty_like(Q);
+    auto eD = torch::empty({0}, Q.options().dtype(torch::kFloat32));
+    auto eS = torch::zeros({B, H, D, D}, Q.options().dtype(torch::kFloat32));
+    auto ez = torch::zeros({B, H, D}, Q.options().dtype(torch::kFloat32));
+    return {eY, eD, eS, ez};
   }
   auto Y = torch::empty_like(Q);
   // Always return a *defined* tensor: an undefined Tensor crashes pybind
@@ -131,12 +186,21 @@ std::pair<torch::Tensor, torch::Tensor> attn_forward(torch::Tensor Q, torch::Ten
   const float* Vp = V.data_ptr<float>();
   float* Yp = Y.data_ptr<float>();
   const float ef = (float)eps;
+  auto S_out = torch::zeros({B, H, D, D}, Q.options().dtype(torch::kFloat32));
+  auto z_out = torch::zeros({B, H, D}, Q.options().dtype(torch::kFloat32));
+  float* Sp = S_out.data_ptr<float>();
+  float* zp = z_out.data_ptr<float>();
   at::parallel_for(0, B * H, 1, [&](int64_t begin, int64_t end) {
     for (int64_t task = begin; task < end; ++task) {
-      attn_forward_task(Qp, Kp, Vp, Yp, denp, T, H, D, ef, task / H, task % H);
+      if (need_state) {
+        attn_forward_state_task(Qp, Kp, Vp, Yp, denp, Sp, zp, T, H, D, ef,
+                                task / H, task % H);
+      } else {
+        attn_forward_task(Qp, Kp, Vp, Yp, denp, T, H, D, ef, task / H, task % H);
+      }
     }
   });
-  return {Y, DEN};
+  return {Y, DEN, S_out, z_out};
 }
 
 // Backward, pass A (forward direction): recompute S/z/num/den/y per step and
@@ -328,7 +392,91 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> attn_backward(
   return {dQ, dK, dV};
 }
 
+// One decode step given the carried state. This is what makes incremental
+// decoding possible at all: the model is a linear recurrence whose state is
+// O(D^2) and independent of T, so a prefill plus N of these replaces N
+// full re-forwards of the whole prefix. Without it, generating N tokens costs
+// O(N*T*D^2) -- measured 0.18/0.36/0.74 s per forward at 128/256/512 tokens,
+// i.e. quadratic in the number of generated tokens.
+//
+// S, z are updated in place and returned for chaining; y is [B,H,D].
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> attn_step(
+    torch::Tensor S, torch::Tensor z, torch::Tensor q, torch::Tensor k,
+    torch::Tensor v, double eps) {
+  TORCH_CHECK(S.device().is_cpu() && z.device().is_cpu() && q.device().is_cpu() &&
+                  k.device().is_cpu() && v.device().is_cpu(),
+              "attn_step: all tensors must be CPU");
+  TORCH_CHECK(S.scalar_type() == torch::kFloat32 && z.scalar_type() == torch::kFloat32 &&
+                  q.scalar_type() == torch::kFloat32 && k.scalar_type() == torch::kFloat32 &&
+                  v.scalar_type() == torch::kFloat32,
+              "attn_step: all tensors must be float32");
+  TORCH_CHECK(q.dim() == 3 && k.sizes() == q.sizes() && v.sizes() == q.sizes(),
+              "attn_step: q/k/v must be [B,H,D] with matching shapes");
+  TORCH_CHECK(S.dim() == 4 && z.dim() == 3, "attn_step: S must be [B,H,D,D], z [B,H,D]");
+  TORCH_CHECK(S.is_contiguous() && z.is_contiguous() && q.is_contiguous() &&
+                  k.is_contiguous() && v.is_contiguous(),
+              "attn_step: all tensors must be contiguous");
+  TORCH_CHECK(std::isfinite(eps) && eps > 0, "attn_step: eps must be positive finite");
+  const int64_t B = q.size(0), H = q.size(1), D = q.size(2);
+  TORCH_CHECK(D > 0 && D <= 2048, "attn_step: D=", D, " out of supported range (1, 2048]");
+  TORCH_CHECK(S.size(0) == B && S.size(1) == H && S.size(2) == D && S.size(3) == D,
+              "attn_step: S shape must be [B,H,D,D]");
+  TORCH_CHECK(z.size(0) == B && z.size(1) == H && z.size(2) == D,
+              "attn_step: z shape must be [B,H,D]");
+  auto y = torch::empty_like(q);
+  const float* qp = q.data_ptr<float>();
+  const float* kp = k.data_ptr<float>();
+  const float* vp = v.data_ptr<float>();
+  float* Sp = S.data_ptr<float>();
+  float* zp = z.data_ptr<float>();
+  float* yp = y.data_ptr<float>();
+  const float ef = (float)eps;
+  at::parallel_for(0, B * H, 1, [&](int64_t begin, int64_t end) {
+    std::vector<float> kn(D), num(D);
+    for (int64_t task = begin; task < end; ++task) {
+      float* Sr0 = Sp + task * D * D;
+      float* zr = zp + task * D;
+      const float* qr = qp + task * D;
+      const float* kr = kp + task * D;
+      const float* vr = vp + task * D;
+      normalize_key(kr, kn.data(), D);
+      for (int64_t i = 0; i < D; ++i) {
+        const float ki = kn[i];
+        zr[i] += ki;
+        float* Sr = Sr0 + (size_t)i * D;   // S is row-major [D][D]
+        const __m256 kv = _mm256_set1_ps(ki);
+        int64_t j = 0;
+        for (; j + 8 <= D; j += 8) {
+          __m256 sv = _mm256_add_ps(_mm256_loadu_ps(Sr + j),
+                                    _mm256_mul_ps(kv, _mm256_loadu_ps(vr + j)));
+          _mm256_storeu_ps(Sr + j, sv);
+        }
+        for (; j < D; ++j) Sr[j] += ki * vr[j];
+      }
+      float den = 0.0f;
+      for (int64_t j = 0; j < D; ++j) num[j] = 0.0f;
+      for (int64_t i = 0; i < D; ++i) {
+        const __m256 qv = _mm256_set1_ps(qr[i]);
+        const float* srow = Sr0 + (size_t)i * D;
+        int64_t j = 0;
+        for (; j + 8 <= D; j += 8) {
+          __m256 n = _mm256_add_ps(_mm256_loadu_ps(num.data() + j),
+                                   _mm256_mul_ps(qv, _mm256_loadu_ps(srow + j)));
+          _mm256_storeu_ps(num.data() + j, n);
+        }
+        for (; j < D; ++j) num[j] += qr[i] * srow[j];
+        den += qr[i] * zr[i];
+      }
+      const float denc = den < ef ? ef : den;
+      float* yr = yp + task * D;
+      for (int64_t j = 0; j < D; ++j) yr[j] = num[j] / denc;
+    }
+  });
+  return {y, S, z};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_forward", &attn_forward, "linear-attention recurrent forward (AVX1)");
   m.def("attn_backward", &attn_backward, "linear-attention recurrent backward (AVX1)");
+  m.def("attn_step", &attn_step, "one linear-attention decode step from carried state (AVX1)");
 }

@@ -14,8 +14,9 @@ import pytest
 import torch
 
 from embeddings import MmapEmbedding, RamEmbedding
-from rawr_graph import build_graph, fallback_graph, hidden_cols, load_graph, save_graph
-from smaul_linear import LinearConfig, SmaulLinear
+from rawr_graph import (RawrGraph, build_graph, fallback_graph, hidden_cols,
+                         load_graph, save_graph)
+from smaul_linear import LinearConfig, SmaulLinear, SparseLinear
 from tokenizer import SmaulTokenizer
 
 
@@ -222,3 +223,212 @@ def test_graph_save_load_roundtrip(tmp_path):
     save_graph(g, tmp_path / "g.json")
     g2 = load_graph(tmp_path / "g.json")
     assert g2.edges == g.edges and g2.digest == g.digest
+
+
+# ---------------------------------------------------------------------------
+# hidden_cols: the column selection is what an existing Rawr checkpoint is
+# interpreted through, so the optimized selection must stay bit-identical to
+# the original "score every j, sort, truncate" implementation.
+# ---------------------------------------------------------------------------
+
+def _hidden_cols_reference(out_f, in_f, graph, sparsity, min_per_row=1):
+    """The pre-optimization implementation, verbatim, as the oracle."""
+    v = graph.vocab_size
+    directed = graph.directed_set()
+    k = int(round(in_f * (1.0 - sparsity)))
+    k = max(min_per_row, min(in_f, k))
+    cols = []
+    for i in range(out_f):
+        vi = i % v
+        scored = []
+        for j in range(in_f):
+            s = 1 if (vi, j % v) in directed else 0
+            scored.append((-s, abs(i - j), j))
+        scored.sort()
+        cols.append([j for _, _, j in scored[:k]])
+    return torch.tensor(cols, dtype=torch.long)
+
+
+_GRAPHS = [
+    fallback_graph(16, 4),
+    fallback_graph(64, 4),
+    fallback_graph(7, 3),                       # vocab < in_f in some shapes
+    RawrGraph(vocab_size=5, edges=[(0, 1), (1, 2), (2, 2), (3, 4)]),
+    RawrGraph(vocab_size=64, edges=[(0, 0), (5, 9), (63, 1), (30, 30), (2, 61)]),
+]
+
+
+@pytest.mark.parametrize("gi", range(len(_GRAPHS)))
+def test_hidden_cols_matches_full_sort_reference(gi):
+    g = _GRAPHS[gi]
+    for out_f, in_f in [(1, 1), (4, 8), (8, 4), (16, 16), (33, 7), (64, 32),
+                        (9, 9), (20, 5), (40, 3)]:
+        for sparsity in (0.0, 0.5, 0.9, 0.99):
+            for min_per_row in (1, 2, 4, 8):
+                want = _hidden_cols_reference(out_f, in_f, g, sparsity, min_per_row)
+                got = hidden_cols(out_f, in_f, g, sparsity, min_per_row)
+                assert got.shape == want.shape, (gi, out_f, in_f, sparsity, min_per_row)
+                assert torch.equal(got, want), (gi, out_f, in_f, sparsity, min_per_row)
+
+
+def test_hidden_cols_row_length_is_uniform_and_bounded():
+    """min_per_row > in_f must not produce ragged rows."""
+    g = fallback_graph(32, 4)
+    c = hidden_cols(16, 8, g, 0.5, 99)
+    assert c.shape == (16, 8)
+    assert c.shape[1] <= 8
+    for row in c:
+        assert len(set(row.tolist())) == row.numel()   # no duplicate columns
+
+
+def test_hidden_cols_rejects_bad_arguments():
+    g = fallback_graph(16, 4)
+    with pytest.raises(ValueError):
+        hidden_cols(0, 8, g, 0.5, 1)
+    with pytest.raises(ValueError):
+        hidden_cols(8, 0, g, 0.5, 1)
+    with pytest.raises(ValueError):
+        hidden_cols(8, 8, g, 1.0, 1)
+    with pytest.raises(ValueError):
+        hidden_cols(8, 8, g, -0.1, 1)
+    with pytest.raises(ValueError):
+        hidden_cols(8, 8, g, 0.5, 0)
+
+
+def test_rawr_gate_and_up_share_one_cols_tensor():
+    """Identical shapes must not pay for the derivation twice."""
+    g = fallback_graph(64, 4)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2,
+                       architecture="rawr", rawr_sparsity=0.9)
+    m = SmaulLinear(cfg, rawr_graph=g)
+    assert m.blocks[0].ffn.gate.cols is m.blocks[0].ffn.up.cols
+    assert torch.equal(m.blocks[0].ffn.gate.cols, m.blocks[0].ffn.up.cols)
+    # Still independent state/parameters, and still a real forward.
+    assert m.blocks[0].ffn.gate.values is not m.blocks[0].ffn.up.values
+    x = torch.randint(0, 64, (2, 8))
+    _, loss = m(x, x)
+    assert torch.isfinite(loss)
+
+
+# ---------------------------------------------------------------------------
+# SparseLinear gradients. The audit found no gradient check for
+# _SparseLinearFn, which let a total error in d/dvalues (the gather was
+# dropped from the multiplicand, leaving dout*values) pass unnoticed because
+# the loss still went down. All three gradients are pinned to a dense
+# reference here.
+# ---------------------------------------------------------------------------
+
+def _dense_reference(sl, x):
+    """out = x @ W.T with W nonzero only on the cols support."""
+    W = torch.zeros(sl.out_f, sl.in_f)
+    W.scatter_(1, sl.cols, sl.values.detach())
+    return x @ W.t(), W
+
+
+@pytest.mark.parametrize("rows,out_f,in_f,K", [
+    (2, 4, 8, 3), (7, 5, 3, 2), (16, 33, 17, 5), (128, 320, 256, 26),
+])
+def test_sparse_linear_gradients_match_dense_reference(rows, out_f, in_f, K):
+    torch.manual_seed(rows)
+    sl = SparseLinear(in_f, out_f,
+                      torch.stack([torch.randperm(in_f)[:K] for _ in range(out_f)]))
+    X = torch.randn(rows, in_f)
+    G = torch.randn(rows, out_f)
+
+    xr = X.clone().requires_grad_(True)
+    yr, W = _dense_reference(sl, xr)
+    yr.backward(G)
+
+    xn = X.clone().requires_grad_(True)
+    yn = sl(xn)
+    yn.backward(G)
+
+    scale = max(float(xr.grad.abs().max()), 1.0)
+    assert float((yn - yr).abs().max()) / scale < 1e-5
+    assert float((xn.grad - xr.grad).abs().max()) / scale < 1e-5
+    # d/dvalues is the dense grad restricted to the support, not the whole one.
+    W2 = torch.zeros(out_f, in_f, requires_grad=True)
+    with torch.no_grad():
+        W2.copy_(W)
+    (X @ W2.t()).backward(G)
+    support = torch.arange(out_f)[:, None].expand_as(sl.cols)
+    gv_ref = W2.grad[support, sl.cols]
+    assert sl.values.grad.shape == (out_f, K)
+    assert float((sl.values.grad - gv_ref).abs().max()) / max(
+        1e-30, float(gv_ref.abs().max())) < 1e-5
+
+
+def test_sparse_linear_backward_covers_every_output_row():
+    """A dropped gather or a short block must not leave rows un-updated."""
+    torch.manual_seed(7)
+    out_f, in_f, K = 40, 24, 5
+    sl = SparseLinear(in_f, out_f,
+                      torch.stack([torch.randperm(in_f)[:K] for _ in range(out_f)]))
+    x = torch.randn(9, in_f, requires_grad=True)
+    sl(x).sum().backward()
+    # Every output row contributes dout = 1, so every grad_v is the column sum.
+    expect = x.detach()[:, sl.cols.reshape(-1)].view(9, out_f, K).sum(0)
+    assert torch.allclose(sl.values.grad, expect, atol=1e-5)
+    assert (sl.values.grad.abs().sum(1) > 0).all(), "some rows got no gradient"
+
+
+def test_sparse_linear_bf16_input_gradients_finite():
+    torch.manual_seed(3)
+    sl = SparseLinear(64, 96, torch.stack([torch.randperm(64)[:9] for _ in range(96)]))
+    x = torch.randn(2, 8, 64, dtype=torch.bfloat16, requires_grad=True)
+    y = sl(x)
+    assert y.dtype is torch.bfloat16
+    y.float().pow(2).sum().backward()
+    assert x.grad.dtype is torch.bfloat16
+    assert sl.values.grad.dtype is torch.float32
+    assert torch.isfinite(x.grad).all() and torch.isfinite(sl.values.grad).all()
+
+
+def test_sparse_grad_v_native_matches_torch_fallback():
+    """The fused d/dvalues kernel must agree with the gather it replaces.
+
+    Forces both backend paths: ``_sparse`` is set to False to take the
+    chunked torch fallback and reset to None to rebuild/reuse the extension.
+    """
+    from kernel.compute import get_backend
+    be = get_backend()
+    native = be.has_sparse_native
+    try:
+        for rows, out_f, in_f, K in [(64, 128, 96, 12), (16, 33, 17, 5), (2, 4, 8, 3)]:
+            torch.manual_seed(rows)
+            cols = torch.stack([torch.randperm(in_f)[:K] for _ in range(out_f)])
+            vals = torch.randn(out_f, K) * 0.1
+            xf = torch.randn(rows, in_f)
+            dof = torch.randn(rows, out_f)
+            be._sparse = False
+            fb = be.sparse_grad_v(dof, xf, cols, vals, 1 << 22)
+            be._sparse = None
+            if native:
+                nat = be.sparse_grad_v(dof, xf, cols, vals, 1 << 22)
+                scale = max(float(fb.abs().max()), 1.0)
+                assert float((nat - fb).abs().max()) / scale < 1e-5, (rows, out_f, in_f, K)
+            # And both must match an explicit reference.
+            ref = torch.empty_like(vals)
+            for o0 in range(0, out_f, 16):
+                o1 = min(o0 + 16, out_f)
+                g = xf.index_select(1, cols[o0:o1].reshape(-1)).view(rows, o1 - o0, K)
+                ref[o0:o1] = (dof[:, o0:o1].unsqueeze(-1) * g).sum(0)
+            scale = max(float(ref.abs().max()), 1.0)
+            assert float((fb - ref).abs().max()) / scale < 1e-5
+    finally:
+        be._sparse = None
+
+
+def test_sparse_grad_v_fallback_handles_degenerate_shapes():
+    from kernel.compute import get_backend
+    be = get_backend()
+    be._sparse = False          # force the torch path regardless of the extension
+    try:
+        for rows, out_f, in_f, K in [(1, 1, 1, 1), (4, 3, 7, 2)]:
+            cols = torch.stack([torch.randperm(in_f)[:K] for _ in range(out_f)])
+            vals = torch.randn(out_f, K)
+            out = be.sparse_grad_v(torch.randn(rows, out_f), torch.randn(rows, in_f),
+                                   cols, vals, 1 << 22)
+            assert out.shape == (out_f, K) and torch.isfinite(out).all()
+    finally:
+        be._sparse = None

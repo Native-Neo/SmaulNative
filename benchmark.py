@@ -33,6 +33,18 @@ def parse_args(argv=None):
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--threads", type=int, default=2)
+    # Default to what train.py actually runs. LinearConfig.architecture
+    # defaults to "plain" in code while the CLI defaults to "rawr", so a
+    # benchmark that does not pass this measures a configuration nobody
+    # trains -- and the rawr sparse path is where the cost is.
+    p.add_argument("--arch", choices=("rawr", "plain"), default="rawr",
+                   help="architecture to benchmark (default: rawr, the train.py default)")
+    p.add_argument("--step-optimizer", dest="step_optimizer",
+                   choices=("smaul", "lion"), default="smaul",
+                   help="optimizer for the full-step timing in --mode full "
+                        "(default: smaul, the train.py default)")
+    p.add_argument("--rawr-sparsity", type=float, default=0.9,
+                   help="rawr-sparsity used when --arch rawr (default: 0.9, the train.py default)")
     args = p.parse_args(argv)
     for name in ("d", "layers", "heads", "ctx", "batch", "threads"):
         if getattr(args, name) <= 0:
@@ -81,7 +93,7 @@ def run_full(argv=None):
     # importing the benchmark as a library has no global side effect.
     _prev_sigint = signal.getsignal(signal.SIGINT)
     try:
-        from train import Lion
+        from train import Lion, SmaulOpt
     finally:
         try:
             signal.signal(signal.SIGINT, _prev_sigint)
@@ -92,7 +104,9 @@ def run_full(argv=None):
     be.configure(args.threads)
     torch.manual_seed(42)
 
-    print(f"backend={be.name} native={be.has_native} threads={args.threads} d={args.d} layers={args.layers} ctx={args.ctx}")
+    print(f"backend={be.name} native={be.has_native} threads={args.threads} d={args.d} "
+          f"layers={args.layers} ctx={args.ctx} arch={args.arch} "
+          f"step_optimizer={args.step_optimizer}")
     R, D = args.batch * args.ctx, args.d
     out = {}
 
@@ -120,8 +134,18 @@ def run_full(argv=None):
 
     out["fp32_bwd"] = med(ref_bwd, args.iters)
 
-    cfg = LinearConfig(vocab_size=2000, d_model=D, n_layer=1, n_heads=args.heads)
-    blk = Block(cfg).eval()
+    def mk(n_layer=1, **kw):
+        return LinearConfig(vocab_size=2000, d_model=D, n_layer=n_layer,
+                            n_heads=args.heads, architecture=args.arch,
+                            rawr_sparsity=args.rawr_sparsity, **kw)
+    cfg = mk()
+    # Block is constructed directly here, so --arch rawr needs the graph that
+    # SmaulLinear would otherwise build for itself.
+    bench_graph = None
+    if args.arch == "rawr":
+        from rawr_graph import fallback_graph
+        bench_graph = fallback_graph(cfg.vocab_size, cfg.rawr_min_degree)
+    blk = Block(cfg, bench_graph).eval()
     xb = torch.randn(args.batch, args.ctx, D).to(torch.bfloat16)
     out["attention"] = med(lambda: blk.att(blk.n1(xb)), args.iters)
     out["ffn"] = med(lambda: blk.ffn(xb), args.iters)
@@ -129,15 +153,20 @@ def run_full(argv=None):
     a = torch.randn_like(xb)
     out["residual"] = med(lambda: (xb.float() + a.float()).to(xb.dtype), args.iters)
 
-    model = SmaulLinear(LinearConfig(vocab_size=2000, d_model=D, n_layer=args.layers, n_heads=args.heads))
+    model = SmaulLinear(mk(n_layer=args.layers))
     model.train()
-    opt = Lion(list(model.parameters()), lr=2e-4)
+    if args.step_optimizer == "smaul":
+        opt = SmaulOpt(list(model.parameters()), lr=2e-4)
+    else:
+        opt = Lion(list(model.parameters()), lr=2e-4)
     ids = torch.randint(0, 2000, (args.batch, args.ctx))
 
     def full_step():
         opt.zero_grad(model)
         _, loss = model(ids, ids)
         loss.backward()
+        if hasattr(opt, "narrow_grads_"):
+            opt.narrow_grads_(model)
         opt.step(model)
 
     # Time the full step BEFORE the requant micro-bench mutates weights,
@@ -158,11 +187,15 @@ def run_full(argv=None):
     upd = torch.randn(m8r.out_f, m8r.in_f) * 1e-4
     out["requant"] = med(lambda: m8r.requant(upd, 0.0), args.iters)
 
-    # Stored bytes: FP8 weights (u8) + scales (fp32) + norms/embed/head (fp32/bf16 actual).
+    # Stored bytes: FP8 weights (u8) + scales (fp32) + everything else at its
+    # real width (embedding/head/norms, and SparseLinear.values for rawr).
+    # "other" must come from state_dict(), NOT from parameters() minus the FP8
+    # weights: FP8Linear stores w8/sc as *buffers*, so the FP8 bytes are not in
+    # parameters() at all and that subtraction used to print a negative number.
     fp8b = sum(m.w8.numel() + m.sc.numel() * 4 for _, m in fp8_modules(model))
     fpb = sum(m.w8.numel() * 4 for _, m in fp8_modules(model))
-    other = sum(p.numel() * p.element_size() for p in model.parameters()) - fpb
-    # fpb already counts FP8 weights as fp32; other adds the rest.
+    stored = sum(t.numel() * t.element_size() for t in model.state_dict().values())
+    other = stored - fp8b
     print(f"\n{'op':12s} {'FP8 ms':>9s} {'FP32 ms':>9s} {'ratio':>6s}")
     fwd_ratio = out['fp8_fwd'] / out['fp32_fwd'] if out['fp32_fwd'] else float('nan')
     bwd_ratio = out['fp8_bwd'] / out['fp32_bwd'] if out['fp32_bwd'] else float('nan')
@@ -171,7 +204,8 @@ def run_full(argv=None):
     for k in ("attention", "ffn", "rmsnorms", "residual", "requant"):
         print(f"{k:12s} {out[k]:9.2f}")
     print(f"\nfull step {step_ms:.0f}ms | {tps:.0f} tok/s | RSS {rss_mb():.0f}MB | "
-          f"stored FP8 {fp8b/1048576:.1f}MiB vs FP32 {fpb/1048576:.1f}MiB (+other {other/1048576:.1f}MiB)")
+          f"checkpoint {stored/1048576:.1f}MiB = FP8 {fp8b/1048576:.1f}MiB "
+          f"(same weights in fp32: {fpb/1048576:.1f}MiB) + {other/1048576:.1f}MiB other")
 
 #!/usr/bin/env python3
 """Optimizer comparison: Lion vs SmaulOpt on identical tensors/conditions.
@@ -200,9 +234,10 @@ def run_opt(argv=None):
     torch.manual_seed(42)
 
     print(f"backend={be.name} native={be.has_native} threads={args.threads} d={args.d} "
-          f"layers={args.layers} ctx={args.ctx} batch={args.batch}")
+          f"layers={args.layers} ctx={args.ctx} batch={args.batch} arch={args.arch}")
     cfg = LinearConfig(vocab_size=2000, d_model=args.d, n_layer=args.layers,
-                       n_heads=args.heads)
+                       n_heads=args.heads, architecture=args.arch,
+                       rawr_sparsity=args.rawr_sparsity)
     ids = torch.randint(0, 2000, (args.batch, args.ctx))
     # Identical shapes/grads/clip/threads for every entry; the only difference is
     # the optimizer. SmaulOpt is compared across state storage width and across

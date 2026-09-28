@@ -315,6 +315,98 @@ def fallback_graph(vocab_size: int, min_degree: int = 4) -> RawrGraph:
                          vocab_size, edges, 0, min_degree))
 
 
+_ADJ_CACHE: Dict[tuple, Dict[int, frozenset]] = {}
+_ADJ_CACHE_MAX = 8
+
+
+def _adjacency(graph: RawrGraph) -> Dict[int, frozenset]:
+    """token id -> neighbour token ids, equivalent to ``RawrGraph.directed_set()``.
+
+    ``directed_set()`` builds one tuple per ordered pair (2*len(edges) of them)
+    and is called once per ``hidden_cols`` invocation, i.e. 25 times for the
+    8-layer default and 55 times for the 1B preset. Adjacency lists carry the
+    same information in the same number of entries and answer the only
+    question ``hidden_cols`` asks: "which columns are connected to this row?".
+
+    Cached by content. Graphs are immutable once built, and the key is the
+    digest plus the two structural fields it is derived from, so a cache hit
+    is only possible for an identical graph. A graph with no digest (built by
+    hand rather than by ``build_graph``/``fallback_graph``) is not cached,
+    because two such graphs would otherwise collide on an empty key.
+    """
+    # No digest means a hand-built graph, and two of those would collide on an
+    # empty key, so those are recomputed rather than cached.
+    key = (graph.vocab_size, len(graph.edges), graph.digest) if graph.digest else None
+    if key is not None:
+        hit = _ADJ_CACHE.get(key)
+        if hit is not None:
+            return hit
+    adj: Dict[int, set] = {}
+    for a, b in graph.edges:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    out = {a: frozenset(s) for a, s in adj.items()}
+    if key is not None:
+        if len(_ADJ_CACHE) >= _ADJ_CACHE_MAX:
+            _ADJ_CACHE.pop(next(iter(_ADJ_CACHE)))
+        _ADJ_CACHE[key] = out
+    return out
+
+
+def _row_cols(i: int, in_f: int, k: int, vi: int, adj: Dict[int, frozenset],
+              v: int) -> List[int]:
+    """The k kept columns for output row i, in the order a full sort gives.
+
+    Equivalent to scoring every j in range(in_f) by (-edge, |i-j|, j), sorting
+    and truncating to k, but it only ever touches the answer: the graph edges
+    for this row (typically a handful) plus the `k - len(edges)` nearest
+    non-edges. Building and sorting the full in_f-long list per row was the
+    whole cost -- 96% of hidden_cols' runtime on the 8-layer default.
+
+    Ordering is preserved exactly, which matters: ``cols`` is what a Rawr
+    checkpoint is interpreted through, so any change here would silently
+    reinterpret every existing checkpoint.
+    """
+    nbrs = adj.get(vi)
+    if nbrs:
+        if in_f <= v:
+            # j % v == j, so the connected columns are the neighbours in range.
+            edge_js = sorted(j for j in nbrs if j < in_f)
+        else:
+            edge_js = sorted(j for j in range(in_f) if (j % v) in nbrs)
+    else:
+        edge_js = []
+    edge_js.sort(key=lambda j: (abs(i - j), j))
+    if len(edge_js) >= k:
+        return edge_js[:k]
+    picked = list(edge_js)
+    picked_set = set(edge_js)
+    need = k - len(picked)
+    # Fill with the nearest non-edges. Sorting by (|i-j|, j) is a merge of two
+    # runs, not a walk outward from i: for j <= i the distance grows as j
+    # falls, and for j > i it grows as j rises, so the candidate order is
+    # [min(i, in_f-1) downwards] merged with [i+1 upwards], taking the lower
+    # index first on a tie (that is the `i - a <= b - i` branch). This is
+    # O(need), which matters because i and j are in different ranges: for the
+    # LM head i reaches vocab_size while j only reaches d_model, so walking
+    # outward from i would scan |i - in_f| columns per row -- 3489 of them at
+    # vocab 8000 / d 512, which was 7x slower than the sort it replaced.
+    a = min(i, in_f - 1)              # next j <= i (i >= 0, in_f >= 1, both validated)
+    b = i + 1                         # next j > i
+    while need > 0:
+        if a >= 0 and (b >= in_f or (i - a) <= (b - i)):
+            j = a
+            a -= 1
+        else:
+            j = b
+            b += 1
+        if j in picked_set:                    # an edge, already kept
+            continue
+        picked.append(j)
+        need -= 1
+    return picked
+
+
 def hidden_cols(out_f: int, in_f: int, graph: RawrGraph,
                 sparsity: float, min_per_row: int = 1):
     """Derive deterministic sparse column indices for a hidden linear layer.
@@ -322,6 +414,10 @@ def hidden_cols(out_f: int, in_f: int, graph: RawrGraph,
     Maps hidden index -> vocab id via modulo, keeps an edge-weighted top-K
     per output row (K from sparsity), distance tiebreak, ring fallback.
     Returns LongTensor (out_f, K) with K >= 1. No RNG.
+
+    Deterministic and stable across versions: the returned order is exactly
+    the one the original full-sort implementation produced, so checkpoints
+    written by earlier commits keep loading against the same columns.
     """
     import torch
 
@@ -332,20 +428,14 @@ def hidden_cols(out_f: int, in_f: int, graph: RawrGraph,
     if min_per_row < 1:
         raise ValueError(f"min_per_row must be >= 1, got {min_per_row}")
     v = graph.vocab_size
-    directed = graph.directed_set()
+    adj = _adjacency(graph)
     k = int(round(in_f * (1.0 - sparsity)))
-    k = max(min_per_row, min(in_f, k))
-    cols = []
-    for i in range(out_f):
-        vi = i % v
-        scored = []
-        for j in range(in_f):
-            vj = j % v
-            s = 1 if (vi, vj) in directed else 0
-            scored.append((-s, abs(i - j), j))
-        scored.sort()
-        cols.append([j for _, _, j in scored[:k]])
-    return torch.tensor(cols, dtype=torch.long)
+    # min(in_f, ...) is not cosmetic: it keeps every row the same length when
+    # min_per_row > in_f, which the truncation in a full sort did implicitly.
+    k = min(in_f, max(min_per_row, k))
+    return torch.tensor(
+        [_row_cols(i, in_f, k, i % v, adj, v) for i in range(out_f)],
+        dtype=torch.long)
 
 
 def save_graph(graph: RawrGraph, path: Path) -> None:

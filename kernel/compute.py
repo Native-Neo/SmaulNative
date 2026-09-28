@@ -69,6 +69,8 @@ class CpuBackend:
     def __init__(self):
         self._ext = None
         self._attn = None
+        self._sparse = None
+        self._quant = None
         self._lock = threading.Lock()
         self._warned_fallback = False
 
@@ -167,16 +169,137 @@ class CpuBackend:
     def has_attn_native(self):
         return self._load_attn() is not None
 
-    def attn_forward(self, Q, K, V, eps, need_den):
+    def _load_sparse(self):
+        if self._sparse is not None:
+            return None if self._sparse is False else self._sparse
+        with self._lock:
+            if self._sparse is not None:
+                return None if self._sparse is False else self._sparse
+            try:
+                from torch.utils.cpp_extension import load
+                root = Path(__file__).resolve().parent
+                self._sparse = load(name="smaul_sparse",
+                    sources=[str(root / "sparse_cpu.cpp")],
+                    extra_cflags=_native_cflags(), verbose=False)
+            except Exception as exc:
+                self._sparse = False
+                warnings.warn(f"sparse native ext unavailable; torch chunked fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
+        return None if self._sparse is False else self._sparse
+
+    @property
+    def has_sparse_native(self):
+        return self._load_sparse() is not None
+
+    def sparse_grad_v(self, dout, x, cols, values, budget=1 << 22):
+        """grad_v[o, m] = sum_r dout[r, o] * x[r, cols[o, m]] (into a new tensor).
+
+        ``dout`` is [rows, out_f] and ``x`` is [rows, in_f], both float32; the
+        kernel wants them transposed to [out_f, rows] / [in_f, rows] so the
+        inner product is contiguous. The torch fallback gathers instead, which
+        materialises rows*out_f*K elements (836 MiB for an 8000x512 head at
+        rows=512, K=51) and is ~100x slower; ``budget`` caps that temporary.
+        """
+        rows = int(dout.shape[0])
+        out_f = int(dout.shape[1])
+        k = int(values.shape[1])
+        if rows <= 0 or out_f <= 0 or k == 0:
+            return torch.empty_like(values)
+        e = self._load_sparse()
+        if (e is not None and dout.device.type == "cpu"
+                and x.device.type == "cpu"
+                and dout.dtype == torch.float32 and x.dtype == torch.float32
+                and values.dtype == torch.float32
+                and cols.dtype == torch.int64 and cols.is_contiguous()
+                and values.is_contiguous()):
+            dT = dout.t().contiguous()
+            xT = x.t().contiguous()
+            return e.sparse_grad_v(dT, xT, cols, torch.empty_like(values))
+        self._warn_fallback_once("sparse_grad_v torch fallback (native missing or unsupported dtype)")
+        out = torch.empty_like(values)
+        b = max(1, min(out_f, int(budget) // max(1, rows * k * 4)))
+        for o0 in range(0, out_f, b):
+            o1 = min(o0 + b, out_f)
+            g = x.index_select(1, cols[o0:o1].reshape(-1)).view(rows, o1 - o0, k)
+            out[o0:o1] = (dout[:, o0:o1].unsqueeze(-1) * g).sum(0)
+        return out
+
+    def _load_quant(self):
+        if self._quant is not None:
+            return None if self._quant is False else self._quant
+        with self._lock:
+            if self._quant is not None:
+                return None if self._quant is False else self._quant
+            try:
+                from torch.utils.cpp_extension import load
+                root = Path(__file__).resolve().parent
+                self._quant = load(name="smaul_quant",
+                    sources=[str(root / "quant_cpu.cpp")],
+                    extra_cflags=_native_cflags(), verbose=False)
+            except Exception as exc:
+                self._quant = False
+                warnings.warn(f"fp8 quantizer native ext unavailable; torch fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
+        return None if self._quant is False else self._quant
+
+    def fp8_quantize_tiles(self, w32, tile):
+        """Tiled E4M3 quantize, or None to let the caller use the torch path.
+
+        Returns (codes uint8 [out_f, nt*tile] padded, scales float32
+        [out_f, nt], non-finite input count). Bit-exact with the torch
+        reference by construction: the codebook permutation and midpoints are
+        taken from the same cached ``_tables`` rather than rebuilt in C++,
+        because E4M3 has two codes for +448 and two for -448 and the tie order
+        comes from torch.argsort.
+        """
+        e = self._load_quant()
+        if e is not None and w32.device.type == "cpu" \
+                and w32.dtype == torch.float32 and w32.is_contiguous():
+            from kernel.fp8_tile import _quant_tables
+            order, bounds = _quant_tables(w32.device)
+            codes, sc, nf = e.fp8_quantize_tiles(w32, tile, order, bounds)
+            return codes, sc, nf
+        return None
+
+    def attn_forward(self, Q, K, V, eps, need_den, need_state=False):
+        """Returns (Y, DEN, S, z).
+
+        S and z are the final recurrent state, computed only when
+        ``need_state`` is set (an inference caller decodes from it instead of
+        re-running the prefix); they are None otherwise.
+        """
         e = self._load_attn()
         if (e is not None and Q.device.type == "cpu" and Q.dtype == torch.float32
                 and K.dtype == torch.float32 and V.dtype == torch.float32):
             Qc = Q if Q.is_contiguous() else Q.contiguous()
             Kc = K if K.is_contiguous() else K.contiguous()
             Vc = V if V.is_contiguous() else V.contiguous()
-            Y, DEN = e.attn_forward(Qc, Kc, Vc, float(eps), bool(need_den))
-            return Y, (DEN if need_den else None)
-        return _get_attn_ref()(Q, K, V, eps), None
+            Y, DEN, S, z = e.attn_forward(Qc, Kc, Vc, float(eps), bool(need_den),
+                                           bool(need_state))
+            return Y, (DEN if need_den else None), S, z
+        Y = _get_attn_ref()(Q, K, V, eps)
+        return Y, None, None, None
+
+    def attn_step(self, S, z, q, k, v, eps):
+        """One decode step, advancing the carried (S, z) in place.
+
+        Returns (y, S, z) with y [B, H, D]. This is what turns inference from
+        O(N*T) into O(T + N*D^2): without it every generated token re-runs the
+        whole prefix, so generating N tokens is quadratic in N.
+        """
+        e = self._load_attn()
+        if (e is not None and S.device.type == "cpu"
+                and S.dtype == torch.float32 and z.dtype == torch.float32
+                and q.dtype == torch.float32 and k.dtype == torch.float32
+                and v.dtype == torch.float32
+                and S.is_contiguous() and z.is_contiguous()
+                and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+            return e.attn_step(S, z, q, k, v, float(eps))
+        # torch fallback: the same recurrence, vectorised over (b, h).
+        kn = k / k.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        S.add_(kn.unsqueeze(-1) * v.unsqueeze(-2))
+        z.add_(kn)
+        num = (q.unsqueeze(-2) @ S).squeeze(-2)
+        den = (q * z).sum(-1, keepdim=True).clamp_min(eps)
+        return num / den, S, z
 
     def attn_backward(self, dY, Q, K, V, Y, DEN, eps):
         e = self._load_attn()
