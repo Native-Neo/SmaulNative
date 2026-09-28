@@ -23,6 +23,7 @@
 
 #include <ATen/Parallel.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <torch/extension.h>
@@ -88,9 +89,23 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> fp8_quantize_tiles(
   const float* wp = w32.data_ptr<float>();
   uint8_t* cp = codes.data_ptr<uint8_t>();
   float* sp = scales.data_ptr<float>();
-  int64_t nonfinite = 0;
-
+  // The non-finite count is a diagnostic, but it is the one that decides
+  // whether the caller warns about saturated weights -- i.e. the one that is
+  // supposed to surface divergence. So it has to be exact.
+  //
+  // It was a plain int64 incremented from inside at::parallel_for, which is a
+  // data race: two workers incrementing it concurrently lose updates, and the
+  // count comes back short. It did not reproduce in 600 trials at 1/2/4
+  // threads with maximal contention (an all-NaN 512x512 input, where every
+  // iteration increments), so this is undefined behaviour that has not yet
+  // bitten -- which is exactly why it is worth closing rather than watching.
+  //
+  // Count into a task-local and fold in once per task: the atomic is then paid
+  // per chunk, not per element. The chunk count is what bounds that, and
+  // at::parallel_for sizes chunks from the thread count, not from out_f.
+  std::atomic<int64_t> nonfinite{0};
   at::parallel_for(0, out_f, 1, [&](int64_t begin, int64_t end) {
+    int64_t nonfinite_local = 0;
     for (int64_t o = begin; o < end; ++o) {
       const float* wrow = wp + o * in_f;
       uint8_t* crow = cp + o * nt * tile;
@@ -100,7 +115,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> fp8_quantize_tiles(
         float amax = 0.0f;
         for (int64_t k = k0; k < k1; ++k) {
           const float w = wrow[k];
-          if (!std::isfinite(w)) ++nonfinite;
+          if (!std::isfinite(w)) ++nonfinite_local;
           const float a = finite_abs(w);
           if (a > amax) amax = a;
         }
@@ -116,9 +131,11 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> fp8_quantize_tiles(
         for (int64_t k = k1; k < k0 + tile; ++k) crow[k] = 0;  // pad
       }
     }
+    nonfinite.fetch_add(nonfinite_local, std::memory_order_relaxed);
   });
-  return {codes, scales, nonfinite};
+  return {codes, scales, nonfinite.load(std::memory_order_relaxed)};
 }
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp8_quantize_tiles", &fp8_quantize_tiles,
