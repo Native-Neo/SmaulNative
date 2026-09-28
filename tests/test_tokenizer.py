@@ -4,7 +4,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
-from tokenizer import SmaulTokenizer, _build, devanagari_units, read_texts
+from tokenizer import (CASE, SPECIAL, SmaulTokenizer, _build, _guaranteed,
+                        devanagari_units, read_texts)
 
 
 def test_recursive_text_order_is_deterministic(tmp_path):
@@ -60,3 +61,58 @@ def test_devanagari_units_preserve_marks_and_joiners():
     assert devanagari_units("क्ष") == ["क्ष"]
     assert devanagari_units("क्\u200dष") == ["क्\u200dष"]
     assert devanagari_units("क\u093c") == ["क\u093c"]
+
+
+# ---------------------------------------------------------------------------
+# The guaranteed character set is 227 entries and used to be emitted
+# unconditionally, so any --vocab below 237 (8 special + 2 case + 227) was
+# silently overshot and the failure appeared later as an unrelated-looking
+# "Rawr graph vocab 237 != config vocab 48" from SmaulLinear.
+# ---------------------------------------------------------------------------
+
+_MIN_HONEST_VOCAB = len(SPECIAL) + len(CASE) + len(_guaranteed())
+
+
+@pytest.mark.parametrize("vocab_size", [24, 48, 96, 200, _MIN_HONEST_VOCAB - 1])
+def test_vocab_size_is_always_honoured(vocab_size):
+    """The vocabulary comes out at exactly vocab_size, no overshoot."""
+    data = _build(["a b"], vocab_size=vocab_size, word_budget=8)
+    assert len(data["vocab"]) == vocab_size, (
+        f"asked for {vocab_size}, got {len(data['vocab'])}")
+    assert data["stats"]["vocab_size"] == vocab_size
+
+
+@pytest.mark.parametrize("vocab_size", [24, 48, 96])
+def test_vocab_size_below_the_guaranteed_set_is_truncated(capsys, vocab_size):
+    """Below 237 the guaranteed set is cut, and the cut is announced.
+
+    Deterministic rather than arbitrary: the set is sorted and deduped, so a
+    prefix is stable across runs and machines.
+    """
+    _build(["a b"], vocab_size=vocab_size, word_budget=8)
+    out = capsys.readouterr().out
+    assert "guaranteed character set" in out, out
+    assert f"vocab_size={vocab_size}" in out, out
+    # And it says what would have been needed, so the fix is actionable.
+    assert str(_MIN_HONEST_VOCAB) in out, out
+    data = _build(["a b"], vocab_size=vocab_size, word_budget=8)
+    again = _build(["a b"], vocab_size=vocab_size, word_budget=8)
+    assert data["vocab"] == again["vocab"], "truncation is not deterministic"
+
+
+def test_guaranteed_set_is_not_truncated_when_it_fits(capsys):
+    """No notice, and no behaviour change, at or above the honest minimum."""
+    for v in (_MIN_HONEST_VOCAB, _MIN_HONEST_VOCAB + 1, 512):
+        capsys.readouterr()
+        _build(["a b"], vocab_size=v, word_budget=8)
+        assert "guaranteed character set" not in capsys.readouterr().out, v
+
+
+def test_guaranteed_prefix_is_kept_in_order():
+    """What survives is a prefix of the guaranteed set, not an arbitrary subset."""
+    vocab_size = 100
+    data = _build(["a b"], vocab_size=vocab_size, word_budget=8)
+    budget = vocab_size - len(SPECIAL) - len(CASE)
+    want = [g for g in _guaranteed()[:budget]]
+    got = [t for t in data["vocab"] if t in set(_guaranteed())]
+    assert got == want, (got[:5], want[:5])
