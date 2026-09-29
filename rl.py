@@ -124,15 +124,23 @@ class SmaulRL:
                 print(f"[WARN] prompt truncated to last {self.MODEL_WINDOW} tokens ({len(prompt_ids)} provided)")
             ids = prompt_ids[-self.MODEL_WINDOW:]
             logits, _ = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
-            response, old_logprobs = [], []
+            response: List[int] = []
             for _ in range(max_new_tokens):
-                token, logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
+                token, _logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
                 if token == self.eos_id:
                     break
                 response.append(token)
-                old_logprobs.append(logprob)
                 ids = (ids + [token])[-self.MODEL_WINDOW:]
                 logits, _ = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
+            # Score the response with the same helper grpo_step will recompute it
+            # with, rather than accumulating the sampled logprobs here. The loop
+            # above sees a window that slides one token at a time, while _logprob
+            # truncates the response to what still fits the window; the two
+            # disagree as soon as prompt+response exceeds it, and grpo_step then
+            # aborts on the length check. Sharing one code path makes the stored
+            # and recomputed logprobs identical at step 0 by construction.
+            old_logprobs = [float(x) for x in
+                            self._logprob(prompt, response, temperature, top_k, top_p)]
             return self._decode(response), response, old_logprobs
         finally:
             self.model.train(was_training)
