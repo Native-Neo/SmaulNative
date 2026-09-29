@@ -19,7 +19,18 @@ def normalize_text(text: str) -> str:
     # Preserve code indentation: only strip blank lines at the ends, not spaces.
     text = unicodedata.normalize("NFKC", text).replace("\r\n", "\n").replace("\r", "\n")
     text = _CONTROL.sub("", text)
-    return text.strip("\n").strip("\u200b\u200c\u200d\ufeff").strip()
+    text = text.strip("\n").strip("\u200b\u200c\u200d\ufeff")
+    # Drop leading and trailing *blank lines* only. A bare str.strip() here used
+    # to remove the first content line's leading whitespace, which silently
+    # de-indented the opening line of any code snippet -- and this corpus
+    # deliberately ingests .py/.cpp/.rs/.java and friends. Trailing spaces on the
+    # last line went with it.
+    lines = text.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
 
 
 def _ratio(pattern: re.Pattern[str], text: str) -> float:
@@ -60,6 +71,14 @@ def filter_text(text: Any, dataset: str = "auto", min_chars: int = 20, max_chars
         return None
     text = normalize_text(text)
     if len(text) < min_chars or len(text) > max_chars:
+        return None
+    # An empty record is never worth training on, and no threshold setting makes
+    # one useful. The gates above are all thresholds the CLI can lower -- with
+    # --min_chars 0 --min_unique 0 the uniqueness and length gates both pass and
+    # this filter used to hand back "" (or whitespace), which stream_data then
+    # yielded as a document. Unconditional, so it does not depend on the caller
+    # having left a gate standing.
+    if not text:
         return None
     if "\ufffd" in text or _URL_ONLY.fullmatch(text):
         return None
