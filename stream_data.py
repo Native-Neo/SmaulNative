@@ -64,7 +64,12 @@ def _files(repo_id: str, path: str, retries: int = 3) -> list[str]:
         try:
             items = _api().list_repo_tree(repo_id=repo_id, repo_type="dataset", path_in_repo=path,
                                           recursive=True)
-            return sorted(item.path for item in items if getattr(item, "path", "").endswith(".parquet"))
+            # Case-insensitively, to match dataset.discover_files, which
+            # compares suffix.lower(). A repo with a stray .PARQUET was silently
+            # producing an empty file list and a "No Parquet files found" error
+            # that pointed at the wrong thing.
+            return sorted(item.path for item in items
+                          if getattr(item, "path", "").lower().endswith(".parquet"))
         except Exception as exc:
             last = exc
             print(f"[STREAM] list_repo_tree attempt {attempt}/{retries} failed: {type(exc).__name__}",
@@ -101,8 +106,12 @@ def _read_row_group(remote: str, row_group: int, columns: list[str] | None, toke
         except FileNotFoundError:
             raise
         except Exception as exc:
-            # Do not retry schema/type errors: only transient IO.
-            if "parquet" in type(exc).__name__.lower() and "magic" in str(exc).lower():
+            # Do not retry a file that is not parquet at all: retrying cannot
+            # help, and the backoff is up to 30s a try. Match on the message --
+            # pyarrow raises ArrowInvalid, whose class name contains neither
+            # "parquet" nor "magic", so testing the class name meant this never
+            # fired and a corrupt file was retried the full retry budget.
+            if "magic bytes" in str(exc).lower() or "not a parquet file" in str(exc).lower():
                 raise
             if attempt + 1 >= retries:
                 raise
@@ -247,12 +256,14 @@ def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
             yield from _stream_file(config, dataset_name, rel_path, min_chars, max_chars, skip, with_position, workers)
         if dataset_name == start_dataset and start_file is not None and not found_start_file:
             raise FileNotFoundError(f"resume file not found: {start_dataset}/{start_file}")
-        # Do not stream later datasets when resuming: a typo'd start_file used
-        # to stream everything after it before failing at the end.
+        # Do not stream later datasets when resuming. Resume is scoped to the
+        # start dataset, so once its files are done the outer loop must end --
+        # otherwise a resume of `--dataset all` carries on into every dataset
+        # after the start one, and the stream no longer matches the run being
+        # resumed. Later *files* of the same dataset still stream above; this
+        # is only about crossing into another dataset.
         if start_dataset is not None and dataset_name == start_dataset and start_file is not None:
-            # Resume is within one file; later files of the SAME dataset still
-            # stream (loop above), but later DATASETS do not.
-            pass
+            break
     if not found_start_file:
         raise FileNotFoundError(f"resume file not found: {start_dataset}/{start_file}")
 
