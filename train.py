@@ -1046,9 +1046,29 @@ def _load_smaul_states(out: Path, opt: "SmaulOpt", model) -> None:
         if not has_full and not r_ok:
             raise ValueError(f"SmaulOpt state for one object has no v at all; refusing")
     for obj, tens in list(new_vr.items()):
-        want_c = tuple(new_vc[obj].shape)
-        if tuple(tens.shape) != want_c and tuple(tens.shape) == want_c[::-1]:
-            raise ValueError(f"SmaulOpt v_row/v_col are transposed for one object")
+        # Each marginal is 1-D and must line up with its own extent of m:
+        # v_row is the mean over dim=1 so it is R long, v_col the mean over
+        # dim=0 so it is C long. That is what catches a transposed pair, and
+        # for a non-square state it catches it outright.
+        #
+        # The previous check here compared v_row's shape to v_col's *reversed*
+        # shape, which cannot fire: both marginals are 1-D, so `shape[::-1]` is
+        # the shape itself, and the two clauses below were mutually exclusive by
+        # construction. It was unreachable for every state the optimizer writes,
+        # while reading as a guard against exactly this mistake.
+        tm = new_m.get(obj)
+        if tm is None:
+            continue
+        if tm.dim() == 2:
+            if tens.dim() != 1 or int(tens.shape[0]) != int(tm.shape[0]):
+                raise ValueError(
+                    f"SmaulOpt v_row has shape {tuple(tens.shape)}, expected ({int(tm.shape[0])},) "
+                    f"for an m of {tuple(tm.shape)}; a transposed or mismatched pair")
+            tc = new_vc[obj]
+            if tc.dim() != 1 or int(tc.shape[0]) != int(tm.shape[1]):
+                raise ValueError(
+                    f"SmaulOpt v_col has shape {tuple(tc.shape)}, expected ({int(tm.shape[1])},) "
+                    f"for an m of {tuple(tm.shape)}; a transposed or mismatched pair")
     # Shape check against live objects (fail clearly on arch change).
     for obj, tm in new_m.items():
         # FP8 modules store [out_f, in_f]; dense params store param shape.
