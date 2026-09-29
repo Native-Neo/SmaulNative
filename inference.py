@@ -126,6 +126,18 @@ class LinearInference:
             ids = torch.tensor(list(dict.fromkeys(recent)), device=logits.device)
             vals = logits[ids]
             logits[ids] = torch.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
+        # A diverged model can emit NaN or -inf *alongside* finite logits, and
+        # both decode paths are poisoned by it: torch's argmax treats NaN as the
+        # maximum, so one bad entry would win every greedy step and generation
+        # would emit the same token forever; and the softmax below raises
+        # "probability tensor contains inf, nan or element < 0". Neither is a
+        # useful response to a numerical blip. Clamp the bad entries to -inf
+        # here -- before the greedy early-return, so both paths are covered --
+        # which makes them the least likely token rather than a crash or a
+        # hijack. The isfinite(...).any() guard further down still ends the
+        # turn if this leaves nothing sampleable at all.
+        logits = torch.where(torch.isfinite(logits), logits,
+                             torch.full_like(logits, -float("inf")))
         if temperature <= 0:
             return int(torch.argmax(logits).item())
         logits /= temperature
