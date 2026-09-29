@@ -26,6 +26,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -174,6 +175,52 @@ _QUICKSORT_BY_LANG = {
 }
 _LANG_FENCE = {"Python": "python", "JavaScript": "javascript", "C++": "cpp", "Rust": "rust"}
 
+# Descending variants are derived from the ascending ones by inverting the
+# partition comparison, because a partition predicate is the only thing that
+# decides direction. Swapping the two operators inverts Hoare (C++), Lomuto
+# (Rust) and the three-way split (Python, JavaScript) without touching the
+# recursion, which stays correct either way.
+#
+# The concatenation order in the Python and JavaScript bodies is deliberately
+# NOT rewritten. Inverting the filters already moves the greater elements into
+# `left`, so `left + middle + right` becomes greatest-first on its own.
+# Swapping that line as well -- the obvious "invert it completely" move -- puts
+# the small elements first and sorts ascending again, which is what happened
+# here until the generated code was executed instead of read.
+#
+# A duplicated table of hand-written descending implementations was the
+# alternative, and it was rejected: four languages that can silently drift
+# apart are worse than four verified rewrites. All four are checked by
+# compiling and running them in tests/test_syntheticdata.py.
+_DESCENDING_REWRITES = {
+    "Python": [
+        ("[x for x in arr if x < pivot]", "[x for x in arr if x > pivot]"),
+        ("[x for x in arr if x > pivot]", "[x for x in arr if x < pivot]"),
+    ],
+    "JavaScript": [
+        ("arr.filter(x => x < pivot)", "arr.filter(x => x > pivot)"),
+        ("arr.filter(x => x > pivot)", "arr.filter(x => x < pivot)"),
+    ],
+    "C++": [
+        ("a[i] < pivot", "a[i] > pivot"),
+        ("a[j] > pivot", "a[j] < pivot"),
+    ],
+    "Rust": [("arr[i] < pivot", "arr[i] > pivot")],
+}
+
+
+def _descending_variant(lang: str, ascending: str) -> str:
+    """Invert the ascending implementation's partition predicate.
+
+    Substituted in a single pass: Python and JavaScript swap "< pivot" and
+    "> pivot" in the same string, and a sequential replace would let the second
+    rule undo the first (which is exactly what a placeholder-based two-pass
+    attempt did here before this comment existed).
+    """
+    mapping = dict(_DESCENDING_REWRITES[lang])
+    pattern = re.compile("|".join(re.escape(k) for k in mapping))
+    return pattern.sub(lambda m: mapping[m.group(0)], ascending)
+
 
 def gen_sorting_algorithm_code() -> Dict[str, str]:
     algo = "Quick Sort"
@@ -187,8 +234,13 @@ def gen_sorting_algorithm_code() -> Dict[str, str]:
     prompt = (f"Write a clean, optimized implementation of {algo} in {lang} "
               f"that sorts [{example_str}] in {order} order.")
     think = f"Demonstrate standard {algo} logic in {lang} with complexity analysis."
-    code = _QUICKSORT_BY_LANG[lang]
-    response = (f"Here is the implementation of **{algo}** in **{lang}**:\n\n"
+    ascending = _QUICKSORT_BY_LANG[lang]
+    # The prompt states the order, so the answer has to honour it. It used to
+    # not: `order` was drawn and then discarded, and the ascending body was
+    # returned for roughly half of all samples.
+    code = ascending if order == "ascending" else _descending_variant(lang, ascending)
+    response = (f"Here is the implementation of **{algo}** in **{lang}** "
+                f"({order}):\n\n"
                 f"```{_LANG_FENCE[lang]}\n{code}```\n\n"
                 f"### Complexity Analysis:\n"
                 f"- **Time Complexity:** Average $\\mathcal{{O}}(N \\log N)$, Worst-case $\\mathcal{{O}}(N^2)$\n"
