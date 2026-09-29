@@ -1088,3 +1088,66 @@ def test_main_auto_accepts_prompt_repetition_and_no_verify(monkeypatch):
     assert captured["prompts"] == ["a", "b"]
     assert captured["verify"] is False        # --no-verify inverts to verify=False
     assert captured["count"] == 4
+
+
+# ---------------------------------------------------------------------------
+# generate() and _logprob() disagreed about how much of a response is scorable,
+# and grpo_step checks that they agree. Found by asking what happens to a long
+# prompt, not by reading the code.
+# ---------------------------------------------------------------------------
+
+def test_generate_scores_with_the_same_window_rule_as_logprob(tmp_path, monkeypatch):
+    """A response that overflows the window must not desynchronize the lengths.
+
+    generate() used to accumulate one logprob per sampled token from a window
+    that slides one token at a time, while _logprob truncates the response to
+    what still fits. Past that point the two lists differ in length and
+    grpo_step aborts with "stored and recomputed token log-probabilities have
+    different lengths" -- after the human has already sat through the whole
+    preference round.
+    """
+    rl = _rl(tmp_path)
+    monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 8)
+    _text, tokens, old = rl.generate("hi", 20, 1.0, 0, 1.0, seed=0)
+    assert len(tokens) > 8, "need a response that overflows the window"
+    assert len(old) < len(tokens), "the overflow should be reported as unscorable"
+    new = rl._logprob("hi", tokens, 1.0, 0, 1.0)
+    assert len(old) == new.numel()
+    # And because both come from the same helper, they are bit-identical: this
+    # is the first-step importance ratio, and it must be exactly 1.
+    assert torch.allclose(torch.tensor(old, dtype=new.dtype), new, atol=0.0)
+
+
+def test_grpo_step_survives_a_response_longer_than_the_window(tmp_path, monkeypatch, capsys):
+    """The end-to-end consequence: collect a long response, then train on it."""
+    rl = _rl(tmp_path)
+    monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 8)
+    cands = rl.candidates("hi", 2, 20, 1.0, 0, 1.0)
+    assert all(len(c["tokens"]) > 8 for c in cands), "need overlong responses"
+    assert all(len(c["old_logprobs"]) < len(c["tokens"]) for c in cands)
+    loss = rl.grpo_step("hi", cands, 0, 1e-3, 0.2, 0.02)
+    assert loss == loss and abs(loss) != float("inf")
+    # It reached a real update and a checkpoint, rather than raising.
+    assert (tmp_path / "work" / "policy" / "model.safetensors").exists()
+    assert "different lengths" not in capsys.readouterr().out
+
+
+def test_generated_logprobs_are_exactly_reproducible(tmp_path, monkeypatch):
+    """Not merely close: the same code path on the same input, bit for bit.
+
+    An earlier test allowed 1e-4 here, which is a tolerance for a
+    near-miss. With one shared helper there is no kernel-selection noise left
+    to absorb, so the tolerance is zero and would catch a reintroduction.
+    """
+    rl = _rl(tmp_path)
+    _t, tokens, old = rl.generate("hello", 6, 1.0, 0, 1.0, seed=5)
+    new = rl._logprob("hello", tokens, 1.0, 0, 1.0)
+    assert torch.equal(torch.tensor(old, dtype=new.dtype), new)
+
+
+def test_generate_short_response_is_fully_scored(tmp_path, monkeypatch):
+    """The common case must not regress into dropping anything."""
+    rl = _rl(tmp_path)
+    monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 512)
+    _t, tokens, old = rl.generate("hello", 6, 1.0, 0, 1.0, seed=2)
+    assert len(old) == len(tokens) > 0
