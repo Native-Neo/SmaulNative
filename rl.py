@@ -84,6 +84,11 @@ class SmaulRL:
 
     @classmethod
     def _sample(cls, logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> Tuple[int, float]:
+        # A partly-degenerated policy emits NaN/inf next to finite logits. Mask
+        # them to -inf first: multinomial rejects a vector containing NaN, so
+        # without this a single bad value aborts the whole run, and argmax would
+        # rank NaN highest. -inf makes it the token that is never sampled.
+        logits = logits.float().masked_fill(~torch.isfinite(logits), -float("inf"))
         filtered = cls._filter_logits(logits, temperature, top_k, top_p)
         if not bool(torch.isfinite(filtered).any()):
             # All-masked: fall back to greedy on unfiltered logits instead of NaN crash.
