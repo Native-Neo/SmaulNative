@@ -3,8 +3,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from rl import SmaulRL
-from autorl import AutoRL
+from rl import AutoRL, SmaulRL
 
 
 def test_sample_logprob_matches_sampling_distribution():
