@@ -573,3 +573,220 @@ def test_rawr_graph_json_roundtrip_tolerates_the_new_stats_keys(tmp_path):
     (tmp_path / "g.json").write_text(json.dumps(p))
     g2 = load_graph(tmp_path / "g.json")
     assert g2.edges == g.edges and g2.digest == g.digest
+
+
+# ---------------------------------------------------------------------------
+# rawr_graph's validation and its CLI had no coverage. The digest check is the
+# one that matters most: `cols` is not persisted, it is re-derived from
+# rawr_graph.json on load, so a corrupt or tampered graph would silently
+# reinterpret every SparseLinear weight in a Rawr checkpoint rather than fail.
+# ---------------------------------------------------------------------------
+
+def _graph_file(tmp_path, graph, name="g.json"):
+    save_graph(graph, tmp_path / name)
+    return tmp_path / name
+
+
+def test_load_graph_detects_a_tampered_digest(tmp_path):
+    """A graph whose recorded digest disagrees with its edges must be refused.
+
+    This is the guard that stops a silently edited rawr_graph.json from
+    reinterpreting every Rawr weight: the columns are not stored, they are
+    re-derived from the graph, so a wrong-but-loadable graph is not a warning,
+    it is a different model.
+    """
+    g = fallback_graph(16, 4)
+    p = _graph_file(tmp_path, g)
+    import json
+    payload = json.loads(p.read_text())
+    assert load_graph(p).edges == g.edges          # the honest file loads
+    payload["stats"]["digest"] = "0" * 16
+    p.write_text(json.dumps(payload))
+    with pytest.raises(ValueError) as e:
+        load_graph(p)
+    assert "digest mismatch" in str(e.value)
+
+
+def test_load_graph_detects_tampered_edges(tmp_path):
+    """Same guard, reached by editing the edges rather than the digest."""
+    g = fallback_graph(16, 4)
+    p = _graph_file(tmp_path, g)
+    import json
+    payload = json.loads(p.read_text())
+    payload["edges"].append([0, 5])                 # a plausible-looking edge
+    p.write_text(json.dumps(payload))
+    with pytest.raises(ValueError) as e:
+        load_graph(p)
+    assert "digest mismatch" in str(e.value)
+
+
+def test_load_graph_backfills_a_missing_digest(tmp_path):
+    """A graph written without a digest is accepted and given the right one."""
+    g = fallback_graph(16, 4)
+    p = _graph_file(tmp_path, g)
+    import json
+    payload = json.loads(p.read_text())
+    payload["stats"]["digest"] = ""
+    p.write_text(json.dumps(payload))
+    got = load_graph(p)
+    assert got.edges == g.edges
+    assert got.digest == g.digest       # recomputed, not left empty
+
+
+@pytest.mark.parametrize("mutate,exc", [
+    (lambda d: d.pop("edges"), ValueError),
+    (lambda d: d.pop("config"), ValueError),
+    (lambda d: d.update(edges="not-a-list"), (ValueError, TypeError)),
+])
+def test_load_graph_rejects_malformed_files(tmp_path, mutate, exc):
+    g = fallback_graph(16, 4)
+    p = _graph_file(tmp_path, g)
+    import json
+    payload = json.loads(p.read_text())
+    mutate(payload)
+    p.write_text(json.dumps(payload))
+    with pytest.raises(exc):
+        load_graph(p)
+
+
+def test_load_graph_reports_an_unreadable_file(tmp_path):
+    bad = tmp_path / "g.json"
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(RuntimeError) as e:
+        load_graph(bad)
+    assert "could not load" in str(e.value)
+
+
+@pytest.mark.parametrize("kw", [
+    dict(window=0), dict(window=-1), dict(min_degree=0), dict(min_degree=-3),
+])
+def test_build_graph_rejects_bad_shape_arguments(kw):
+    with pytest.raises(ValueError):
+        build_graph(_mini_tokenizer(), corpus_texts=iter([]), **kw)
+
+
+def test_build_graph_is_deterministic_and_ignores_empty_documents():
+    """Same inputs -> same edges, and unusable documents are skipped not fatal."""
+    texts = ["hello world", "", "   ", None, 42, "hello world again"]
+    a = build_graph(_mini_tokenizer(), corpus_texts=iter(list(texts)))
+    b = build_graph(_mini_tokenizer(), corpus_texts=iter(list(texts)))
+    assert a.edges == b.edges, "same input must give the same graph"
+    assert a.digest == b.digest
+    # Only the two usable documents were counted; the empty, whitespace-only,
+    # None and non-string entries were skipped rather than raising.
+    assert a.stats()["corpus_docs"] == 2, a.stats()
+    # A corpus of only unusable documents is not an error either.
+    empty = build_graph(_mini_tokenizer(), corpus_texts=iter(["", "   ", None]))
+    assert empty.stats()["corpus_docs"] == 0
+    assert empty.edges, "the ring fallback still guarantees connectivity"
+
+
+def test_graph_stats_are_self_consistent(tmp_path):
+    """The numbers print_stats reports must agree with the graph they describe.
+
+    print_stats and the JSON written into every Rawr checkpoint are built from
+    stats(), so a count that drifts from the edges would be quoted as the model's
+    sparsity while being unrelated to it.
+    """
+    for texts in (["alpha beta"], ["a b c d e f g h", "h g f e d c b a"] * 3):
+        g = build_graph(_mini_tokenizer(), corpus_texts=iter(texts))
+        st = g.stats()
+        assert st["rawr_connection_count"] == len(g.directed_set())
+        assert st["dense_connection_count"] == g.vocab_size ** 2
+        assert st["undirected_edge_count"] == len(g.edges)
+        expected = 1.0 - st["rawr_connection_count"] / st["dense_connection_count"]
+        assert st["sparsity"] == pytest.approx(expected)
+        # est_compute_reduction is the graph-edge figure, deliberately the same
+        # quantity as sparsity -- which is why the model has its own number.
+        assert st["estimated_compute_reduction"] == pytest.approx(st["sparsity"])
+        assert st["min_connections"] >= g.min_degree
+        assert st["min_connections"] <= st["max_connections"]
+
+
+def test_build_graph_respects_max_docs(tmp_path):
+    texts = [f"doc {i} alpha beta" for i in range(10)]
+    unlimited = build_graph(_mini_tokenizer(), corpus_texts=iter(texts))
+    two = build_graph(_mini_tokenizer(), corpus_texts=iter(texts), max_docs=2)
+    assert two.stats()["corpus_docs"] == 2
+    assert unlimited.stats()["corpus_docs"] == 10
+    assert set(two.edges) <= set(unlimited.edges)
+
+
+def test_build_graph_truncates_long_documents():
+    text = " ".join(["alpha beta"] * 50)          # 100 tokens
+    full = build_graph(_mini_tokenizer(), corpus_texts=iter([text]))
+    cut = build_graph(_mini_tokenizer(), corpus_texts=iter([text]),
+                      max_tokens_per_doc=10)
+    assert cut.stats()["corpus_tokens"] == 10
+    assert cut.stats()["corpus_tokens"] < full.stats()["corpus_tokens"]
+
+
+def test_fallback_graph_rejects_a_bad_min_degree():
+    with pytest.raises(ValueError):
+        fallback_graph(16, 0)
+
+
+def test_check_ids_rejects_out_of_range_tokens():
+    from rawr_graph import _check_ids
+    assert _check_ids([0, 1, 2], 3, "x") == [0, 1, 2]
+    for bad in ([3], [-1]):
+        with pytest.raises(ValueError) as e:
+            _check_ids(bad, 3, "x")
+        assert "invalid token id" in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# The analysis/export CLI.
+# ---------------------------------------------------------------------------
+
+def _write_tokenizer(tmp_path):
+    tp = tmp_path / "tok.json"
+    _mini_tokenizer().save(tp)
+    return tp
+
+
+def test_cli_builds_and_saves_a_graph(tmp_path, monkeypatch, capsys):
+    import rawr_graph
+    tp = _write_tokenizer(tmp_path)
+    out = tmp_path / "graph.json"
+    monkeypatch.setattr("sys.argv", ["rawr_graph.py", "--tokenizer", str(tp),
+                                     "--out", str(out)])
+    rawr_graph.main()
+    assert out.exists()
+    # The printed report is the analysis surface, so it must carry the graph
+    # digest and the honest graph-vs-model labelling.
+    printed = capsys.readouterr().out
+    assert "digest:" in printed
+    assert "graph_sparsity:" in printed and "NOT the model" in printed
+    assert f"saved: {out}" in printed
+    # And what it wrote is loadable and identical to a fresh build.
+    g = load_graph(out)
+    assert g.vocab_size > 0 and g.edges
+
+
+def test_cli_accepts_a_dict_file_and_a_corpus(tmp_path, monkeypatch):
+    import rawr_graph
+    tp = _write_tokenizer(tmp_path)
+    d = tmp_path / "words.txt"
+    d.write_text("alpha\n\n  \nbeta\n", encoding="utf-8")
+    data = tmp_path / "corpus"
+    data.mkdir()
+    (data / "a.txt").write_text("alpha beta alpha gamma", encoding="utf-8")
+    out = tmp_path / "graph.json"
+    monkeypatch.setattr("sys.argv", [
+        "rawr_graph.py", "--tokenizer", str(tp), "--dict-file", str(d),
+        "--data", str(data), "--out", str(out), "--min-degree", "2",
+        "--window", "1"])
+    rawr_graph.main()
+    g = load_graph(out)
+    assert g.min_degree == 2
+    # The dict file's blank lines are skipped, and the corpus contributed.
+    assert g.stats()["corpus_docs"] >= 1
+    assert g.stats()["dictionary_words"] >= 1
+
+
+def test_cli_requires_a_tokenizer(monkeypatch):
+    import rawr_graph
+    monkeypatch.setattr("sys.argv", ["rawr_graph.py"])
+    with pytest.raises(SystemExit):
+        rawr_graph.main()
