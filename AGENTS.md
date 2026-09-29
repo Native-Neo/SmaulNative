@@ -13,9 +13,9 @@ the same directory. This is the single hard rule on this repository.
 - If a change genuinely cannot be expressed as one file per commit (a rename that must land
   with its call sites, a generated artifact), stop and ask before committing.
 - Commit messages are prose describing *why*; the file list should be self-explanatory.
-- Verify each commit leaves the tree working where that is possible: `python -m pytest -q
-  --ignore=tests/test_rl.py` after anything touching a kernel, `smaul_linear.py`, `train.py`
-  or `rawr_graph.py`.
+- Verify each commit leaves the tree working where that is possible:
+  `python -m pytest -q` after anything touching a kernel, `smaul_linear.py`,
+  `train.py` or `rawr_graph.py`.
 - Nothing is pushed unless asked.
 
 ## Commands
@@ -30,8 +30,9 @@ python benchmark.py --mode full|opt|arch --d 512 --layers 4 --ctx 256 --batch 2 
 
 - **No lint / format / typecheck config exists** (no ruff, mypy, black, flake8, pre-commit,
   or `pyproject.toml`). Verification is `pytest` only. Do not introduce a linter.
-- `pytest -q` **currently fails at collection** on `tests/test_rl.py` (see Known breakage).
-  For a green run: `python -m pytest -q --ignore=tests/test_rl.py`.
+- `pytest -q` collects and passes clean -- 460 tests, no `--ignore` needed. It
+  did not until 4d81541; if you see `--ignore=tests/test_rl.py` anywhere, that
+  advice is stale.
 - `datasets/` is gitignored and usually absent. `train.py --data` needs a real directory;
   `syntheticdata.py` can generate one. Every other path is relative to cwd.
 - The first FP8 forward JIT-compiles two C++ extensions (`smaul_fp8_ivb`, `smaul_attn`) via
@@ -106,8 +107,11 @@ Any optimizer added here must satisfy this, because the training loop depends on
 
 ## Known breakage / drift (pre-existing — do not "fix" silently, and don't blame your change)
 
-- `tests/test_rl.py` imports `autorl`, which does not exist (folded into `rl.py` in
-  511d585). This is why plain `pytest -q` fails on a clean tree.
+- `tests/test_rl.py` used to import `autorl`, which does not exist (folded into
+  `rl.py` in 511d585), which is why plain `pytest -q` failed at collection. Fixed
+  in 4d81541 -- a one-word import, nothing else. `rl.py` is still only 26%
+  covered and three of that file's five tests assert torch algebra without
+  calling `rl.py` at all, so do not read a green `test_rl.py` as RL coverage.
 - `.github/workflows/test.yml` runs `from compute import get_backend`, but `compute.py`
   lives at `kernel/compute.py`; that CI step ImportErrors.
 - Docs still reference files that do not exist: `infer_linear.py`, `autorl.py`,
