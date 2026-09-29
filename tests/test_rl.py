@@ -375,12 +375,17 @@ def test_generate_truncates_a_prompt_past_the_window(tmp_path, monkeypatch, caps
     rl = _rl(tmp_path)
     monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 4)
     monkeypatch.setattr(SmaulRL, "_encode", lambda self, t: list(range(10)))
-    seen = []
-    rl.model.register_forward_pre_hook(
-        lambda mod, inp: seen.append(inp[0].shape[-1]))
+    # The generation path uses prefill/step, not __call__, so a forward hook
+    # would only see _logprob's final batched forward. Watch the prefill sizes.
+    sizes = []
+    real_prefill = rl.model.prefill
+    monkeypatch.setattr(rl.model, "prefill",
+                        lambda idx: (sizes.append(idx.shape[1]), real_prefill(idx))[1])
     rl.generate("x", 1, 1.0, 0, 1.0, seed=0)
     assert "truncated" in capsys.readouterr().out
-    assert seen[0] == 4                     # the model never sees more than the window
+    # Generation never shows the model more than the window, even though ten
+    # tokens were supplied.
+    assert sizes and all(n <= 4 for n in sizes), sizes
 
 
 def test_generate_restores_the_training_flag(tmp_path, monkeypatch):
@@ -1151,3 +1156,132 @@ def test_generate_short_response_is_fully_scored(tmp_path, monkeypatch):
     monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 512)
     _t, tokens, old = rl.generate("hello", 6, 1.0, 0, 1.0, seed=2)
     assert len(old) == len(tokens) > 0
+
+
+# ---------------------------------------------------------------------------
+# generate() now prefills once and steps per token instead of re-running the
+# whole window every step. The condition governing when a step is still
+# equivalent to a re-forward is the subtle part, so it is pinned from both
+# sides: against a forced re-forward path, and against a mock that counts calls.
+# ---------------------------------------------------------------------------
+
+def test_incremental_generate_matches_the_reforward_path(tmp_path, monkeypatch):
+    """The optimization must not change what comes out, within kernel noise.
+
+    Forcing incremental off has to reproduce the same tokens, and the logprobs
+    have to match bit-exactly because they come from _logprob's batched
+    forward either way -- that part is not allowed to drift at all.
+    """
+    from rl import SmaulRL
+    rl = _rl(tmp_path)
+    monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 64)
+
+    fast = rl.generate("hello world", 24, 1.0, 0, 1.0, seed=11)
+    # Hide prefill/step on the class so generate takes the old re-forward loop.
+    monkeypatch.delattr(type(rl.model), "prefill")
+    monkeypatch.delattr(type(rl.model), "step")
+    slow = rl.generate("hello world", 24, 1.0, 0, 1.0, seed=11)
+    assert fast[1] == slow[1], (fast[1][:10], slow[1][:10])
+    assert fast[0] == slow[0]
+    # Exact, not approximate: both go through _logprob.
+    assert fast[2] == slow[2]
+
+
+def test_incremental_generate_makes_far_fewer_model_calls(tmp_path, monkeypatch):
+    """The whole point: one prefill plus one step per token, not a re-forward.
+
+    A re-forward per token makes the call count track the token count exactly.
+    Incremental makes it track it too, but the *work* per call is 1 token rather
+    than the window, so this asserts on the total tokens the model consumed --
+    which is the quantity that actually determines the time.
+    """
+    rl = _rl(tmp_path)
+    monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 64)
+    seen = []
+    real_prefill, real_step = rl.model.prefill, rl.model.step
+
+    class Counter:
+        def __init__(self):
+            self.tokens = 0
+            self.calls = 0
+
+        def prefill(self, idx):
+            self.calls += 1
+            self.tokens += idx.shape[1]
+            return real_prefill(idx)
+
+        def step(self, idx, states):
+            self.calls += 1
+            self.tokens += idx.shape[1]
+            return real_step(idx, states)
+
+    counter = Counter()
+    monkeypatch.setattr(rl.model, "prefill", counter.prefill)
+    monkeypatch.setattr(rl.model, "step", counter.step)
+
+    prompt_len = len(rl._encode("hello world"))
+    assert prompt_len < 64, "this measures the window-not-full case"
+    rl.generate("hello world", 32, 1.0, 0, 1.0, seed=4)
+    # A re-forward loop would have consumed ~32 * min(prompt+32, 64) tokens.
+    reforward_bound = 32 * min(prompt_len + 32, 64)
+    assert counter.tokens < reforward_bound / 4, (counter.tokens, reforward_bound)
+    assert counter.calls <= 1 + 32 + 1        # prefill + steps + at most one re-prefill
+
+
+def test_incremental_generate_refills_when_the_window_slides(tmp_path, monkeypatch):
+    """Crossing MODEL_WINDOW must re-prefill, not step through the slide.
+
+    Stepping while the state is one token wider than the window the re-forward
+    path would have used is the specific bug the absorbed comparison prevents.
+    A response longer than the window has to take the re-prefill branch at least
+    once.
+    """
+    rl = _rl(tmp_path)
+    monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 8)
+    prefill_sizes = []
+    real_prefill = rl.model.prefill
+    monkeypatch.setattr(rl.model, "prefill",
+                        lambda idx: (prefill_sizes.append(idx.shape[1]), real_prefill(idx))[1])
+    _text, tokens, _old = rl.generate("hello", 24, 1.0, 0, 1.0, seed=2)
+    assert len(tokens) > 8, "need a response that crosses the window"
+    assert len(prefill_sizes) >= 2, "the window slid but nothing re-prefilled"
+    # Every re-prefill after the first is capped at the window, never larger.
+    assert all(size <= 8 for size in prefill_sizes), prefill_sizes
+
+
+def test_full_window_degenerates_to_a_reprefill_per_token(tmp_path, monkeypatch):
+    """Documented cost of the slide rule, so nobody re-derives it by hand.
+
+    Once the id list is at MODEL_WINDOW, every append truncates straight back to
+    the window, so absorbed + 1 can never equal min(len(ids), MODEL_WINDOW)
+    again and the loop re-prefills the whole window on every step. That makes
+    the incremental path exactly as expensive as the re-forward it replaced --
+    neutral, not a regression, and the 3x win only applies while the window has
+    room. inference.py never hits this because its MODEL_WINDOW is 262144.
+    """
+    rl = _rl(tmp_path)
+    monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 8)
+    monkeypatch.setattr(SmaulRL, "_encode", lambda self, t: list(range(8)))
+    prefill_sizes, step_calls = [], []
+    real_prefill, real_step = rl.model.prefill, rl.model.step
+    monkeypatch.setattr(rl.model, "prefill",
+                        lambda idx: (prefill_sizes.append(idx.shape[1]), real_prefill(idx))[1])
+    monkeypatch.setattr(rl.model, "step",
+                        lambda idx, st: (step_calls.append(idx.shape[1]), real_step(idx, st))[1])
+    _text, tokens, _old = rl.generate("hello", 6, 1.0, 0, 1.0, seed=0)
+    assert len(tokens) == 6
+    assert step_calls == [], "a full window must not step"
+    assert len(prefill_sizes) >= 6, "one re-prefill per token is the degenerate case"
+
+
+def test_generate_falls_back_when_the_model_has_no_prefill(tmp_path, monkeypatch):
+    """A model predating prefill/step must still generate, as before."""
+    rl = _rl(tmp_path)
+    monkeypatch.setattr(SmaulRL, "MODEL_WINDOW", 32)
+    saved = type(rl.model).prefill
+    try:
+        del type(rl.model).prefill
+        text, tokens, old = rl.generate("hello", 6, 1.0, 0, 1.0, seed=1)
+    finally:
+        type(rl.model).prefill = saved
+    assert len(old) == len(tokens) > 0 and isinstance(text, str)
