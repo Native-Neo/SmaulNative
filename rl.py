@@ -123,7 +123,46 @@ class SmaulRL:
             if len(prompt_ids) > self.MODEL_WINDOW:
                 print(f"[WARN] prompt truncated to last {self.MODEL_WINDOW} tokens ({len(prompt_ids)} provided)")
             ids = prompt_ids[-self.MODEL_WINDOW:]
-            logits, _ = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
+            # Prefill/step instead of re-running the whole window per token. The
+            # loop below used to call the model on the entire id list each step,
+            # which is quadratic in the response length; at count=8 candidates
+            # and a few hundred tokens that is thousands of full-window forwards.
+            #
+            # Measured at d=128 L=2, median of 5, 64 tokens out:
+            #   prompt 40 tok  (window not full)  724 ms -> 227 ms   3.2x
+            #   prompt 900 tok (window full)     2308 ms -> 1919 ms  1.2x
+            # The win is conditional and the condition matters. While the id
+            # list is shorter than MODEL_WINDOW the state and the window agree
+            # and a step costs one token. Once the window is full, `ids` is
+            # truncated straight back to MODEL_WINDOW on every append, so
+            # absorbed + 1 never equals min(len(ids), MODEL_WINDOW) again and
+            # every step re-prefills the full window. That makes the new path
+            # exactly as expensive as the re-forward it replaces -- neutral, not
+            # slower, but no gain either. inference.py does not hit this because
+            # its MODEL_WINDOW is 262144; this file's is 512.
+            #
+            # The slide rule itself is the subtle part and is deliberately the
+            # same one inference.py uses and explains at length: a step is only
+            # equivalent to a re-forward while the carried state covers exactly
+            # the window the re-forward path would have used. See
+            # inference.py:314 for the full argument; do not "simplify" the
+            # condition below without reading it.
+            #
+            # A per-token step is not bit-identical to a batched forward and
+            # cannot be -- torch picks a different GEMM/SpMM kernel for [1, d]
+            # than [T, d], worth ~5e-7 relative. That is why the returned
+            # logprobs come from _logprob's batched forward rather than from the
+            # sampler, so the stored values stay exact.
+            incremental = callable(getattr(self.model, "prefill", None)) and \
+                callable(getattr(self.model, "step", None))
+            states = None
+            absorbed = 0
+            if incremental:
+                logits, states = self.model.prefill(
+                    torch.tensor([ids], dtype=torch.long, device=self.device))
+                absorbed = len(ids)
+            else:
+                logits, _ = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
             response: List[int] = []
             for _ in range(max_new_tokens):
                 token, _logprob = self._sample(logits[0, -1], temperature, top_k, top_p)
@@ -131,7 +170,17 @@ class SmaulRL:
                     break
                 response.append(token)
                 ids = (ids + [token])[-self.MODEL_WINDOW:]
-                logits, _ = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
+                if not incremental:
+                    logits, _ = self.model(torch.tensor([ids], dtype=torch.long, device=self.device))
+                elif absorbed + 1 == min(len(ids), self.MODEL_WINDOW):
+                    logits, states = self.model.step(
+                        torch.tensor([[token]], dtype=torch.long, device=self.device), states)
+                    absorbed += 1
+                else:
+                    window = ids[-self.MODEL_WINDOW:]
+                    logits, states = self.model.prefill(
+                        torch.tensor([window], dtype=torch.long, device=self.device))
+                    absorbed = len(window)
             # Score the response with the same helper grpo_step will recompute it
             # with, rather than accumulating the sampled logprobs here. The loop
             # above sees a window that slides one token at a time, while _logprob
