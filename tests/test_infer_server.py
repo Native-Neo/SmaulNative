@@ -29,12 +29,14 @@ class Engine:
 
     def __init__(self, pieces=("Hello", " ", "world"), encode_error=None,
                  prompt_error=None, stream_error=None):
+        self.release = threading.Event()
         self.pieces = list(pieces)
         self.encode_error = encode_error
         self.prompt_error = prompt_error
         self.stream_error = stream_error
         self.calls = []
         self.streamed = 0
+        self.counted = []
 
     def encode(self, text):
         if self.encode_error:
@@ -52,6 +54,7 @@ class Engine:
             if self.stream_error is not None and i == 1:
                 raise self.stream_error
             self.streamed += 1
+            self.counted.append(piece)
             yield piece
 
     def generate(self, prompt, max_new_tokens=256, temperature=0.7, top_k=50,
@@ -339,3 +342,135 @@ def test_a_mid_stream_error_still_terminates_the_stream():
     eng = Engine(stream_error=RuntimeError("boom"))
     text = _post(_client(eng), stream=True).text
     assert text.rstrip().endswith("data: [DONE]"), "the stream never terminated"
+
+
+# --- the producer thread ----------------------------------------------------
+#
+# Driven by calling the route handler directly rather than through TestClient.
+# A sync TestClient close on a half-read SSE response can block until the
+# producer finishes, which is what wedged the suite when this was first written
+# as an HTTP test. Calling the endpoint with a stub Request gives the same
+# control over is_disconnected() and cannot hang.
+
+def _chat_endpoint(app):
+    for route in app.routes:
+        if getattr(route, "path", None) == "/v1/chat/completions":
+            return route.endpoint
+    raise AssertionError("chat endpoint not found")
+
+
+class StubRequest:
+    def __init__(self, disconnect_after=0):
+        self.checks = 0
+        self.disconnect_after = disconnect_after
+
+    async def is_disconnected(self):
+        self.checks += 1
+        return self.checks > self.disconnect_after
+
+
+class _CountedEngine(Engine):
+    """An endless producer that records how many tokens it actually produced."""
+
+    def __init__(self, interval=0.002):
+        super().__init__()
+        self.counted = []
+        self.interval = interval
+        self.running = threading.Event()
+        self.release = threading.Event()
+
+    def stream(self, prompt, **kwargs):
+        self.calls.append(("stream", prompt, kwargs))
+        self.running.set()
+        while not self.release.is_set():
+            self.counted.append(1)
+            time.sleep(self.interval)
+            yield "tok "
+
+
+def _settle_observation(engine, **drive_kw):
+    """Frames plus before/after production counts, measured inside the loop."""
+    import asyncio
+
+    from infer_server import ChatRequest
+
+    app = create_app(engine)
+    chat = _chat_endpoint(app)
+    req = ChatRequest(messages=[{"role": "user", "content": "hi"}], stream=True)
+    request = StubRequest(drive_kw.get("disconnect_after", 0))
+    max_chunks = drive_kw.get("max_chunks")
+
+    async def go():
+        response = await chat(req, request, _auth=None)
+        out = []
+        stream = response.body_iterator
+        try:
+            async for frame in stream:
+                out.append(frame)
+                if max_chunks is not None and len(out) >= max_chunks:
+                    break
+        finally:
+            # What Starlette does when a client disconnects mid-stream, and the
+            # only thing that raises GeneratorExit in the generator. Breaking out
+            # of an `async for` on its own leaves the generator suspended and open,
+            # so without this the measurement watches a stream nobody closed.
+            await stream.aclose()
+        await asyncio.sleep(0.05)
+        at_exit = len(engine.counted)
+        await asyncio.sleep(0.4)
+        return out, at_exit, len(engine.counted)
+
+    try:
+        return asyncio.run(go())
+    finally:
+        # Only the endless producer needs releasing; a finite one is done.
+        engine.release.set()
+
+
+def test_a_disconnect_stops_the_producer_thread():
+    """A client that hangs up must not leave the server generating for it.
+
+    The producer is a daemon thread feeding an asyncio queue, so it has no other
+    way to learn the consumer is gone. It used to run to completion regardless,
+    holding a thread and every chunk it produced -- up to max_tokens worth -- for
+    a response nobody would read.
+    """
+    eng = _CountedEngine()
+    _frames, at_exit, after = _settle_observation(eng, disconnect_after=0)
+    assert eng.running.is_set(), "the producer never started"
+    # Without this, "the count stopped climbing" is trivially true.
+    assert at_exit > 0, "the producer produced nothing, so this proves nothing"
+    assert after <= at_exit + 2, (
+        f"producer kept generating after the client hung up: "
+        f"{at_exit} -> {after} tokens")
+
+
+def test_closing_the_response_early_stops_the_producer():
+    """The same leak, reached by closing the generator rather than disconnecting.
+
+    A client that stops reading a streamed response closes the generator, which
+    arrives as GeneratorExit. The stop signal has to sit in a finally, or this
+    path leaks exactly as the explicit-disconnect one did.
+    """
+    eng = _CountedEngine()
+    _frames, at_exit, after = _settle_observation(eng, disconnect_after=10_000,
+                                                  max_chunks=2)
+    assert eng.running.is_set(), "the producer never started"
+    assert at_exit > 0, "the producer produced nothing, so this proves nothing"
+    assert after <= at_exit + 2, (
+        f"producer kept generating after the response was closed: "
+        f"{at_exit} -> {after} tokens")
+
+
+def test_a_normal_finish_still_emits_stop_and_done():
+    """The stop signal must not truncate a stream that ran to completion."""
+    frames, _at, _after = _settle_observation(
+        Engine(pieces=("a", "b")), disconnect_after=10_000)
+    text = "".join(frames)
+    assert text.rstrip().endswith("data: [DONE]")
+    # startswith, not ==: every frame carries its trailing "\n\n".
+    payloads = [json.loads(f[len("data: "):]) for f in frames
+                if f.startswith("data: ") and not f.startswith("data: [DONE]")]
+    assert "".join(p["choices"][0]["delta"].get("content", "")
+                   for p in payloads) == "ab"
+    assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
