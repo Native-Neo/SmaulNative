@@ -288,6 +288,7 @@ def main_human():
 
 import argparse
 import hashlib
+import pickle
 import json
 import random
 from pathlib import Path
@@ -334,7 +335,8 @@ class AutoRL(SmaulRL):
             try:
                 state = torch.load(self.preference_model_path, map_location=self.device, weights_only=True)
                 self.preference_model.load_state_dict(state)
-            except (OSError, RuntimeError, ValueError, TypeError) as exc:
+            except (OSError, RuntimeError, ValueError, TypeError,
+                    pickle.UnpicklingError, EOFError) as exc:
                 print(f"[WARN] ignoring corrupt preference checkpoint {self.preference_model_path}: {exc}")
         if self.preference_meta_path.exists():
             try:
