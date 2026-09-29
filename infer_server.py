@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 import os
+import threading
 import time
 import uuid
 from typing import List, Literal, Optional
@@ -97,6 +98,11 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW,
         request_id = "chatcmpl-" + uuid.uuid4().hex
 
         async def chunks():
+            # Set when the consumer goes away for any reason: an explicit
+            # disconnect, a client that hung up, or this generator being closed
+            # (which is how a dropped connection reaches it). The producer is a
+            # plain thread with no other way to learn any of those.
+            stop = threading.Event()
             try:
                 # Run blocking generation in a thread so the event loop stays
                 # responsive; the model is stateless per-request (no shared KV),
@@ -110,13 +116,14 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW,
                             prompt, max_new_tokens=req.max_tokens, temperature=req.temperature,
                             top_k=req.top_k, top_p=req.top_p,
                             repetition_penalty=req.repetition_penalty):
+                            if stop.is_set():
+                                return
                             loop.call_soon_threadsafe(queue.put_nowait, ("data", text))
                     except Exception as exc:  # surface as SSE error, not silent cut
                         loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
                     finally:
                         loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
-                import threading
                 worker = threading.Thread(target=_produce, daemon=True)
                 worker.start()
                 while True:
@@ -138,6 +145,13 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW,
                 yield "data: [DONE]\n\n"
             except Exception as exc:
                 yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
+            finally:
+                # Covers the normal finish and every early exit above, including
+                # GeneratorExit when the client disconnects mid-stream. Without
+                # this the worker keeps generating into a queue nobody drains,
+                # holding a thread and every chunk it produced until the model
+                # finishes -- up to max_tokens=65536 of it.
+                stop.set()
 
         if req.stream:
             return StreamingResponse(chunks(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
