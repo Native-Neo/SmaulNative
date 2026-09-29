@@ -206,3 +206,212 @@ def test_dense_block_size_is_a_performance_knob_not_a_semantic_one():
         assert SmaulOpt._OB == 64
     finally:
         SmaulOpt._DENSE_OB = prev
+
+
+# ---------------------------------------------------------------------------
+# main() itself: the primary entry point, and the only place the CLI defaults,
+# the Rawr graph build, the model/optimizer construction and the step loop meet.
+# It was entirely uncovered (train.py sat at 60% with main() at zero), which is
+# how a real run could regress without any test noticing -- the recovery pass
+# added a print_model_compute call in here and there was no test for it either.
+#
+# These drive main() for a couple of steps against a temporary corpus. It is
+# affordable: a tokenizer builds in ~2 ms on a tiny corpus, and the model is a
+# 1-layer micro preset. No ./datasets and no network.
+# ---------------------------------------------------------------------------
+
+def _corpus(tmp_path, reps=60, extra=""):
+    d = tmp_path / "corpus"
+    d.mkdir(exist_ok=True)
+    (d / "a.txt").write_text(
+        "hello world this is a small english corpus for a smoke test. " * reps
+        + extra, encoding="utf-8")
+    return d
+
+
+def _train_argv(out, data, extra=()):
+    return ["train.py", "--data", str(data), "--out", str(out),
+            "--d", "32", "--layers", "1", "--heads", "2", "--ffn_mult", "2.0",
+            "--ctx", "32", "--batch", "2", "--steps", "2", "--log_every", "1",
+            "--save_every", "1000", "--rawr-max-docs", "1",
+            "--rawr-max-tokens-per-doc", "64", "--tok_records", "2000",
+            "--vocab", "64", "--threads", "1", *extra]
+
+
+def _run_main(monkeypatch, argv):
+    import train
+    monkeypatch.setattr("sys.argv", argv)
+    train.STOP = False                 # a prior test may have tripped the handler
+    train.main()
+
+
+def test_main_trains_and_reports(tmp_path, monkeypatch, capsys):
+    """A real 2-step run: Rawr by default, both numbers printed and distinct."""
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path)))
+    printed = capsys.readouterr().out
+    # The step line, with the live-gradient figure the recovery pass added.
+    assert "stored " in printed and "live grads" in printed
+    assert "[done]" in printed
+    # The graph figure is labelled as the graph's, and the model's real
+    # arithmetic is printed next to it. They must not be conflated, and at
+    # --rawr-sparsity 0.9 the dense attention is most of the MACs.
+    assert "graph_sparsity:" in printed and "NOT the model" in printed
+    assert "dense share of MAC:" in printed
+    assert "model_sparsity:" in printed
+    share = float(printed.split("dense share of MAC:")[1].split("%")[0])
+    assert 0.0 < share < 100.0
+    # And the run actually produced a checkpoint.
+    assert (out / "config.json").exists()
+    assert (out / "model.safetensors").exists()
+
+
+@pytest.mark.parametrize("arch", ["rawr", "plain"])
+def test_main_both_architectures(tmp_path, monkeypatch, capsys, arch):
+    """--architecture plain must not take the Rawr-only branches."""
+    out = tmp_path / f"run_{arch}"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path),
+                                      ("--architecture", arch)))
+    printed = capsys.readouterr().out
+    assert "[done]" in printed
+    if arch == "plain":
+        # No graph is built, so neither the graph nor the model-compute block.
+        assert "graph_sparsity:" not in printed
+        assert "dense share of MAC:" not in printed
+        assert '"architecture": "plain"' in (out / "config.json").read_text()
+    else:
+        assert "graph_sparsity:" in printed
+        assert (out / "rawr_graph.json").exists()
+
+
+@pytest.mark.parametrize("opt", ["lion", "smaul"])
+def test_main_both_optimizers(tmp_path, monkeypatch, capsys, opt):
+    out = tmp_path / f"run_{opt}"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path),
+                                      ("--optimizer", opt)))
+    assert "[done]" in capsys.readouterr().out
+    assert (out / "model.safetensors").exists()
+    # SmaulOpt checkpoints its state; Lion is deliberately resume-free.
+    assert (out / "optimizer.json").exists()
+    if opt == "smaul":
+        assert (out / "optimizer_state.safetensors").exists()
+
+
+def test_main_saves_periodically_and_prints_a_save_line(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path),
+                                      ("--steps", "1", "--save_every", "1")))
+    printed = capsys.readouterr().out
+    assert "[save]" in printed
+    assert (out / "model.safetensors").exists()
+
+
+def test_main_respects_rawr_sparsity_in_what_it_reports(tmp_path, monkeypatch, capsys):
+    """The reported dense share must fall as --rawr-sparsity rises.
+
+    Sparse layers shrink with the knob; the dense attention does not, so the
+    dense share of per-token MAC goes *up*. If this ever inverts, the model
+    sparsity claim is being computed over the wrong set of layers.
+    """
+    shares = []
+    for sp in ("0.5", "0.9", "0.99"):
+        out = tmp_path / f"run_{sp}"
+        _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path),
+                                          ("--rawr-sparsity", sp)))
+        printed = capsys.readouterr().out
+        shares.append(float(printed.split("dense share of MAC:")[1].split("%")[0]))
+    assert shares[0] < shares[1] < shares[2], shares
+
+
+def test_main_rejects_a_missing_data_dir(tmp_path, monkeypatch):
+    with pytest.raises((ValueError, RuntimeError)) as e:
+        _run_main(monkeypatch, _train_argv(tmp_path / "run", tmp_path / "nope"))
+    assert "data" in str(e.value).lower()
+
+
+def test_main_rejects_an_empty_data_dir(tmp_path, monkeypatch):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises((ValueError, RuntimeError)):
+        _run_main(monkeypatch, _train_argv(tmp_path / "run", empty))
+
+
+# main() rejects bad input in two different ways, and both are fail-fast.
+# _validate_args and the checks after apply_preset raise ValueError naming the
+# flag; argparse's own type/choices reject at parse time with SystemExit(2) and
+# a usage message. The distinction is worth pinning -- a traceback and a usage
+# message are different things for a user to debug -- and so is the coverage:
+# every one of these 18 was a real check in the source with nothing asserting it.
+@pytest.mark.parametrize("flag,value", [
+    ("--steps", "0"), ("--steps", "-3"),
+    ("--d", "0"), ("--d", "-8"),
+    ("--layers", "0"),
+    ("--heads", "0"), ("--heads", "-1"),
+    ("--ctx", "0"), ("--ctx", "-4"),
+    ("--batch", "0"),
+    ("--lr", "0"), ("--lr", "-1.0"), ("--lr", "nan"),
+    ("--wd", "-1"), ("--wd", "nan"),
+    ("--grad_clip", "0"),
+    ("--epsilon", "0"), ("--epsilon", "inf"),
+    ("--beta-m", "-1"), ("--beta-v", "-1"), ("--beta-m", "1.0"),
+    ("--tok_records", "-1"),
+    ("--threads", "0"),
+    ("--rawr-sparsity", "-0.1"), ("--rawr-sparsity", "1.5"),
+    ("--rawr-min-degree", "0"),
+    ("--vocab", "0"),
+])
+def test_main_validates_numeric_arguments(tmp_path, monkeypatch, flag, value):
+    """The ValueError names the flag, so the user knows which one to fix."""
+    data = _corpus(tmp_path)
+    argv = _train_argv(tmp_path / "run", data) + [flag, value]
+    with pytest.raises(ValueError) as e:
+        _run_main(monkeypatch, argv)
+    # --rawr-sparsity and friends are reported by their argparse dest name, so
+    # normalise the flag the same way; the rest already match verbatim.
+    # Each check names the offending option, though not consistently: most spell
+    # it the way the user typed it, while --beta-m reports its argparse dest
+    # (beta_m). Both are accepted here. The real exception is
+    # --rawr-min-degree, which is validated inside rawr_graph.build_graph and so
+    # reports "min_degree must be >= 1" -- the concept rather than the spelling.
+    # Still fail-fast and still correct; recorded here so the difference is
+    # deliberate rather than surprising, and so a change in wording is noticed.
+    dest = flag.lstrip("-").replace("-", "_")
+    accepted = {dest, flag} | ({"min_degree"} if flag == "--rawr-min-degree" else set())
+    assert any(a in str(e.value) for a in accepted), (flag, value, str(e.value))
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--optimizer", "adam"),          # not a house optimizer
+    ("--architecture", "sparse"),
+    ("--embedding-storage", "disk"),
+    ("--precision", "bf16"),
+    ("--state-dtype", "fp64"),
+])
+def test_main_rejects_out_of_range_choices_at_parse_time(tmp_path, monkeypatch, flag, value):
+    """argparse choices fail at parse time with a usage error, not a traceback."""
+    data = _corpus(tmp_path)
+    argv = _train_argv(tmp_path / "run", data) + [flag, value]
+    with pytest.raises(SystemExit) as e:
+        _run_main(monkeypatch, argv)
+    assert e.value.code == 2
+
+
+def test_main_does_not_leave_a_partial_checkpoint_after_a_validation_error(tmp_path, monkeypatch):
+    """A rejected run must not leave a directory that looks trained."""
+    out = tmp_path / "run"
+    with pytest.raises(ValueError):
+        _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path)) + ["--lr", "0"])
+    assert not (out / "model.safetensors").exists()
+    assert not (out / "config.json").exists()
+    assert not (out / "optimizer.json").exists()
+
+
+def test_main_uses_the_preset_when_given(tmp_path, monkeypatch, capsys):
+    """--preset must override the explicit dims on the command line."""
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path), ("--preset", "2K")))
+    import json
+    cfg = json.loads((out / "config.json").read_text())
+    from train import PRESETS
+    p = PRESETS["2K"]
+    assert (cfg["d_model"], cfg["n_layer"], cfg["n_heads"]) == (p["d"], p["layers"], p["heads"])
