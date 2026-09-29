@@ -1815,3 +1815,403 @@ def test_lion_and_smaul_clip_agree_on_the_same_gradients():
     assert bf16_norm == pytest.approx(_exact_norm([pre]), rel=1e-9)
     assert bf16_norm == pytest.approx(fp32_norm, rel=1e-3)   # bf16 input rounding
     assert float(p1.grad.float().norm()) <= 1.0 + 1e-3      # and it did rescale
+
+
+# ---------------------------------------------------------------------------
+# _load_smaul_states is a wall of deliberate refusals -- "refusing partial
+# load", "refusing to guess", "refusing to pretend state exists". The happy path
+# is covered by test_fp8_state_survives_checkpoint above; none of the guards
+# were. A guard that silently stops raising does not fail loudly, it accepts a
+# corrupt or mismatched checkpoint and resumes a run with the wrong optimizer
+# state, which is the one outcome this function exists to prevent.
+# ---------------------------------------------------------------------------
+
+def _trained_fp8_checkpoint(tmp_path, factor_v=True, steps=2, sdt="fp32"):
+    """A real checkpoint with real state, plus the blobs, for corruption."""
+    from safetensors.torch import load_file
+    torch.manual_seed(11)
+    d = tmp_path / f"ck_{factor_v}_{sdt}"
+    d.mkdir(exist_ok=True)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                       precision="fp8", architecture="plain")
+    model = SmaulLinear(cfg)
+    assert fp8_modules(model), "expected FP8 modules"
+    opt = SmaulOpt(list(model.parameters()), lr=1e-4, state_dtype=sdt, factor_v=factor_v)
+    ids = torch.randint(0, 64, (2, 8))
+    for _ in range(steps):
+        opt.zero_grad(model)
+        _, loss = model(ids, ids)
+        loss.backward()
+        opt.step(model)
+    model.save_pretrained(d)
+    _save_optimizer(d, opt, model)
+    sp = d / "optimizer_state.safetensors"
+    # steps=0 produces no state at all, and _save_smaul_states correctly writes
+    # nothing in that case, so there is no file to read.
+    blobs = load_file(str(sp), device="cpu") if sp.exists() else {}
+    return d, model, opt, ids, blobs
+
+
+def _reloaded(d):
+    return SmaulLinear.from_pretrained(d), SmaulOpt(list(SmaulLinear.from_pretrained(d).parameters()))
+
+
+def _attempt(d, blobs):
+    """Write `blobs` over the checkpoint's state and try to resume from it."""
+    from safetensors.torch import save_file
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()))
+    sp = d / "optimizer_state.safetensors"
+    if sp.exists():
+        sp.unlink()
+    if blobs is not None:
+        save_file(blobs, str(sp))
+    return lambda: _load_optimizer(d, opt2, model2)
+
+
+def test_round_trip_restores_state_exactly(tmp_path):
+    """The baseline the guards protect: a resume is bit-identical in state."""
+    d, model, opt, _ids, blobs = _trained_fp8_checkpoint(tmp_path)
+    assert blobs, "expected a non-empty state file"
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()))
+    _load_optimizer(d, opt2, model2)
+    assert opt2.step_count == opt.step_count == 2
+    mods2 = dict(fp8_modules(model2))
+    for name, m in fp8_modules(model):
+        assert torch.equal(opt.m[m], opt2.m[mods2[name]]), name
+    _assert_v_sig_equal(_v_sig(opt2, model2), _v_sig(opt, model))
+
+
+def test_round_trip_restores_dense_param_state_too(tmp_path):
+    """The embedding is a dense Parameter, not an FP8 module; it uses the
+    other key prefix, and a guard that only understood fp8.* would drop it."""
+    d, model, opt, _ids, _blobs = _trained_fp8_checkpoint(tmp_path)
+    params2 = dict(SmaulLinear.from_pretrained(d).named_parameters())
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()))
+    _load_optimizer(d, opt2, model2)
+    dense = [n for n, _ in model.named_parameters() if n in params2]
+    assert dense, "expected dense parameters"
+    for n in dense:
+        p2 = params2[n]
+        if p2 in opt2.m:
+            assert torch.equal(opt.m[p2], opt2.m[p2]), n
+
+
+def test_resume_leaves_no_temp_state_file(tmp_path):
+    d, _m, _o, _i, _b = _trained_fp8_checkpoint(tmp_path)
+    assert [p.name for p in d.iterdir() if p.name.endswith(".tmp")] == []
+
+
+# --- a checkpoint that claims progress but carries no state ------------------
+
+def test_resume_refuses_a_missing_state_file_when_step_is_nonzero(tmp_path):
+    d, _m, _o, _i, _blobs = _trained_fp8_checkpoint(tmp_path)
+    (d / "optimizer_state.safetensors").unlink()
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()))
+    # A live optimizer that already has state: this is the "continuing a run
+    # whose checkpoint lost its state file" case, distinct from the JSON-only
+    # claim tested next.
+    opt2.load_state_dict(json.loads((d / "optimizer.json").read_text()))
+    opt2.m = {p: torch.zeros_like(p) for p in list(model2.parameters())[:1]}
+    assert opt2.step_count and opt2.m
+    with pytest.raises(ValueError, match="missing optimizer_state.safetensors"):
+        _load_optimizer(d, opt2, model2)
+
+
+def test_resume_refuses_to_pretend_state_exists(tmp_path):
+    """The distinct message when optimizer.json says step>0 but state is gone.
+
+    Same missing file, different question: the first case has live state in the
+    optimizer, the second has only the JSON's claim. Both must refuse, and the
+    message has to distinguish them or the operator cannot tell which happened.
+    """
+    d, _m, _o, _i, _blobs = _trained_fp8_checkpoint(tmp_path)
+    (d / "optimizer_state.safetensors").unlink()
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()))
+    opt2.load_state_dict(json.loads((d / "optimizer.json").read_text()))
+    opt2.m, opt2.v, opt2.v_row, opt2.v_col = {}, {}, {}, {}     # no live state
+    with pytest.raises(ValueError, match="refusing to pretend state exists"):
+        _load_optimizer(d, opt2, model2)
+
+
+def test_a_fresh_checkpoint_without_state_is_accepted(tmp_path):
+    """step=0 with no state file is a legitimate new run, not corruption."""
+    d, _m, _o, _i, _blobs = _trained_fp8_checkpoint(tmp_path, steps=0)
+    assert not (d / "optimizer_state.safetensors").exists()
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()))
+    _load_optimizer(d, opt2, model2)             # must not raise
+    assert opt2.step_count == 0
+
+
+# --- malformed keys ---------------------------------------------------------
+
+def test_resume_rejects_a_key_with_no_separator(tmp_path):
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path)
+    bad = dict(blobs)
+    bad["m"] = bad[next(iter(bad))].clone()   # clone: safetensors rejects aliases
+    with pytest.raises(ValueError, match="invalid SmaulOpt state key"):
+        _attempt(d, bad)()
+
+
+def test_resume_rejects_an_unknown_state_kind(tmp_path):
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path)
+    bad = dict(blobs)
+    first = next(iter(blobs))
+    bad["momentum." + first.split(".", 1)[1]] = bad[first].clone()
+    with pytest.raises(ValueError, match="invalid SmaulOpt state key"):
+        _attempt(d, bad)()
+
+
+def test_resume_rejects_an_unknown_key_prefix(tmp_path):
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path)
+    bad = dict(blobs)
+    first = next(iter(blobs))
+    bad["m.other." + first.split(".", 1)[1]] = bad[first].clone()
+    with pytest.raises(ValueError, match="invalid SmaulOpt state key"):
+        _attempt(d, bad)()
+
+
+def test_resume_rejects_state_for_a_parameter_that_no_longer_exists(tmp_path):
+    """A renamed or deleted parameter must not be silently skipped."""
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path)
+    bad = dict(blobs)
+    victim = next(k for k in bad if k.startswith("m.param."))
+    bad["m.param.no_such_parameter"] = bad.pop(victim)
+    with pytest.raises(ValueError, match="no matching parameter"):
+        _attempt(d, bad)()
+
+
+def test_resume_rejects_state_for_an_fp8_module_that_no_longer_exists(tmp_path):
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path)
+    bad = dict(blobs)
+    victim = next(k for k in bad if k.startswith("m.fp8."))
+    bad["m.fp8.no_such_module"] = bad.pop(victim)
+    with pytest.raises(ValueError, match="no matching FP8 module"):
+        _attempt(d, bad)()
+
+
+# --- inconsistent v representations ----------------------------------------
+
+def test_resume_rejects_a_half_written_factored_pair(tmp_path):
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path, factor_v=True)
+    assert any(k.startswith("v_col.") for k in blobs), "need a factored state"
+    bad = {k: v for k, v in blobs.items() if not k.startswith("v_col.")}
+    with pytest.raises(ValueError, match="refusing partial load"):
+        _attempt(d, bad)()
+
+
+def test_resume_rejects_full_and_factored_v_for_one_object(tmp_path):
+    """Never guess which of two v representations is meant."""
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path, factor_v=True)
+    row_key = next(k for k in blobs if k.startswith("v_row."))
+    base = row_key.split(".", 1)[1]
+    m_key = "m." + base
+    bad = dict(blobs)
+    bad["v." + base] = blobs[m_key].clone()          # both forms for one object
+    assert bad["v." + base].data_ptr() != blobs[row_key].data_ptr()
+    with pytest.raises(ValueError, match="refusing to guess"):
+        _attempt(d, bad)()
+
+
+def test_resume_rejects_an_object_with_no_v_at_all(tmp_path):
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path)
+    base = next(k for k in blobs if k.startswith("v.")).split(".", 1)[1]
+    bad = {k: v for k, v in blobs.items() if k not in ("v." + base,)}
+    with pytest.raises(ValueError, match="no v at all"):
+        _attempt(d, bad)()
+
+
+def test_resume_rejects_transposed_marginals(tmp_path):
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path, factor_v=True)
+    # A swap is only detectable when the two extents differ, so pick a
+    # non-square 2-D state.
+    square = None
+    for k in blobs:
+        if not k.startswith("v_col."):
+            continue
+        base = k.split(".", 1)[1]
+        m = blobs.get("m." + base)
+        if m is not None and m.dim() == 2 and m.shape[0] != m.shape[1]:
+            square = base
+            break
+    assert square is not None, "fixture needs a non-square 2-D state"
+    bad = dict(blobs)
+    bad["v_row." + square] = blobs["v_col." + square].clone()
+    bad["v_col." + square] = blobs["v_row." + square].clone()
+    with pytest.raises(ValueError, match="transposed or mismatched pair"):
+        _attempt(d, bad)()
+
+
+# --- shape and architecture mismatches -------------------------------------
+
+def test_resume_rejects_marginals_that_do_not_match_their_own_extent(tmp_path):
+    """The check that replaced an unreachable one: lengths against m.
+
+    The old guard compared v_row's shape to v_col's reversed shape, which can
+    never fire because both are 1-D -- `shape[::-1]` is the shape. This is the
+    invariant it was reaching for.
+    """
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path, factor_v=True)
+    base = None
+    for k in blobs:
+        if k.startswith("v_row."):
+            cand = k.split(".", 1)[1]
+            m = blobs.get("m." + cand)
+            if m is not None and m.dim() == 2:
+                base = cand
+                break
+    assert base is not None
+    bad = dict(blobs)
+    bad["v_row." + base] = blobs["v_row." + base].reshape(1, -1)   # 2-D marginal
+    with pytest.raises(ValueError, match="transposed or mismatched pair"):
+        _attempt(d, bad)()
+
+
+def test_square_states_cannot_be_caught_by_shape_alone(tmp_path):
+    """Documented limit of the new check, so it is not oversold.
+
+    For a square 2-D state the two marginals have the same length, so swapping
+    them is invisible to any shape comparison -- only a value comparison would
+    catch it, and none is made. The new guard catches every non-square case,
+    which is all of them in practice.
+    """
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path, factor_v=True)
+    squares = []
+    for k in blobs:
+        if not k.startswith("v_col."):
+            continue
+        base_k = k.split(".", 1)[1]
+        m = blobs.get("m." + base_k)
+        if m is not None and m.dim() == 2 and m.shape[0] == m.shape[1]:
+            squares.append(base_k)
+    if not squares:
+        pytest.skip("fixture produced no square 2-D state")
+    # It loads without complaint, which is the point: shape checks cannot help here.
+    _attempt(d, blobs)()
+
+
+def test_resume_rejects_a_state_of_the_wrong_shape(tmp_path):
+    """The arch-changed case: same names, different extents."""
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path)
+    victim = next(k for k in blobs if k.startswith("m.fp8."))
+    bad = dict(blobs)
+    base = victim.split(".", 1)[1]
+    bad[victim] = torch.zeros(blobs[victim].shape[0] + 8, blobs[victim].shape[1])
+    # Keep the marginals consistent with the widened m, so the live-object shape
+    # check is the one that fires rather than the marginal check.
+    for prefix in ("v_row", "v_col", "v"):
+        k = prefix + "." + base
+        if k in bad:
+            t = bad[k]
+            if t.dim() == 1:
+                # v_row is R long and v_col is C long, for the *widened* m.
+                n = bad[victim].shape[0] if prefix == "v_row" else bad[victim].shape[1]
+                bad[k] = torch.zeros(n)
+    with pytest.raises(ValueError, match="checkpoint incompatible"):
+        _attempt(d, bad)()
+
+
+def test_resume_rejects_m_and_v_of_different_shapes(tmp_path):
+    d, _m, _o, _i, blobs = _trained_fp8_checkpoint(tmp_path, factor_v=False)
+    assert any(k.startswith("v.") for k in blobs), "need a full-v state"
+    victim = next(k for k in blobs if k.startswith("v."))
+    bad = dict(blobs)
+    bad[victim] = torch.zeros(blobs[victim].shape[0], blobs[victim].shape[1] + 3)
+    with pytest.raises(ValueError, match="m/v shape mismatch"):
+        _attempt(d, bad)()
+
+
+def test_resume_reports_an_unreadable_state_file(tmp_path):
+    d, _m, _o, _i, _blobs = _trained_fp8_checkpoint(tmp_path)
+    (d / "optimizer_state.safetensors").write_bytes(b"not a safetensors file")
+    with pytest.raises((RuntimeError, ValueError)) as e:
+        _attempt(d, None)()
+    assert "state" in str(e.value).lower() or "safetensors" in str(e.value).lower()
+
+
+# --- full-v vs factored-v across a resume ----------------------------------
+
+def test_resume_refuses_a_factored_state_when_factor_v_is_disabled(tmp_path):
+    """Expanding a factored v into a full v would have to invent the rank term."""
+    d, _m, _o, _i, _blobs = _trained_fp8_checkpoint(tmp_path, factor_v=True)
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()), factor_v=False)
+    with pytest.raises(ValueError, match="factor_v is disabled"):
+        _load_optimizer(d, opt2, model2)
+
+
+def test_resume_migrates_a_full_v_state_to_factored(tmp_path):
+    """The documented migration, and the claim it makes is checkable.
+
+    "the marginals of a stored v are exactly recoverable, so R and C are
+    preserved exactly; only the rank term is dropped" -- so the migrated
+    row/col means must equal the original tensor's means, not merely be close.
+    """
+    d, _m, _o, _i, _blobs = _trained_fp8_checkpoint(tmp_path, factor_v=False)
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()), factor_v=True, state_dtype="fp32")
+    _load_optimizer(d, opt2, model2)
+    assert opt2.v_row, "expected the full v to have been migrated"
+    assert not any(o in opt2.v for o in opt2.v_row), "a migrated object kept both forms"
+    # The pre-migration tensor is gone, so compare against the checkpoint's own
+    # stored full v.
+    from safetensors.torch import load_file
+    blobs = load_file(str(d / "optimizer_state.safetensors"), device="cpu")
+    stored = {k: v for k, v in blobs.items() if k.startswith("v.")}
+    assert stored, "the fixture must have stored a full v"
+    by_name = dict(model2.named_parameters())
+    by_name.update(dict(fp8_modules(model2)))
+    checked, kept = 0, 0
+    for k, v in stored.items():
+        obj_name = k.split(".", 1)[1].split(".", 1)[1]
+        obj = by_name.get(obj_name)
+        assert obj is not None, obj_name
+        if obj in opt2.v_row:
+            # 2-D with both extents >= 2: migrated to marginals.
+            assert torch.allclose(opt2.v_row[obj].float(), v.float().mean(dim=1), atol=1e-6), obj_name
+            assert torch.allclose(opt2.v_col[obj].float(), v.float().mean(dim=0), atol=1e-6), obj_name
+            assert obj not in opt2.v, obj_name
+            checked += 1
+        else:
+            # 1-D/0-D states cannot be factored and must keep the full v.
+            assert obj in opt2.v, obj_name
+            kept += 1
+    assert checked, "expected at least one migrated 2-D state"
+    assert kept, "expected at least one unfactorable 1-D state"
+
+
+def test_migrated_state_is_saved_back_in_factored_form(tmp_path):
+    """The message promises the next save writes the factored form; check it."""
+    d, _m, _o, _i, _blobs = _trained_fp8_checkpoint(tmp_path, factor_v=False)
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()), factor_v=True, state_dtype="fp32")
+    _load_optimizer(d, opt2, model2)
+    out2 = tmp_path / "resaved"
+    out2.mkdir()
+    model2.save_pretrained(out2)
+    _save_optimizer(out2, opt2, model2)
+    from safetensors.torch import load_file
+    blobs = load_file(str(out2 / "optimizer_state.safetensors"), device="cpu")
+    assert any(k.startswith("v_row.") for k in blobs), sorted(blobs)[:5]
+    # And that file must load back without needing another migration.
+    model3 = SmaulLinear.from_pretrained(out2)
+    opt3 = SmaulOpt(list(model3.parameters()), factor_v=True, state_dtype="fp32")
+    _load_optimizer(out2, opt3, model3)
+    _assert_v_sig_equal(_v_sig(opt3, model3), _v_sig(opt2, model2))
+
+
+@pytest.mark.parametrize("sdt", ["bf16", "fp16", "fp32"])
+def test_restored_state_keeps_the_declared_storage_width(tmp_path, sdt):
+    """A resumed run must not silently widen or narrow its own state."""
+    d, _m, _o, _i, _blobs = _trained_fp8_checkpoint(tmp_path, sdt=sdt)
+    want = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[sdt]
+    model2 = SmaulLinear.from_pretrained(d)
+    opt2 = SmaulOpt(list(model2.parameters()), state_dtype=sdt)
+    _load_optimizer(d, opt2, model2)
+    for t in list(opt2.m.values()) + list(opt2.v_row.values()) + list(opt2.v_col.values()):
+        assert t.dtype == want, (sdt, t.dtype)
