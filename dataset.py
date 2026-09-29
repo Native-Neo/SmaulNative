@@ -419,7 +419,7 @@ def _preprocess_conversation(conversations: List[Dict], tokenizer: TokenizerWrap
 
 
 def discover_sft_records(dataset_dir: Path) -> List[Dict]:
-    records = []
+    records_out: List[Dict] = []
     for path in discover_files(dataset_dir):
         if path.suffix.lower() not in (".json", ".jsonl"):
             continue
@@ -438,16 +438,31 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
                         # Accept both {"conversations": [...]} and {"data": {"conversations": ...}}.
                         if isinstance(obj, dict) and isinstance(obj.get("data"), dict):
                             obj = obj["data"]
-                        records.append(obj)
+                        records_out.append(obj)
             else:
                 data = json.loads(path.read_text(encoding="utf-8-sig", errors="replace"))
+                # Only unwrap {"data": [...]} when data is a list; a legit
+                # string field named "data" must not misfire.
                 if isinstance(data, dict) and isinstance(data.get("data"), list):
-                    records.extend(data["data"])
+                    records = data["data"]
                 else:
-                    records.extend(data if isinstance(data, list) else [data])
+                    records = data
+                if not isinstance(records, list):
+                    records = [records]
+                for i, record_obj in enumerate(records, 1):
+                    # Same per-record {"data": {...}} unwrap the .jsonl branch
+                    # does. Without it a single wrapped export -- the whole file
+                    # being {"data": {"conversations": ...}} -- is filtered out
+                    # below and the dataset silently loads as empty.
+                    if isinstance(record_obj, dict) and isinstance(record_obj.get("data"), dict):
+                        record_obj = record_obj["data"]
+                    if isinstance(record_obj, dict) and isinstance(record_obj.get("conversations"), list) \
+                            and record_obj["conversations"]:
+                        records_out.append(record_obj)
         except Exception as e:
             print(f"[WARN] skipping SFT file {path}: {type(e).__name__}: {e}")
             continue
+    records = records_out
     records = [r for r in records if isinstance(r, dict) and isinstance(r.get("conversations"), list)
                and r["conversations"]]
     if not records:
