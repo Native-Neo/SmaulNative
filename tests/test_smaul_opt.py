@@ -2346,3 +2346,103 @@ def test_lion_load_state_dict_is_tolerant():
     opt = Lion(_p())
     opt.load_state_dict({"name": "smaul", "lr": 5e-4, "step": 3, "factor_v": True})
     assert opt.lr == 5e-4, "Lion should take the hyperparameters it understands"
+
+
+# ---------------------------------------------------------------------------
+# AGENTS.md: "FP8 weight gradients accumulate in module._gw, not .grad, and
+# accumulate across backward calls. Any optimizer must call zero_grad(model)
+# *with the model* or _gw double-counts."
+#
+# The second sentence is about zero_grad; the first is a stronger property and it
+# is what makes gradient accumulation usable with the FP8 path at all. Two
+# backward calls followed by one step must equal one big backward exactly -- if
+# _gw were overwritten rather than accumulated, or zeroed between the backwards,
+# the weights would drift with no error anywhere.
+# ---------------------------------------------------------------------------
+
+def _fp8_model(seed=0):
+    torch.manual_seed(seed)
+    cfg = LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2, tile=32,
+                       precision="fp8", architecture="plain")
+    model = SmaulLinear(cfg)
+    assert fp8_modules(model), "expected FP8 modules"
+    return model
+
+
+def test_micro_batched_backward_equals_one_big_backward():
+    """Two backwards, one step -- bit-identical to a single fused backward."""
+    a, b = _fp8_model(), _fp8_model(0)
+    b.load_state_dict(a.state_dict())
+    oa = Lion(list(a.parameters()), lr=1e-2)
+    ob = Lion(list(b.parameters()), lr=1e-2)
+    x1 = torch.randint(0, 64, (1, 8))
+    x2 = torch.randint(0, 64, (1, 8))
+
+    oa.zero_grad(a)
+    _, l1 = a(x1, x1); l1.backward()
+    _, l2 = a(x2, x2); l2.backward()
+    assert all(m._gw is not None for _, m in fp8_modules(a))
+    oa.step(a)
+
+    ob.zero_grad(b)
+    big = torch.cat([x1, x2])
+    _, l3 = b(big, big); l3.backward()
+    ob.step(b)
+
+    sa, sb = a.state_dict(), b.state_dict()
+    assert set(sa) == set(sb)
+    worst = 0.0
+    for k in sa:
+        if sa[k].dtype.is_floating_point:
+            worst = max(worst, float((sa[k].float() - sb[k].float()).abs().max()))
+    assert worst == 0.0, f"accumulation changed the result by {worst}"
+
+
+def test_gw_is_cleared_after_every_step_not_just_the_first():
+    """So a second step cannot start from the first step's gradients."""
+    model = _fp8_model()
+    opt = Lion(list(model.parameters()), lr=1e-3)
+    ids = torch.randint(0, 64, (2, 8))
+    for step in range(1, 4):
+        opt.zero_grad(model)
+        _, loss = model(ids, ids)
+        loss.backward()
+        assert all(m._gw is not None for _, m in fp8_modules(model)), step
+        opt.step(model)
+        assert all(m._gw is None for _, m in fp8_modules(model)), \
+            f"_gw survived step {step}, so step {step + 1} would double-count"
+
+
+def test_zero_grad_without_the_model_warns_and_leaves_gw_alone(tmp_path, capsys):
+    """The documented footgun: zero_grad() with no model cannot reach _gw.
+
+    AGENTS.md calls this out, so it is pinned as the behaviour it has: a
+    RuntimeWarning rather than an error, and the stale _gw survives -- which is
+    exactly why passing the model is required. (RuntimeWarning, not
+    UserWarning: I guessed UserWarning first and the test passed only because a
+    failure to warn looks identical to a failure to warn for the right reason.)
+    """
+    model = _fp8_model()
+    opt = Lion(list(model.parameters()), lr=1e-3)
+    ids = torch.randint(0, 64, (2, 8))
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
+    loss.backward()
+    assert all(m._gw is not None for _, m in fp8_modules(model))
+
+    with pytest.warns(RuntimeWarning, match="_gw"):
+        opt.zero_grad()
+    assert all(m._gw is not None for _, m in fp8_modules(model)), \
+        "zero_grad() cleared _gw after all, so the warning overstates the problem"
+
+
+def test_zero_grad_with_the_model_clears_gw_and_the_dense_grads():
+    model = _fp8_model()
+    opt = Lion(list(model.parameters()), lr=1e-3)
+    ids = torch.randint(0, 64, (2, 8))
+    opt.zero_grad(model)
+    _, loss = model(ids, ids)
+    loss.backward()
+    opt.zero_grad(model)
+    assert all(m._gw is None for _, m in fp8_modules(model))
+    assert all(p.grad is None for p in model.parameters() if p.grad is not None)
