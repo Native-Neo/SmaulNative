@@ -9,7 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 import syntheticdata
-from syntheticdata import (_DS_TEMPLATES, _QUICKSORT_BY_LANG, _descending_variant,
+from syntheticdata import (_DS_FENCE, _DS_TEMPLATES, _LANG_FENCE, _QUICKSORT_BY_LANG,
+                            _descending_variant,
                             export_dataset_iter, format_chatml,
                             gen_cyber_security_qa, gen_data_structure_code,
                             gen_linear_equation, gen_quadratic_equation,
@@ -396,3 +397,72 @@ def test_cli_generates_a_dataset(tmp_path, monkeypatch):
     syntheticdata.main()
     lines = (out / "synthetic_bilingual.jsonl").read_text().splitlines()
     assert len(lines) == 12
+
+
+# ---------------------------------------------------------------------------
+# Two guarantees docs/syntheticdata.md states about these generators, neither of
+# which was pinned. They are worth pinning in the file that makes them.
+# ---------------------------------------------------------------------------
+
+def test_the_fenced_language_always_matches_the_prompt_language():
+    """"The prompt language/code in each sample always matches the emitted code."
+
+    The fence tag is looked up from a table, so this holds only if the table has
+    an entry for every language a body can be selected under. A new language
+    without a fence entry would KeyError, and a mismatched entry would ship
+    Python tagged as rust.
+    """
+    for _ in range(300):
+        s = gen_data_structure_code()
+        lang = re.match(r"Implement a \w+ data structure in (\S+)", s["instruction"]).group(1)
+        fence = re.search(r"```(\w+)", s["response"]).group(1)
+        assert fence == _DS_FENCE[lang], (lang, fence)
+    seen = set()
+    for _ in range(300):
+        s = gen_sorting_algorithm_code()
+        lang = re.search(r"implementation of \*\*Quick Sort\*\* in \*\*(\S+?)\*\*", s["response"]).group(1)
+        fence = re.search(r"```(\w+)", s["response"]).group(1)
+        assert lang in _LANG_FENCE, lang
+        assert _LANG_FENCE[lang] == fence, (lang, fence)
+        seen.add(lang)
+    assert seen == set(_LANG_FENCE), f"not every language was emitted: {seen}"
+
+
+def test_every_language_in_the_tables_has_a_fence_entry():
+    """The tables and the fences have to stay in step, in both directions."""
+    assert set(_LANG_FENCE) == set(_QUICKSORT_BY_LANG)
+    assert set(_DS_FENCE) == {lang for _ds, lang in _DS_TEMPLATES}
+
+
+def test_linear_answers_give_an_exact_fraction_and_a_marked_approximation():
+    """"the exact fraction plus an explicitly approximate decimal, never a rounded
+    value presented as exact"."""
+    for _ in range(200):
+        s = gen_linear_equation()
+        body = s["response"]
+        fractions = re.findall(r"x = (-?\d+)/(-?\d+)", body)
+        assert fractions, body
+        for num, den in fractions:
+            # The fraction is exact: it is (c - b) / a verbatim.
+            assert num == str(int(num)), num
+            assert int(den) != 0
+        # Every decimal is introduced by \approx, never presented as exact.
+        decimals = re.findall(r"(-?\d+\.\d{4})", body)
+        assert decimals, body
+        for value in decimals:
+            idx = body.index(value)
+            before = body[max(0, idx - 12):idx]
+            assert "approx" in before or "\\frac" in before, (value, before)
+        assert "approx" in body, "no approximation marker at all"
+
+
+def test_hindi_answers_carry_the_same_approximation_marker():
+    """The guarantee is stated for both languages, so check the Hindi half too."""
+    seen = 0
+    for _ in range(400):
+        s = gen_linear_equation()
+        if s["domain"] != "math_algebra_hi":
+            continue
+        seen += 1
+        assert "\\approx" in s["response"], s["response"][-160:]
+    assert seen, "no Hindi samples were generated, so this proved nothing"
