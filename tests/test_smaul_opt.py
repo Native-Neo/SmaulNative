@@ -2215,3 +2215,134 @@ def test_restored_state_keeps_the_declared_storage_width(tmp_path, sdt):
     _load_optimizer(d, opt2, model2)
     for t in list(opt2.m.values()) + list(opt2.v_row.values()) + list(opt2.v_col.values()):
         assert t.dtype == want, (sdt, t.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Lion validated one of its five hyperparameters. AGENTS.md states the house
+# style as "validate inputs eagerly and raise ValueError at boundaries
+# (constructors and CLI parsing both do this)", and SmaulOpt implements that for
+# every one of its own -- so Lion was the odd one out, and it is the default
+# optimizer.
+# ---------------------------------------------------------------------------
+
+def _p():
+    return [torch.nn.Parameter(torch.randn(3))]
+
+
+@pytest.mark.parametrize("kw", [
+    dict(lr=-1.0), dict(lr=0.0), dict(lr=float("nan")), dict(lr=float("inf")),
+    dict(betas=(2.0, 0.99)), dict(betas=(-0.5, 0.9)), dict(betas=(0.9, 1.5)),
+    dict(betas=(0.9,)),                       # too short
+    dict(betas="ab"),                          # not a pair at all
+    dict(betas=("a", "b")),
+    dict(wd=-1.0), dict(wd=float("inf")), dict(wd=float("nan")),
+    dict(clip=0.0), dict(clip=-1.0), dict(clip=float("nan")),
+])
+def test_lion_rejects_bad_hyperparameters(kw):
+    with pytest.raises(ValueError):
+        Lion(_p(), **kw)
+
+
+def test_a_run_cannot_start_with_a_nan_learning_rate():
+    """Why the check is in the constructor rather than in step().
+
+    Lion(lr=nan) used to be accepted and turned every weight into NaN on the
+    first step, with no error -- which in a long run reads as a divergence that
+    never gets attributed to the constructor. Now the run refuses to start.
+    """
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+
+    model = M()
+    before = model.w.detach().clone()
+    with pytest.raises(ValueError, match="lr must be positive finite"):
+        Lion(model.parameters(), lr=float("nan"))
+    assert torch.equal(model.w.detach(), before), "construction touched the weights"
+    # And a healthy lr leaves them finite, which is the contrast that matters.
+    opt = Lion(model.parameters(), lr=1e-2)
+    for _ in range(3):
+        opt.zero_grad(model)
+        (model.w * 2).sum().backward()
+        opt.step(model)
+    assert torch.isfinite(model.w).all()
+
+
+def test_a_negative_learning_rate_is_refused_rather_than_ascending():
+    """Lion sign-steps by lr, so a negative lr walks uphill, silently."""
+    with pytest.raises(ValueError, match="lr must be positive finite"):
+        Lion(_p(), lr=-1e-2)
+
+
+def test_lion_accepts_the_values_train_py_and_rl_py_pass():
+    """Coercion, not rejection: numeric strings and ints stay usable."""
+    # betas=1.0 is *not* accepted: the range is [0, 1) in both optimizers, since
+    # a beta of exactly 1 means momentum never decays.
+    opt = Lion(_p(), lr="1e-4", betas=(0, 0.99), wd=0)
+    assert opt.lr == 1e-4 and opt.b1 == 0.0 and opt.wd == 0.0
+
+
+def test_lion_defaults_are_unchanged():
+    opt = Lion(_p())
+    assert (opt.lr, opt.b1, opt.b2, opt.wd, opt.clip) == (1e-4, 0.9, 0.99, 0.01, 1.0)
+
+
+def test_both_optimizers_agree_on_what_a_valid_hyperparameter_is():
+    """The two constructors must not drift into different contracts."""
+    bad = [dict(lr=-1.0), dict(clip=0.0), dict(lr=float("nan"))]
+    for kw in bad:
+        with pytest.raises(ValueError):
+            Lion(_p(), **kw)
+        with pytest.raises(ValueError):
+            SmaulOpt(_p(), **{"lr": kw["lr"]} if "lr" in kw else kw)
+
+
+@pytest.mark.parametrize("dt", ["bf16", "fp16", "fp32"])
+def test_smaul_opt_rejects_an_unknown_state_dtype(dt):
+    with pytest.raises(ValueError, match="state_dtype"):
+        SmaulOpt(_p(), state_dtype="fp64")
+
+
+@pytest.mark.parametrize("value", [-1.0, 0.0, float("nan"), float("inf"), "x", None])
+def test_smaul_opt_rejects_bad_lr(value):
+    with pytest.raises(ValueError, match="lr"):
+        SmaulOpt(_p(), lr=value)
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.0, 2.0, float("nan"), "x"])
+def test_smaul_opt_rejects_bad_betas(value):
+    with pytest.raises(ValueError, match="beta"):
+        SmaulOpt(_p(), beta_m=value)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf"), "x"])
+def test_smaul_opt_rejects_a_bad_epsilon(value):
+    with pytest.raises(ValueError, match="epsilon"):
+        SmaulOpt(_p(), epsilon=value)
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), "x"])
+def test_smaul_opt_rejects_a_bad_weight_decay(value):
+    # 0.0 is valid: no decay. Only negatives and non-finites are not.
+    with pytest.raises(ValueError, match="weight_decay"):
+        SmaulOpt(_p(), weight_decay=value)
+    assert SmaulOpt(_p(), weight_decay=0.0).weight_decay == 0.0
+
+
+def test_smaul_opt_rejects_a_non_smaul_checkpoint():
+    """m/v state is not interchangeable with another optimizer's."""
+    opt = SmaulOpt(_p())
+    with pytest.raises(ValueError, match="no optimizer name"):
+        opt.load_state_dict({"lr": 1e-4})
+    with pytest.raises(ValueError, match="cannot load optimizer"):
+        opt.load_state_dict({"name": "lion", "lr": 1e-4})
+    with pytest.raises(ValueError, match="must be a dict"):
+        opt.load_state_dict(["not", "a", "dict"])
+
+
+def test_lion_load_state_dict_is_tolerant():
+    """Lion needs no momentum state, so a SmaulOpt checkpoint is readable."""
+    opt = Lion(_p())
+    opt.load_state_dict({"name": "smaul", "lr": 5e-4, "step": 3, "factor_v": True})
+    assert opt.lr == 5e-4, "Lion should take the hyperparameters it understands"
