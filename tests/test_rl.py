@@ -1285,3 +1285,60 @@ def test_generate_falls_back_when_the_model_has_no_prefill(tmp_path, monkeypatch
     finally:
         type(rl.model).prefill = saved
     assert len(old) == len(tokens) > 0 and isinstance(text, str)
+
+
+# ---------------------------------------------------------------------------
+# docs/autorl.md: "skips non-finite losses, and never marks a random model as
+# trained (valid == 0 leaves the checkpoint alone)". The "valid == 0" half was
+# tested only for structurally unusable records -- a NaN reward model is the other
+# way to get there, and the one where a checkpoint would otherwise record a
+# training run that never validated anything.
+# ---------------------------------------------------------------------------
+
+def test_a_non_finite_reward_model_never_gets_marked_as_trained(tmp_path, capsys):
+    a = _autorl(tmp_path)
+    _write_prefs(a.preference_path, _prefs(4))
+    # A diverged reward model scores NaN, so every pairwise loss is NaN.
+    with torch.no_grad():
+        for p in a.preference_model.parameters():
+            p.fill_(float("nan"))
+    assert not torch.isfinite(a.preference_scores("hello", [{"text": "a"}, {"text": "b"}])).all()
+
+    assert a.train_preferences(1, 1e-3) == 4, "records were still read"
+    printed = capsys.readouterr().out
+    assert printed.count("skipping non-finite preference loss") == 4, printed[-300:]
+    assert "no valid records trained" in printed
+    assert a.preference_trained == 0
+    assert not a.preference_model_path.exists(), "a checkpoint was written for a run that validated nothing"
+
+
+def test_a_non_finite_reward_model_leaves_a_previous_checkpoint_intact(tmp_path, capsys):
+    """The stronger form: a good checkpoint must survive a diverged round."""
+    a = _autorl(tmp_path)
+    _write_prefs(a.preference_path, _prefs(4))
+    a.train_preferences(1, 1e-2)
+    assert a.preference_model_path.exists()
+    before = a.preference_model_path.read_bytes()
+    trained_before = a.preference_trained
+    capsys.readouterr()
+
+    with torch.no_grad():
+        for p in a.preference_model.parameters():
+            p.fill_(float("nan"))
+    # Two new records, so it is not "up to date" and actually tries to train.
+    with a.preference_path.open("a", encoding="utf-8") as fh:
+        for r in _prefs(6)[4:]:
+            fh.write(json.dumps(r) + "\n")
+    a.train_preferences(1, 1e-2)
+    assert "no valid records trained" in capsys.readouterr().out
+    assert a.preference_model_path.read_bytes() == before, "the checkpoint was overwritten"
+    assert a.preference_trained == trained_before
+
+
+def test_a_finite_reward_model_does_get_marked(tmp_path):
+    """The control: the guarantee above must not be vacuous."""
+    a = _autorl(tmp_path)
+    _write_prefs(a.preference_path, _prefs(4))
+    assert a.train_preferences(1, 1e-2) == 4
+    assert a.preference_trained == 4
+    assert a.preference_model_path.exists()
