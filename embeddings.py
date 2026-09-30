@@ -80,6 +80,13 @@ class MmapEmbedding(nn.Module):
 
         self.vocab_size = int(vocab_size)
         self.d_model = int(d_model)
+        # Whether this file is one we just created. Freshness used to be decided
+        # by sampling row 0 and the last row and checking they were zero, which
+        # meant a real checkpoint whose first and last rows happened to be all
+        # zeros had its entire table overwritten with N(0, 0.02) -- silently,
+        # with no warning and nothing to notice downstream except that the model
+        # had stopped working. Provenance is knowable; content is not.
+        fresh = True
         if path is None:
             fd, tmp = tempfile.mkstemp(prefix="smaul_emb_", suffix=".dat")
             os.close(fd)
@@ -92,6 +99,7 @@ class MmapEmbedding(nn.Module):
             self.path = Path(path)
             self._owns_file = False
             if self.path.exists():
+                fresh = False
                 if self.path.stat().st_size != self.vocab_size * self.d_model * 4:
                     raise ValueError(
                         f"mmap file {self.path} is {self.path.stat().st_size} bytes, "
@@ -107,13 +115,10 @@ class MmapEmbedding(nn.Module):
         self._mem = np.memmap(str(self.path), dtype=np.float32, mode="r+",
                               shape=(self.vocab_size, self.d_model))
         tensor = torch.from_numpy(self._mem)
-        # Fresh files read as zeros; give them the standard N(0, 0.02) init
-        # with chunked writes (never materializing a second full copy).
-        # Only sample edge rows to decide: scanning the whole mapping here
-        # would fault every page into RAM and defeat lazy paging.
-        _sample = tensor[:1].clone().detach()
-        _tail = tensor[-1:].clone().detach()
-        if bool((_sample == 0).all()) and bool((_tail == 0).all()):
+        # Only a file we just created is zero-filled, so give it the standard
+        # N(0, 0.02) init with chunked writes (never materializing a second full
+        # copy). An existing file is whatever it says it is and is left alone.
+        if fresh:
             with torch.no_grad():
                 for r0 in range(0, self.vocab_size, 1024):
                     r1 = min(self.vocab_size, r0 + 1024)
