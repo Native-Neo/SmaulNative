@@ -23,3 +23,7 @@ python stream_data.py --dataset hindi --max_records 1000 | \
   indentation is preserved (only blank edge lines stripped).
 - `auto`/`openthoughts` apply no script gate (lenient); mixed bilingual text that fails both
   script gates should use `--dataset auto` or tuned thresholds.
+- A record that is empty after normalization is always rejected, at any threshold. Every
+  other gate is tunable from the CLI, and `--min_chars 0 --min_unique 0` used to disable
+  both of the ones that would have caught it, emitting `{"text": ""}` for a record worth
+  nothing. The emptiness check does not depend on a threshold being left standing.
