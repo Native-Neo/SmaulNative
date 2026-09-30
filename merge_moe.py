@@ -3,6 +3,7 @@
 Each branch's block FFN becomes one expert; attention/embeddings/norms/head come from base."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -55,7 +56,24 @@ def merge(base_dir: Path, branch_dirs: list, out_dir: Path, top_k: int = 1, forc
     if top_k > n_exp:
         raise ValueError(f"top_k ({top_k}) exceeds expert count ({n_exp})")
     moe_cfg = LinearConfig(**{**base_cfg.__dict__, "is_moe": True, "num_experts": n_exp, "num_experts_per_tok": top_k})
-    model = SmaulLinear(moe_cfg)
+    # The routers are freshly initialised, which is intended (a dense checkpoint
+    # has no router to carry over, and a copied one would be meaningless). But
+    # "freshly initialised" did not mean "different every time": seeding from the
+    # inputs makes two merges of the same checkpoints produce the same model, so
+    # a merge can be verified, reproduced, or extended by one more expert without
+    # disturbing the ones already there. Without this, `blocks.0.ffn.gate.weight`
+    # was the only tensor that differed between two identical merges.
+    #
+    # fork_rng keeps the caller's global RNG untouched -- seeding it here would be
+    # a side effect on every later random draw in the process. No `devices`
+    # argument: passing devices=[] forks *nothing*, not even the CPU generator,
+    # which was the first thing this got wrong.
+    seed = int(hashlib.sha256(
+        "|".join([str(base_dir), *[str(b) for b in branch_dirs], str(top_k)]).encode()
+    ).hexdigest()[:8], 16)
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        model = SmaulLinear(moe_cfg)
     out_sd = model.state_dict()
     for k, v in base_sd.items():
         if ".ffn." in k or ".gate." in k:
