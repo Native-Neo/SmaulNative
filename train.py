@@ -165,10 +165,34 @@ def install_handlers() -> None:
 class Lion:
     def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), wd=0.01, clip=1.0):
         self.p = [p for p in params if p.requires_grad]
-        self.lr, self.b1, self.b2, self.wd = lr, betas[0], betas[1], wd
-        if clip <= 0:
-            raise ValueError(f"clip must be positive, got {clip}")
-        self.clip = clip
+        import math as _math
+        # Same fail-fast contract SmaulOpt applies to its own hyperparameters:
+        # coerce, then check finiteness and range. Only `clip` was checked here,
+        # so a negative learning rate silently ascended the loss, a beta outside
+        # [0, 1) ran the momentum away, and a NaN learning rate turned every
+        # weight into NaN without a word. train.py's CLI happens to validate
+        # these before reaching here, but Lion is also constructed directly --
+        # by rl.py, and by any caller importing it.
+        try:
+            _lr = float(lr)
+            _b1, _b2 = float(betas[0]), float(betas[1])
+            _wd = float(wd)
+            _clip = float(clip)
+        except (TypeError, ValueError, IndexError):
+            raise ValueError(
+                f"invalid hyperparameters lr={lr!r} betas={betas!r} "
+                f"wd={wd!r} clip={clip!r}") from None
+        if not _math.isfinite(_lr) or _lr <= 0:
+            raise ValueError(f"lr must be positive finite, got {lr!r}")
+        if not _math.isfinite(_b1) or not 0.0 <= _b1 < 1.0:
+            raise ValueError(f"betas[0] must be in [0, 1), got {betas[0]!r}")
+        if not _math.isfinite(_b2) or not 0.0 <= _b2 < 1.0:
+            raise ValueError(f"betas[1] must be in [0, 1), got {betas[1]!r}")
+        if not _math.isfinite(_wd) or _wd < 0:
+            raise ValueError(f"wd must be non-negative finite, got {wd!r}")
+        if not _math.isfinite(_clip) or _clip <= 0:
+            raise ValueError(f"clip must be positive finite, got {clip!r}")
+        self.lr, self.b1, self.b2, self.wd, self.clip = _lr, _b1, _b2, _wd, _clip
         self.m = {}
     def zero_grad(self, model=None):
         for p in self.p:
