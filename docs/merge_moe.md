@@ -37,8 +37,12 @@ python merge_moe.py --base ./runs/base --branches ./runs/branch1 ./runs/branch2 
 2. Copies every shared tensor straight from the base, skipping `.ffn.` and `.gate.`
    keys; a missing key or shape mismatch raises `ValueError`.
 3. Fills each expert from the corresponding branch's `.ffn.` tensors
-   (`.ffn.` -> `.ffn.experts.{e}.`); the router gate keeps its random init (a warning
-   is printed -- finetune before use).
+   (`.ffn.` -> `.ffn.experts.{e}.`); the router gate gets a fresh init (a warning
+   is printed -- finetune before use). "Fresh" is not "different every run": the
+   seed is derived from the base path, branch paths and `top_k`, so two merges of
+   the same inputs are byte-identical while a different branch set gets its own
+   routers. That matters because a merge is otherwise impossible to verify or to
+   extend by one expert without disturbing the routing of the ones already there.
 4. Writes `config.json` + `model.safetensors`, copies the base `tokenizer.json` so the
    output loads directly in `LinearInference`, plus a `merge_config.json` recording the
    base, branches, expert count, and top_k. Branch tokenizers must match the base when
