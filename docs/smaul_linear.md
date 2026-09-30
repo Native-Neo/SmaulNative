@@ -85,8 +85,15 @@ figure "NOT the model" for the same reason.
 
 `SmaulLinear.prefill(idx)` / `SmaulLinear.step(idx, states)` decode one token at a time from
 the carried linear-attention state, replacing a re-forward of the whole prefix per generated
-token (2.4x-21.5x for generation; see `inference.md`). `inference.py` drives them; training
-never calls them, and `Block.forward` remains the training path.
+token (2.4x-21.5x for generation; see `inference.md`). `inference.py` drives them, and so
+does `rl.py` -- for sampling candidates, not for the update. Training never calls
+them, and `Block.forward` remains the training path.
+
+`rl.py` carries its own copy of the slide rule rather than sharing one helper, so the two
+will need changing together if the window semantics ever move. Note the difference in
+scale: `inference.py`'s `MODEL_WINDOW` is 262144, so a full window never arises there,
+while `rl.py`'s is 512 -- and once the context fills it, the state no longer lines up
+with the window and every step re-prefills, which is where that path's speedup goes.
 
 ## Persistence
 
