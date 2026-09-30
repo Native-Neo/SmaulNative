@@ -415,3 +415,236 @@ def test_main_uses_the_preset_when_given(tmp_path, monkeypatch, capsys):
     from train import PRESETS
     p = PRESETS["2K"]
     assert (cfg["d_model"], cfg["n_layer"], cfg["n_heads"]) == (p["d"], p["layers"], p["heads"])
+
+
+# ---------------------------------------------------------------------------
+# The diverged-run guard. Every step whose loss or gradient norm is non-finite
+# is skipped and counted, and 50 in a row aborts. That is the only thing standing
+# between a diverging run and an infinite loop writing NaN checkpoints, and none
+# of it was exercised.
+#
+# There is no --resume flag in train.py, so the resume machinery in
+# dataset.PretrainStream is unreachable from here. docs/train.md says so.
+# ---------------------------------------------------------------------------
+
+def _corpus(tmp_path, reps=60, extra=""):
+    d = tmp_path / "corpus"
+    d.mkdir(exist_ok=True)
+    (d / "a.txt").write_text(
+        "hello world this is a small english corpus for a smoke test. " * reps
+        + extra, encoding="utf-8")
+    return d
+
+
+def _train_argv(out, data, extra=()):
+    return ["train.py", "--data", str(data), "--out", str(out),
+            "--d", "32", "--layers", "1", "--heads", "2", "--ffn_mult", "2.0",
+            "--ctx", "32", "--batch", "2", "--steps", "2", "--log_every", "1",
+            "--save_every", "1000", "--rawr-max-docs", "1",
+            "--rawr-max-tokens-per-doc", "64", "--tok_records", "2000",
+            "--vocab", "64", "--threads", "1", *extra]
+
+
+def _run_main(monkeypatch, argv):
+    import train
+    monkeypatch.setattr("sys.argv", argv)
+    train.STOP = False                 # a prior test may have tripped the handler
+    train.main()
+
+
+class _NaNLoss(SmaulLinear):
+    """Real model, real step, but the loss is not finite."""
+    bad = True
+
+    def forward(self, x, y, **kw):
+        logits, loss = super().forward(x, y, **kw)
+        if self.bad:
+            return logits, torch.tensor(float("nan"), requires_grad=True)
+        return logits, loss
+
+
+def _patch_model(monkeypatch, cls):
+    monkeypatch.setattr("train.SmaulLinear", cls)
+
+
+def test_a_non_finite_loss_step_is_skipped_and_counted(tmp_path, monkeypatch, capsys):
+    _patch_model(monkeypatch, _NaNLoss)
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path), ("--steps", "3",)))
+    printed = capsys.readouterr().out
+    assert "non-finite loss, skip step 0 (1 consecutive)" in printed
+    # A skipped step does not count towards the step budget.
+    assert "no steps completed" in printed
+
+
+def test_fifty_consecutive_bad_losses_abort(tmp_path, monkeypatch, capsys):
+    _patch_model(monkeypatch, _NaNLoss)
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path), ("--steps", "500",)))
+    printed = capsys.readouterr().out
+    assert "50 consecutive non-finite losses; stopping to avoid infinite loop" in printed
+    # It stopped at 50, not after running all 500.
+    assert printed.count("non-finite loss, skip step") == 50, printed.count(
+        "non-finite loss, skip step")
+
+
+def test_fifty_consecutive_bad_grads_abort(tmp_path, monkeypatch, capsys):
+    """The gradient branch, via the real seam.
+
+    Both optimizers compute the pre-clip global norm in _clip() from the
+    module-level _grad_norm, so making that return inf makes opt.step report inf
+    while the loss, the forward and the backward all stay real. The previous
+    attempt corrupted the gradients from inside forward(), which called
+    backward() a second time and raised.
+    """
+    monkeypatch.setattr("train._grad_norm", lambda grads: float("inf"))
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path), ("--steps", "500",)))
+    printed = capsys.readouterr().out
+    assert "50 consecutive non-finite grads; stopping" in printed
+    assert printed.count("non-finite grads, skip step") == 50
+
+
+def test_the_counter_resets_after_a_good_step(tmp_path, monkeypatch, capsys):
+    """Otherwise 50 slow bad steps spread over a long run abort a healthy one."""
+    _patch_model(monkeypatch, _NaNLoss)
+
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, data, ("--steps", "6",)))
+    first = capsys.readouterr().out
+    assert "consecutive)" in first
+    assert "1 consecutive" in first and "2 consecutive" in first
+
+    _NaNLoss.bad = False                 # the run recovers
+    try:
+        _run_main(monkeypatch, _train_argv(out, data, ("--steps", "2",)))
+    finally:
+        _NaNLoss.bad = True
+    assert "[done] steps=2" in capsys.readouterr().out
+
+
+def test_a_run_where_every_step_fails_does_not_overwrite_the_checkpoint(tmp_path, monkeypatch, capsys):
+    """An existing good checkpoint must survive a run that never completes."""
+    _patch_model(monkeypatch, _NaNLoss)
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    # First a healthy run, to leave a checkpoint behind.
+    _NaNLoss.bad = False
+    try:
+        _run_main(monkeypatch, _train_argv(out, data, ("--steps", "2",)))
+    finally:
+        _NaNLoss.bad = True
+    capsys.readouterr()
+    good = (out / "model.safetensors").read_bytes()
+
+    _run_main(monkeypatch, _train_argv(out, data, ("--steps", "2",)))
+    assert "no steps completed; checkpoint not overwritten" in capsys.readouterr().out
+    assert (out / "model.safetensors").read_bytes() == good, "the good checkpoint changed"
+
+
+# --- the CLI surfaces main() reaches before the loop -----------------------
+
+def test_list_presets_prints_every_preset(monkeypatch, capsys):
+    import train
+    monkeypatch.setattr("sys.argv", ["train.py", "--list-presets"])
+    train.main()
+    printed = capsys.readouterr().out
+    for name in train.PRESETS:
+        assert name in printed
+    assert "params" in printed
+
+
+def test_tokenizer_is_reused_when_it_matches(monkeypatch, capsys, tmp_path):
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, data))
+    tok = out / "tokenizer.json"
+    first = tok.read_bytes()
+    capsys.readouterr()
+    _run_main(monkeypatch, _train_argv(out, data))
+    assert tok.read_bytes() == first, "a matching tokenizer was rebuilt"
+
+
+def test_a_mismatched_tokenizer_is_rebuilt(tmp_path, monkeypatch, capsys):
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, data))
+    capsys.readouterr()
+    # A tokenizer for a different vocab must not be used as-is.
+    _run_main(monkeypatch, _train_argv(out, data, ("--vocab", "48")))
+    assert "rebuilding" in capsys.readouterr().out
+
+
+def test_a_corrupt_tokenizer_is_reported_clearly(tmp_path, monkeypatch):
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    tok = out / "tokenizer.json"
+    tok.parent.mkdir(parents=True, exist_ok=True)
+    tok.write_text("{not json", encoding="utf-8")
+    with pytest.raises((RuntimeError, ValueError)) as e:
+        _run_main(monkeypatch, _train_argv(out, data))
+    assert "tokenizer" in str(e.value).lower()
+
+
+def test_an_explicit_tokenizer_path_is_used(tmp_path, monkeypatch):
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    elsewhere = tmp_path / "mytok.json"
+    _run_main(monkeypatch, _train_argv(out, data, ("--tokenizer", str(elsewhere),)))
+    assert elsewhere.exists(), "--tokenizer was ignored"
+
+
+def test_the_config_records_what_the_model_was_trained_on(tmp_path, monkeypatch):
+    """The tokenizer hash and dataset fingerprint are how a checkpoint says what
+    it saw. A resumed-from or compared-against run needs them to be present."""
+    import json
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, data))
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["tokenizer_sha256"], "no tokenizer hash recorded"
+    assert cfg["dataset_fingerprint"], "no dataset fingerprint recorded"
+    assert cfg["architecture"] in ("rawr", "plain")
+    assert cfg["embedding_storage"] == "ram"
+
+
+def test_mmap_embedding_storage_works_end_to_end(tmp_path, monkeypatch, capsys):
+    import json
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, data,
+                                       ("--embedding-storage", "mmap",)))
+    assert (out / "embeddings.dat").exists(), "the mmap table was not created"
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["embedding_storage"] == "mmap"
+    assert "[done]" in capsys.readouterr().out
+
+
+def test_rawr_dict_and_graph_out_are_honoured(tmp_path, monkeypatch, capsys):
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    words = tmp_path / "words.txt"
+    words.write_text("hello\n\nworld\n", encoding="utf-8")
+    graph = tmp_path / "graph.json"
+    _run_main(monkeypatch, _train_argv(out, data,
+                                       ("--rawr-dict", str(words),
+                                        "--rawr-graph-out", str(graph))))
+    assert graph.exists(), "--rawr-graph-out was ignored"
+    assert "graph digest=" in capsys.readouterr().out
+
+
+def test_main_survives_an_unreadable_dataset_for_fingerprinting(tmp_path, monkeypatch):
+    """A fingerprint failure must not abort the run; it degrades to ""."""
+    data = _corpus(tmp_path)
+    out = tmp_path / "run"
+    import train as train_mod
+    original = train_mod._dataset_fingerprint
+
+    def boom(*a, **k):
+        raise OSError("stat failed")
+
+    monkeypatch.setattr(train_mod, "_dataset_fingerprint", boom)
+    _run_main(monkeypatch, _train_argv(out, data))
+    assert (out / "config.json").exists()
+    monkeypatch.setattr(train_mod, "_dataset_fingerprint", original)
