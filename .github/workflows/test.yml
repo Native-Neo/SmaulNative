@@ -59,7 +59,7 @@ jobs:
         run: |
           python -c "
           import os
-          from compute import get_backend
+          from kernel.compute import get_backend
           be = get_backend(); be.configure()
           print('native fp8:', be.has_native, '| native attn:', be.has_attn_native)
           if os.environ.get('SMAULNATIVE_REQUIRE_NATIVE_RQT') == '1' and not (be.has_native and be.has_attn_native):
