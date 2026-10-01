@@ -110,10 +110,8 @@ class RawrGraph:
     def out_degree(self) -> List[int]:
         deg = [0] * self.vocab_size
         for a, b in self.edges:
-            if a == b:
-                deg[a] += 1
-            else:
-                deg[a] += 1
+            deg[a] += 1
+            if b != a:          # a self-loop is one connection, not two
                 deg[b] += 1
         return deg
 
@@ -190,17 +188,13 @@ def build_graph(tokenizer,
             continue
         if not ids:
             continue
-        ok = True
         for i in range(len(ids) - 1):
             a, b = ids[i], ids[i + 1]
             edge_set.add((min(a, b), max(a, b)))
         # Single-token words contribute a self-loop (the token is usable).
         if len(ids) == 1:
             edge_set.add((ids[0], ids[0]))
-        # Word is "covered" when every consecutive pair made it into the set.
-        if all((min(ids[i], ids[i + 1]), max(ids[i], ids[i + 1])) in edge_set
-               for i in range(len(ids) - 1)):
-            covered_words += 1
+        covered_words += 1
 
     corpus_bigrams: set = set()
     n_docs = n_toks = 0
@@ -269,10 +263,6 @@ def build_graph(tokenizer,
 
     edges = sorted(edge_set)
     digest = _digest_edges(vocab_size, edges, window, min_degree)
-    corpus_cov = 1.0
-    if corpus_bigrams:
-        have = sum(1 for e in corpus_bigrams if e in edge_set)
-        corpus_cov = have / len(corpus_bigrams)
     return RawrGraph(
         vocab_size=vocab_size,
         edges=[(int(a), int(b)) for a, b in edges],
@@ -283,7 +273,10 @@ def build_graph(tokenizer,
         corpus_tokens=n_toks,
         corpus_bigrams=len(corpus_bigrams),
         dict_coverage=(covered_words / len(words)) if words else 0.0,
-        corpus_coverage=corpus_cov,
+        # corpus_coverage is always 1.0: every corpus bigram is added to
+        # edge_set on the loop above, so it could never measure anything else.
+        # The field stays because it is persisted in rawr_graph.json stats.
+        corpus_coverage=1.0,
         digest=digest,
     )
 
@@ -349,8 +342,6 @@ def _adjacency(graph: RawrGraph) -> Dict[int, frozenset]:
     hand rather than by ``build_graph``/``fallback_graph``) is not cached,
     because two such graphs would otherwise collide on an empty key.
     """
-    # No digest means a hand-built graph, and two of those would collide on an
-    # empty key, so those are recomputed rather than cached.
     key = (graph.vocab_size, len(graph.edges), graph.digest) if graph.digest else None
     if key is not None:
         hit = _ADJ_CACHE.get(key)
@@ -530,7 +521,7 @@ def print_model_compute(p: dict) -> None:
     arithmetic, and they disagree sharply whenever the attention projections
     are a large share of the model.
     """
-    print(f"-- model compute (per token, from the built model) --")
+    print("-- model compute (per token, from the built model) --")
     print(f"rawr_sparsity:         {p['rawr_sparsity']:.4f}")
     print(f"fp8_dense layers:      {p['fp8_modules']:>12,}   (attention q/k/v/o -- NOT sparsified)")
     print(f"sparse layers:         {p['sparse_modules']:>12,}   (Rawr FFN + LM head)")
