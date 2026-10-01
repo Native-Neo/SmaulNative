@@ -75,7 +75,7 @@ def discover_files(dataset_dir: Path) -> List[Path]:
                 files.append(p.resolve())
         except OSError:
             continue
-        if len(files) > 100_000:
+        if len(files) >= 100_000:
             print("[WARN] file scan capped at 100k files")
             break
     files.sort()
@@ -244,11 +244,12 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                         if text:
                             yield text, str(path), i
             elif suffix == ".parquet":
+                # Imported inside the try below, so a missing pyarrow must be
+                # re-raised as a RuntimeError: ModuleNotFoundError is not one,
+                # and the warn-and-skip handler would otherwise swallow every
+                # parquet file and leave the stream silently empty.
                 import pyarrow.parquet as pq
-                try:
-                    pf = pq.ParquetFile(path)
-                except ImportError as exc:
-                    raise RuntimeError("parquet support requires pyarrow") from exc
+                pf = pq.ParquetFile(path)
                 schema_names = pf.schema_arrow.names
                 schema_lower = [c.lower() for c in schema_names]
                 fast_col = None
@@ -290,10 +291,11 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                             text = extract_text(row, str(path)).strip()
                             if text:
                                 yield text, str(path), record
-        except RuntimeError:
+        except (RuntimeError, ModuleNotFoundError, ImportError):
+            # Missing dependencies abort, as does a RuntimeError raised on
+            # purpose. Everything else is one bad file and is skipped.
             raise
         except Exception as e:
-            # Warn-and-skip: one bad file must not abort the whole stream.
             print(f"[WARN] skipping dataset file {path}: {type(e).__name__}: {e}")
             continue
     if skipped_jsonl:
@@ -449,7 +451,7 @@ def discover_sft_records(dataset_dir: Path) -> List[Dict]:
                     records = data
                 if not isinstance(records, list):
                     records = [records]
-                for i, record_obj in enumerate(records, 1):
+                for record_obj in records:
                     # Same per-record {"data": {...}} unwrap the .jsonl branch
                     # does. Without it a single wrapped export -- the whole file
                     # being {"data": {"conversations": ...}} -- is filtered out
