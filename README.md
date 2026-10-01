@@ -83,9 +83,9 @@ representation rather than a fake-quantized view of an FP32 master parameter.
 Every `FP8Linear` stores `uint8` E4M3 codes plus `float32` per-tile scales (tile width
 64 by default). The forward pass runs through the compute backend -- natively in AVX
 when the extension is available, otherwise via a bounded torch fallback that never
-materializes the full FP32 matrix. Weight gradients accumulate in FP32 and are folded
-back into the quantized storage by `requant` after every Lion step, so the packed
-weights themselves carry the training forward.
+materializes the full FP32 matrix. Weight gradients accumulate in a bf16 `_gw` buffer and
+are folded back into the quantized storage by `requant` after every optimizer step, so the
+packed weights themselves carry the training forward.
 
 See [docs/rqt.md](docs/rqt.md) for the storage format, the training step, and GGUF export.
 
