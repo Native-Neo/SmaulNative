@@ -349,11 +349,16 @@ def _build(texts, vocab_size, word_budget=40000, max_records=0):
             tokens.append(g); seen_tokens.add(g)
     whitespace = [(x, n) for x, n in chars.most_common() if x.isspace() and x not in seen_tokens]
     for source in (whitespace, words.most_common(word_budget), graphemes.most_common(), symbols.most_common(), chars.most_common()):
+        if len(tokens) >= vocab_size: break
         for x, _ in source:
+            # Capacity is checked before the append, not after: appending then
+            # testing lets a full vocab absorb one more entry and overshoot by
+            # exactly 1. The requester then gets a tokenizer whose vocab_size
+            # disagrees with what it asked for, which train.py reads as a
+            # version mismatch and rebuilds on every run.
+            if len(tokens) >= vocab_size: break
             if x not in seen_tokens:
                 tokens.append(x); seen_tokens.add(x)
-            if len(tokens) >= vocab_size: break
-        if len(tokens) >= vocab_size: break
     while len(tokens) < vocab_size:
         token = f"<unused_{len(tokens)}>"
         tokens.append(token)
