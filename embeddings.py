@@ -94,10 +94,8 @@ class MmapEmbedding(nn.Module):
             with open(tmp, "wb") as f:
                 f.truncate(self.vocab_size * self.d_model * 4)
             self.path = Path(tmp)
-            self._owns_file = True
         else:
             self.path = Path(path)
-            self._owns_file = False
             if self.path.exists():
                 fresh = False
                 if self.path.stat().st_size != self.vocab_size * self.d_model * 4:
@@ -108,10 +106,8 @@ class MmapEmbedding(nn.Module):
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with open(self.path, "wb") as f:
                     f.truncate(self.vocab_size * self.d_model * 4)
-        # TRUE mmap: shares file pages, never bulk-loads the file into RAM.
-        # writes through to the file; only touched pages are faulted in.
-        import numpy as np  # noqa: F811
-
+        # TRUE mmap: shares file pages, never bulk-loads the file into RAM, and
+        # writes through; only touched pages are faulted in.
         self._mem = np.memmap(str(self.path), dtype=np.float32, mode="r+",
                               shape=(self.vocab_size, self.d_model))
         tensor = torch.from_numpy(self._mem)
@@ -127,13 +123,10 @@ class MmapEmbedding(nn.Module):
         self.weight = nn.Parameter(tensor)
 
     def _apply(self, fn, recurse=True):
-        # Keep the mapped weight on CPU fp32: device/dtype moves apply to any
-        # future buffers but must not copy the table off its mapping.
-        if recurse:
-            for module in self.children():
-                module._apply(fn)
-        # Intentionally skip self.weight (the mapping). Everything else in
-        # this module (nothing today) would use the default path.
+        # Deliberately does not call nn.Module._apply: the mapped weight must
+        # stay on CPU fp32, and a .to(device) or .half() must not copy the
+        # table off its mapping. This module has no children today, so
+        # recursing is a no-op kept only for future submodules.
         return self
 
     def forward(self, idx):
