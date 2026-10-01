@@ -1268,7 +1268,8 @@ def main():
                    help="Learning rate (--lr is learning_rate; --wd is weight_decay)")
     a.add_argument("--wd", type=float, default=0.01)
     a.add_argument("--optimizer", choices=("lion", "smaul"), default="smaul",
-                   help="Optimizer: lion (default) or smaul (SmaulOpt v2.1)")
+                   help="Optimizer: smaul (default, SmaulOpt v2.1) or lion "
+                        "(resume-free, fixed betas)")
     a.add_argument("--beta-m", dest="beta_m", type=float, default=0.9,
                    help="SmaulOpt beta_m (momentum decay); Lion keeps its built-in betas")
     a.add_argument("--beta-v", dest="beta_v", type=float, default=0.999,
