@@ -29,9 +29,11 @@ The forward pass calls `kernel.compute.get_backend()` (default `cpu`, see [cpu.m
   FP32 weight matrix is never materialized.
 
 For the backward pass, input gradients flow through the same backend path, while weight
-gradients accumulate in FP32 into the module's `_gw` buffer output-block by
+gradients accumulate into the module's `_gw` buffer output-block by
 output-block (`g2[:, o0:o1].T @ x2`, summed over micro-batches) -- no full-matrix `dW`
-transient is ever built.
+transient is ever built. The block product is computed in FP32 and accumulated into a
+bfloat16 `_gw` (`kernel.fp8_tile.GW_DTYPE`), so each block rounds exactly once on the way
+in; consumers read it blockwise and must not widen it whole.
 
 ## Training step
 
