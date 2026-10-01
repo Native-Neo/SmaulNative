@@ -371,10 +371,9 @@ class _SparseLinearFn(torch.autograd.Function):
         ctx.save_for_backward(x, cols, values)
         ctx.out_f = int(out_f)
         ctx.grad_v_budget = int(grad_v_budget)
-        # Non-tensor argument: autograd passes it through untouched and wants
-        # no gradient for it (see _csr_T_parts). Stored on ctx, not
-        # save_for_backward, because it is derived from `cols` rather than
-        # being an input/output.
+        # Non-tensor argument, hence not save_for_backward (which is for tensors)
+        # and correspondingly None in backward's return. It is derived from
+        # `cols` rather than being an input or output.
         ctx.csr_t_crow, ctx.csr_t_perm = csr_t
         in_f = x.shape[-1]
         xf = x.reshape(-1, in_f).float()
@@ -386,8 +385,6 @@ class _SparseLinearFn(torch.autograd.Function):
         x, cols, values = ctx.saved_tensors
         out_f = ctx.out_f
         d = x.shape[-1]
-        rows = x.numel() // d
-        k = values.shape[1]
         xf = x.reshape(-1, d).float()
         dof = dout.reshape(-1, out_f).float()
         # d/dx = dout @ S, i.e. (S^T @ dout^T)^T, using the cached transposed
@@ -509,17 +506,24 @@ class SwiFFN_MoE(nn.Module):
         self.gate = nn.Linear(cfg.d_model, cfg.num_experts, bias=False)
 
     def balance_loss(self, prob: torch.Tensor) -> torch.Tensor:
-        # Switch-Transformer style load-balancing aux loss. Top-k routing is
-        # non-differentiable, so without this the gate collapses to 1-2 experts.
-        # Callers add `1e-2 * moe.balance_loss(prob)` during training.
+        """Switch-Transformer load-balancing aux loss over the router softmax.
+
+        Without it top-k routing collapses onto one or two experts. Add
+        ``1e-2 * moe.balance_loss(prob)`` to the training loss, where ``prob``
+        is the pre-topk router softmax -- ``forward`` computes it but does not
+        return it, so a caller wiring this up must capture it from
+        ``last_prob``.
+        """
         density = prob.mean(0)
         return (density * density * self.num_experts).sum()
 
     def forward(self, x):
-        # NOTE: top-k routing is non-differentiable; the gate only learns via
-        # straight-through on topv weights. Monitor expert usage and add
-        # balance_loss() during training to prevent collapse.
         prob = torch.softmax(self.gate(x.float()), -1)
+        # The topk gather is differentiable in the selected values, so the gate
+        # receives gradient through topv and none through topi: unselected
+        # experts get exactly zero. That is the collapse mechanism
+        # balance_loss() exists to counteract.
+        self.last_prob = prob
         topv, topi = torch.topk(prob, self.top_k, -1)
         denom = topv.sum(-1, keepdim=True)
         # Guard tiny denominators (would explode weights); fall back to uniform.
@@ -554,11 +558,13 @@ class Block(nn.Module):
     def forward(self, x):
         ck = self.training and torch.is_grad_enabled()
         n1x = self.n1(x)
-        # Attention is deliberately NOT checkpointed. Checkpointing it re-runs
-        # the q/k/v/o projections in backward -- cost ~rows*d^2 -- to avoid
-        # holding Q, K, V, Y and DEN, which is only 5*rows*d*4 bytes. That
-        # ratio is scale-invariant, so it is a bad trade at every model size:
-        # measured 1124.6 -> 899.1 ms per block step (1.25x) for 5 MiB/layer.
+        # Attention is deliberately NOT checkpointed. Saving Q, K, V, Y and DEN costs
+        # 5*rows*d*4 bytes; checkpointing avoids that by re-running the q/k/v/o
+        # projections in backward for ~rows*d^2 MACs, so the trade worsens as d
+        # grows rather than staying flat. Measured 1124.6 ms -> 899.1 ms per
+        # block step for 5 MiB/layer at d=512, i.e. checkpointing measured
+        # faster, so this is a measured call and not an assumed one. Revisit if
+        # the block ever runs at a d where the re-run cost dominates.
         ax = self.att(n1x)
         a = self.n2(ax.float())
         x = self.n3((x.float() + a.float()).to(x.dtype))
@@ -568,7 +574,7 @@ class Block(nn.Module):
         f = self.n4(fx.float())
         return self.n5((x.float() + f.float()).to(x.dtype))
 
-    def _tail(self, x, n1x, att_out):
+    def _tail(self, x, att_out):
         """n2..n5 given the attention output; shared by forward/prefill/step."""
         a = self.n2(att_out.float())
         x = self.n3((x.float() + a.float()).to(x.dtype))
@@ -578,15 +584,13 @@ class Block(nn.Module):
 
     def prefill(self, x):
         """Full-prefix pass that captures the attention state. Inference only."""
-        n1x = self.n1(x)
-        ax, st = self.att.prefill(n1x)
-        return self._tail(x, n1x, ax), st
+        ax, st = self.att.prefill(self.n1(x))
+        return self._tail(x, ax), st
 
     def step(self, x, st):
         """One decode step for a single position, advancing st in place."""
-        n1x = self.n1(x)
-        ax, st = self.att.step(n1x, st)
-        return self._tail(x, n1x, ax), st
+        ax, st = self.att.step(self.n1(x), st)
+        return self._tail(x, ax), st
 
 
 class SmaulLinear(nn.Module):
@@ -733,6 +737,8 @@ class SmaulLinear(nn.Module):
         ==================  ==================================================
         fp8_dense_mac       dense FP8Linear MAC (attention q/k/v/o, and the
                             SwiFFN projections on architecture='plain')
+        fp32_dense_mac      dense MAC from precision='fp32', where the
+                            projections are _DenseLinear rather than FP8Linear
         sparse_nnz_mac      nonzero MAC of every SparseLinear
         sparse_dense_mac    what those SparseLinears would cost dense
         dense_head_mac      a dense LM head (architecture='plain' uses a
@@ -752,28 +758,36 @@ class SmaulLinear(nn.Module):
         """
         fp8 = [(n, m) for n, m in self.named_modules() if isinstance(m, FP8Linear)]
         sp = [(n, m) for n, m in self.named_modules() if isinstance(m, SparseLinear)]
+        # _DenseLinear is what _linear() builds under precision='fp32'. It is a
+        # bare nn.Module wrapper, not an nn.Linear subclass, so it has to be
+        # matched explicitly or the whole fp32 model reports zero attention and
+        # FFN MACs and a wildly wrong dense_share.
+        dl = [(n, m) for n, m in self.named_modules() if isinstance(m, _DenseLinear)]
         fp8_dense = sum(m.in_f * m.out_f for _, m in fp8)
+        fp32_dense = sum(m.lin.in_features * m.lin.out_features for _, m in dl)
         sparse_nnz = sum(m.out_f * m.cols.shape[1] for _, m in sp)
         sparse_dense = sum(m.out_f * m.in_f for _, m in sp)
-        # A head that is neither of the above is a plain dense nn.Linear and is
-        # real arithmetic, so it belongs in the dense bucket. (SparseLinear and
-        # FP8Linear heads are already counted above; this must not double count
-        # them, hence the isinstance checks rather than a shape comparison.)
+        # A head that is none of the above is a plain dense nn.Linear and is
+        # real arithmetic, so it belongs in the dense bucket. (SparseLinear,
+        # FP8Linear and _DenseLinear heads are already counted above; this must
+        # not double count them, hence the isinstance checks.)
         dense_head = 0
-        if not isinstance(self.head, (SparseLinear, FP8Linear)):
+        if not isinstance(self.head, (SparseLinear, FP8Linear, _DenseLinear)):
             dense_head = int(self.head.in_features * self.head.out_features)
         emb = 0
         w = getattr(self.emb, "weight", None)
         if w is not None:
             emb = int(w.numel())
-        dense = fp8_dense + dense_head
+        dense = fp8_dense + fp32_dense + dense_head
         mac = dense + sparse_nnz
         # Projections only -- see the emb_dense_mac note above.
         total_dense = sparse_dense + dense
         return {
             "fp8_modules": len(fp8),
             "sparse_modules": len(sp),
-            "fp8_dense_mac": fp8_dense,
+            "fp8_dense_mac": fp8_dense + fp32_dense,
+            "fp32_modules": len(dl),
+            "fp32_dense_mac": fp32_dense,
             "sparse_nnz_mac": sparse_nnz,
             "sparse_dense_mac": sparse_dense,
             "dense_head_mac": dense_head,
@@ -811,20 +825,14 @@ class SmaulLinear(nn.Module):
                 src = np.memmap(str(emb.path), dtype=np.float32, mode="r",
                                 shape=(self.cfg.vocab_size, self.cfg.d_model)) \
                     if hasattr(emb, "path") else emb.weight.detach().cpu().float().numpy()
-                import numpy as _np
-
                 tmp_e = dest.with_suffix(".dat.tmp")
-                dst = _np.memmap(str(tmp_e), dtype=_np.float32, mode="w+",
-                                 shape=(self.cfg.vocab_size, self.cfg.d_model))
+                dst = np.memmap(str(tmp_e), dtype=np.float32, mode="w+",
+                                shape=(self.cfg.vocab_size, self.cfg.d_model))
                 for r0 in range(0, self.cfg.vocab_size, 1024):
                     r1 = min(self.cfg.vocab_size, r0 + 1024)
                     dst[r0:r1] = src[r0:r1]
                 dst.flush()
-                del dst
-                try:
-                    del src
-                except Exception:
-                    pass
+                del dst, src
                 os.replace(tmp_e, dest)
             sd = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()
                   if not k.startswith("emb.")}
