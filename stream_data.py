@@ -195,10 +195,6 @@ def _stream_file(config: Dict[str, str], dataset_name: str, rel_path: str, min_c
                     record += 1
                     if not isinstance(text, str):
                         continue
-                    # Length pre-check before expensive normalization in filter.
-                    if len(text) < min_chars or len(text) > max_chars * 4:
-                        # filter_text re-checks precisely; this is a cheap guard.
-                        pass
                     text = filter_text(text, dataset_name, min_chars, max_chars)
                     if text is not None:
                         yield (text, position) if with_position else text
@@ -241,21 +237,22 @@ def stream_dataset(name: str, min_chars: int = 20, max_chars: int = 1_000_000,
         if start_dataset == dataset_name and start_file is not None and start_file not in paths:
             raise FileNotFoundError(f"resume file not found: {start_dataset}/{start_file}")
 
-        active_file = start_file is None or dataset_name != start_dataset
+        # Resume starts at start_file and continues through the rest of *this*
+        # dataset's files; only earlier files in it are skipped. start_file was
+        # checked against paths above, so it is guaranteed to appear here.
+        resuming = dataset_name == start_dataset and start_file is not None
         for rel_path in paths:
-            if not active_file:
-                if rel_path != start_file:
+            if resuming:
+                if rel_path != start_file and not found_start_file:
                     continue
-                active_file = True
-                found_start_file = True
+                if rel_path == start_file:
+                    found_start_file = True
             skip = start_record if dataset_name == start_dataset and rel_path == start_file else 0
             print(
                 f"[STREAM] {dataset_name}/{rel_path}" + (f" from row {skip:,}" if skip else ""),
                 file=sys.stderr,
             )
             yield from _stream_file(config, dataset_name, rel_path, min_chars, max_chars, skip, with_position, workers)
-        if dataset_name == start_dataset and start_file is not None and not found_start_file:
-            raise FileNotFoundError(f"resume file not found: {start_dataset}/{start_file}")
         # Do not stream later datasets when resuming. Resume is scoped to the
         # start dataset, so once its files are done the outer loop must end --
         # otherwise a resume of `--dataset all` carries on into every dataset
