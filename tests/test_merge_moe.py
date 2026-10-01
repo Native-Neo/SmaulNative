@@ -248,6 +248,9 @@ def test_an_empty_out_dir_is_fine_without_force(tmp_path, trio):
     out = tmp_path / "merged"
     out.mkdir()
     merge(base, branches, out)          # must not raise
+    # And it must actually have written the merge, not merely returned quietly.
+    assert (out / "model.safetensors").exists()
+    assert (out / "config.json").exists()
 
 
 def test_two_merges_of_the_same_inputs_are_identical(tmp_path, trio):
