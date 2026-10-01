@@ -613,7 +613,7 @@ class SmaulOpt:
             st_c = torch.zeros(c, dtype=dt, device=device)
             self.v_col[key] = st_c
         elif st_c.device != device:
-            st_c = st_c.to(c.device)
+            st_c = st_c.to(device)
             self.v_col[key] = st_c
         return st_r, st_c
 
