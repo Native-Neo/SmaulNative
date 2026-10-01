@@ -23,7 +23,7 @@ def test_undecodable_bytes_are_not_silently_lost(tmp_path):
     try:
         texts = list(read_texts(tmp_path))
     except UnicodeDecodeError:
-        return
+        pytest.skip("read_texts decodes strictly; nothing to assert")
     # errors=replace preserves content as U+FFFD instead of crashing the stream.
     assert texts and any("ok" in t for t in texts)
     assert any("\ufffd" in t for t in texts)
