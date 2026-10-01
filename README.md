@@ -132,13 +132,13 @@ position via `start_dataset` / `start_file` / `start_record`.
 
 ## Resume
 
-Lion (the default optimizer) checkpoints are resume-free: each save writes
+Lion (`--optimizer lion`) checkpoints are resume-free: each save writes
 `model.safetensors` + `config.json` (with `tokenizer_sha256` + `dataset_fingerprint`), the
 tokenizer, and `optimizer.json` holding only the Lion hyperparameters (`lr`, `wd`, betas,
 `clip`). No optimizer momentum, RNG state, or dataset position is stored, so re-running a
 Lion training command always starts from step 0.
 
-SmaulOpt (`--optimizer smaul`) checkpoints are resumable: `optimizer.json` additionally
+SmaulOpt (`--optimizer smaul`, the default) checkpoints are resumable: `optimizer.json` additionally
 records the step counter, `beta_m`, `beta_v`, `epsilon`, weight decay, and
 `state_dtype`, and `optimizer_state.safetensors` stores the `m`/`v` states at that width,
 so `train._load_optimizer(dir, opt, model)` continues training from the saved step.
@@ -153,7 +153,7 @@ rank-1 gradients and weakest on sparse ones.
 
 ## Testing
 
-Run the full suite (72 tests) with:
+Run the full suite (955 tests) with:
 
 ```bash
 python -m pytest -q
