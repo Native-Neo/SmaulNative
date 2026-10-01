@@ -64,6 +64,14 @@ def filter_text(text: Any, dataset: str = "auto", min_chars: int = 20, max_chars
                 dev_ratio: float = 0.20, latin_ratio: float = 0.50) -> Optional[str]:
     if min_chars < 0 or max_chars < 0 or min_chars > max_chars:
         raise ValueError(f"require 0 <= min_chars <= max_chars, got {min_chars}/{max_chars}")
+    for _name, _v in (("min_unique", min_unique), ("min_dev", min_dev),
+                      ("min_latin", min_latin)):
+        if not isinstance(_v, int) or isinstance(_v, bool) or _v < 0:
+            raise ValueError(f"{_name} must be a non-negative int, got {_v!r}")
+    for _name, _v in (("dev_ratio", dev_ratio), ("latin_ratio", latin_ratio)):
+        if not isinstance(_v, (int, float)) or isinstance(_v, bool) \
+                or not 0.0 <= float(_v) <= 1.0:
+            raise ValueError(f"{_name} must be in [0, 1], got {_v!r}")
     if not isinstance(text, str):
         return None
     # Cheap length guard BEFORE expensive NFKC + set() on huge inputs (DoS).
