@@ -370,7 +370,20 @@ def test_main_survives_a_broken_pipe(monkeypatch):
     monkeypatch.setattr(stream_data, "stream_dataset",
                         lambda *a, **k: iter(["a", "b"]))
     monkeypatch.setattr(sys, "argv", ["stream_data.py"])
-    stream_data.main()      # must return quietly
+    assert stream_data.main() is None      # returned quietly, no traceback
+
+    # Same for the other buffer path: the first flush succeeds, the trailing
+    # write fails. The two BrokenPipeError handlers are separate code.
+    state = {"n": 0}
+
+    def fail_second(*args, **kwargs):
+        state["n"] += 1
+        if state["n"] > 1:
+            raise BrokenPipeError
+        return len(args[0]) if args else 0
+
+    monkeypatch.setattr(sys.stdout, "write", fail_second)
+    assert stream_data.main() is None
 
 
 def test_main_rejects_a_negative_max_records(monkeypatch):
