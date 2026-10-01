@@ -1,7 +1,7 @@
 # train.py
 
 `train.py` is the SmaulLinear FP8 pretraining entry point: pretraining with tiled E4M3
-weights and an FP32 Lion (default) or SmaulOpt optimizer. Lion checkpoints are
+weights and an FP32 SmaulOpt (default) or Lion optimizer. Lion checkpoints are
 resume-free; SmaulOpt checkpoints save full optimizer state and resume exactly.
 
 ## Run it
@@ -31,7 +31,7 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--steps` | `1000` | optimizer steps |
 | `--lr` | `2e-4` | learning rate (`learning_rate`) |
 | `--wd` | `0.01` | weight decay (`weight_decay`) |
-| `--optimizer` | `lion` | `lion` (default) or `smaul` (SmaulOpt v1) |
+| `--optimizer` | `smaul` | `smaul` (default, SmaulOpt) or `lion` (resume-free, fixed betas) |
 | `--beta-m` | `0.9` | SmaulOpt `beta_m` (momentum decay) |
 | `--beta-v` | `0.999` | SmaulOpt `beta_v` (magnitude-EMA decay) |
 | `--epsilon` | `1e-8` | SmaulOpt `epsilon` (must be positive) |
@@ -119,9 +119,9 @@ reused only when its vocabulary size equals `--vocab` and its format version is 
 
 ## Optimizer
 
-Two optimizers are selectable with `--optimizer`; the default is unchanged.
+Two optimizers are selectable with `--optimizer`. The default is `smaul`.
 
-### `lion` (default, resume-free)
+### `lion` (resume-free)
 
 `Lion` keeps FP32 momentum per parameter/FP8 module (betas `0.9`/`0.99`). Each step:
 
@@ -140,7 +140,7 @@ Two optimizers are selectable with `--optimizer`; the default is unchanged.
 4. Applies a sign update scaled by `--lr`, with decay `lr * wd` folded into the FP8
    `requant` for quantized layers and multiplicative decay for the rest.
 
-### `smaul` (SmaulOpt v1)
+### `smaul` (SmaulOpt, default)
 
 `SmaulOpt` (`train.SmaulOpt`) is a small deterministic FP32 adaptive optimizer holding
 exactly two persistent FP32 states per trainable parameter/FP8 module — `m` (momentum) and
