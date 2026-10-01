@@ -595,13 +595,15 @@ class SmaulOpt:
 
         ``g.abs().mean(dim)`` materializes a full-size copy of |g|. The L1 norm
         is the same quantity as a fused reduction, so it allocates only the
-        output vector.
+        output vector. Accumulated in FP32 even when `g` is narrower: a bf16
+        reduction is ~2e-3 relative off, and the class contract is that the
+        update math is always FP32 with only the stored buffers narrow.
         """
         if dim == 0:
             n = g.shape[0]
         else:
             n = g.shape[1]
-        return torch.linalg.vector_norm(g, ord=1, dim=dim) / n
+        return torch.linalg.vector_norm(g, ord=1, dim=dim, dtype=torch.float32) / n
 
     def _v_marginal_state(self, key, shape, device):
         """Fetch or lazily create the factored (row, col) marginals for `key`."""
