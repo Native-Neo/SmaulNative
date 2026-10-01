@@ -55,15 +55,20 @@ def get_repo_files(repo_id: str, path: str, retries: int = 3) -> list[dict]:
                 if item_path and item_path.endswith(".parquet"):
                     files.append({"path": item_path, "size": int(getattr(item, "size", 0) or 0)})
             files.sort(key=lambda x: x["path"])
-            if not files:
-                raise RuntimeError(f"No Parquet files found in {repo_id}/{path}")
-            print(f"[HF] Found {len(files):,} remote parquet files.")
-            return files
+            break
         except Exception as exc:  # transient HF/network errors
             last = exc
             print(f"[WARN] list_repo_tree attempt {attempt}/{retries} failed: {type(exc).__name__}: {exc}")
             time.sleep(min(2 ** attempt, 10))
-    raise RuntimeError(f"could not list {repo_id}/{path} after {retries} attempts: {last}")
+    else:
+        raise RuntimeError(f"could not list {repo_id}/{path} after {retries} attempts: {last}")
+    # An empty listing is permanent, not transient: failing here instead of
+    # inside the try keeps it out of the retry/backoff path, which would burn
+    # 14 s and then blame the network for a filter problem.
+    if not files:
+        raise RuntimeError(f"No Parquet files found in {repo_id}/{path}")
+    print(f"[HF] Found {len(files):,} remote parquet files.")
+    return files
 
 
 def format_conversation(value: Any) -> str:
@@ -112,14 +117,26 @@ def stream_raw_parquet(parquet_path: Path, start_row: int = 0) -> Iterator[tuple
                 text = extract_text({"prompt": pr, "completion": co}, str(parquet_path)).strip()
                 if text:
                     yield row, text
-        elif text_col or conversation_col:
+        elif text_col:
+            # text_col won the column selection above, so values here are
+            # strings. A coexisting "conversations" column must not change how
+            # this one is read: formatting a str as a conversation yields ""
+            # for every row and the download reports 0 rows, exit 0.
             col = batch.column(0)
             for i in range(batch.num_rows):
                 row = current + i
                 if row < start_row:
                     continue
                 value = col[i].as_py()
-                text = format_conversation(value) if conversation_col else value
+                if isinstance(value, str) and value.strip():
+                    yield row, value.strip()
+        elif conversation_col:
+            col = batch.column(0)
+            for i in range(batch.num_rows):
+                row = current + i
+                if row < start_row:
+                    continue
+                text = format_conversation(col[i].as_py())
                 if isinstance(text, str) and text.strip():
                     yield row, text.strip()
         else:
