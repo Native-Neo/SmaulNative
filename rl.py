@@ -454,6 +454,31 @@ class AutoRL(SmaulRL):
         with self.preference_path.open("r", encoding="utf-8") as handle:
             return sum(1 for line in handle if line.strip())
 
+    def human_preference_count(self) -> int:
+        """Records written by a human, excluding the run's own auto-labels.
+
+        _save_preference appends auto_confirmed records to the same file the
+        --no-verify guard reads, so preference_count() grows with every
+        unattended run. The guard must not count its own output, or the
+        MIN_HUMAN_PREFS_FOR_AUTO barrier becomes a one-time bootstrap instead
+        of the documented invariant. Records without a source field predate
+        auto-labeling and count as human.
+        """
+        if not self.preference_path.exists():
+            return 0
+        n = 0
+        with self.preference_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    src = json.loads(line).get("source", "human")
+                except (ValueError, AttributeError):
+                    continue
+                if src != "auto_confirmed":
+                    n += 1
+        return n
+
     def train_preferences(self, epochs: int, lr: float) -> int:
         """Incrementally train the reward model on new human records.
 
@@ -588,7 +613,7 @@ class AutoRL(SmaulRL):
             raise ValueError("--max_new_tokens must be positive")
         print(f"[PREF] loading {self.preference_count()} preference records")
         self.train_preferences(preference_epochs, preference_lr)
-        human_records = self.preference_count()
+        human_records = self.human_preference_count()
         reward_trained = self.preference_trained
         if not verify and (human_records < MIN_HUMAN_PREFS_FOR_AUTO or reward_trained <= 0):
             raise RuntimeError(
