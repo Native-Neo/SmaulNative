@@ -884,6 +884,12 @@ class SmaulOpt:
             "clip": self.clip,
             "state_dtype": self.state_dtype,
             "factor_v": bool(self.factor_v),
+            # Both change the update: update_clip bounds |u|, and grad_dtype
+            # decides what precision the clipped gradients are stored at. A
+            # resume that silently reverted them would train a different
+            # optimizer than the one that wrote the checkpoint.
+            "update_clip": self.update_clip,
+            "grad_dtype": self.grad_dtype,
         }
 
     def load_state_dict(self, d):
@@ -940,8 +946,22 @@ class SmaulOpt:
         fv = d.get("factor_v", None)
         if fv is not None and not isinstance(fv, bool):
             raise ValueError(f"checkpoint factor_v must be a bool, got {fv!r}")
+        uclip = d.get("update_clip", self.update_clip)
+        try:
+            _uclip = float(uclip)
+        except (TypeError, ValueError):
+            raise ValueError(f"checkpoint update_clip invalid: {uclip!r}") from None
+        if not _math.isfinite(_uclip) or _uclip <= 0:
+            raise ValueError(f"checkpoint update_clip invalid: {uclip!r}")
+        gdt = d.get("grad_dtype", self.grad_dtype)
+        if gdt not in (None, "bf16", "fp16", "fp32"):
+            raise ValueError(f"checkpoint grad_dtype invalid: {gdt!r}")
+        if gdt == "fp32":
+            # Same spelling as the constructor: fp32 means "do not narrow".
+            gdt = None
         self.lr, self.beta_m, self.beta_v = _lr, _bm, _bv
         self.epsilon, self.weight_decay, self.clip = _eps, _wd, _clip
+        self.update_clip, self.grad_dtype = _uclip, gdt
         self.step_count = _step
         # State storage width follows the checkpoint; stored m/v buffers are
         # recast by the state loader, so a resumed run keeps the saved width.
