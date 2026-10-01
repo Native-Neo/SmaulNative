@@ -411,7 +411,7 @@ def test_attn_fallback_matches_native():
     from smaul_linear import _attn_reference, _LinearAttnFn
     be = get_backend()
     if not be.has_attn_native:
-        return
+        pytest.skip("smaul_attn extension did not build")
     torch.manual_seed(9)
     B, T, H, D = 2, 48, 4, 32
     Q = torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0
