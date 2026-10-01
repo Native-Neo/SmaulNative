@@ -15,8 +15,8 @@ from pathlib import Path
 
 import torch
 
-# Cached reference fallbacks (avoids repeated lazy imports + breaks the
-# smaul_linear <-> compute import cycle cost after first use).
+# Cached reference fallbacks. Resolved lazily so the smaul_linear <-> compute
+# import cycle is only paid once, and only if the native extensions are absent.
 _attn_ref_fn = None
 _attn_ref_bwd_fn = None
 
@@ -320,10 +320,9 @@ class CpuBackend:
 
 
 def _torch_forward(x, w, s, in_f, out_f, tile):
-    from kernel.fp8_tile import TILE as _TILE, _OB, decode_tile
-    if tile != _TILE:
-        # Fallback honors the layer tile; OB stays blocked for cache reuse.
-        pass
+    # Honors the layer's tile; _OB stays fixed because it is only an output-row
+    # blocking factor for cache reuse, not a quantization boundary.
+    from kernel.fp8_tile import _OB, decode_tile
     with torch.no_grad():
         y = torch.zeros(x.shape[0], out_f, dtype=torch.float32, device=x.device)
         OB, nt = _OB, (in_f + tile - 1) // tile
