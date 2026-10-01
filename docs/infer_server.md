@@ -11,7 +11,7 @@ python infer_server.py --model ./runs/linear --device auto --dtype auto \
 |---|---|---|
 | `--model` / `--device` / `--dtype` | `./runs/linear` / `auto` / `auto` | engine selection |
 | `--host` / `--port` | `127.0.0.1` / `8080` | bind address; non-loopback binds warn (and require `--api-token`) |
-| `--max-prompt-tokens` | `512` | prompt cap (= model window); max `4096` |
+| `--max-prompt-tokens` | `262144` | prompt cap (= `inference.MODEL_WINDOW`); max `262144` |
 | `--api-token` | none (or `SMAUL_API_TOKEN` env) | require `Authorization: Bearer <token>` (or `X-API-Key`) |
 
 ## Endpoints
