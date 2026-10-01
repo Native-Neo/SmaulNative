@@ -236,6 +236,12 @@ class Lion:
             # Clear them and skip the update; caller also guards loss.
             self.zero_grad(model)
             return norm
+        if not any(m._gw is not None for _, m in mods) \
+                and not any(p.grad is not None for p in self.p):
+            # No gradients at all: nothing to update. Return before advancing
+            # the (nonexistent) bias correction or evicting live momentum as
+            # "dead", exactly as the inf path above skips the counter.
+            return 0.0
         live = set()
         for _, m in mods:
             if m._gw is None:
@@ -681,6 +687,11 @@ class SmaulOpt:
             # correction stays aligned with actual updates.
             self.zero_grad(model)
             return norm
+        if not any(m._gw is not None for _, m in mods) \
+                and not any(p.grad is not None for p in self.p):
+            # Same for the empty step: no gradients, no update, so the counter
+            # must not advance and live momentum must not be evicted as "dead".
+            return 0.0
         self.step_count += 1
         t = int(self.step_count)
         bc1 = 1.0 - self.beta_m ** t
