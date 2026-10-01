@@ -2,8 +2,8 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import importlib
 import signal
+import subprocess
 
 import pytest
 import torch
@@ -156,15 +156,28 @@ def test_sha_file_matches_hashlib(tmp_path):
 
 
 def test_install_handlers_is_only_called_from_main():
-    """Importing train must not hijack process signals (benchmark.py imports it)."""
-    import train
-    before = signal.getsignal(signal.SIGINT)
-    importlib.reload(train)
-    assert signal.getsignal(signal.SIGINT) is before, \
-        "importing train installed a SIGINT handler"
-    train.install_handlers()
-    assert signal.getsignal(signal.SIGINT) is not before
-    signal.signal(signal.SIGINT, before)   # leave the process as we found it
+    """Importing train must not hijack process signals (benchmark.py imports it).
+
+    Checked in a subprocess on purpose. importlib.reload() in-process rebuilds
+    every class in the module, so test_smaul_opt.py's top-level
+    `from train import SmaulOpt` would keep pointing at the *old* class while
+    train._save_optimizer's isinstance check sees the new one -- and every
+    checkpoint test after it in the same session fails on missing state files.
+    The subprocess asks the same question without disturbing the interpreter.
+    """
+    root = Path(__file__).resolve().parent.parent
+    code = (
+        "import signal, sys; sys.path.insert(0, %r)\n"
+        "before = signal.getsignal(signal.SIGINT)\n"
+        "import train\n"
+        "assert signal.getsignal(signal.SIGINT) is before, 'import installed a handler'\n"
+        "train.install_handlers()\n"
+        "assert signal.getsignal(signal.SIGINT) is not before\n"
+        % str(root)
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       text=True, cwd=str(root))
+    assert r.returncode == 0, r.stderr
 
 
 def test_dense_block_size_is_a_performance_knob_not_a_semantic_one():
