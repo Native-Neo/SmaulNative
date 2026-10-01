@@ -154,6 +154,10 @@ def test_flush_is_safe_to_call_twice_and_on_a_dead_module(tmp_path):
     emb.flush()
     orphan = MmapEmbedding.__new__(MmapEmbedding)
     orphan.flush()          # no _mem attribute yet
+    # flush() swallows AttributeError from the un-built instance and
+    # ValueError from an already-released mapping; both must still return.
+    assert orphan.flush() is None
+    assert emb.flush() is None
 
 
 def test_to_device_leaves_the_mapping_on_cpu(tmp_path):
