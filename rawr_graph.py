@@ -247,6 +247,7 @@ def build_graph(tokenizer,
         if (v, v) not in edge_set:
             edge_set.add((v, v))
             d += 1
+            deg[v] = d
         k = 1
         while d < min_degree:
             for nb in ((v + k) % vocab_size, (v - k) % vocab_size):
@@ -255,7 +256,12 @@ def build_graph(tokenizer,
                 e = (min(v, nb), max(v, nb))
                 if e not in edge_set:
                     edge_set.add(e)
+                    deg[nb] = deg.get(nb, 0) + 1
                     d += 1
+                # A ring neighbour already in edge_set was put there by an
+                # earlier vertex's pass, and that pass credited it to this
+                # token via deg[v]. Counting it again would double-count, so
+                # d advances only for edges this pass actually added.
             k += 1
             if k > vocab_size + 1:  # degenerate tiny vocabs
                 break
@@ -296,16 +302,25 @@ def fallback_graph(vocab_size: int, min_degree: int = 4) -> RawrGraph:
     edge_set: set = set()
     for v in range(vocab_size):
         edge_set.add((v, v))
-        k = 1
+        # Ring degree is symmetric -- v's neighbours add the same edges v's own
+        # pass would -- so the reachable floor is 1 + 2 * ring_steps. That is
+        # why an odd min_degree lands one above it, and why the loop stops per
+        # neighbour rather than per ring step.
         d = 1
+        k = 1
         while d < min_degree:
             for nb in ((v + k) % vocab_size, (v - k) % vocab_size):
+                edge_set.add((min(v, nb), max(v, nb)))
+                # Every ring neighbour counts, including one whose edge an
+                # earlier vertex already added: it is a real edge and v really
+                # is connected through it. Skipping already-present edges
+                # without advancing d is what left every token with roughly
+                # double min_degree neighbours (7.0 average at min_degree=4,
+                # against a documented 4) and doubled the edge count feeding
+                # rawr_connection_count.
+                d += 1
                 if d >= min_degree:
                     break
-                e = (min(v, nb), max(v, nb))
-                if e not in edge_set:
-                    edge_set.add(e)
-                    d += 1
             k += 1
             if k > vocab_size + 1:
                 break
