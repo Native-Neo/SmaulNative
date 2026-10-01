@@ -47,7 +47,7 @@ See [train.md](train.md) for all flags, the Lion optimizer, and the checkpoint f
 Single prompt, interactive chat, or local server -- all load `./runs/linear` by default:
 
 ```bash
-python infer_linear.py --model ./runs/linear --prompt "Hello world" --max 64
+python infer_cli.py --model ./runs/linear --prompt "Hello world" --max-tokens 64
 python infer_cli.py --model ./runs/linear
 python infer_server.py --model ./runs/linear --port 8080
 ```
@@ -61,10 +61,10 @@ Collect human preferences and GRPO-train, or run verified automatic RL:
 
 ```bash
 python rl.py --model_dir ./runs/linear --prompt "Explain gravity" --responses 8
-python autorl.py --model_dir ./runs/linear --prompt "Explain gravity" --responses 8
+python rl.py --auto --model_dir ./runs/linear --prompt "Explain gravity" --responses 8
 ```
 
-See [rl.md](rl.md) and [autorl.md](autorl.md). Auto-labeling without `--no-verify`
+See [rl.md](rl.md) and [autorl.md](autorl.md) (which documents `rl.py --auto`). Auto-labeling without `--no-verify`
 requires at least 4 human preference records first.
 
 ## MoE + export
