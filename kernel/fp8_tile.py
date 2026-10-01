@@ -3,7 +3,6 @@ import threading
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from kernel.compute import get_backend
 
@@ -123,9 +122,9 @@ def decode_tile(w, s, o0, o1, t, tile=TILE, dtype=torch.float32):
     """Decode rows [o0:o1] of one tile ``t`` to ``dtype``. Ragged-safe.
 
     Kept per-tile because the torch fallback (``compute._torch_forward`` /
-    ``_torch_backward_input``) and ``err_stats`` want exactly one tile, and
-    because the last tile may be short. The requant hot path uses
-    ``decode_block`` instead -- see there for why.
+    ``_torch_backward_input``) wants exactly one tile, and because the last tile
+    may be short. The requant hot path uses ``decode_block`` instead -- see
+    there for why.
     """
     lut = _lut(w.device, dtype)
     blk = w[o0:o1, t * tile:(t + 1) * tile].long()
@@ -168,7 +167,7 @@ class _Fn(torch.autograd.Function):
         ctx.need_x = ctx.needs_input_grad[0]
         x2 = x.reshape(-1, in_f).float().contiguous()
         y = get_backend().fp8_forward(x2, w, s, in_f, out_f, tile)
-        return y.reshape(*x.shape[:-1], out_f).to(x.dtype if x.dtype != torch.float32 else torch.float32)
+        return y.reshape(*x.shape[:-1], out_f).to(x.dtype)
 
     @staticmethod
     def backward(ctx, g):
