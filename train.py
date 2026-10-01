@@ -154,7 +154,7 @@ def _grad_norm(grads) -> float:
 
 def install_handlers() -> None:
     # Install SIGINT/SIGTERM handlers explicitly from main() only.
-    # Importing train (e.g. cpu/benchmark_full.py imports Lion) must not
+    # Importing train (e.g. benchmark.py imports Lion) must not
     # hijack process signals as a side effect.
     for _sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -991,8 +991,7 @@ def _save_smaul_states(out: Path, opt: "SmaulOpt", model) -> None:
     if tensors:
         tmp = out / "optimizer_state.safetensors.tmp"
         save_file(tensors, str(tmp))
-        import os as _os
-        _os.replace(tmp, out / "optimizer_state.safetensors")
+        os.replace(tmp, out / "optimizer_state.safetensors")
 
 
 def _load_optimizer(out: Path, opt, model=None):
@@ -1156,25 +1155,23 @@ def _validate_args(args) -> None:
         raise ValueError(f"--lr looks invalid: {args.lr}")
     if not 0 <= args.wd < 10:
         raise ValueError(f"--wd looks invalid: {args.wd}")
-    if getattr(args, "optimizer", "lion") not in ("lion", "smaul"):
+    if getattr(args, "optimizer", "smaul") not in ("lion", "smaul"):
         raise ValueError(f"--optimizer must be lion/smaul, got {getattr(args, 'optimizer')!r}")
-    import math as _math
     for _n, _flag in (("beta_m", "--beta-m"), ("beta_v", "--beta-v")):
         _v = getattr(args, _n, None)
         if _v is None:
             continue
-        if not isinstance(_v, (int, float)) or not _math.isfinite(float(_v)):
+        if not isinstance(_v, (int, float)) or not math.isfinite(float(_v)):
             raise ValueError(f"{_flag} must be finite, got {_v!r}")
         if not 0.0 <= float(_v) < 1.0:
             raise ValueError(f"{_flag} must be in [0.0, 1.0), got {_v!r}")
     _eps = getattr(args, "epsilon", None)
     if _eps is not None:
-        if not isinstance(_eps, (int, float)) or not _math.isfinite(float(_eps)) \
+        if not isinstance(_eps, (int, float)) or not math.isfinite(float(_eps)) \
                 or float(_eps) <= 0:
             raise ValueError(f"--epsilon must be positive finite, got {_eps!r}")
     ff = getattr(args, "ffn_mult", 2.5)
-    import math as _math
-    if not isinstance(ff, (int, float)) or not _math.isfinite(ff) or ff <= 0:
+    if not isinstance(ff, (int, float)) or not math.isfinite(ff) or ff <= 0:
         raise ValueError(f"--ffn_mult must be positive finite, got {ff!r}")
 
 def _tok(args, out: Path):
