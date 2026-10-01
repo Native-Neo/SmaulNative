@@ -22,7 +22,9 @@ def _load_tokenizer(path: Path):
         raise ValueError("tokenizer.json has no vocabulary")
     max_id = -1
     for token, idx in vocab.items():
-        if not isinstance(idx, int) or idx < 0:
+        # bool is a subclass of int: without the explicit exclusion a JSON
+        # `true` passes the isinstance check and lands at tokens[True].
+        if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
             raise ValueError(f"invalid tokenizer id for {token!r}: {idx!r}")
         if idx > MAX_VOCAB_IDS:
             raise ValueError(f"tokenizer id {idx} exceeds cap {MAX_VOCAB_IDS} (crafted file?)")
@@ -35,33 +37,25 @@ def _load_tokenizer(path: Path):
     return tokens
 
 
-def _dequant(state, expected_tile: int | None = None):
-    from kernel.fp8_tile import decode_tile
-    out = {}
-    for k, v in state.items():
-        if k.endswith(".w8"):
-            base = k[:-3]
-            if base + ".sc" not in state:
-                raise ValueError(f"FP8 weight {k} has no matching {base}.sc")
-            sc = state[base + ".sc"]
-            if sc.dim() != 2 or sc.shape[0] != v.shape[0] or sc.shape[1] <= 0:
-                raise ValueError(f"bad scale shape for {k}: {tuple(sc.shape)}")
-            out_f, in_f = v.shape
-            n_tiles = sc.shape[1]
-            if in_f % n_tiles != 0:
-                raise ValueError(f"in_f ({in_f}) not divisible by tiles ({n_tiles}) for {k}")
-            tile = in_f // n_tiles
-            if tile <= 0:
-                raise ValueError(f"zero tile for {k}")
-            if expected_tile is not None and tile != expected_tile:
-                raise ValueError(f"tile mismatch for {k}: {tile} != config {expected_tile}")
-            parts = [decode_tile(v, sc, 0, out_f, t, tile, torch.float32) for t in range(n_tiles)]
-            out[base + ".weight"] = torch.cat(parts, 1)
-        elif k.endswith(".sc"):
-            continue
-        else:
-            out[k] = v
-    return out
+def _check_fp8_pair(name: str, tensor, sc, expected_tile: int) -> int:
+    """Validate one .w8/.sc pair and return its tile width.
+
+    The streaming converter below dequantizes one weight at a time, so the
+    checks live here rather than in a whole-state helper: without them a
+    zero-width scale table divides by zero, and an in_f that is not a multiple
+    of the tile count silently truncates the integer division and drops input
+    columns while writing out a valid-looking model.
+    """
+    if sc.dim() != 2 or sc.shape[0] != tensor.shape[0] or sc.shape[1] <= 0:
+        raise ValueError(f"bad scale shape for {name}: {tuple(sc.shape)}")
+    out_f, in_f = tensor.shape
+    n_tiles = sc.shape[1]
+    if in_f % n_tiles != 0:
+        raise ValueError(f"in_f ({in_f}) not divisible by tiles ({n_tiles}) for {name}")
+    tile = in_f // n_tiles
+    if tile != expected_tile:
+        raise ValueError(f"tile mismatch for {name}: {tile} != {expected_tile}")
+    return tile
 
 
 def convert(input_dir: Path, output: Path, dtype: str, overwrite: bool = False):
@@ -84,9 +78,10 @@ def convert(input_dir: Path, output: Path, dtype: str, overwrite: bool = False):
         v = cfg.get(key)
         if not isinstance(v, int) or v <= 0 or v > 1_000_000:
             raise ValueError(f"config {key} invalid: {v!r}")
-    ctx_len = int(cfg.get("ctx_len", cfg.get("context_length", 512)))
-    if ctx_len <= 0 or ctx_len > 1_000_000:
-        ctx_len = 512
+    ctx_len = cfg.get("ctx_len", cfg.get("context_length", 512))
+    if isinstance(ctx_len, bool) or not isinstance(ctx_len, int) \
+            or not 0 < ctx_len <= 1_000_000:
+        raise ValueError(f"config context_length invalid: {ctx_len!r}")
     tokens = _load_tokenizer(input_dir / "tokenizer.json")
     if len(tokens) != int(cfg["vocab_size"]):
         raise ValueError(f"tokenizer vocab is {len(tokens)}, checkpoint expects {cfg['vocab_size']}")
@@ -124,10 +119,8 @@ def convert(input_dir: Path, output: Path, dtype: str, overwrite: bool = False):
             if sc is None:
                 raise ValueError(f"FP8 weight {orig} has no matching {base}.sc")
             out_f, in_f = tensor.shape
+            tile = _check_fp8_pair(orig, tensor, sc, expected_tile)
             n_tiles = sc.shape[1]
-            tile = in_f // n_tiles
-            if tile != expected_tile:
-                raise ValueError(f"tile mismatch for {orig}: {tile} != {expected_tile}")
             parts = [decode_tile(tensor, sc, 0, out_f, t, tile, torch.float32) for t in range(n_tiles)]
             tensor = torch.cat(parts, 1)
             del parts, sc
