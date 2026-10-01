@@ -43,8 +43,8 @@ language tag comes from `_LANG_FENCE` (`syntheticdata.py:175`) / `_DS_FENCE`
 ## Zero-duplicate guarantee & format
 
 - **Uniqueness**: every generated prompt is BLAKE2-hashed into a compact digest set
-  (32 bytes/entry, not full strings); a duplicate is thrown away and regenerated, so all
-  `--count` records are distinct. It stops hard at `target_count * 10` attempts, so don't
+  (16-byte digest, 32 hex chars/entry, not full strings); a duplicate is thrown away and
+  regenerated, so all `--count` records are distinct. It stops hard at `target_count * 10` attempts, so don't
   ask for more than the combinatorial space can realistically supply. `--seed` reproduces a run.
 - **Streaming**: `main()` generates and writes incrementally (`iter_unique_dataset` +
   `export_dataset_iter`, 10k-row Parquet batches) so million-scale runs never hold the whole
