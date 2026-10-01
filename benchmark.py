@@ -5,19 +5,8 @@ Use --mode full for FP8/FP32 and end-to-end measurements, or --mode arch for
 Rawr/Plain x RAM/mmap comparison.
 """
 
-#!/usr/bin/env python3
-"""cpu/benchmark_full.py -- Benchmark the CURRENT SmaulLinear/FP8 pipeline.
-
-Measures separately: FP8Linear forward/backward, Linear Attention, FFN,
-RMSNorm, residual add, optimizer/requant, complete training step,
-end-to-end tokens/sec, RSS, parameter storage. FP8 vs FP32 side by side.
-Do not assume FP8 is faster; this script measures it.
-
-Usage: python cpu/benchmark_full.py [--d 512] [--layers 4] [--ctx 256] [--batch 2] [--iters 10]
-"""
 import argparse
 import resource
-import signal
 import statistics
 import sys
 import time
@@ -71,6 +60,7 @@ def med(fn, iters, warm=3):
 
 
 def rss_mb():
+    """Peak RSS in MiB. ru_maxrss is a high-water mark, not current usage."""
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # Linux returns KiB, macOS returns bytes.
     if sys.platform == "darwin":
@@ -79,7 +69,7 @@ def rss_mb():
 
 
 def run_full(argv=None):
-    _root = str(Path(__file__).resolve().parent.parent)
+    _root = str(Path(__file__).resolve().parent)
     if _root not in sys.path:
         sys.path.insert(0, _root)
     args = parse_args(argv)
@@ -88,17 +78,8 @@ def run_full(argv=None):
 
     from kernel.compute import get_backend
     from kernel.fp8_tile import FP8Linear, decode_tile, fp8_modules
-    from smaul_linear import Block, LinearConfig, SmaulLinear, SwiFFN  # noqa: F401
-    # train.py installs a process SIGINT handler at import; save/restore so
-    # importing the benchmark as a library has no global side effect.
-    _prev_sigint = signal.getsignal(signal.SIGINT)
-    try:
-        from train import Lion, SmaulOpt
-    finally:
-        try:
-            signal.signal(signal.SIGINT, _prev_sigint)
-        except (OSError, ValueError):
-            pass
+    from smaul_linear import Block, LinearConfig, SmaulLinear  # noqa: F401
+    from train import Lion, SmaulOpt
 
     be = get_backend()
     be.configure(args.threads)
@@ -119,8 +100,14 @@ def run_full(argv=None):
         ref.weight.copy_(torch.cat([decode_tile(m8.w8, m8.sc, 0, D, t) for t in range(nt)], 1))
     x = torch.randn(R, D)
     g = torch.randn(R, D)
-    out["fp8_fwd"] = med(lambda: m8(x), args.iters)
-    out["fp32_fwd"] = med(lambda: ref(x), args.iters)
+    # Both forwards under no_grad: ref carries a requires_grad weight and x does
+    # not, so without this only the FP32 side builds and saves an AddmmBackward
+    # node. That cost lands entirely in fp32_fwd and biases the fwd_ratio this
+    # file exists to report. (The FP8 side cannot build one -- FP8Linear's
+    # weights are buffers, not parameters.)
+    with torch.no_grad():
+        out["fp8_fwd"] = med(lambda: m8(x), args.iters)
+        out["fp32_fwd"] = med(lambda: ref(x), args.iters)
 
     def fp8_bwd():
         xx = x.clone().requires_grad_(True)
@@ -207,17 +194,13 @@ def run_full(argv=None):
           f"checkpoint {stored/1048576:.1f}MiB = FP8 {fp8b/1048576:.1f}MiB "
           f"(same weights in fp32: {fpb/1048576:.1f}MiB) + {other/1048576:.1f}MiB other")
 
-#!/usr/bin/env python3
-"""Optimizer comparison: Lion vs SmaulOpt on identical tensors/conditions.
-
-Measures update time, persistent optimizer-state bytes, and CPU throughput.
-Same shapes, same gradients, same clipping, same thread count for every
-optimizer; no per-optimizer tuning. This is a v1 measurement, not a claim
-about convergence quality.
-
-Usage: python benchmark.py --mode opt [--d 512] [--layers 4] [--iters 10]
-"""
 def run_opt(argv=None):
+    """Lion vs SmaulOpt on identical tensors/conditions.
+
+    Update time, persistent optimizer-state bytes, and CPU throughput. Same
+    shapes, same gradients, same clipping, same thread count for both; no
+    per-optimizer tuning. A measurement, not a claim about convergence.
+    """
     _root = str(Path(__file__).resolve().parent)
     if _root not in sys.path:
         sys.path.insert(0, _root)
@@ -260,13 +243,12 @@ def run_opt(argv=None):
         else:
             opt = SmaulOpt(list(model.parameters()), lr=2e-4, clip=1.0,
                            state_dtype=sdt, factor_v=bool(fv))
-        holder = model  # both optimizers walk fp8_modules(model)
 
         def one_step():
-            opt.zero_grad(holder)
+            opt.zero_grad(model)
             _, loss = model(ids, ids)
             loss.backward()
-            return float(opt.step(holder))
+            return float(opt.step(model))
 
         for _ in range(3):
             one_step()
@@ -297,10 +279,12 @@ def run_opt(argv=None):
         print(f"{key:11s} step {step_ms:8.2f} ms | state {state_bytes / 1048576:7.2f} MiB "
               f"({n_state} values) | {tok_s:8.1f} tok/s")
 
-    base = results["smaul_fp32_fullv"]
     fullv = results["smaul_bf16_fullv"]
+    # "vs fullv" is relative to bf16 full-v, so every bf16 row reads 1.00x and
+    # only the wider-state rows move. It isolates the factored-v saving rather
+    # than the fp32 reference.
     print(f"\n{'optimizer':20s} {'step ms':>9s} {'m MiB':>8s} {'v MiB':>8s} "
-          f"{'total MiB':>10s} {'vs fullv':>9s} {'tok/s':>8s}  note")
+          f"{'total MiB':>10s} {'vs bf16 fullv':>13s} {'tok/s':>8s}  note")
     for name, v in results.items():
         parts = name.split("_")
         sdt = parts[1] if len(parts) > 1 else ""
@@ -312,33 +296,20 @@ def run_opt(argv=None):
         rel = v["state_bytes"] / max(fullv["state_bytes"], 1)
         print(f"{name:20s} {v['step_ms']:9.2f} {v['m_bytes'] / 1048576:8.2f} "
               f"{v['v_bytes'] / 1048576:8.2f} {v['state_bytes'] / 1048576:10.2f} "
-              f"{rel:8.2f}x {v['tok_s']:8.1f}  {note}")
+              f"{rel:13.2f}x {v['tok_s']:8.1f}  {note}")
     f_rel = fullv["state_bytes"] / max(results["smaul_bf16_factored"]["state_bytes"], 1)
     print(f"\nbf16 factored-v vs full-v: {f_rel:.2f}x less optimizer state")
     print("(measurement only. Per-step ms is dominated by forward/backward and is "
           "noisy on this machine; the m/v/total MiB columns are exact.)")
 
 
-# !/usr/bin/env python3
-"""Reproducible Rawr-vs-Plain x RAM-vs-mmap comparison (experimental).
-
-Runs all four combos with IDENTICAL dims, tokenizer, dataset, optimizer and
-batch config, then reports: param count, stored bytes, graph edges/sparsity,
-tokens/sec, peak memory, embedding lookup, startup/load time, train/val loss.
-
-Hypothesis under test (not a claim): Rawr may use the same nominal budget
-more effectively because excluded connections consume no storage/compute.
-
-Usage:
-    python cpu/benchmark_arch.py [--out ./runs/arch_bench] [--steps 8]
-"""
-import argparse
+# The arch-mode comparison below runs all four Rawr/Plain x RAM/mmap combos
+# with IDENTICAL dims, tokenizer, dataset, optimizer and batch config, then
+# reports param count, stored bytes, graph edges/sparsity, tokens/sec, peak
+# memory, embedding lookup, startup/load time and train/val loss. Hypothesis
+# under test, not a claim: Rawr may use the same nominal budget more
+# effectively because excluded connections consume no storage/compute.
 import json
-import resource
-import statistics
-import sys
-import time
-from pathlib import Path
 
 _ROOT = str(Path(__file__).resolve().parent)
 if _ROOT not in sys.path:
@@ -492,6 +463,11 @@ def run_arch(argv=None):
     a.add_argument("--out", default="./runs/arch_bench")
     a.add_argument("--steps", type=int, default=STEPS)
     args = a.parse_args(argv)
+    # Fail here rather than three lines into run_combo's while loop, where a
+    # non-positive value skips the loop entirely and then indexes the empty
+    # train_losses list.
+    if args.steps <= 0:
+        a.error("--steps must be >= 1")
     globals()["STEPS"] = args.steps
 
     out = Path(args.out)
@@ -499,7 +475,8 @@ def run_arch(argv=None):
     tok = build_tokenizer()
     chunks = encode_all(tok, TRAIN_TEXTS, CTX)
     val_chunks = encode_all(tok, VAL_TEXTS, CTX)
-    assert chunks and val_chunks, "no data chunks (tokenizer/dataset issue)"
+    if not chunks or not val_chunks:
+        raise RuntimeError("no data chunks (tokenizer/dataset issue)")
 
     results = {}
     for arch, storage in [("rawr", "ram"), ("rawr", "mmap"),
@@ -529,7 +506,6 @@ def run_arch(argv=None):
 
 
 def main():
-    import sys
     mode = "full"
     if "--mode" in sys.argv:
         i = sys.argv.index("--mode")
