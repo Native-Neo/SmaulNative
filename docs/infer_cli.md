@@ -12,12 +12,12 @@ Commands inside the session: `/clear`, `/system <text>`, `/exit` (`Ctrl-D`/`Ctrl
 
 ## Behavior
 
-- Sampling flags are validated up front (`--max-tokens` in `[1, 4096]`, `--temperature >= 0`,
+- Sampling flags are validated up front (`--max-tokens` in `[1, 65536]`, `--temperature >= 0`,
   `0 < --top-p <= 1`, `--repeat-penalty > 0`).
 - History is capped at `--max-history` turns (default 40): oldest turns are dropped with a
   `[history trimmed]` notice. This matches the engine reality -- the model only attends to the
-  last 512 tokens, so unbounded history would silently forget early context while slowing
-  every turn.
+  last 262144 tokens (`inference.MODEL_WINDOW`), so unbounded history would silently forget
+  early context while slowing every turn.
 - `Ctrl-C` mid-answer stops generation: an empty interruption discards the pending user turn
   (nothing saved); a partial answer is kept with a ` [stopped]` suffix instead of masquerading
   as a complete turn.
