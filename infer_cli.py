@@ -83,9 +83,13 @@ def main():
 
         messages.append({"role": "user", "content": user})
         if len(messages) > args.max_history:
-            # Drop oldest turns (keep pairs) and warn: engine window is 512
-            # tokens, so unbounded history silently forgets anyway.
+            # Drop oldest turns (whole user/assistant pairs, so the history never
+            # starts on an assistant turn) and warn: the engine window is
+            # inference.MODEL_WINDOW tokens, so unbounded history silently
+            # forgets anyway.
             drop = len(messages) - args.max_history
+            if drop % 2:
+                drop += 1          # never leave a leading assistant turn
             del messages[:drop]
             print(f"[history trimmed: dropped {drop} oldest turn(s)]")
         try:
