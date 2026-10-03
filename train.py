@@ -1225,6 +1225,17 @@ def _validate_args(args) -> None:
     ff = getattr(args, "ffn_mult", 2.5)
     if not isinstance(ff, (int, float)) or not math.isfinite(ff) or ff <= 0:
         raise ValueError(f"--ffn_mult must be positive finite, got {ff!r}")
+    # A negative --rawr-max-docs is truthy, so build_graph's `if max_docs and
+    # n_docs >= max_docs` fires on the first document and the graph is built
+    # from a single doc. A negative --rawr-max-tokens-per-doc reaches
+    # `ids[:max_tokens_per_doc]` and silently drops the last token of every
+    # document. Both must fail here, not corrupt the graph quietly.
+    for _n in ("rawr_max_docs", "rawr_max_tokens_per_doc"):
+        _v = getattr(args, _n, 0)
+        if _v is None:
+            continue
+        if not isinstance(_v, int) or isinstance(_v, bool) or _v < 0:
+            raise ValueError(f"--{_n.replace('_', '-')} must be a non-negative int, got {_v!r}")
 
 def _tok(args, out: Path):
     from tokenizer import VERSION as _TOK_VERSION
