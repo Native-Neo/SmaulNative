@@ -66,6 +66,8 @@ class LinearInference:
             raise ValueError(f"architecture must be rawr/plain, got {architecture!r}")
         if embedding_storage is not None and embedding_storage not in ("ram", "mmap"):
             raise ValueError(f"embedding_storage must be ram/mmap, got {embedding_storage!r}")
+        if dtype != "auto" and dtype not in {"fp32", "bf16"}:
+            raise ValueError(f"unsupported dtype: {dtype}")
         self.model_dir = Path(model_dir)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -94,8 +96,6 @@ class LinearInference:
         # _seed_all touches global RNG, so unsynchronized sharing races.
         self._gen_lock = threading.RLock()
         if dtype != "auto":
-            if dtype not in {"fp32", "bf16"}:
-                raise ValueError(f"unsupported dtype: {dtype}")
             self.model = self.model.to(torch.bfloat16 if dtype == "bf16" else torch.float32)
             # .to(bf16) also casts FP8 per-tile scales (float32 buffers) to
             # bf16, which breaks the native kernel (expects f32) and degrades
