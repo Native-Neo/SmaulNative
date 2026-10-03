@@ -30,7 +30,7 @@ python benchmark.py --mode full|opt|arch --d 512 --layers 4 --ctx 256 --batch 2 
 
 - **No lint / format / typecheck config exists** (no ruff, mypy, black, flake8, pre-commit,
   or `pyproject.toml`). Verification is `pytest` only. Do not introduce a linter.
-- `pytest -q` collects and passes clean -- 460 tests, no `--ignore` needed. It
+- `pytest -q` collects and passes clean -- 955 tests, no `--ignore` needed. It
   did not until 4d81541; if you see `--ignore=tests/test_rl.py` anywhere, that
   advice is stale.
 - `datasets/` is gitignored and usually absent. `train.py --data` needs a real directory;
@@ -95,7 +95,7 @@ Any optimizer added here must satisfy this, because the training loop depends on
 
 - **Tests have no `conftest.py`.** Every test file must begin with
   `sys.path.insert(0, str(Path(__file__).resolve().parent.parent))` or its imports fail.
-  All 15 existing tests do; follow suit in new ones.
+  All 16 existing test files do; follow suit in new ones.
 - Tests must not require `./datasets` or network. Prefer tiny `LinearConfig` models.
 - `train.py` installs SIGINT/SIGTERM handlers **only inside `main()`** via
   `install_handlers()`, deliberately, so that importing `train` (which `benchmark.py`
@@ -112,14 +112,13 @@ Any optimizer added here must satisfy this, because the training loop depends on
   in 4d81541 -- a one-word import, nothing else. `rl.py` is still only 26%
   covered and three of that file's five tests assert torch algebra without
   calling `rl.py` at all, so do not read a green `test_rl.py` as RL coverage.
-- `.github/workflows/test.yml` runs `from compute import get_backend`, but `compute.py`
-  lives at `kernel/compute.py`; that CI step ImportErrors.
-- Docs still reference files that do not exist: `infer_linear.py`, `autorl.py`,
+- `.github/workflows/test.yml` used to run `from compute import get_backend`, but
+  `compute.py` lives at `kernel/compute.py`. Fixed: the step imports from
+  `kernel.compute`, like the tests do.
+- Docs used to reference files that do not exist: `infer_linear.py`, `autorl.py`,
   `cpu/benchmark_full.py`, `cpu/benchmark_arch.py` (benchmarks were consolidated into
-  `benchmark.py` behind `--mode`).
-- Docs that reference files which do not exist: `autorl.py` (in `docs/quickstart.md`),
-  `cpu/benchmark_full.py`, `cpu/benchmark_arch.py` (benchmarks were consolidated into
-  `benchmark.py` behind `--mode`; `docs/cpu.md` is fixed, `quickstart.md` is not).
+  `benchmark.py` behind `--mode`). Fixed: `docs/quickstart.md` names the real entry
+  points, and the stale `cpu/*.py` strings in `benchmark.py`/`train.py` are gone.
 - **JIT lock hang:** a stale `~/.cache/torch_extensions/py*/smaul_fp8_ivb/lock` left by a
   killed process makes every FP8 test hang forever inside `file_baton.wait()`. Symptom is
   pytest producing *no output* on the first FP8 test. Fix: delete that lock file.
