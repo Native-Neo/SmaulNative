@@ -19,5 +19,6 @@ repo root.
 - [infer_cli.py](docs/infer_cli.md)
 - [infer_server.py](docs/infer_server.md)
 - [rl.py](docs/rl.md)
+- [rl.py --auto](docs/autorl.md) -- unattended preference learning
 - [convert_linear_to_gguf.py](docs/convert_gguf.md)
 - [CPU Optimizations](docs/cpu.md)
