@@ -76,7 +76,8 @@ Lion, inference, and export paths are shared.
 performed, by walking the built model. It is the counterpart to `RawrGraph.stats()`, and it
 exists because the two disagree sharply: the graph's `sparsity` describes the `vocab x vocab`
 token-edge space, not the model. At the 32M preset (V8000, d512, 8 layers, ffn 2.5) the graph
-reports 99.91% while **97.7% of the arithmetic the model performs is dense**, because the
+reports 99.91% while **97.7% of the arithmetic the model performs is dense at
+`--rawr-sparsity 0.99`** (80.9% at the default 0.9; see the table in train.md), because the
 graph only drives the FFN and the LM head — the attention projections are dense `FP8Linear`
 and dominate. `train.py` prints both at startup and `rawr_graph.print_stats` labels the graph
 figure "NOT the model" for the same reason.
