@@ -89,10 +89,10 @@ class SmaulRL:
         # without this a single bad value aborts the whole run, and argmax would
         # rank NaN highest. -inf makes it the token that is never sampled.
         logits = logits.float().masked_fill(~torch.isfinite(logits), -float("inf"))
+        # _filter_logits always keeps at least one logit (top_k keeps the max,
+        # top_p keeps rank 0), so an all-masked result means the input had no
+        # finite value to begin with; the RuntimeError below is the handler.
         filtered = cls._filter_logits(logits, temperature, top_k, top_p)
-        if not bool(torch.isfinite(filtered).any()):
-            # All-masked: fall back to greedy on unfiltered logits instead of NaN crash.
-            filtered = logits.float()
         log_probs = F.log_softmax(filtered, -1)
         if not bool(torch.isfinite(log_probs).any()):
             raise RuntimeError("sampling failed: all logits non-finite")
