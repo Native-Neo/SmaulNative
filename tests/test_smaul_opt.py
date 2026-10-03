@@ -924,10 +924,17 @@ def test_factor_v_off_keeps_full_v_everywhere():
 
 
 def test_threshold_never_costs_more_than_full():
-    """For any shape we factor, R + C <= R * C, so factoring never costs more."""
-    for r in range(2, 12):
-        for c in range(2, 12):
-            assert r + c <= r * c, (r, c)
+    """_factor_shape agrees with R + C <= R * C on every 2-D shape.
+
+    The point is the code's decision, not the arithmetic: factoring must be
+    taken exactly where it cannot cost more, and refused everywhere else.
+    """
+    opt = _factored_opt(torch.nn.Parameter(torch.randn(2, 2)), factor_v=True)
+    for r in range(0, 14):
+        for c in range(0, 14):
+            assert opt._factor_shape((r, c)) is (r >= 2 and c >= 2), (r, c)
+            if r >= 2 and c >= 2:
+                assert r + c <= r * c, (r, c)
     # ...and we refuse exactly the shapes where that would not hold.
     p = torch.nn.Parameter(torch.randn(1, 8))
     opt = _factored_opt(p, factor_v=True)
@@ -952,12 +959,29 @@ def test_factored_state_holds_no_full_matrix_v():
 
 
 def test_large_matrix_memory_target():
-    """The stated target: a 4096x4096 v goes from ~32 MB to ~16 KB."""
+    """The stated target: a 4096x4096 v goes from ~32 MB to ~16 KB.
+
+    Computed from the optimizer's own storage width and state layout, not
+    from literals: a regression that widens _storage_dtype or stores a full
+    v alongside the marginals breaks this.
+    """
     R = C = 4096
-    full = R * C * 2
-    factored = (R + C) * 2
-    assert full == 33554432 and factored == 16384
+    p = torch.nn.Parameter(torch.zeros(8, 8))
+    opt = _factored_opt(p, factor_v=True)
+    assert opt._factor_shape((R, C)) is True
+    width = torch.empty(0, dtype=opt._storage_dtype(signed=False)).element_size()
+    full = R * C * width
+    factored = (R + C) * width
+    assert (full, factored) == (33554432, 16384)
     assert full / factored > 2000
+    # And the real state after a step has exactly that shape: one full m,
+    # two marginals, no full v anywhere.
+    q = torch.nn.Parameter(torch.randn(300, 400))
+    opt2 = _factored_opt(q, factor_v=True)
+    q.grad = torch.randn(300, 400)
+    opt2.step(_dummy_model())
+    assert opt2.v_row[q].numel() + opt2.v_col[q].numel() == 300 + 400
+    assert q not in opt2.v
 
 
 def test_m_is_always_full_size():
@@ -2089,8 +2113,9 @@ def test_square_states_cannot_be_caught_by_shape_alone(tmp_path):
         m = blobs.get("m." + base_k)
         if m is not None and m.dim() == 2 and m.shape[0] == m.shape[1]:
             squares.append(base_k)
-    if not squares:
-        pytest.skip("fixture produced no square 2-D state")
+    # The 32x32 attention projections are always square; if the fixture ever
+    # stops producing one, the test must fail, not silently skip.
+    assert squares, "fixture produced no square 2-D state"
     # It loads without complaint, which is the point: shape checks cannot help here.
     _attempt(d, blobs)()
 
