@@ -276,14 +276,19 @@ def test_fused_lion_requant_matches_full_matrix():
     gw = m._gw.clone()
     gw_snapshot = gw.clone()
     w8_before, sc_before = m.w8.clone(), m.sc.clone()
-    st = torch.zeros_like(gw)
+    # Production Lion always holds fp32 momentum (zeros_like of the widened
+    # gradient); a bf16 st never occurs outside this test, and mixed bf16/fp32
+    # block arithmetic rounds differently from either pure form. Pin the real
+    # configuration: fp32 momentum, narrow gradient.
+    st = torch.zeros(gw.shape, dtype=torch.float32)
     m.fused_lion_requant(gw, st, lr, wd, b1, b2)
     assert m._gw is None
     assert torch.equal(gw, gw_snapshot)
     # Reference: the old full-matrix formulas computed with plain torch ops.
-    st_ref = torch.zeros_like(gw)
-    upd = (st_ref * b1 + gw * (1 - b1)).sign() * lr
-    st_ref.mul_(b2).add_(gw, alpha=1 - b2)
+    gw_f = gw.float()
+    st_ref = torch.zeros_like(gw_f)
+    upd = (st_ref * b1 + gw_f * (1 - b1)).sign() * lr
+    st_ref.mul_(b2).add_(gw_f, alpha=1 - b2)
     assert torch.equal(st, st_ref)
     m_ref = FP8Linear(128, 130, tile=32)
     m_ref.w8.copy_(w8_before)

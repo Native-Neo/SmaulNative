@@ -275,7 +275,10 @@ class FP8Linear(nn.Module):
         """
         for o0 in range(0, self.out_f, _OB):
             o1 = min(o0 + _OB, self.out_f)
-            g_b, s_b = gw[o0:o1], st[o0:o1]
+            # Widened per block, not per matrix: .float() on an fp32 block is a
+            # no-op view, on a narrow block a block-sized copy. Either way no
+            # full-matrix FP32 transient is ever built.
+            g_b, s_b = gw[o0:o1].float(), st[o0:o1]
             upd_b = (s_b * b1 + g_b * (1.0 - b1)).sign() * lr
             s_b.mul_(b2).add_(g_b, alpha=1.0 - b2)
             self._requant_block(o0, o1, upd_b, lr * wd)
