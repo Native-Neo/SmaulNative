@@ -384,10 +384,11 @@ class SmaulTokenizer:
         self.vocab = data["vocab"]
         self.id_to_token = {}
         for x, i in self.vocab.items():
-            try:
-                self.id_to_token[int(i)] = x
-            except (TypeError, ValueError):
+            # int() accepts True ("1"), "5" and 5.9: without the guard a
+            # crafted file silently collides ids instead of failing to load.
+            if isinstance(i, bool) or not isinstance(i, int) or i < 0:
                 raise ValueError(f"invalid vocab id for {x!r}: {i!r}")
+            self.id_to_token[i] = x
         try:
             self.unk_token_id = data["unk_id"]
             self.pad_token_id = self.vocab["<pad>"]
