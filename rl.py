@@ -345,7 +345,6 @@ def main_human():
 
 import argparse
 import hashlib
-import pickle
 import json
 import random
 from pathlib import Path
@@ -388,14 +387,24 @@ class AutoRL(SmaulRL):
         self._load_preference_model()
 
     def _load_preference_model(self):
+        weights_ok = not self.preference_model_path.exists()
         if self.preference_model_path.exists():
             try:
                 state = torch.load(self.preference_model_path, map_location=self.device, weights_only=True)
                 self.preference_model.load_state_dict(state)
-            except (OSError, RuntimeError, ValueError, TypeError,
-                    pickle.UnpicklingError, EOFError) as exc:
+                weights_ok = True
+            except Exception as exc:
+                # Deliberately broad: a half-written file can fail anywhere in
+                # unpickling (IndexError, struct.error, ...), and any failure
+                # here must degrade to an untrained model, never propagate.
                 print(f"[WARN] ignoring corrupt preference checkpoint {self.preference_model_path}: {exc}")
-        if self.preference_meta_path.exists():
+        # The meta file is read independently of the weights, so a truncated
+        # .pt next to an intact .meta.json would otherwise leave
+        # preference_trained > 0 on top of a random init -- and run() would
+        # then auto-label on it. Only a model whose weights actually loaded
+        # may claim to be trained.
+        self._preference_weights_ok = weights_ok
+        if self.preference_meta_path.exists() and weights_ok:
             try:
                 meta = json.loads(self.preference_meta_path.read_text())
                 self.preference_trained = max(0, int(meta.get("records", 0)))
@@ -404,6 +413,7 @@ class AutoRL(SmaulRL):
                 self.preference_trained = 0
                 self._preference_hash = ""
         else:
+            self.preference_trained = 0
             self._preference_hash = ""
 
     def _prefs_hash(self, lines: List[str]) -> str:
