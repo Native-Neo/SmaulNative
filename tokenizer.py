@@ -14,10 +14,15 @@ CHATML_TAG = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>")
 # "eBay" lowercases lossily, see case_type). Multi-char operators are single tokens.
 # Numbers cover ASCII + Devanagari digits (U+0966-096F).
 _DIGIT = r"(?:\d|[\u0966-\u096F])"
-TOKEN_RE = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>|\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F\u200C\u200D]+|" + _DIGIT + r"+(?:\." + _DIGIT + r"+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]", re.UNICODE)
+# The trailing letter run covers every other Unicode script (Greek, Cyrillic,
+# CJK, accented Latin...). Without it those characters matched no alternative
+# -- the catch-all [^\w\s] cannot match a word character -- and vanished
+# without an error ('κόσμο' -> [], 'café' -> 'caf','ve'). It sits after the
+# Latin and Devanagari alternatives so ASCII tokenization is unchanged. (v8)
+TOKEN_RE = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>|\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F\u200C\u200D]+|[^\W\d_]+|" + _DIGIT + r"+(?:\." + _DIGIT + r"+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]", re.UNICODE)
 DEV_BASE = re.compile(r"[\u0900-\u097F]")
 TEXT_KEYS = ("text", "content", "document", "body", "code", "prompt", "completion", "input", "output", "question", "answer")
-VERSION = 7
+VERSION = 8
 
 class TokenIds(list):
     @property
