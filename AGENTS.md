@@ -112,6 +112,8 @@ Any optimizer added here must satisfy this, because the training loop depends on
   in 4d81541 -- a one-word import, nothing else. `rl.py` is still only 26%
   covered and three of that file's five tests assert torch algebra without
   calling `rl.py` at all, so do not read a green `test_rl.py` as RL coverage.
+  `tests/test_autorl.py` (four tests, pre-fold leftover) was deleted outright;
+  `test_rl.py` superseded all of it with real-model coverage.
 - `.github/workflows/test.yml` used to run `from compute import get_backend`, but
   `compute.py` lives at `kernel/compute.py`. Fixed: the step imports from
   `kernel.compute`, like the tests do.
