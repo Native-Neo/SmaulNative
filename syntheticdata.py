@@ -29,7 +29,7 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 try:
     import pyarrow as pa
@@ -467,6 +467,7 @@ def export_dataset_iter(samples_iter, output_dir: Path, fmt: str = "both", overw
     parquet_schema = None
     batch: List[Dict[str, str]] = []
     PARQUET_BATCH = 10_000
+    write_error: Optional[BaseException] = None
     try:
         for item in samples_iter:
             count += 1
@@ -494,11 +495,21 @@ def export_dataset_iter(samples_iter, output_dir: Path, fmt: str = "both", overw
                 table = pa.Table.from_pylist([{"instruction": "", "response": "", "think": "",
                                                "domain": "", "text": ""}]).slice(0, 0)
                 pq_writer = pq.ParquetWriter(parquet_tmp, table.schema, compression="zstd")
+    except BaseException as exc:
+        # Remembered so the closes below cannot stand in for it: a failed
+        # write_table followed by a failed close() would otherwise report the
+        # close and bury the write error that actually explains the breakage.
+        write_error = exc
+        raise
     finally:
         if jsonl_f is not None:
             jsonl_f.close()
         if pq_writer is not None:
-            pq_writer.close()
+            try:
+                pq_writer.close()
+            except Exception:
+                if write_error is None:
+                    raise
     if jsonl_f is not None:
         os.replace(jsonl_tmp, jsonl_path)
         print(f"  └─ JSONL exported: {jsonl_path} ({os.path.getsize(jsonl_path) / (1024*1024):.2f} MB)")
