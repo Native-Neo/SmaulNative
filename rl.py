@@ -636,6 +636,11 @@ class AutoRL(SmaulRL):
             raise ValueError("--responses must be at least 2")
         if max_new_tokens <= 0:
             raise ValueError("--max_new_tokens must be positive")
+        # Same ranges grpo_step enforces, checked before model load and
+        # generation instead of after them: a bad --rl_lr must not cost 8
+        # sampled responses and a picked winner before it fails.
+        if not 0 < rl_lr < 1 or not 0 <= clip < 1 or not 0 <= kl_coef < 10:
+            raise ValueError(f"invalid hyperparams rl_lr={rl_lr} clip={clip} kl_coef={kl_coef}")
         print(f"[PREF] loading {self.preference_count()} preference records")
         self.train_preferences(preference_epochs, preference_lr)
         human_records = self.human_preference_count()
