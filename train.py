@@ -246,33 +246,52 @@ class Lion:
         for _, m in mods:
             if m._gw is None:
                 continue
-            g = m._gw.float().contiguous()
+            # Passed narrow: fused_lion_requant widens per output block, so no
+            # full-matrix FP32 copy of the gradient is ever built.
+            gw = m._gw
             st = self.m.get(m)
-            if st is None or st.shape != g.shape:
-                st = torch.zeros_like(g)
+            if st is None or st.shape != tuple(gw.shape):
+                st = torch.zeros(tuple(gw.shape), dtype=torch.float32, device=gw.device)
                 self.m[m] = st
-            elif st.device != g.device:
-                st = st.to(g.device)
+            elif st.device != gw.device:
+                st = st.to(gw.device)
                 self.m[m] = st
             live.add(m)
-            m.fused_lion_requant(g, st, self.lr, self.wd, self.b1, self.b2)
+            m.fused_lion_requant(gw, st, self.lr, self.wd, self.b1, self.b2)
         for p in self.p:
             if p.grad is None:
                 continue
-            g = p.grad.float()
+            g = p.grad
             st = self.m.get(p)
             if st is None or st.shape != tuple(p.shape):
-                st = torch.zeros_like(p, dtype=torch.float32)
+                st = torch.zeros(tuple(p.shape), dtype=torch.float32, device=g.device)
                 self.m[p] = st
             elif st.device != g.device:
                 st = st.to(g.device)
                 self.m[p] = st
             live.add(p)
-            upd = st.mul(self.b1).add(g, alpha=1 - self.b1).sign()
-            if self.wd:
-                p.mul_(1 - self.lr * self.wd)
-            p.add_(upd, alpha=-self.lr)
-            st.mul_(self.b2).add_(g, alpha=1 - self.b2)
+            # Blocked over rows for 2-D parameters so the sign-update never
+            # holds full-matrix transients (the embedding is the large one).
+            # Elementwise throughout, so blocking is bit-exact. Narrower
+            # gradients widen per block via promotion, never whole.
+            if g.dim() >= 2:
+                rows = g.shape[0]
+                for o0 in range(0, rows, 256):
+                    o1 = min(o0 + 256, rows)
+                    gb = g[o0:o1].float()
+                    sb = st[o0:o1]
+                    upd = sb.mul(self.b1).add(gb, alpha=1 - self.b1).sign()
+                    if self.wd:
+                        p[o0:o1].mul_(1 - self.lr * self.wd)
+                    p[o0:o1].add_(upd.to(p.dtype), alpha=-self.lr)
+                    sb.mul_(self.b2).add_(gb, alpha=1 - self.b2)
+            else:
+                gb = g.float()
+                upd = st.mul(self.b1).add(gb, alpha=1 - self.b1).sign()
+                if self.wd:
+                    p.mul_(1 - self.lr * self.wd)
+                p.add_(upd.to(p.dtype), alpha=-self.lr)
+                st.mul_(self.b2).add_(gb, alpha=1 - self.b2)
         # Evict momentum for dead params/modules (e.g. architecture change).
         for k in list(self.m):
             if k not in live:
