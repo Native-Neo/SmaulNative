@@ -1400,6 +1400,32 @@ def main():
         raise ValueError(f"--architecture must be rawr/plain, got {arch!r}")
     if storage not in ("ram", "mmap"):
         raise ValueError(f"--embedding-storage must be ram/mmap, got {storage!r}")
+    opt_name = getattr(args, "optimizer", "smaul") or "smaul"
+    if arch != "rawr":
+        # The whole rawr block below is skipped, so non-default rawr flags
+        # would silently do nothing. Warn rather than raise: defaults flow
+        # through here on every plain run and must stay quiet.
+        for _flag, _v, _dflt in (
+                ("--rawr-sparsity", getattr(args, "rawr_sparsity", 0.9), 0.9),
+                ("--rawr-min-degree", getattr(args, "rawr_min_degree", 4), 4),
+                ("--rawr-dict", getattr(args, "rawr_dict", None), None),
+                ("--rawr-graph-out", getattr(args, "rawr_graph_out", None), None),
+                ("--rawr-max-docs", getattr(args, "rawr_max_docs", 2000), 2000),
+                ("--rawr-max-tokens-per-doc", getattr(args, "rawr_max_tokens_per_doc", 1024), 1024)):
+            if _v != _dflt:
+                print(f"[WARN] {_flag}={_v} has no effect with --architecture {arch}")
+    if opt_name != "smaul":
+        # Lion keeps fixed built-in betas and no narrow state: SmaulOpt-only
+        # flags are validated above and then discarded. Same warn-not-raise.
+        for _flag, _v, _dflt in (
+                ("--beta-m", getattr(args, "beta_m", 0.9), 0.9),
+                ("--beta-v", getattr(args, "beta_v", 0.999), 0.999),
+                ("--epsilon", getattr(args, "epsilon", 1e-8), 1e-8),
+                ("--state-dtype", getattr(args, "state_dtype", "bf16"), "bf16"),
+                ("--grad-dtype", getattr(args, "grad_dtype", "bf16"), "bf16"),
+                ("--factor-v/--no-factor-v", getattr(args, "factor_v", True), True)):
+            if _v != _dflt:
+                print(f"[WARN] {_flag}={_v} has no effect with --optimizer {opt_name}")
     rawr_graph = None
     if arch == "rawr":
         from rawr_graph import build_graph, print_stats, save_graph
@@ -1436,7 +1462,6 @@ def main():
         from rawr_graph import print_model_compute
 
         print_model_compute(model.compute_profile())
-    opt_name = getattr(args, "optimizer", "lion") or "lion"
     if opt_name == "smaul":
         opt = SmaulOpt(list(model.parameters()), lr=args.lr,
                        beta_m=getattr(args, "beta_m", 0.9),
