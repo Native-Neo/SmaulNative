@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from dataset import PretrainStream, discover_files, iter_texts, load_tokenizer
+from dataset import PretrainStream, TokenizerWrapper, discover_files, iter_texts
 from kernel.fp8_tile import fp8_modules
 from smaul_linear import LinearConfig, SmaulLinear
 from tokenizer import ensure_tokenizer
@@ -1370,11 +1370,15 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     tok, tok_path = _tok(args, out)
-    tok.save(str(tok_path))
-    try:
-        tok_sha = _sha_file(Path(tok_path))
-    except OSError:
-        tok_sha = ""
+    # The tokenizer file is written only after the first successful step (see
+    # the training loop): writing it here would clobber a good checkpoint's
+    # tokenizer on a run that completes zero steps, while the step == 0 path
+    # below reports the checkpoint was not overwritten. The sha uses the exact
+    # serialization save() writes, so the recorded fingerprint still matches
+    # the file once written.
+    import hashlib as _hashlib
+    tok_sha = _hashlib.sha256(json.dumps(
+        tok.data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
     try:
         ds_fp = _dataset_fingerprint(discover_files(Path(args.data)))
     except (OSError, ValueError, RuntimeError):
@@ -1433,7 +1437,7 @@ def main():
                        grad_dtype=getattr(args, "grad_dtype", "bf16"))
     else:
         opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd, clip=args.grad_clip)
-    wrap = load_tokenizer(str(tok_path))
+    wrap = TokenizerWrapper(tok)
     stream = PretrainStream(Path(args.data), wrap, args.ctx)
     model.train()
     bx, by, step, toks, t0, since = [], [], 0, 0, time.perf_counter(), 0
@@ -1479,6 +1483,8 @@ def main():
             continue
         bad_steps = 0
         step += 1
+        if step == 1:
+            tok.save(str(tok_path))
         toks += xb.numel()
         since += xb.numel()
         if step % args.log_every == 0:
