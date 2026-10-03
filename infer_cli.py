@@ -116,10 +116,12 @@ def main():
             # Do not save empty interrupted answers as full turns.
             messages.pop()
             continue
+        # Counted before the suffix: " [stopped]" is CLI bookkeeping, not a
+        # generated token, and re-encoding it would inflate the rate.
+        tokens = len(engine.encode(text)) if text else 0
         if interrupted:
             text += " [stopped]"
         messages.append({"role": "assistant", "content": text})
-        tokens = len(engine.encode(text)) if text else 0
         print(f"\n[{tokens} tokens | {elapsed:.2f}s | {tokens / max(elapsed, 1e-6):.2f} tok/s]")
 
 
