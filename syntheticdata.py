@@ -324,13 +324,13 @@ _DS_FENCE = {"Python": "python", "C++": "cpp", "Java": "java"}
 def gen_data_structure_code() -> Dict[str, str]:
     ds, lang = random.choice(list(_DS_TEMPLATES))
     op_a, op_b = ("push", "pop") if ds == "Stack" else ("enqueue", "dequeue")
-    # Combinatorial salt: capacity / thread-safety / example element.
-    capacity = random.randint(8, 4096)
+    # Combinatorial salt, restricted to what the static templates below can
+    # actually deliver: asking for a capacity limit or a size() method would
+    # teach the model to ignore half the request, since no template has
+    # either (verified: zero templates mention size or capacity).
     extra = random.choice([
-        f"support up to {capacity} elements",
         f"demonstrate with element {random.randint(1, 9999)}",
         "make it generic over element type",
-        "include a size() method",
     ])
     prompt = (f"Implement a {ds} data structure in {lang} with {op_a}/{op_b}, "
               f"an emptiness check, and {extra}.")
