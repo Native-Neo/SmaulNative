@@ -444,8 +444,7 @@ def _check_overwrite(path: Path, overwrite: bool) -> None:
         )
 
 
-def export_dataset_iter(samples_iter, output_dir: Path, fmt: str = "both", overwrite: bool = False,
-                         total_hint: int | None = None) -> int:
+def export_dataset_iter(samples_iter, output_dir: Path, fmt: str = "both", overwrite: bool = False) -> int:
     """Stream records to disk without materializing them all in RAM.
 
     Writes via ``*.tmp`` + atomic ``os.replace``. Returns record count.
@@ -511,7 +510,7 @@ def export_dataset_iter(samples_iter, output_dir: Path, fmt: str = "both", overw
 
 def export_dataset(samples: List[Dict[str, str]], output_dir: Path, fmt: str = "both",
                    overwrite: bool = False) -> None:
-    export_dataset_iter(iter(samples), output_dir, fmt=fmt, overwrite=overwrite, total_hint=len(samples))
+    export_dataset_iter(iter(samples), output_dir, fmt=fmt, overwrite=overwrite)
 
 
 def main():
@@ -530,8 +529,7 @@ def main():
     start_time = time.time()
     # Stream directly to disk so --count in the millions does not OOM.
     count = export_dataset_iter(iter_unique_dataset(args.count, seed=args.seed),
-                                Path(args.output_dir), fmt=args.format, overwrite=args.overwrite,
-                                total_hint=args.count)
+                                Path(args.output_dir), fmt=args.format, overwrite=args.overwrite)
     print(f"\n=== Dataset Generation Complete ({count:,} Unique Records) in {time.time() - start_time:.2f}s! ===")
 
 
