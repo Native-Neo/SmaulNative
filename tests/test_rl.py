@@ -887,7 +887,10 @@ def test_load_preference_model_tolerates_a_corrupt_checkpoint(tmp_path, capsys):
     first.preference_model_path.write_bytes(b"not a torch file")
     second = AutoRL(str(d), str(tmp_path / "work"), "cpu")
     assert "ignoring corrupt preference checkpoint" in capsys.readouterr().out
-    assert second.preference_trained == 4        # the meta file is independent
+    # The meta file is intact, but the weights it describes did not load: the
+    # model is a random init and must not claim to be trained on 4 records,
+    # or run() would auto-label on noise behind the trained guard.
+    assert second.preference_trained == 0
 
 
 def test_load_preference_model_tolerates_corrupt_meta(tmp_path, capsys):
