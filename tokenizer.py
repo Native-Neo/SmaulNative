@@ -456,6 +456,9 @@ def decode(ids, tok):
             case = "upper"
             continue
         if t in {"<pad>", "<bos>", "<eos>"}:
+            # A case marker must not survive a structural token: <cap><pad>hello
+            # decoded as 'Hello', capitalizing across the padding.
+            case = None
             continue
         if t.startswith("<unused_"):
             # Surface invalid IDs instead of silently dropping them.
