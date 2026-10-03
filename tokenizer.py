@@ -544,6 +544,10 @@ def main():
 
 def encode_cmd(a):
     if a.text_file:
+        # Same 10 MB cap read_texts enforces per file: --text-file /dev/zero
+        # must fail fast, not hang or OOM.
+        if Path(a.text_file).stat().st_size > MAX_PLAIN_BYTES:
+            raise ValueError(f"--text-file exceeds {MAX_PLAIN_BYTES} bytes")
         text = Path(a.text_file).read_text(encoding="utf-8-sig", errors="replace")
     elif a.text is not None:
         text = a.text
