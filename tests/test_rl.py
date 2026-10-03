@@ -25,20 +25,63 @@ def test_filter_rejects_nonpositive_temperature():
         raise AssertionError("temperature=0 must fail")
 
 
-def test_sampled_kl_is_zero_when_policies_match():
-    old = torch.tensor([-1.0, -2.0, -3.0])
-    new = old.clone()
-    assert torch.equal(-(new - old), torch.zeros_like(old))
+def _grpo_candidates(a, prompt="hello world", seed=0):
+    """Two real candidates with real stored old_logprobs, via generate()."""
+    cands = []
+    for i in range(2):
+        text, tokens, logprobs = a.generate(prompt, 4, 1.0, 0, 1.0, seed=seed + i)
+        cands.append({"id": i, "text": text, "tokens": tokens,
+                      "old_logprobs": list(logprobs)})
+    return cands
 
 
-def test_autorl_uses_sampled_old_policy_kl():
-    old = torch.tensor([-1.0, -2.0, -3.0])
-    new = torch.tensor([-1.3, -2.0, -2.8])
-    expected = -(new - old).mean()
-    wrong_reverse_kl = (torch.exp(new - old) - (new - old) - 1).mean()
-    assert expected > 0
-    assert not torch.isclose(expected, wrong_reverse_kl)
-    assert hasattr(AutoRL, "grpo_step")
+def test_sampled_kl_is_zero_when_policies_match(tmp_path):
+    """grpo_step's KL term vanishes when old and new policies agree.
+
+    With old_logprobs freshly recomputed from the current policy, log_ratio is
+    0, ratio is 1, and each candidate's loss is -advantage; advantages are
+    standardized to mean 0, so the stranded KL term must leave loss at 0. A
+    nonzero KL form (or a missing one) breaks this identity.
+    """
+    a = _autorl(tmp_path)
+    cands = _grpo_candidates(a)
+    for c in cands:
+        new_lp = a._logprob("hello world", c["tokens"], 1.0, 0, 1.0)
+        c["old_logprobs"] = [float(v) for v in new_lp]
+    loss = a.grpo_step("hello world", cands, 0, 1e-6, 0.2, 0.02, 1.0, 0, 1.0)
+    assert abs(loss) < 1e-5, loss
+
+
+def test_autorl_uses_sampled_old_policy_kl(tmp_path):
+    """grpo_step penalizes -mean(log_ratio), not the reverse-KL form.
+
+    Stales the stored old_logprobs, predicts the full loss from the
+    pre-step _logprob values (grpo_step mutates the model, so the expectation
+    has to be fixed before the call), and checks the real returned loss
+    against it -- plus that the reverse-KL estimator predicts a different
+    number, so the test can tell the two forms apart.
+    """
+    a = _autorl(tmp_path)
+    prompt = "hello world"
+    cands = _grpo_candidates(a, prompt)
+    for c in cands:
+        c["old_logprobs"] = [v - 0.3 for v in c["old_logprobs"]]
+    clip, kl_coef = 0.2, 0.5
+    rewards = torch.tensor([1.0, -1.0])
+    adv = ((rewards - rewards.mean()) / rewards.std(unbiased=False)).tolist()
+    expected, reverse = [], []
+    for c, av in zip(cands, adv):
+        new_lp = a._logprob(prompt, c["tokens"], 1.0, 0, 1.0)
+        lr = new_lp - torch.tensor(c["old_logprobs"], dtype=new_lp.dtype)
+        ratio = torch.exp(lr.clamp(-20, 20))
+        clipped = ratio.clamp(1 - clip, 1 + clip)
+        expected.append(float(-torch.minimum(ratio * av, clipped * av).mean()
+                              + kl_coef * -lr.mean()))
+        reverse.append(float(-torch.minimum(ratio * av, clipped * av).mean()
+                             + kl_coef * (torch.exp(lr) - lr - 1).mean()))
+    loss = a.grpo_step(prompt, cands, 0, 1e-6, clip, kl_coef, 1.0, 0, 1.0)
+    assert loss == pytest.approx(sum(expected) / len(expected), abs=1e-6), loss
+    assert abs(loss - sum(reverse) / len(reverse)) > 1e-4, loss
 
 
 def test_generate_disables_dropout_and_restores_training_state():
