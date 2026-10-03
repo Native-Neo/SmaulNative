@@ -60,9 +60,11 @@ def merge(base_dir: Path, branch_dirs: list, out_dir: Path, top_k: int = 1, forc
     # has no router to carry over, and a copied one would be meaningless). But
     # "freshly initialised" did not mean "different every time": seeding from the
     # inputs makes two merges of the same checkpoints produce the same model, so
-    # a merge can be verified, reproduced, or extended by one more expert without
-    # disturbing the ones already there. Without this, `blocks.0.ffn.gate.weight`
-    # was the only tensor that differed between two identical merges.
+    # a merge can be verified and reproduced. Without this,
+    # `blocks.0.ffn.gate.weight` was the only tensor that differed between two
+    # identical merges. Note the seed covers branch_dirs, so extending a merge
+    # with one more expert re-draws every router; the expert FFN weights are
+    # preserved, the routing is not.
     #
     # fork_rng keeps the caller's global RNG untouched -- seeding it here would be
     # a side effect on every later random draw in the process. No `devices`
@@ -76,7 +78,9 @@ def merge(base_dir: Path, branch_dirs: list, out_dir: Path, top_k: int = 1, forc
         model = SmaulLinear(moe_cfg)
     out_sd = model.state_dict()
     for k, v in base_sd.items():
-        if ".ffn." in k or ".gate." in k:
+        # Every FFN weight -- gate, up and down alike -- lives under .ffn. in a
+        # dense checkpoint (blocks.N.ffn.gate...), so one test covers all three.
+        if ".ffn." in k:
             continue
         if k not in out_sd:
             raise ValueError(f"shared tensor {k} missing from MoE model")
