@@ -105,8 +105,10 @@ def create_app(engine: LinearInference, max_prompt_tokens: int = MODEL_WINDOW,
             stop = threading.Event()
             try:
                 # Run blocking generation in a thread so the event loop stays
-                # responsive; the model is stateless per-request (no shared KV),
-                # so no global lock is needed (lock starved all requests).
+                # responsive. Serialization still happens, one layer down:
+                # the engine holds _gen_lock across the whole generation, so
+                # concurrent requests queue inside stream() while each holds
+                # its thread here. No extra lock is added at this layer.
                 loop = asyncio.get_running_loop()
                 queue: asyncio.Queue = asyncio.Queue()
 
