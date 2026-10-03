@@ -450,7 +450,22 @@ class AutoRL(SmaulRL):
             raise ValueError("responses must not be empty")
         prompt_ids = self._encode(prompt)
         sep = [self.eos_id] if self.eos_id is not None else []
-        return self._batch_ids([prompt_ids + sep + self._encode(r) for r in responses])
+        pairs = []
+        for r in responses:
+            r_ids = self._encode(r)
+            # Budget the cap per side instead of slicing the joined pair:
+            # _batch_ids keeps the first MAX_PREF_PAIR_LEN tokens, so a prompt
+            # longer than the cap used to delete every response entirely --
+            # all candidates then scored an identical prompt-only prefix and
+            # argmax picked candidate 0 regardless of content. The prompt is
+            # kept from its tail (the tokens adjacent to the response) and the
+            # response from its head, with at least one response token kept so
+            # candidates can never collapse to identical rows.
+            room = MAX_PREF_PAIR_LEN - len(sep) - 1
+            keep_prompt = prompt_ids if len(prompt_ids) <= room else prompt_ids[len(prompt_ids) - room:]
+            keep_resp = r_ids[:max(1, MAX_PREF_PAIR_LEN - len(sep) - len(keep_prompt))]
+            pairs.append(keep_prompt + sep + keep_resp)
+        return self._batch_ids(pairs)
 
     @torch.no_grad()
     def preference_scores(self, prompt: str, candidates: List[Dict]) -> torch.Tensor:
