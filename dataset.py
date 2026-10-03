@@ -154,6 +154,10 @@ def iter_texts(files: List[Path], resume_file: Optional[str] = None, resume_reco
                 started = True
             else:
                 continue
+        # Record numbering is per-branch below (.txt counts paragraphs, .jsonl
+        # counts every line including malformed ones, the rest count parsed
+        # rows), so resume_record is only meaningful for the same file it was
+        # written from -- which is exactly what the resume_file equality pins.
         start_idx = resume_record if str(path.resolve()) == resume_file else 0
         suffix = path.suffix.lower()
         try:
