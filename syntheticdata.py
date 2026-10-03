@@ -27,10 +27,9 @@ import math
 import os
 import random
 import re
-import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set
 
 try:
     import pyarrow as pa
@@ -396,7 +395,6 @@ def iter_unique_dataset(target_count: int, seed: int | None = None, max_attempts
     (global ``random`` is also seeded for the module-level generators).
     """
     import hashlib
-    from collections.abc import Iterator  # noqa: F401  (type hint only)
     if target_count < 0:
         raise ValueError("target_count must be non-negative")
     # Isolated RNG for generator choice (as documented); global random is
@@ -452,7 +450,6 @@ def export_dataset_iter(samples_iter, output_dir: Path, fmt: str = "both", overw
 
     Writes via ``*.tmp`` + atomic ``os.replace``. Returns record count.
     """
-    from typing import Iterable  # local import to avoid cycle
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "synthetic_bilingual.jsonl"
     parquet_path = output_dir / "synthetic_bilingual.parquet"
