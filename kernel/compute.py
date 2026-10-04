@@ -72,7 +72,7 @@ class CpuBackend:
         self._sparse = None
         self._quant = None
         self._lock = threading.Lock()
-        self._warned_fallback = False
+        self._warned_fallback = set()
 
     def configure(self, threads=None):
         if threads is None:
@@ -135,8 +135,11 @@ class CpuBackend:
         return _torch_forward(x, w, s, in_f, out_f, tile)
 
     def _warn_fallback_once(self, msg: str) -> None:
-        if not self._warned_fallback:
-            self._warned_fallback = True
+        # Keyed per message, not one flag for all three fallbacks: FP8 and
+        # sparse have very different performance profiles, so suppressing two
+        # of the three diagnostics hid which path was slow.
+        if msg not in self._warned_fallback:
+            self._warned_fallback.add(msg)
             warnings.warn(msg, RuntimeWarning, stacklevel=3)
 
     def fp8_backward_input(self, g, w, s, in_f, out_f, tile):
