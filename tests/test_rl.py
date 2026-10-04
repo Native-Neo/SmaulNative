@@ -130,14 +130,13 @@ import json
 CORPUS = "hello world this is a small english corpus for the rl tests. " * 30
 
 
-def _model_dir(tmp_path, vocab=64):
+def _model_dir(tmp_path, vocab=256):
     from model import LinearConfig, SmaulLinear
-    from tokenizer import SmaulTokenizer, _build
+    from tokenizer import SmaulTokenizer
     d = tmp_path / "model"
     d.mkdir(exist_ok=True)
-    data = _build(iter([CORPUS]), vocab, 20, 0)
-    SmaulTokenizer(data).save(d / "tokenizer.json")
-    cfg = LinearConfig(vocab_size=len(data["vocab"]), d_model=32, n_layer=1,
+    SmaulTokenizer().save(d / "tokenizer.json")
+    cfg = LinearConfig(vocab_size=vocab, d_model=32, n_layer=1,
                        n_heads=2, ffn_mult=2.0, precision="fp32")
     SmaulLinear(cfg).save_pretrained(d)
     return d
@@ -173,15 +172,8 @@ def test_init_rejects_a_mismatched_tokenizer(tmp_path):
     A vocab disagreement here would otherwise surface much later as an index
     out of range inside the model, with nothing pointing at the tokenizer.
     """
-    import json
     from rl import SmaulRL
-    d = _model_dir(tmp_path)
-    path = d / "tokenizer.json"
-    data = json.loads(path.read_text())
-    # Drop entries so the tokenizer's vocab no longer matches the model's.
-    for name in list(data["vocab"])[10:]:
-        del data["vocab"][name]
-    path.write_text(json.dumps(data))
+    d = _model_dir(tmp_path, vocab=64)
     with pytest.raises(ValueError) as e:
         SmaulRL(str(d), str(tmp_path / "w"), "cpu")
     assert "vocab" in str(e.value)
@@ -214,14 +206,13 @@ def test_init_resumes_the_policy_from_the_work_dir(tmp_path, capsys):
     import json
     from model import SmaulLinear
     # Point the work dir's policy at a *different* set of weights.
-    from tokenizer import SmaulTokenizer, _build
+    from tokenizer import SmaulTokenizer
     alt = tmp_path / "alt"
     alt.mkdir()
-    data = _build(iter([CORPUS]), 64, 20, 0)
-    SmaulTokenizer(data).save(alt / "tokenizer.json")
+    SmaulTokenizer().save(alt / "tokenizer.json")
     SmaulLinear(rl.model.cfg).save_pretrained(alt)
     SmaulLinear.from_pretrained(alt).save_pretrained(policy)
-    SmaulTokenizer(data).save(policy / "tokenizer.json")
+    SmaulTokenizer().save(policy / "tokenizer.json")
     from rl import SmaulRL
     again = SmaulRL(str(tmp_path / "model"), str(tmp_path / "work"), "cpu")
     assert "resuming policy" in capsys.readouterr().out
@@ -772,11 +763,11 @@ def test_batch_ids_truncates_an_oversized_sequence(tmp_path):
     assert mask.sum().item() == MAX_PREF_PAIR_LEN
 
 
-def test_batch_pairs_joins_prompt_and_response_with_eos(tmp_path):
+def test_batch_pairs_joins_prompt_and_response(tmp_path):
     a = _autorl(tmp_path)
-    tokens, mask = a._batch_ids([a._encode("hi") + [a.eos_id] + a._encode("yo")])
+    tokens, mask = a._batch_ids([a._encode("hi") + a._encode("yo")])
     ids = tokens[0][mask[0]].tolist()
-    assert ids == a._encode("hi") + [a.eos_id] + a._encode("yo")
+    assert ids == a._encode("hi") + a._encode("yo")
 
 
 def test_batch_pairs_rejects_no_responses(tmp_path):
