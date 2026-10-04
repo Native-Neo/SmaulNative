@@ -10,7 +10,9 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from model import SmaulLinear
-from tokenizer import SmaulTokenizer
+from tokenizer import IncrementalByteDecoder, SmaulTokenizer
+
+BYTE_VOCAB_SIZE = 256
 
 MODEL_WINDOW = 262144
 MAX_PROMPT_TOKENS = 65536
@@ -29,31 +31,12 @@ def _seed_all(seed: int) -> None:
         pass
 
 
-class _IncrementalDecoder:
-    def __init__(self, tokenizer: SmaulTokenizer):
-        self.table = tokenizer.id_to_token
-        self.case = None
+class _IncrementalDecoder(IncrementalByteDecoder):
+    """Byte-streaming decoder: holds split multi-byte chars across tokens.
 
-    def push(self, token_id: int) -> str:
-        token = self.table.get(int(token_id), "<unk>")
-        if token == "<cap>":
-            self.case = "cap"
-            return ""
-        if token == "<upper>":
-            self.case = "upper"
-            return ""
-        if token in {"<pad>", "<bos>", "<eos>"}:
-            return ""
-        if token.startswith("<unused_"):
-            # Match tokenizer.decode(): invalid IDs surface as <unk>.
-            self.case = None
-            return "<unk>"
-        if self.case == "cap":
-            token = token[:1].upper() + token[1:]
-        elif self.case == "upper":
-            token = token.upper()
-        self.case = None
-        return token
+    Kept under the historical name; generation pushes one byte id at a time
+    and incomplete UTF-8 tails are buffered, never silently dropped.
+    """
 
 
 class LinearInference:
@@ -81,14 +64,19 @@ class LinearInference:
             embedding_storage=embedding_storage).to(self.device)
         self.tokenizer = SmaulTokenizer.from_file(self.model_dir / "tokenizer.json")
         # Fail fast on checkpoint/tokenizer mismatch (silent wrong-tokenization).
+        # Byte-level checkpoints have vocab 256 and a byte-kind tokenizer file;
+        # a legacy word-level tokenizer.json is refused in from_pretrained
+        # before this point, so this only guards size drift.
         cfg_vocab = self.model.cfg.vocab_size
         tok_vocab = self.tokenizer.get_vocab_size()
         if cfg_vocab != tok_vocab:
             raise ValueError(
                 f"checkpoint vocab_size ({cfg_vocab}) != tokenizer vocab ({tok_vocab}); "
-                f"retrain tokenizer with matching --vocab or fix {self.model_dir}")
-        self.eos_id = self.tokenizer.eos_token_id
-        self.bos_id = self.tokenizer.bos_token_id
+                f"byte-level runs need both at {BYTE_VOCAB_SIZE}")
+        # No special tokens in the byte vocabulary: generation is open-ended
+        # and stops on max_new_tokens or a stop sequence.
+        self.eos_id = None
+        self.bos_id = None
         self.last_prompt_tokens = 0
         self.truncated_prompt = False
         # Serializes concurrent generate/stream calls sharing this engine
@@ -202,7 +190,7 @@ class LinearInference:
     def _prepare(self, prompt: str):
         tokens = self.encode(prompt)
         if not tokens:
-            tokens = [self.bos_id] if self.bos_id is not None else [self.eos_id]
+            tokens = [10]  # empty prompt -> single newline byte, always valid
         if len(tokens) > MAX_PROMPT_TOKENS:
             raise ValueError(f"prompt too long: {len(tokens)} tokens (max {MAX_PROMPT_TOKENS})")
         self.last_prompt_tokens = len(tokens)
@@ -282,7 +270,7 @@ class LinearInference:
             logits, _ = self._forward(ids[-MODEL_WINDOW:])
         recent = ids[-128:]
         stops = [s for s in (stop or []) if s]
-        decoder = _IncrementalDecoder(self.tokenizer)
+        decoder = _IncrementalDecoder()
         pending = ""
         max_stop_len = max((len(s) for s in stops), default=0)
         for _ in range(max_new_tokens):
@@ -331,6 +319,7 @@ class LinearInference:
                 absorbed += 1
             else:
                 logits, states, absorbed = self._prefill(ids[-MODEL_WINDOW:])
+        pending += decoder.flush()
         if pending:
             yield pending
 
