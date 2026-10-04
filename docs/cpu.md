@@ -1,6 +1,6 @@
 # Compute backend
 
-The model (`smaul_linear.py`) and FP8 autograd (`kernel/compute.py`) never touch extensions
+The model (`model.py`) and FP8 autograd (`kernel/compute.py`) never touch extensions
 directly. They call into a backend selected with `kernel.compute.get_backend()`; future backends
 register via `compute.register_backend()` without changing model code.
 
