@@ -93,7 +93,7 @@ class ContinualStream:
         self.domains = [Path(d) for d in domains]
         self.tokenizer = tokenizer
         self.ctx_len = int(ctx_len)
-        self.replay = replay or ReplayBuffer(0)
+        self.replay = replay if replay is not None else ReplayBuffer(0)
         self.replay_rate = float(replay_rate)
         self.reset_state = bool(reset_state)
         self._rng = random.Random(seed)
