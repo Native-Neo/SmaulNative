@@ -4,12 +4,13 @@ Local OpenAI-style chat server with a built-in chat UI (`GET /`).
 
 ```bash
 python infer_server.py --model ./runs/linear --device auto --dtype auto \
-    --host 127.0.0.1 --port 8080 --max-prompt-tokens 512 --api-token SECRET
+    --host 127.0.0.1 --port 8080 --api-token SECRET
 ```
 
 | Flag | Default | What it does |
 |---|---|---|
 | `--model` / `--device` / `--dtype` | `./runs/linear` / `auto` / `auto` | engine selection |
+| `--architecture` / `--embedding-storage` | auto (from checkpoint) | expected architecture / embedding backend override |
 | `--host` / `--port` | `127.0.0.1` / `8080` | bind address; non-loopback binds warn (and require `--api-token`) |
 | `--max-prompt-tokens` | `262144` | prompt cap (= `inference.MODEL_WINDOW`); max `262144` |
 | `--api-token` | none (or `SMAUL_API_TOKEN` env) | require `Authorization: Bearer <token>` (or `X-API-Key`) |
