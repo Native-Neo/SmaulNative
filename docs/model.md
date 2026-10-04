@@ -1,4 +1,4 @@
-# smaul_linear.py
+# model.py
 
 The model core: `LinearConfig` and `SmaulLinear`, a linear-attention model with SwiGLU
 FFN/MoE blocks and tiled E4M3 FP8 weights (see [rqt.md](rqt.md) for the quantization
@@ -7,7 +7,7 @@ scheme and [cpu.md](cpu.md) for execution).
 ## Loading a checkpoint
 
 ```python
-from smaul_linear import SmaulLinear
+from model import SmaulLinear
 model = SmaulLinear.from_pretrained("./runs/linear")
 ```
 
