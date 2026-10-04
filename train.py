@@ -1236,6 +1236,16 @@ def _validate_args(args) -> None:
             continue
         if not isinstance(_v, int) or isinstance(_v, bool) or _v < 0:
             raise ValueError(f"--{_n.replace('_', '-')} must be a non-negative int, got {_v!r}")
+    # Sparsity and min-degree were validated late (in LinearConfig.__post_init__
+    # and build_graph, after the tokenizer was trained and the graph built).
+    # Failing here keeps a typo from costing a tokenizer build first.
+    _sp = getattr(args, "rawr_sparsity", 0.9)
+    if not isinstance(_sp, (int, float)) or isinstance(_sp, bool) \
+            or not 0.0 <= float(_sp) < 1.0:
+        raise ValueError(f"--rawr-sparsity must be in [0, 1), got {_sp!r}")
+    _md = getattr(args, "rawr_min_degree", 4)
+    if not isinstance(_md, int) or isinstance(_md, bool) or _md < 1:
+        raise ValueError(f"--rawr-min-degree must be a positive int, got {_md!r}")
 
 def _tok(args, out: Path):
     from tokenizer import VERSION as _TOK_VERSION
