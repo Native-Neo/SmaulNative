@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Rawr token-connectivity graph.
+"""Rawr byte-connectivity graph.
 
-Builds a deterministic sparse token graph from English/Hindi lexical seed
-resources plus the actual SmaulNative training corpus, tokenized with the
-actual SmaulNative tokenizer.
+Builds a deterministic sparse byte graph from English/Hindi lexical seed
+resources plus the actual SmaulNative training corpus, encoded as raw UTF-8
+bytes with the byte-level codec.
 
 Workflow:
     English/Hindi dictionaries (+ built-in seeds)
-    -> tokenize words with the SmaulNative tokenizer
-    -> valid token-sequence (consecutive-pair) relationships
-    -> combine with corpus bigram relationships
+    -> encode words to UTF-8 bytes
+    -> valid byte-sequence (consecutive-pair) relationships
+    -> combine with corpus byte-bigram relationships
     -> sparse connectivity graph (+ configurable fallback)
     -> used by Rawr sparse computation (see model.RawrFFN).
 
@@ -536,8 +536,11 @@ def print_model_compute(p: dict) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Build/inspect the Rawr token graph")
-    p.add_argument("--tokenizer", required=True, help="tokenizer.json path")
+    p = argparse.ArgumentParser(description="Build/inspect the Rawr byte graph")
+    p.add_argument("--tokenizer", default=None,
+                   help="byte tokenizer.json path (optional; the codec needs no table)")
+    p.add_argument("--vocab-size", type=int, default=256,
+                   help="byte vocabulary size (must be 256)")
     p.add_argument("--data", default=None, help="training corpus dir (optional)")
     p.add_argument("--dict-file", default=None, help="extra dictionary (one word per line)")
     p.add_argument("--out", default=None, help="write graph JSON here")
@@ -547,8 +550,11 @@ def main() -> None:
     p.add_argument("--max-tokens-per-doc", type=int, default=1024)
     args = p.parse_args()
 
-    from tokenizer import SmaulTokenizer
-    tok = SmaulTokenizer.from_file(args.tokenizer)
+    from tokenizer import BYTE_VOCAB_SIZE, SmaulTokenizer
+    if args.vocab_size != BYTE_VOCAB_SIZE:
+        raise ValueError(
+            f"--vocab-size must be {BYTE_VOCAB_SIZE} (byte-level), got {args.vocab_size}")
+    tok = SmaulTokenizer.from_file(args.tokenizer) if args.tokenizer else SmaulTokenizer()
 
     extra = None
     if args.dict_file:
