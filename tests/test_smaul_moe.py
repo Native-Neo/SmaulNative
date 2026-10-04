@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from smaul_linear import LinearConfig, SwiFFN_MoE
+from model import LinearConfig, SwiFFN_MoE
 
 
 def test_sparse_moe_matches_dense_reference():
