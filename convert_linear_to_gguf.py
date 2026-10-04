@@ -13,11 +13,21 @@ MAX_VOCAB_IDS = 1_000_000
 
 
 def _load_tokenizer(path: Path):
+    """Accept the byte tokenizer (256 ids) or a legacy word vocabulary.
+
+    Byte checkpoints carry ``{"kind": "byte", "vocab_size": 256}``; the GGUF
+    token list is then the 256 single-byte entries. Legacy files keep the old
+    validated word-vocabulary path.
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError, UnicodeError) as exc:
         raise ValueError(f"could not load tokenizer {path}: {exc}") from exc
-    vocab = data.get("vocab")
+    if isinstance(data, dict) and data.get("kind") == "byte":
+        if int(data.get("vocab_size", 256)) != 256:
+            raise ValueError("byte tokenizer must have vocab_size 256")
+        return [chr(i) for i in range(256)]
+    vocab = data.get("vocab") if isinstance(data, dict) else None
     if not isinstance(vocab, dict) or not vocab:
         raise ValueError("tokenizer.json has no vocabulary")
     max_id = -1
