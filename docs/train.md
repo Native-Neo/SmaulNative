@@ -121,7 +121,7 @@ scale: peak RSS 615 MB, live gradients 32.5 MiB, checkpoint 25.0 MiB, optimizer 
 ## Tokenizer
 The tokenizer is built automatically via `tokenizer.ensure_tokenizer`: an existing file is
 reused only when its vocabulary size equals `--vocab` and its format version is current
-(version 7, `tokenizer.VERSION`); otherwise it is rebuilt from `--data` (up to
+(version 8, `tokenizer.VERSION`); otherwise it is rebuilt from `--data` (up to
 `--tok_records` records) and saved to `--tokenizer`.
 
 ## Optimizer
