@@ -58,7 +58,7 @@ compatibility with the training code.
 
 `train.py` builds the tokenizer itself via `ensure_tokenizer`: an existing file is reused
 only when its vocabulary size matches `--vocab` and its format version is current
-(version 7, `tokenizer.VERSION`); otherwise it is rebuilt from the training data. The
+(version 8, `tokenizer.VERSION`); otherwise it is rebuilt from the training data. The
 manual `train` command above uses the same builder with defaults `--vocab-size 32000`
 and `--word-budget 20000`. Streaming builds (`stream_name != "none"`) require a positive
 `--max-records` cap -- unbounded FineWeb downloads are refused.
