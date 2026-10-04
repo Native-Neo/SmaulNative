@@ -13,7 +13,7 @@ repo root.
 - [stream_data.py](docs/stream_data.md)
 - [train.py](docs/train.md)
 - [RQT](docs/rqt.md) -- tiled E4M3 FP8 training
-- [smaul_linear.py](docs/smaul_linear.md)
+- [model.py](docs/model.md)
 - [merge_moe.py](docs/merge_moe.md)
 - [inference.py](docs/inference.md) -- `LinearInference`, used by infer_cli.py / infer_server.py
 - [infer_cli.py](docs/infer_cli.md)
