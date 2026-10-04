@@ -284,17 +284,13 @@ def test_repetition_penalty_shrinks_both_signs_toward_zero():
     logits = torch.tensor([6.0, -6.0, 0.0])
     base = _sampled_probs(obj, logits, [], 1.0)
     pen = _sampled_probs(obj, logits, [0, 1], 2.0)
-    # Both penalised tokens lose mass to the untouched one.
+    # Both penalised tokens lose mass to the untouched one. (The mechanism --
+    # a positive logit is divided, a negative one multiplied -- is prose in
+    # the docstring; the assertions pin its observable effect, which is what
+    # can actually regress.)
     assert pen[0] < base[0], (base, pen)
     assert pen[1] < base[1], (base, pen)
     assert pen[2] > base[2], (base, pen)
-    # Sign convention: |penalised score| < |original score| for both signs.
-    # The sign convention, stated as the mechanism rather than as magnitudes:
-    # a positive logit is divided and a negative one multiplied, and in both
-    # cases the penalised logit ends up strictly *lower* than the original --
-    # which is what lowers its probability.
-    assert 6.0 / 2.0 < 6.0
-    assert -6.0 * 2.0 < -6.0
 
 
 def test_repetition_penalty_does_not_reorder_tokens():
@@ -461,7 +457,6 @@ def test_incremental_decoder_upper_applies_to_a_whole_token():
 
 
 def test_engine_vocab_size_encode_decode_round_trip(tmp_path):
-    from smaul_linear import LinearConfig, SmaulLinear
     from test_last_token import _model_dir, _plain_cfg
     d = _model_dir(tmp_path, "plain")
     engine = LinearInference(str(d), device="cpu")
