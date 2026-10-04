@@ -60,20 +60,22 @@ Without them training still works through the torch fallback.
 python download.py --languages hindi english --max_rows 100000
 # or: python syntheticdata.py --count 250000 --format both --output-dir ./datasets
 
-# 2. Train a tokenizer (must match train.py --vocab)
-python tokenizer.py train --fromdataset ./datasets --vocab-size 8000 \
-    --output ./runs/linear/tokenizer.json
+# 2. Byte codec (no training step -- fixed 256 entries, written automatically)
+#    Inspect it any time:
+python tokenizer.py encode --text "Hello नमस्ते"
 
-# 3. Pretraining
+# 3. Pretraining (finite)
 python train.py --data ./datasets --out ./runs/linear \
-    --tokenizer ./runs/linear/tokenizer.json \
-    --d 512 --layers 8 --heads 8 --vocab 8000 \
+    --d 512 --layers 8 --heads 8 --vocab 256 \
     --ctx 256 --batch 2 --steps 1000 --threads 2
+
+# 4. Continual stream training with replay (see docs/train.md)
+python train.py --data ./datasets/new --old-data ./datasets/old \
+    --out ./runs/cont --continual --replay-size 512 --replay-rate 0.1
 ```
 
-If the tokenizer file is absent (or its vocabulary size / format version mismatches),
-`train.py` trains it automatically. Supplying an existing tokenizer is recommended for
-reproducible training.
+The byte `tokenizer.json` is written automatically; a legacy word-level file is
+refused with a clear error instead of being silently reused.
 
 ## RQT Training
 
@@ -106,19 +108,21 @@ before tuning -- see `python benchmark.py --help`.
 
 ## Configuration
 
-The default training configuration is `--d 512 --layers 8 --heads 8 --vocab 8000` with
-`--ctx 256 --batch 2`. `--d` controls width, `--layers` controls depth, `--vocab` must
-match the tokenizer, and `d_model` must be divisible by `n_heads`. `LinearConfig` also
-exposes `ffn_mult` (default `2.5`), `tile` (default `64`), `precision` (`fp8` or
+The default training configuration is `--d 512 --layers 8 --heads 8 --vocab 256` with
+`--ctx 256 --batch 2`. `--d` controls width, `--layers` controls depth, `--vocab` is
+always the 256 byte values, and `d_model` must be divisible by `n_heads`. `LinearConfig` also
+exposes `ffn_mult` (default `2.5`, also the MoE expert hidden-dim knob), `tile` (default `64`), `precision` (`fp8` or
 `fp32`, default `fp8`), and the MoE fields
-`is_moe`/`num_experts`/`num_experts_per_tok` (set via `merge_moe.py`, not training).
+`is_moe`/`num_experts`/`num_experts_per_tok`/`moe_balance_weight` (set via
+`--moe-experts`/`--moe-top-k`/`--moe-balance-weight` or `merge_moe.py`).
 
 For CPU training, start with a small `--ctx`: the linear-attention state is compact,
 but longer contexts still cost more per step.
 
 ## Remote Streaming
 
-`train.py` itself has no streaming mode. To use remote data without downloading a full
+`train.py --continual` trains as a stream over `--domains` with replay (see
+docs/train.md). To use remote data without downloading a full
 dataset first, stream filtered records to stdout and consume them downstream:
 
 ```bash
