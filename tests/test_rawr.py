@@ -21,16 +21,7 @@ from tokenizer import SmaulTokenizer
 
 
 def _mini_tokenizer():
-    data = {
-        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3,
-                  "hello": 4, "world": 5, " ": 6, "!": 7, "namaste": 8,
-                  "shabd": 9, "12": 10, "def": 11},
-        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
-        "case_tokens": ["<cap>", "<upper>"],
-        "unk_id": 1,
-        "stats": {"vocab_size": 12},
-    }
-    return SmaulTokenizer(data)
+    return SmaulTokenizer()
 
 
 def _tiny_cfg(arch="plain", storage="ram", vocab=48, d=16):
@@ -709,7 +700,11 @@ def test_build_graph_respects_max_docs(tmp_path):
     two = build_graph(_mini_tokenizer(), corpus_texts=iter(texts), max_docs=2)
     assert two.stats()["corpus_docs"] == 2
     assert unlimited.stats()["corpus_docs"] == 10
-    assert set(two.edges) <= set(unlimited.edges)
+    # Bigram *types* are a subset (fewer docs see fewer pairs); full edge
+    # sets are not, because the ring fallback completes degrees differently
+    # depending on how many corpus edges each token already has.
+    assert two.stats()["corpus_bigram_types"] <= unlimited.stats()["corpus_bigram_types"]
+    assert two.edges and unlimited.edges
 
 
 def test_build_graph_truncates_long_documents():
@@ -785,8 +780,19 @@ def test_cli_accepts_a_dict_file_and_a_corpus(tmp_path, monkeypatch):
     assert g.stats()["dictionary_words"] >= 1
 
 
-def test_cli_requires_a_tokenizer(monkeypatch):
+def test_cli_requires_a_tokenizer(monkeypatch, tmp_path):
+    """The tokenizer file is optional now: byte encoding needs no table."""
     import rawr_graph
-    monkeypatch.setattr("sys.argv", ["rawr_graph.py"])
-    with pytest.raises(SystemExit):
+    out = tmp_path / "graph.json"
+    monkeypatch.setattr("sys.argv", ["rawr_graph.py", "--out", str(out),
+                                     "--max-docs", "0"])
+    rawr_graph.main()
+    assert out.exists()
+    assert load_graph(out).vocab_size == 256
+
+
+def test_cli_rejects_a_non_byte_vocab_size(monkeypatch):
+    import rawr_graph
+    monkeypatch.setattr("sys.argv", ["rawr_graph.py", "--vocab-size", "64"])
+    with pytest.raises(ValueError, match="256"):
         rawr_graph.main()
