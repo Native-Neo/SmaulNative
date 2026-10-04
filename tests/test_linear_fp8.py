@@ -344,12 +344,8 @@ def test_fp32_precision_trains_and_roundtrips(tmp_path):
 
 
 def test_bad_precision_rejected():
-    try:
+    with pytest.raises(ValueError, match="unknown precision"):
         LinearConfig(precision="int8")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("expected ValueError for unknown precision")
 
 
 def test_merge_precision_rules(tmp_path):
