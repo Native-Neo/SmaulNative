@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from inference import LinearInference
-from smaul_linear import LinearConfig, SmaulLinear
+from model import LinearConfig, SmaulLinear
 from tokenizer import SmaulTokenizer
 
 _VOCAB = 64
