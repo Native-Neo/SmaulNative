@@ -1,33 +1,258 @@
 #!/usr/bin/env python3
+"""Byte-level codec for SmaulNative.
+
+The model path is true byte-level: vocabulary is exactly the 256 UTF-8 byte
+values, text is encoded once via UTF-8, and the model consumes byte IDs
+directly. There is no BPE/WordPiece/SentencePiece, no word tokenizer, and no
+giant vocabulary in this path.
+
+The corpus text-extraction helpers (``read_texts`` and the record coercers)
+are kept: reading heterogeneous dataset files into plain strings is still
+needed before the single UTF-8 encoding step. Everything word/vocab-building
+(``TOKEN_RE``, ``_build``, case markers, Devanagari units, guaranteed sets)
+was specific to the old subword/word tokenizer and is gone.
+"""
+
 import argparse
-import csv
 import json
-import re
-import unicodedata
-from collections import Counter
 from pathlib import Path
 
-SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"]
-CASE = ["<cap>", "<upper>"]
-CHATML_TAG = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>")
-# NOTE: Latin words split on hyphens/camelCase by design ("well-known" -> well,-,known;
-# "eBay" lowercases lossily, see case_type). Multi-char operators are single tokens.
-# Numbers cover ASCII + Devanagari digits (U+0966-096F).
-_DIGIT = r"(?:\d|[\u0966-\u096F])"
-# The trailing letter run covers every other Unicode script (Greek, Cyrillic,
-# CJK, accented Latin...). Without it those characters matched no alternative
-# -- the catch-all [^\w\s] cannot match a word character -- and vanished
-# without an error ('κόσμο' -> [], 'café' -> 'caf','ve'). It sits after the
-# Latin and Devanagari alternatives so ASCII tokenization is unchanged. (v8)
-TOKEN_RE = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?think>|\s+|[A-Za-z]+(?:'[A-Za-z]+)?|[\u0900-\u097F\u200C\u200D]+|[^\W\d_]+|" + _DIGIT + r"+(?:\." + _DIGIT + r"+)?|==|!=|<=|>=|=>|->|::|//|\*\*|&&|\|\||[^\w\s]", re.UNICODE)
-DEV_BASE = re.compile(r"[\u0900-\u097F]")
-TEXT_KEYS = ("text", "content", "document", "body", "code", "prompt", "completion", "input", "output", "question", "answer")
-VERSION = 8
+BYTE_VOCAB_SIZE = 256
+VERSION = 9
+KIND = "byte"
+
+MAX_PLAIN_BYTES = 10_000_000
+
 
 class TokenIds(list):
     @property
     def ids(self):
         return list(self)
+
+
+def encode_bytes(text: str) -> list:
+    """Encode text to raw UTF-8 byte IDs (each 0-255)."""
+    if not isinstance(text, str):
+        raise ValueError(f"encode requires str, got {type(text).__name__}")
+    return list(text.encode("utf-8"))
+
+
+def decode_bytes(ids, errors: str = "replace") -> str:
+    """Decode byte IDs to text, safely.
+
+    Out-of-range or non-int entries raise; incomplete/invalid UTF-8 is
+    handled per ``errors`` (default ``replace`` so arbitrary byte sequences
+    never crash and never silently drop bytes without a marker).
+    """
+    buf = bytearray()
+    for i in ids:
+        if isinstance(i, bool) or not isinstance(i, int):
+            raise ValueError(f"invalid byte id {i!r}: expected int in [0, 255]")
+        if not 0 <= i <= 255:
+            raise ValueError(f"invalid byte id {i!r}: expected int in [0, 255]")
+        buf.append(i)
+    return bytes(buf).decode("utf-8", errors=errors)
+
+
+def _incomplete_tail_len(buf: bytes) -> int:
+    """Length of a trailing incomplete UTF-8 sequence (0 if none)."""
+    n = len(buf)
+    if n == 0:
+        return 0
+    # Count trailing continuation bytes (10xxxxxx).
+    cont = 0
+    i = n - 1
+    while i >= 0 and (buf[i] & 0xC0) == 0x80:
+        cont += 1
+        i -= 1
+    if i < 0:
+        return n  # only continuation bytes; wait for a lead byte
+    lead = buf[i]
+    if lead < 0x80:
+        return 0
+    if 0xC2 <= lead <= 0xDF:
+        need = 1
+    elif 0xE0 <= lead <= 0xEF:
+        need = 2
+    elif 0xF0 <= lead <= 0xF4:
+        need = 3
+    else:
+        return 0  # invalid lead; let errors=replace surface it
+    have = cont
+    return (cont + 1) if have < need else 0
+
+
+class IncrementalByteDecoder:
+    """Streaming byte->text decoder that waits for split multi-byte chars.
+
+    Complete prefixes decode immediately; a trailing incomplete UTF-8
+    sequence is buffered until more bytes arrive (or ``flush()`` replaces
+    it, so generation never hangs and never silently drops bytes).
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def push(self, byte_id: int) -> str:
+        if isinstance(byte_id, bool) or not isinstance(byte_id, int) \
+                or not 0 <= byte_id <= 255:
+            raise ValueError(f"invalid byte id {byte_id!r}")
+        self._buf.append(byte_id)
+        return self._emit(flush=False)
+
+    def push_ids(self, ids) -> str:
+        out = []
+        for i in ids:
+            out.append(self.push(int(i)))
+        return "".join(out)
+
+    def _emit(self, flush: bool) -> str:
+        raw = bytes(self._buf)
+        if not raw:
+            return ""
+        if not flush:
+            tail = _incomplete_tail_len(raw)
+            if tail:
+                head = raw[:-tail] if tail < len(raw) else b""
+                text = head.decode("utf-8", errors="replace")
+                self._buf = bytearray(raw[len(head):])
+                return text
+        text = raw.decode("utf-8", errors="replace")
+        self._buf = bytearray()
+        return text
+
+    def flush(self) -> str:
+        return self._emit(flush=True)
+
+
+class SmaulTokenizer:
+    """Byte-level tokenizer: fixed 256-entry vocabulary, no training.
+
+    Kept under the historical name so ``dataset.load_tokenizer``,
+    ``rawr_graph.build_graph`` and inference keep importing the same symbol.
+    ``ByteTokenizer`` is the same class under its accurate name.
+    """
+
+    kind = KIND
+    unk_token_id = None
+    pad_token_id = None
+    bos_token_id = None
+    eos_token_id = None
+
+    def __init__(self, data=None):
+        data = dict(data) if data else {}
+        kind = data.get("kind", KIND)
+        if kind != KIND:
+            raise ValueError(
+                f"legacy word-level tokenizer (kind={kind!r}, version={data.get('version')!r}); "
+                "byte-level checkpoints need a byte tokenizer "
+                f"(kind={KIND!r}). Delete the file and re-run: a byte "
+                "tokenizer is written automatically, no training needed.")
+        self.data = {"version": VERSION, "kind": KIND,
+                     "vocab_size": BYTE_VOCAB_SIZE}
+        self.vocab_size = BYTE_VOCAB_SIZE
+        # Byte id -> single-byte latin-1 char, for display/debug only.
+        self.id_to_token = {i: chr(i) for i in range(256)}
+        self.vocab = {chr(i): i for i in range(256)}
+
+    @classmethod
+    def from_file(cls, path):
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+            raise RuntimeError(f"could not load tokenizer {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"tokenizer {path} must contain a JSON object")
+        if data.get("kind", KIND) != KIND or data.get("version") != VERSION:
+            # Old word-level files carry kind != byte or version 8.
+            if data.get("kind") != KIND:
+                raise ValueError(
+                    f"tokenizer {path} is a legacy word-level file "
+                    f"(version={data.get('version')!r}); byte-level runs need "
+                    f"kind={KIND!r}. Delete it and re-run.")
+            raise ValueError(
+                f"tokenizer {path} version {data.get('version')!r} != {VERSION}; "
+                "delete it and re-run")
+        return cls(data)
+
+    def save(self, path):
+        import os
+        import tempfile
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def get_vocab_size(self): return BYTE_VOCAB_SIZE
+    def token_to_id(self, token): return None
+    def encode(self, text): return TokenIds(encode_bytes(text))
+    def decode(self, ids): return decode_bytes(ids)
+
+
+ByteTokenizer = SmaulTokenizer
+
+
+def load(path): return SmaulTokenizer.from_file(path)
+
+
+def encode(text, tok):
+    if isinstance(tok, SmaulTokenizer):
+        return tok.encode(text)
+    return TokenIds(encode_bytes(text))
+
+
+def decode(ids, tok):
+    return decode_bytes(ids)
+
+
+def train_tokenizer(dataset_dir, output_path, vocab_size=BYTE_VOCAB_SIZE,
+                    stream_name="none", max_records=0, texts=None):
+    """Write a byte tokenizer file (no training; vocabulary is fixed)."""
+    if vocab_size != BYTE_VOCAB_SIZE:
+        raise ValueError(
+            f"byte vocabulary is exactly {BYTE_VOCAB_SIZE}; got {vocab_size}")
+    tok = SmaulTokenizer()
+    tok.save(output_path)
+    return tok
+
+
+def ensure_tokenizer(output_path, texts_or_dir=None, vocab_size=BYTE_VOCAB_SIZE,
+                     max_records=0, stream_name="none"):
+    if vocab_size != BYTE_VOCAB_SIZE:
+        raise ValueError(
+            f"byte vocabulary is exactly {BYTE_VOCAB_SIZE}; got {vocab_size}")
+    path = Path(output_path)
+    if path.exists():
+        try:
+            tok = load(path)
+            if tok.get_vocab_size() == BYTE_VOCAB_SIZE:
+                return tok
+        except (RuntimeError, ValueError):
+            print("[TOKENIZER] existing file is legacy/unreadable; writing byte tokenizer")
+    else:
+        print(f"[TOKENIZER] writing byte vocabulary={BYTE_VOCAB_SIZE}")
+    return train_tokenizer(None, path, vocab_size)
+
+
+# ---------------------------------------------------------------------------
+# Corpus text extraction (kept): dataset files -> plain strings, encoded to
+# UTF-8 bytes exactly once downstream by SmaulTokenizer.encode.
+# ---------------------------------------------------------------------------
+
+TEXT_KEYS = ("text", "content", "document", "body", "code", "prompt", "completion",
+             "input", "output", "question", "answer")
+
 
 def _coerce_list_text(value):
     if isinstance(value, str):
@@ -45,6 +270,7 @@ def _coerce_list_text(value):
                         break
         return "\n".join(parts) if parts else ""
     return ""
+
 
 def _string_values(data):
     if isinstance(data, str):
@@ -73,6 +299,7 @@ def _string_values(data):
         for value in data:
             yield from _string_values(value)
 
+
 def _record_text(record):
     lower = {str(k).lower(): v for k, v in record.items()}
     prompt, completion = lower.get("prompt"), lower.get("completion")
@@ -87,9 +314,9 @@ def _record_text(record):
             return value
     return "\n".join(x for value in record.values() for x in _string_values(value))
 
-MAX_PLAIN_BYTES = 10_000_000
 
 def read_texts(path, max_records=0):
+    import csv
     path = Path(path)
     if path.is_file():
         files = [path]
@@ -100,14 +327,16 @@ def read_texts(path, max_records=0):
             try:
                 if not p.is_file():
                     continue
-                # Skip symlinks escaping the corpus root.
                 if p.is_symlink() and root not in p.resolve().parents:
                     continue
             except OSError:
                 continue
             files.append(p)
     seen = 0
-    plain = {".txt", ".text", ".py", ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".rs", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".cs", ".php", ".rb", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".html", ".css", ".scss", ".sql", ".md", ".rst", ".yaml", ".yml", ".toml", ".xml"}
+    plain = {".txt", ".text", ".py", ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".rs",
+             ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".cs", ".php", ".rb", ".swift",
+             ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".html", ".css", ".scss",
+             ".sql", ".md", ".rst", ".yaml", ".yml", ".toml", ".xml"}
     for f in files:
         ext = f.suffix.lower()
         if ext in plain:
@@ -123,7 +352,6 @@ def read_texts(path, max_records=0):
                 print(f"[WARN] skipping unreadable file {f}: {exc}")
                 continue
             if text and text.strip():
-                # Split into paragraphs so plain files count like JSONL lines.
                 for para in text.split("\n\n"):
                     para = para.strip()
                     if not para:
@@ -214,7 +442,6 @@ def read_texts(path, max_records=0):
                 if preferred:
                     columns = [preferred]
                 else:
-                    # Fallback: string columns only (skip binary/image).
                     try:
                         string_cols = [f.name for f in pf.schema_arrow
                                        if str(f.type).startswith("string")]
@@ -236,304 +463,18 @@ def read_texts(path, max_records=0):
         if max_records and seen >= max_records:
             return
 
-def _clean(text):
-    # Preserve ChatML tags as tokens (matched by TOKEN_RE); only normalize
-    # whitespace control chars here.
-    return text
-
-
-def tokenize_text(text):
-    return TOKEN_RE.findall(text)
-
-def devanagari_units(text):
-    out, i = [], 0
-    ZWJ = "\u200d"
-    ZWNJ = "\u200c"
-    cat = unicodedata.category
-    while i < len(text):
-        c = text[i]
-        if not DEV_BASE.fullmatch(c):
-            out.append(c)
-            i += 1
-            continue
-        u = c
-        i += 1
-        while i < len(text):
-            c = text[i]
-            if c == "्":
-                u += c
-                i += 1
-                while i < len(text) and (cat(text[i]).startswith("M") or text[i] in (ZWJ, ZWNJ)):
-                    u += text[i]
-                    i += 1
-                if i < len(text) and DEV_BASE.fullmatch(text[i]):
-                    u += text[i]
-                    i += 1
-                continue
-            if cat(c).startswith("M") or c in (ZWJ, ZWNJ):
-                u += c
-                i += 1
-                continue
-            break
-        out.append(u)
-    return out
-
-def canonical(x):
-    return x.lower()
-
-def case_type(x):
-    # Lossy by design for mixed case (hELLO/eBay -> lowercase, no marker):
-    # vocab stays small at the cost of exact round-trip for odd casing.
-    if x.isupper():
-        return "upper"
-    if x[:1].isupper() and x[1:].islower():
-        return "cap"
-    return None
-
-def _guaranteed():
-    chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-    chars.update([" ", "\n", "\t", "  ", "   ", "\n\n", ".", ",", "!", "?", ";", ":", "-", "(", ")", "[", "]", "{", "}", "'", '"', "/", "\\", "|", "@", "#", "$", "%", "^", "&", "*", "+", "=", "<", ">", "~", "`"])
-    for cp in range(0x0900, 0x0980):
-        try:
-            chars.add(chr(cp))
-        except ValueError:
-            pass
-    return sorted(chars)
-
-def _build(texts, vocab_size, word_budget=40000, max_records=0):
-    if vocab_size < len(SPECIAL) + len(CASE) + 1:
-        raise ValueError(f"vocab_size must be at least {len(SPECIAL) + len(CASE) + 1}")
-    if word_budget < 0 or max_records < 0:
-        raise ValueError("word_budget and max_records must be non-negative")
-    words, graphemes, chars, symbols = Counter(), Counter(), Counter(), Counter()
-    total_words = total_tokens = seen = 0
-    for text in texts:
-        seen += 1
-        text = _clean(text)
-        chars.update(text)
-        for token in TOKEN_RE.findall(text):
-            total_tokens += 1
-            if token.isspace(): continue
-            if token.isalpha() or token.isdigit():
-                base = canonical(token); words[base] += 1; total_words += 1
-                if DEV_BASE.search(token): graphemes.update(devanagari_units(token))
-            else:
-                symbols[token] += 1
-        if max_records and seen >= max_records: break
-    if seen == 0 or total_tokens == 0:
-        raise RuntimeError("no usable text records found for tokenizer training")
-    tokens, seen_tokens = SPECIAL + CASE, set(SPECIAL + CASE)
-    # The guaranteed single-char set (227 entries: 62 ASCII + 128 Devanagari +
-    # whitespace/punctuation) is emitted *first* and unconditionally, so it was
-    # never bounded by vocab_size. At vocab_size < 237 that silently overshot:
-    # asking for 48 produced a 237-entry vocabulary, and the failure surfaced
-    # far downstream as SmaulLinear's "Rawr graph vocab 237 != config vocab 48"
-    # -- which reads like a graph problem and is not one. The sub-256K train
-    # presets (vocab 24-96) all hit it.
-    #
-    # Bound it by the budget that is actually left. vocab_size >= 237 is
-    # unchanged -- the cap cannot bite, so every existing tokenizer.json and
-    # every tokenizer_sha256 in a checkpoint stays byte-identical. Below that,
-    # _guaranteed() is already sorted and deduped, so keeping a prefix is
-    # deterministic; the notice is printed rather than truncating silently,
-    # because a truncated guaranteed set is a real reduction in coverage.
-    guaranteed = _guaranteed()
-    if len(tokens) + len(guaranteed) > vocab_size:
-        keep = max(0, vocab_size - len(tokens))
-        print(f"[TOKENIZER] vocab_size={vocab_size} cannot hold the full "
-              f"{len(guaranteed)}-entry guaranteed character set "
-              f"({len(tokens)} reserved + {len(guaranteed)} = "
-              f"{len(tokens) + len(guaranteed)} needed); keeping the first {keep}. "
-              f"Use --vocab >= {len(tokens) + len(guaranteed)} for full coverage.")
-        guaranteed = guaranteed[:keep]
-    for g in guaranteed:
-        if g not in seen_tokens:
-            tokens.append(g); seen_tokens.add(g)
-    whitespace = [(x, n) for x, n in chars.most_common() if x.isspace() and x not in seen_tokens]
-    for source in (whitespace, words.most_common(word_budget), graphemes.most_common(), symbols.most_common(), chars.most_common()):
-        if len(tokens) >= vocab_size: break
-        for x, _ in source:
-            # Capacity is checked before the append, not after: appending then
-            # testing lets a full vocab absorb one more entry and overshoot by
-            # exactly 1. The requester then gets a tokenizer whose vocab_size
-            # disagrees with what it asked for, which train.py reads as a
-            # version mismatch and rebuilds on every run.
-            if len(tokens) >= vocab_size: break
-            if x not in seen_tokens:
-                tokens.append(x); seen_tokens.add(x)
-    while len(tokens) < vocab_size:
-        token = f"<unused_{len(tokens)}>"
-        tokens.append(token)
-        seen_tokens.add(token)
-    vocab = {x: i for i, x in enumerate(tokens)}
-    # case_stats intentionally NOT saved: it bloated tokenizer.json and was
-    # never used by encode/decode.
-    return {"version": VERSION, "vocab": vocab, "special_tokens": SPECIAL, "case_tokens": CASE, "unk_id": vocab["<unk>"], "stats": {"vocab_size": len(vocab), "whole_words": min(word_budget, len(words)), "unique_words": len(words), "total_words": total_words, "total_tokens": total_tokens, "devanagari_units": len(graphemes), "characters": len(chars), "symbols": len(symbols)}}
-
-def train(dataset, vocab_size=32000, word_budget=20000, max_records=0):
-    return _build(read_texts(Path(dataset), max_records), vocab_size, word_budget, max_records)
-
-class SmaulTokenizer:
-    def __init__(self, data):
-        if not isinstance(data, dict) or "vocab" not in data:
-            raise ValueError("invalid tokenizer data: missing 'vocab'")
-        self.data = data
-        self.vocab = data["vocab"]
-        self.id_to_token = {}
-        for x, i in self.vocab.items():
-            # int() accepts True ("1"), "5" and 5.9: without the guard a
-            # crafted file silently collides ids instead of failing to load.
-            if isinstance(i, bool) or not isinstance(i, int) or i < 0:
-                raise ValueError(f"invalid vocab id for {x!r}: {i!r}")
-            self.id_to_token[i] = x
-        try:
-            self.unk_token_id = data["unk_id"]
-            self.pad_token_id = self.vocab["<pad>"]
-            self.bos_token_id = self.vocab["<bos>"]
-            self.eos_token_id = self.vocab["<eos>"]
-        except KeyError as exc:
-            raise ValueError(f"tokenizer missing required special token {exc}") from exc
-    @classmethod
-    def from_file(cls, path):
-        try:
-            return cls(json.loads(Path(path).read_text(encoding="utf-8-sig")))
-        except (OSError, json.JSONDecodeError, UnicodeError) as exc:
-            raise RuntimeError(f"could not load tokenizer {path}: {exc}") from exc
-    def save(self, path):
-        import os
-        import tempfile
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, separators=(",", ":"))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    def get_vocab_size(self): return len(self.vocab)
-    def token_to_id(self, token): return self.vocab.get(token)
-    def encode(self, text): return TokenIds(encode(text, self))
-    def decode(self, ids): return decode(ids, self)
-
-def load(path): return SmaulTokenizer.from_file(path)
-
-def encode(text, tok):
-    v, u = tok.vocab, tok.unk_token_id; cap, upper = v.get("<cap>"), v.get("<upper>"); out = []
-    for t in tokenize_text(text):
-        if t.isspace():
-            out.extend(v.get(c, u) for c in t); continue
-        b = canonical(t)
-        if b in v:
-            c = case_type(t)
-            if c == "cap" and cap is not None: out.append(cap)
-            elif c == "upper" and upper is not None: out.append(upper)
-            out.append(v[b]); continue
-        if DEV_BASE.search(t):
-            for g in devanagari_units(t): out.extend([v[g]] if g in v else [v.get(c, u) for c in g])
-        else: out.extend(v.get(c, u) for c in t)
-    return out
-
-def decode(ids, tok):
-    tab, out, case = tok.id_to_token, [], None
-    for i in ids:
-        try:
-            t = tab.get(int(i), "<unk>")
-        except (TypeError, ValueError):
-            t = "<unk>"
-        if t == "<cap>":
-            case = "cap"
-            continue
-        if t == "<upper>":
-            case = "upper"
-            continue
-        if t in {"<pad>", "<bos>", "<eos>"}:
-            # A case marker must not survive a structural token: <cap><pad>hello
-            # decoded as 'Hello', capitalizing across the padding.
-            case = None
-            continue
-        if t.startswith("<unused_"):
-            # Surface invalid IDs instead of silently dropping them.
-            out.append("<unk>")
-            case = None
-            continue
-        if case == "cap":
-            t = t[:1].upper() + t[1:]
-        elif case == "upper":
-            t = t.upper()
-        out.append(t)
-        case = None
-    return "".join(out)
-
-def train_tokenizer(dataset_dir, output_path, vocab_size=32000, stream_name="none", max_records=0, texts=None):
-    if texts is not None:
-        data = _build(texts, vocab_size, min(20000, vocab_size // 2), max_records)
-    elif stream_name != "none":
-        if not max_records or max_records <= 0:
-            raise ValueError("--max-records must be positive when streaming (refusing unbounded FineWeb download)")
-        from stream_data import stream_dataset
-        data = _build(stream_dataset(stream_name), vocab_size, min(20000, vocab_size // 2), max_records)
-    else:
-        data = train(dataset_dir, vocab_size=vocab_size, max_records=max_records)
-    tok = SmaulTokenizer(data)
-    tok.save(output_path)
-    return tok
-
-def ensure_tokenizer(output_path, texts_or_dir=None, vocab_size=32000, max_records=0, stream_name="none"):
-    if texts_or_dir is not None and not isinstance(texts_or_dir, (str, Path)):
-        path = Path(output_path)
-        if path.exists():
-            try:
-                tok = load(path)
-                if tok.get_vocab_size() == vocab_size and tok.data.get("version") == VERSION:
-                    return tok
-                print(f"[TOKENIZER] rebuild: existing={tok.get_vocab_size()} v={tok.data.get('version')} requested={vocab_size} v={VERSION}")
-            except Exception:
-                print("[TOKENIZER] existing file unreadable; rebuilding")
-        else:
-            print(f"[TOKENIZER] creating vocabulary={vocab_size}")
-        return train_tokenizer(path.parent, path, vocab_size, max_records=max_records, texts=texts_or_dir)
-    dataset_dir = texts_or_dir if texts_or_dir is not None else output_path
-    path = Path(output_path)
-    if isinstance(dataset_dir, (str, Path)) and Path(dataset_dir).suffix == ".json":
-        dataset_dir = Path(dataset_dir).parent
-    if path.exists():
-        try:
-            tok = load(path)
-            if tok.get_vocab_size() == vocab_size and tok.data.get("version") == VERSION:
-                return tok
-            print(f"[TOKENIZER] rebuild: existing={tok.get_vocab_size()} v={tok.data.get('version')} requested={vocab_size} v={VERSION}")
-        except Exception:
-            print("[TOKENIZER] existing file unreadable; rebuilding")
-    else:
-        print(f"[TOKENIZER] creating vocabulary={vocab_size}")
-    if stream_name != "none":
-        return train_tokenizer(dataset_dir, path, vocab_size, stream_name, max_records)
-    return train_tokenizer(dataset_dir if isinstance(dataset_dir, (str, Path)) else "./datasets", path, vocab_size, max_records=max_records)
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Byte-level codec (vocab is fixed at 256)")
     s = p.add_subparsers(dest="cmd", required=True)
-    x = s.add_parser("train")
-    x.add_argument("--fromdataset", required=True)
-    x.add_argument("--vocab-size", type=int, default=32000)
-    x.add_argument("--word-budget", type=int, default=20000)
-    x.add_argument("--max-records", type=int, default=0)
-    x.add_argument("--output", default="tokenizer.json")
-    x.set_defaults(f=train_cmd)
     x = s.add_parser("encode")
-    x.add_argument("--tokenizer", required=True)
+    x.add_argument("--tokenizer", default=None,
+                   help="Optional byte tokenizer file (validated, not trained)")
     x.add_argument("--text", default=None)
-    x.add_argument("--text-file", default=None, help="Read text from file (for Hindi/newlines)")
+    x.add_argument("--text-file", default=None, help="Read text from file")
     x.set_defaults(f=encode_cmd)
     x = s.add_parser("decode")
-    x.add_argument("--tokenizer", required=True)
+    x.add_argument("--tokenizer", default=None)
     x.add_argument("--ids", required=True)
     x.set_defaults(f=decode_cmd)
     a = p.parse_args()
@@ -541,9 +482,9 @@ def main():
 
 
 def encode_cmd(a):
+    if a.tokenizer:
+        load(a.tokenizer)  # validate only; encoding needs no table
     if a.text_file:
-        # Same 10 MB cap read_texts enforces per file: --text-file /dev/zero
-        # must fail fast, not hang or OOM.
         if Path(a.text_file).stat().st_size > MAX_PLAIN_BYTES:
             raise ValueError(f"--text-file exceeds {MAX_PLAIN_BYTES} bytes")
         text = Path(a.text_file).read_text(encoding="utf-8-sig", errors="replace")
@@ -551,36 +492,17 @@ def encode_cmd(a):
         text = a.text
     else:
         raise ValueError("encode requires --text or --text-file")
-    print(*load(a.tokenizer).encode(text))
+    print(*encode_bytes(text))
 
 
 def decode_cmd(a):
+    if a.tokenizer:
+        load(a.tokenizer)
     try:
         ids = [int(v) for v in a.ids.split()]
     except ValueError as exc:
         raise ValueError(f"invalid --ids {a.ids!r}: expected space-separated ints") from exc
-    print(load(a.tokenizer).decode(ids))
+    print(decode_bytes(ids))
 
-def train_cmd(a):
-    if a.vocab_size <= 0 or a.word_budget < 0 or a.max_records < 0:
-        raise ValueError("--vocab-size/--word-budget/--max-records invalid")
-    d = _build((t for t in read_texts(Path(a.fromdataset), a.max_records)), a.vocab_size, a.word_budget, a.max_records)
-    out = Path(a.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    import os
-    import tempfile
-    fd, tmp = tempfile.mkstemp(dir=str(out.parent), prefix=out.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, separators=(",", ":"))
-        os.replace(tmp, out)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    s = d["stats"]
-    print(f"Vocabulary: {s['vocab_size']:,}\nWhole words: {s['whole_words']:,}\nUnique words: {s['unique_words']:,}\nCorpus words: {s['total_words']:,}\nDevanagari units: {s['devanagari_units']:,}\nCharacters: {s['characters']:,}\nSymbols/operators: {s['symbols']:,}\nSaved: {a.output}")
 
 if __name__ == "__main__": main()
