@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from kernel.fp8_tile import fp8_modules
-from smaul_linear import LinearConfig, SmaulLinear
-from train import Lion, SmaulOpt, _load_optimizer, _save_optimizer, _grad_norm
+from model import LinearConfig, Lion, SmaulLinear, SmaulOpt, _grad_norm
+from train import _load_optimizer, _save_optimizer
 
 
 def _dummy_model():
@@ -1602,7 +1602,7 @@ def test_step_never_widens_the_whole_gw():
     read row slices and let the FP32 state accumulators promote.
     """
     import inspect
-    from train import SmaulOpt as _S
+    from model import SmaulOpt as _S
     src = inspect.getsource(_S.step)
     assert "_gw.float()" not in src, "step() must not widen the whole _gw to FP32"
     assert "_gw.float()" not in inspect.getsource(_S)
