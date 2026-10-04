@@ -9,8 +9,31 @@ resume-free; SmaulOpt checkpoints save full optimizer state and resume exactly.
 ```bash
 python train.py --data ./datasets --out ./runs/linear \
     --tokenizer ./runs/linear/tokenizer.json \
-    --d 512 --layers 8 --heads 8 --vocab 8000 \
+    --d 512 --layers 8 --heads 8 --vocab 256 \
     --ctx 256 --batch 2 --steps 1000 --threads 2
+```
+
+Finite training:
+
+```bash
+python train.py --data ./datasets --out ./runs/finite \
+    --d 512 --layers 8 --heads 8 --ctx 256 --batch 2 --steps 1000 \
+    --moe-experts 4 --moe-top-k 2
+```
+
+Continual stream training with replay and retention measurement:
+
+```bash
+python train.py --data ./datasets/new-domain --old-data ./datasets/old-domain \
+    --out ./runs/cont --continual --domains ./datasets/new-domain \
+    --replay-size 512 --replay-rate 0.1 --trunk-lr-mult 0.3 \
+    --d 512 --layers 8 --heads 8 --ctx 256 --batch 2 --steps 10000
+```
+
+Inference:
+
+```bash
+python infer_cli.py --model ./runs/linear --prompt "Hello world" --max 64
 ```
 
 | Flag | Default | What it does |
@@ -19,11 +42,11 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--out` | `./runs/linear` | checkpoint directory |
 | `--tokenizer` | `<out>/tokenizer.json` | tokenizer path (default follows `--out`; auto-trained if missing/mismatched) |
 | `--preset` / `--list-presets` | none | named size preset, overriding `--vocab/--d/--layers/--heads/--ffn_mult`; `--list-presets` prints them and exits |
-| `--vocab` | `8000` | vocabulary size; must match the tokenizer |
+| `--vocab` | `256` | vocabulary size; byte-level, must be `256` |
 | `--d` | `512` | model width (`d_model`) |
 | `--layers` | `8` | block count (`n_layer`) |
 | `--heads` | `8` | linear-attention head count |
-| `--ffn_mult` | `2.5` | FFN width multiplier |
+| `--ffn_mult` | `2.5` | FFN width multiplier (also the MoE expert hidden-dim knob) |
 | `--architecture` | `rawr` | `rawr` (sparse, default) or `plain` (dense baseline) |
 | `--embedding-storage` | `ram` | embedding table: `ram` (`nn.Embedding`) or `mmap` (file-backed) |
 | `--rawr-sparsity` | `0.9` | Rawr: fraction of connections omitted; see the warning below |
@@ -33,6 +56,19 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--rawr-max-docs` | `2000` | Rawr: max corpus docs sampled for graph edges (`0` = unlimited) |
 | `--rawr-max-tokens-per-doc` | `1024` | Rawr: max tokens read per corpus doc for graph edges |
 | `--precision` | `fp8` | weight precision: tiled-E4M3 `fp8` or plain `fp32` |
+| `--moe-experts` | `1` | total MoE experts per block (`1` = dense FFN, no routing) |
+| `--moe-top-k` | `1` | active experts per token (only these execute) |
+| `--moe-balance-weight` | `0.01` | router load-balancing aux-loss weight |
+| `--continual` | off | continual stream training with replay and per-group LRs |
+| `--domains` | `--data` | comma-separated dataset dirs, trained in order without auto state reset |
+| `--old-data` | none | reference domain for retention eval (old loss before/after) |
+| `--replay-size` | `512` | bounded replay reservoir, in chunks (`0` disables storage) |
+| `--replay-rate` | `0.1` | fraction of continual steps interleaved from replay, `[0, 1]` |
+| `--trunk-lr-mult` | `0.3` | shared-trunk LR multiplier in continual mode (conservative) |
+| `--expert-lr` | `--lr` | MoE expert LR in continual mode |
+| `--router-lr` | `--lr` | router LR in continual mode |
+| `--reset-state` | off | reset the stream carry-over buffer between domains |
+| `--retention-batches` | `20` | eval batches per domain for retention reports |
 | `--ctx` | `256` | training sequence length |
 | `--batch` | `2` | sequences per optimizer step |
 | `--steps` | `1000` | optimizer steps |
@@ -48,10 +84,10 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--grad_clip` | `1.0` | global grad-norm clip |
 | `--log_every` | `10` | log cadence (steps) |
 | `--save_every` | `200` | checkpoint cadence (steps) |
-| `--tok_records` | `200000` | max records for automatic tokenizer training (`0` = unlimited) |
 | `--threads` | `2` | CPU threads (via `compute.get_backend().configure()`) |
 
-There are no SFT, streaming, or resume flags: the trainer only pretrains.
+There are no SFT or resume flags: the trainer pretrains (finite) or runs the
+continual stream described below.
 
 In `fp32` mode every projection is a plain FP32 linear (`fp8_modules` is empty) and both
 optimizers run their standard parameter path; checkpoints, inference, and GGUF export work
@@ -119,10 +155,42 @@ scale: peak RSS 615 MB, live gradients 32.5 MiB, checkpoint 25.0 MiB, optimizer 
 `cols` index RAM 1.5 MiB.
 
 ## Tokenizer
-The tokenizer is built automatically via `tokenizer.ensure_tokenizer`: an existing file is
-reused only when its vocabulary size equals `--vocab` and its format version is current
-(version 8, `tokenizer.VERSION`); otherwise it is rebuilt from `--data` (up to
-`--tok_records` records) and saved to `--tokenizer`.
+The tokenizer is a fixed byte codec written automatically via
+`tokenizer.ensure_tokenizer`: an existing valid byte file is reused, a
+legacy/unreadable one is rewritten. No training data is needed for the codec
+itself. `--vocab` must be `256`.
+
+## Continual stream training
+
+`--continual` trains indefinitely over `--domains` (default: `--data` alone) as
+one byte stream: the carry-over buffer threads through domains with no
+auto-reset on domain change (`--reset-state` clears it explicitly between
+domains). Every new chunk enters a bounded replay reservoir (`--replay-size`
+chunks, uniform reservoir sampling, constant memory); a `--replay-rate`
+fraction of steps is interleaved from replay so new data never fully replaces
+old data and old domains keep exercising their experts.
+
+Three optimizer groups keep the shared RAWR/recurrent trunk comparatively
+stable while experts adapt faster: trunk LR is `--lr * --trunk-lr-mult`
+(default `0.3 * --lr`), experts use `--expert-lr`, the router `--router-lr`
+(both default to `--lr`). Each group carries its own momentum state; FP8
+weight grads are isolated per group while it steps (`continual.GwStash`), so
+no optimizer change was needed. Step lines log `moe_inactive` (experts with no
+tokens) and `max_use` (largest expert usage fraction) when MoE is on.
+
+Retention is measured, not claimed: with `--old-data`, the run evaluates
+old-domain loss before training, then old-domain and new-domain loss after,
+and prints `[retention] old a -> b (delta +d) new c`. A positive delta is
+forgetting; replay, the conservative trunk rate, and expert routing are what
+reduce it. Catastrophic forgetting is not claimed solved.
+
+## MoE training
+
+`--moe-experts N --moe-top-k K` builds `SwiFFN_MoE` blocks with `RawrFFN`
+experts on `architecture="rawr"` (dense `SwiFFN` experts on `"plain"`).
+`--moe-balance-weight` scales the Switch-style load-balancing aux loss added
+to the training loss. `merge_moe.py` can additionally upcycle per-domain dense
+checkpoints into MoE experts; see `merge_moe.md`.
 
 ## Optimizer
 
