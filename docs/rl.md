@@ -11,7 +11,8 @@ python rl.py --model_dir ./runs/linear --work_dir ./rl \
 
 ## Flow
 
-1. `candidates()` samples `count` (1-64) responses per prompt.
+1. `candidates()` samples `count` (1-64) responses per prompt; both CLIs require
+   at least 2 (a single response has no contrast to learn from).
 2. `_pick()` shows them; you choose the best (`Ctrl-D` keeps the first).
 3. `_save()` appends `{prompt, responses, chosen, source: "human"}` to
    `work_dir/preferences.jsonl` (append + fsync).
