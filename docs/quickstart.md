@@ -47,7 +47,7 @@ See [train.md](train.md) for all flags, the Lion optimizer, and the checkpoint f
 Single prompt, interactive chat, or local server -- all load `./runs/linear` by default:
 
 ```bash
-python infer_cli.py --model ./runs/linear --prompt "Hello world" --max-tokens 64
+python infer_cli.py --model ./runs/linear --prompt "Hello world" --max 64
 python infer_cli.py --model ./runs/linear
 python infer_server.py --model ./runs/linear --port 8080
 ```
