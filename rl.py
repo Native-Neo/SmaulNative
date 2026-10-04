@@ -12,9 +12,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from smaul_linear import SmaulLinear
+from model import Lion, SmaulLinear
 from tokenizer import SmaulTokenizer
-from train import Lion
 
 
 def _seed_all(seed: int) -> None:
