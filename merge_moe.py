@@ -37,7 +37,8 @@ def merge(base_dir: Path, branch_dirs: list, out_dir: Path, top_k: int = 1, forc
     base_cfg, base_sd = _load(base_dir)
     branches = [_load(bd) for bd in branch_dirs]
     for cfg, _ in branches:
-        for f in ("vocab_size", "d_model", "n_layer", "n_heads", "precision", "ffn_mult", "tile", "eps"):
+        for f in ("vocab_size", "d_model", "n_layer", "n_heads", "precision", "ffn_mult",
+                  "tile", "eps", "architecture", "rawr_sparsity", "rawr_min_degree"):
             if getattr(cfg, f) != getattr(base_cfg, f):
                 raise ValueError(f"branch {f}={getattr(cfg, f)} != base {f}={getattr(base_cfg, f)}")
     # Tokenizers must match or the merged model tokenizes differently per expert.
@@ -75,7 +76,26 @@ def merge(base_dir: Path, branch_dirs: list, out_dir: Path, top_k: int = 1, forc
     ).hexdigest()[:8], 16)
     with torch.random.fork_rng():
         torch.manual_seed(seed)
-        model = SmaulLinear(moe_cfg)
+        graph = None
+        if base_cfg.architecture == "rawr":
+            # Rawr experts are SparseLinear values interpreted through the
+            # graph's columns, which are re-derived (not stored). Building the
+            # MoE against the fallback graph would silently reinterpret every
+            # branch expert, so the base graph is reused and branch graphs
+            # must match it exactly.
+            from rawr_graph import load_graph
+
+            gp = Path(base_dir) / "rawr_graph.json"
+            if not gp.exists():
+                raise FileNotFoundError(
+                    f"Rawr base {base_dir} is missing rawr_graph.json")
+            graph = load_graph(gp)
+            for bd in branch_dirs:
+                bgp = Path(bd) / "rawr_graph.json"
+                if bgp.exists() and load_graph(bgp).digest != graph.digest:
+                    raise ValueError(
+                        f"branch {bd} graph != base graph; refusing to mix columns")
+        model = SmaulLinear(moe_cfg, rawr_graph=graph)
     out_sd = model.state_dict()
     for k, v in base_sd.items():
         # Every FFN weight -- gate, up and down alike -- lives under .ffn. in a
