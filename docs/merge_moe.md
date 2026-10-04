@@ -51,6 +51,6 @@ python merge_moe.py --base ./runs/base --branches ./runs/branch1 ./runs/branch2 
 The result loads like any other checkpoint:
 
 ```python
-from smaul_linear import SmaulLinear
+from model import SmaulLinear
 model = SmaulLinear.from_pretrained("./runs/moe")
 ```
