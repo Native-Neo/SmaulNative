@@ -288,8 +288,10 @@ def _validate_args(args) -> None:
     if getattr(args, "vocab", BYTE_VOCAB_SIZE) != BYTE_VOCAB_SIZE:
         raise ValueError(
             f"--vocab must be {BYTE_VOCAB_SIZE} (byte-level); got {getattr(args, 'vocab')!r}")
-    _ne = int(getattr(args, "moe_experts", 1) or 1)
-    _tk = int(getattr(args, "moe_top_k", 1) or 1)
+    _ne = getattr(args, "moe_experts", 1)
+    _ne = 1 if _ne is None else int(_ne)
+    _tk = getattr(args, "moe_top_k", 1)
+    _tk = 1 if _tk is None else int(_tk)
     if _ne < 1:
         raise ValueError(f"--moe-experts must be >= 1, got {_ne}")
     if _tk < 1 or _tk > _ne:
