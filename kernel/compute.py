@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Minimal compute-backend boundary for SmaulNative.
 
-The model (smaul_linear.py) and FP8 autograd (fp8_tile.py) call into a
+The model (model.py) and FP8 autograd (fp8_tile.py) call into a
 backend selected with get_backend(); they never touch extensions directly.
 The CPU backend is default, fully functional, and independently testable.
 Future backends (e.g. AMD FP16/ROCm) register via register_backend()
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 
-# Cached reference fallbacks. Resolved lazily so the smaul_linear <-> compute
+# Cached reference fallbacks. Resolved lazily so the model <-> compute
 # import cycle is only paid once, and only if the native extensions are absent.
 _attn_ref_fn = None
 _attn_ref_bwd_fn = None
@@ -24,7 +24,7 @@ _attn_ref_bwd_fn = None
 def _get_attn_ref():
     global _attn_ref_fn
     if _attn_ref_fn is None:
-        from smaul_linear import _attn_reference
+        from model import _attn_reference
         _attn_ref_fn = _attn_reference
     return _attn_ref_fn
 
@@ -32,7 +32,7 @@ def _get_attn_ref():
 def _get_attn_ref_bwd():
     global _attn_ref_bwd_fn
     if _attn_ref_bwd_fn is None:
-        from smaul_linear import _attn_reference_backward
+        from model import _attn_reference_backward
         _attn_ref_bwd_fn = _attn_reference_backward
     return _attn_ref_bwd_fn
 
