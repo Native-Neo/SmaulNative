@@ -244,7 +244,7 @@ class SmaulRL:
     def _logprob(self, prompt: str, response_tokens: List[int], temperature: float, top_k: int, top_p: float) -> torch.Tensor:
         # Use the SAME sliding window as sampling: prompt truncated to window,
         # response truncated so prompt+response fits without OOM.
-        prompt_ids = self._encode(prompt) or [self.bos_id if self.bos_id is not None else self.eos_id]
+        prompt_ids = self._encode(prompt) or [10]
         if not response_tokens:
             return torch.empty(0, device=self.device)
         prompt_ids = prompt_ids[-self.MODEL_WINDOW:]
