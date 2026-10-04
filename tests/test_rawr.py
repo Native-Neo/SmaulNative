@@ -16,7 +16,7 @@ import torch
 from embeddings import MmapEmbedding, RamEmbedding
 from rawr_graph import (RawrGraph, build_graph, fallback_graph, hidden_cols,
                          load_graph, save_graph)
-from smaul_linear import LinearConfig, SmaulLinear, SparseLinear
+from model import LinearConfig, SmaulLinear, SparseLinear
 from tokenizer import SmaulTokenizer
 
 
@@ -165,7 +165,7 @@ def test_plain_checkpoint_compat(tmp_path):
 
 
 def _tiny_train_step(arch, storage, tmp_path):
-    from train import Lion
+    from model import Lion
 
     torch.manual_seed(0)
     cfg = _tiny_cfg(arch, storage)
@@ -445,7 +445,7 @@ def test_sparse_linear_csr_cache_is_rebuilt_after_an_inference_mode_forward():
     forward/backward happens to tolerate them, so the failure would surface
     far from its cause.
     """
-    from smaul_linear import SparseLinear
+    from model import SparseLinear
     torch.manual_seed(21)
     sl = SparseLinear(32, 48, torch.stack([torch.randperm(32)[:6] for _ in range(48)]))
     x = torch.randn(4, 32)
@@ -474,7 +474,7 @@ def test_sparse_linear_csr_cache_is_rebuilt_after_an_inference_mode_forward():
 
 def test_sparse_linear_csr_cache_tracks_a_replaced_cols_buffer():
     """A new ``cols`` tensor (e.g. from .to(device)) must invalidate the cache."""
-    from smaul_linear import SparseLinear
+    from model import SparseLinear
     torch.manual_seed(22)
     sl = SparseLinear(16, 24, torch.stack([torch.randperm(16)[:4] for _ in range(24)]))
     x = torch.randn(3, 16)
@@ -494,7 +494,7 @@ def test_sparse_linear_csr_cache_tracks_a_replaced_cols_buffer():
 # ---------------------------------------------------------------------------
 
 def test_graph_sparsity_is_not_the_model_sparsity():
-    from smaul_linear import LinearConfig, SmaulLinear
+    from model import LinearConfig, SmaulLinear
     g = fallback_graph(64, 4)
     cfg = LinearConfig(vocab_size=64, d_model=64, n_layer=4, n_heads=4, ffn_mult=2.0,
                        architecture="rawr", rawr_sparsity=0.99)
@@ -513,7 +513,7 @@ def test_graph_sparsity_is_not_the_model_sparsity():
 
 
 def test_compute_profile_counts_are_the_real_layer_shapes():
-    from smaul_linear import LinearConfig, SmaulLinear
+    from model import LinearConfig, SmaulLinear
     g = fallback_graph(48, 4)
     for sp in (0.5, 0.9, 0.99):
         cfg = LinearConfig(vocab_size=48, d_model=32, n_layer=2, n_heads=2, ffn_mult=2.0,
@@ -532,7 +532,7 @@ def test_compute_profile_counts_are_the_real_layer_shapes():
 
 
 def test_compute_profile_on_plain_has_no_sparse_layers():
-    from smaul_linear import LinearConfig, SmaulLinear
+    from model import LinearConfig, SmaulLinear
     cfg = LinearConfig(vocab_size=48, d_model=32, n_layer=2, n_heads=2, ffn_mult=2.0,
                        architecture="plain")
     p = SmaulLinear(cfg).compute_profile()
