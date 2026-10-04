@@ -87,6 +87,10 @@ class MmapEmbedding(nn.Module):
         # with no warning and nothing to notice downstream except that the model
         # had stopped working. Provenance is knowable; content is not.
         fresh = True
+        # Whether the file below is ours to delete: a path=None construction
+        # owns its mkstemp file (consumed by __del__); an explicit path --
+        # usually the checkpoint -- is the caller's.
+        self._owns_file = path is None
         if path is None:
             fd, tmp = tempfile.mkstemp(prefix="smaul_emb_", suffix=".dat")
             os.close(fd)
@@ -153,6 +157,16 @@ class MmapEmbedding(nn.Module):
     def __del__(self):
         try:
             self.flush()
+            # Temp files we created (path=None) are unlinked here: nothing
+            # else knows their names, so without this every construction leaks
+            # one vocab*d*4-byte file in /tmp. Explicit-path files are the
+            # caller's (often the checkpoint) and are left alone.
+            if getattr(self, "_owns_file", False):
+                try:
+                    del self._mem
+                except AttributeError:
+                    pass
+                os.unlink(self.path)
         except Exception:
             pass
 
