@@ -18,13 +18,20 @@ python train.py --data ./datasets --out ./runs/linear \
 | `--data` | `./datasets` | dataset directory scanned by `dataset.discover_files` |
 | `--out` | `./runs/linear` | checkpoint directory |
 | `--tokenizer` | `<out>/tokenizer.json` | tokenizer path (default follows `--out`; auto-trained if missing/mismatched) |
+| `--preset` / `--list-presets` | none | named size preset, overriding `--vocab/--d/--layers/--heads/--ffn_mult`; `--list-presets` prints them and exits |
 | `--vocab` | `8000` | vocabulary size; must match the tokenizer |
 | `--d` | `512` | model width (`d_model`) |
 | `--layers` | `8` | block count (`n_layer`) |
 | `--heads` | `8` | linear-attention head count |
+| `--ffn_mult` | `2.5` | FFN width multiplier |
 | `--architecture` | `rawr` | `rawr` (sparse, default) or `plain` (dense baseline) |
+| `--embedding-storage` | `ram` | embedding table: `ram` (`nn.Embedding`) or `mmap` (file-backed) |
 | `--rawr-sparsity` | `0.9` | Rawr: fraction of connections omitted; see the warning below |
 | `--rawr-min-degree` | `4` | Rawr: connectivity floor per token (>= 1) |
+| `--rawr-dict` | none | Rawr: extra dictionary file (one word per line) on top of built-ins |
+| `--rawr-graph-out` | none | Rawr: also export the connectivity graph JSON here |
+| `--rawr-max-docs` | `2000` | Rawr: max corpus docs sampled for graph edges (`0` = unlimited) |
+| `--rawr-max-tokens-per-doc` | `1024` | Rawr: max tokens read per corpus doc for graph edges |
 | `--precision` | `fp8` | weight precision: tiled-E4M3 `fp8` or plain `fp32` |
 | `--ctx` | `256` | training sequence length |
 | `--batch` | `2` | sequences per optimizer step |
