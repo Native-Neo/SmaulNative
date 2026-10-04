@@ -133,10 +133,15 @@ def convert(input_dir: Path, output: Path, dtype: str, overwrite: bool = False):
         # .sc files skipped above must have been consumed with their .w8;
         # leftovers mean a corrupt checkpoint (orphan scales).
         raise ValueError(f"unconverted tensors remain (orphan .sc?): {sorted(raw)}")
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file(progress=True)
-    writer.close()
+    try:
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file(progress=True)
+    finally:
+        # A failure above must still release the writer: without this the tmp
+        # file is orphaned and the atomicity os.replace implies does not hold
+        # on the error path.
+        writer.close()
     os.replace(tmp, output)
     print(f"[GGUF] wrote {output} | tensors: {count} | dtype: {dtype}")
 
