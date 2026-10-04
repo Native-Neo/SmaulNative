@@ -2,12 +2,14 @@
 """Collect human preferences and GRPO-train SmaulLinear from those choices."""
 
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from smaul_linear import SmaulLinear
@@ -339,20 +341,6 @@ def main_human():
     SmaulRL(args.model_dir, args.work_dir, args.device).run(args.prompt, args.responses, args.max_new_tokens,
         args.temperature, args.top_k, args.top_p, args.rl_lr, args.clip, args.kl_coef)
 
-
-#!/usr/bin/env python3
-"""Train from rl.py preferences and run verified automatic RL for SmaulLinear."""
-
-import argparse
-import hashlib
-import json
-import random
-from pathlib import Path
-from typing import Dict, List
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 # Minimum human preference records required before unattended (--no-verify)
 # auto-labeling is allowed. Below this the reward model is effectively random
