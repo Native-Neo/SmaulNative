@@ -17,7 +17,7 @@ import torch
 from dataset import PretrainStream, TokenizerWrapper, discover_files, iter_texts
 from kernel.fp8_tile import fp8_modules
 from model import Lion, PRESETS, SmaulOpt, apply_preset, build_model, estimate_params
-from tokenizer import ensure_tokenizer
+from tokenizer import BYTE_VOCAB_SIZE, ensure_tokenizer
 
 
 STOP = False
@@ -42,14 +42,14 @@ def install_handlers() -> None:
 
 
 
-def _save_optimizer(out: Path, opt, model=None) -> None:
+def _save_optimizer(out: Path, opt, model=None, suffix: str = "") -> None:
     # JSON, not pickle: torch.save would be arbitrary-code-exec on load.
-    (out / "optimizer.json").write_text(json.dumps(opt.state_dict(), indent=2), encoding="utf-8")
+    (out / f"optimizer{suffix}.json").write_text(json.dumps(opt.state_dict(), indent=2), encoding="utf-8")
     if isinstance(opt, SmaulOpt) and model is not None:
-        _save_smaul_states(out, opt, model)
+        _save_smaul_states(out, opt, model, suffix=suffix)
 
 
-def _save_smaul_states(out: Path, opt: "SmaulOpt", model) -> None:
+def _save_smaul_states(out: Path, opt: "SmaulOpt", model, suffix: str = "") -> None:
     from safetensors.torch import save_file
     param_names = {id(p): n for n, p in model.named_parameters()}
     mod_names = {id(m): n for n, m in fp8_modules(model)}
@@ -80,9 +80,9 @@ def _save_smaul_states(out: Path, opt: "SmaulOpt", model) -> None:
             if v_state is not None:
                 tensors[f"v.{base}"] = v_state.detach().cpu().contiguous()
     if tensors:
-        tmp = out / "optimizer_state.safetensors.tmp"
+        tmp = out / f"optimizer_state{suffix}.safetensors.tmp"
         save_file(tensors, str(tmp))
-        os.replace(tmp, out / "optimizer_state.safetensors")
+        os.replace(tmp, out / f"optimizer_state{suffix}.safetensors")
 
 
 def _load_optimizer(out: Path, opt, model=None):
@@ -285,10 +285,42 @@ def _validate_args(args) -> None:
     _md = getattr(args, "rawr_min_degree", 4)
     if not isinstance(_md, int) or isinstance(_md, bool) or _md < 1:
         raise ValueError(f"--rawr-min-degree must be a positive int, got {_md!r}")
+    if getattr(args, "vocab", BYTE_VOCAB_SIZE) != BYTE_VOCAB_SIZE:
+        raise ValueError(
+            f"--vocab must be {BYTE_VOCAB_SIZE} (byte-level); got {getattr(args, 'vocab')!r}")
+    _ne = int(getattr(args, "moe_experts", 1) or 1)
+    _tk = int(getattr(args, "moe_top_k", 1) or 1)
+    if _ne < 1:
+        raise ValueError(f"--moe-experts must be >= 1, got {_ne}")
+    if _tk < 1 or _tk > _ne:
+        raise ValueError(f"--moe-top-k must be in [1, --moe-experts], got {_tk}")
+    _bw = float(getattr(args, "moe_balance_weight", 0.01))
+    if not math.isfinite(_bw) or _bw < 0:
+        raise ValueError(f"--moe-balance-weight must be non-negative finite, got {_bw!r}")
+    _rr = float(getattr(args, "replay_rate", 0.0))
+    if not 0.0 <= _rr <= 1.0 or not math.isfinite(_rr):
+        raise ValueError(f"--replay-rate must be in [0, 1], got {_rr!r}")
+    _rs = int(getattr(args, "replay_size", 512))
+    if _rs < 0:
+        raise ValueError(f"--replay-size must be non-negative, got {_rs}")
+    _tm = float(getattr(args, "trunk_lr_mult", 0.3))
+    if not math.isfinite(_tm) or _tm <= 0:
+        raise ValueError(f"--trunk-lr-mult must be positive finite, got {_tm!r}")
+    for _n in ("expert_lr", "router_lr"):
+        _v = getattr(args, _n, None)
+        if _v is not None and (not isinstance(_v, (int, float))
+                               or not math.isfinite(float(_v)) or float(_v) <= 0):
+            raise ValueError(f"--{_n.replace('_', '-')} must be positive finite, got {_v!r}")
+    _rb = int(getattr(args, "retention_batches", 20))
+    if _rb < 1:
+        raise ValueError(f"--retention-batches must be positive, got {_rb}")
 
 def _tok(args, out: Path):
-    from tokenizer import VERSION as _TOK_VERSION
+    """Byte tokenizer: fixed 256-entry file, written if missing or legacy.
 
+    No training data is needed for the codec itself; --data is still
+    required for the actual training corpus.
+    """
     tp = Path(args.tokenizer) if args.tokenizer else out / "tokenizer.json"
     if tp.exists():
         try:
@@ -296,20 +328,13 @@ def _tok(args, out: Path):
             t = _load(tp)
         except (OSError, ValueError, KeyError) as exc:
             raise RuntimeError(f"could not load tokenizer {tp}: {exc}") from exc
-        if t.get_vocab_size() == args.vocab and t.data.get("version") == _TOK_VERSION:
-            return t, tp
-        print("[tok] vocab/version mismatch, rebuilding")
-    else:
-        print(f"[tok] {tp} not found, training new tokenizer")
-    data_dir = Path(args.data)
-    if not data_dir.exists():
-        raise ValueError(f"--data {data_dir} does not exist")
-    files = discover_files(data_dir)
-    if not files:
-        raise RuntimeError(f"no training files found in {data_dir}")
-    texts = (t for t, _, _ in iter_texts(files))
-    max_records = max(0, int(getattr(args, "tok_records", 0) or 0))
-    return ensure_tokenizer(tp, texts, args.vocab, max_records=max_records), tp
+        if t.get_vocab_size() != BYTE_VOCAB_SIZE:
+            raise ValueError(
+                f"tokenizer {tp} vocab {t.get_vocab_size()} != {BYTE_VOCAB_SIZE}; "
+                "delete it and re-run to write a byte tokenizer")
+        return t, tp
+    print(f"[tok] writing byte tokenizer ({BYTE_VOCAB_SIZE}) to {tp}")
+    return ensure_tokenizer(tp, None, BYTE_VOCAB_SIZE), tp
 
 
 def _sha_file(p: Path) -> str:
@@ -342,11 +367,13 @@ def main():
     a.add_argument("--preset", default=None,
                    help="Named size preset (overrides --vocab/--d/--layers/--heads/--ffn_mult); see --list-presets")
     a.add_argument("--list-presets", action="store_true", help="List size presets with estimated params and exit")
-    a.add_argument("--vocab", type=int, default=8000)
+    a.add_argument("--vocab", type=int, default=BYTE_VOCAB_SIZE,
+                   help=f"vocabulary size; byte-level, must be {BYTE_VOCAB_SIZE}")
     a.add_argument("--d", type=int, default=512)
     a.add_argument("--layers", type=int, default=8)
     a.add_argument("--heads", type=int, default=8)
-    a.add_argument("--ffn_mult", type=float, default=2.5)
+    a.add_argument("--ffn_mult", type=float, default=2.5,
+                   help="FFN width multiplier (also the MoE expert hidden-dim knob)")
     a.add_argument("--architecture", choices=("rawr", "plain"), default="rawr",
                    help="Model architecture: Rawr sparse (default) or plain dense baseline")
     a.add_argument("--embedding-storage", choices=("ram", "mmap"), default="ram",
@@ -370,6 +397,32 @@ def main():
                    help="Rawr: max corpus docs sampled for graph edges (0 = unlimited)")
     a.add_argument("--rawr-max-tokens-per-doc", type=int, default=1024)
     a.add_argument("--precision", choices=("fp8", "fp32"), default="fp8")
+    a.add_argument("--moe-experts", type=int, default=1,
+                   help="Total MoE experts per block (1 = dense FFN, no routing)")
+    a.add_argument("--moe-top-k", type=int, default=1,
+                   help="Active experts per token (only these execute)")
+    a.add_argument("--moe-balance-weight", type=float, default=0.01,
+                   help="Weight of the router load-balancing aux loss")
+    a.add_argument("--continual", action="store_true",
+                   help="Continual stream training over --domains with replay")
+    a.add_argument("--domains", default=None,
+                   help="Comma-separated dataset dirs trained in order (default: --data only)")
+    a.add_argument("--old-data", default=None,
+                   help="Reference domain for retention eval (old-domain loss before/after)")
+    a.add_argument("--replay-size", type=int, default=512,
+                   help="Bounded replay reservoir in chunks (0 disables storage)")
+    a.add_argument("--replay-rate", type=float, default=0.1,
+                   help="Fraction of continual steps interleaved from replay [0, 1]")
+    a.add_argument("--trunk-lr-mult", type=float, default=0.3,
+                   help="Shared-trunk LR multiplier in continual mode (conservative)")
+    a.add_argument("--expert-lr", type=float, default=None,
+                   help="MoE expert LR in continual mode (default: --lr)")
+    a.add_argument("--router-lr", type=float, default=None,
+                   help="Router LR in continual mode (default: --lr)")
+    a.add_argument("--reset-state", action="store_true",
+                   help="Reset the stream carry-over buffer between domains")
+    a.add_argument("--retention-batches", type=int, default=20,
+                   help="Eval batches per domain for retention reports")
     a.add_argument("--ctx", type=int, default=256)
     a.add_argument("--batch", type=int, default=2)
     a.add_argument("--steps", type=int, default=1000)
@@ -403,8 +456,6 @@ def main():
     a.add_argument("--grad_clip", type=float, default=1.0)
     a.add_argument("--log_every", type=int, default=10)
     a.add_argument("--save_every", type=int, default=200)
-    a.add_argument("--tok_records", type=int, default=200000,
-                   help="Max records for automatic tokenizer training (0 = unlimited)")
     a.add_argument("--threads", type=int, default=2)
     args = a.parse_args()
     if args.list_presets:
@@ -416,8 +467,6 @@ def main():
         return
     apply_preset(args)
     _validate_args(args)
-    if args.tok_records < 0:
-        raise ValueError(f"--tok_records must be non-negative, got {args.tok_records}")
     if args.grad_clip <= 0:
         raise ValueError(f"--grad_clip must be positive, got {args.grad_clip}")
     # Configure threads through the backend (sets OMP/MKL before torch init
@@ -445,20 +494,63 @@ def main():
         ds_fp = ""
     opt_name = getattr(args, "optimizer", "smaul") or "smaul"
     model = build_model(args, tok, out, tok_sha, ds_fp)
-    if opt_name == "smaul":
-        opt = SmaulOpt(list(model.parameters()), lr=args.lr,
-                       beta_m=getattr(args, "beta_m", 0.9),
-                       beta_v=getattr(args, "beta_v", 0.999),
-                       epsilon=getattr(args, "epsilon", 1e-8),
-                       weight_decay=args.wd, clip=args.grad_clip,
-                       state_dtype=getattr(args, "state_dtype", "bf16"),
-                       factor_v=getattr(args, "factor_v", True),
-                       grad_dtype=getattr(args, "grad_dtype", "bf16"))
+    from continual import (ContinualStream, GwStash, ReplayBuffer, evaluate_loss,
+                           global_clip_scale, moe_routing_summary, partition_model,
+                           retention_report)
+    is_moe = bool(model.cfg.is_moe)
+    balance_w = float(getattr(args, "moe_balance_weight", 0.01) or 0.0)
+
+    def _make_opt(params, lr):
+        if opt_name == "smaul":
+            return SmaulOpt(list(params), lr=lr,
+                            beta_m=getattr(args, "beta_m", 0.9),
+                            beta_v=getattr(args, "beta_v", 0.999),
+                            epsilon=getattr(args, "epsilon", 1e-8),
+                            weight_decay=args.wd, clip=args.grad_clip,
+                            state_dtype=getattr(args, "state_dtype", "bf16"),
+                            factor_v=getattr(args, "factor_v", True),
+                            grad_dtype=getattr(args, "grad_dtype", "bf16"))
+        return Lion(list(params), lr=lr, wd=args.wd, clip=args.grad_clip)
+
+    continual = bool(getattr(args, "continual", False))
+    if continual:
+        parts = partition_model(model)
+        lr_trunk = args.lr * float(getattr(args, "trunk_lr_mult", 0.3))
+        lr_expert = float(getattr(args, "expert_lr", 0) or args.lr)
+        lr_router = float(getattr(args, "router_lr", 0) or args.lr)
+        group_lrs = {"trunk": lr_trunk, "expert": lr_expert, "router": lr_router}
+        opts = {}
+        for g, lr in group_lrs.items():
+            if parts[g]["params"] or parts[g]["fp8"]:
+                opts[g] = _make_opt(parts[g]["params"], lr)
+        if not opts:
+            raise RuntimeError("continual partitioning left no trainable group")
+        print(f"[continual] trunk_lr={lr_trunk:.2e} expert_lr={lr_expert:.2e} "
+              f"router_lr={lr_router:.2e} groups={sorted(opts)}")
     else:
-        opt = Lion(list(model.parameters()), lr=args.lr, wd=args.wd, clip=args.grad_clip)
+        parts = None
+        opts = {"all": _make_opt(model.parameters(), args.lr)}
     wrap = TokenizerWrapper(tok)
-    stream = PretrainStream(Path(args.data), wrap, args.ctx)
+    old_data = getattr(args, "old_data", None)
+    if continual:
+        doms = [s.strip() for s in (args.domains.split(",") if getattr(
+            args, "domains", None) else [args.data]) if s.strip()]
+        if not doms:
+            raise ValueError("--domains produced no dataset directory")
+        replay = ReplayBuffer(int(getattr(args, "replay_size", 512)))
+        stream = ContinualStream(
+            [Path(s) for s in doms], wrap, args.ctx, replay=replay,
+            replay_rate=float(getattr(args, "replay_rate", 0.0)),
+            reset_state=bool(getattr(args, "reset_state", False)))
+    else:
+        stream = PretrainStream(Path(args.data), wrap, args.ctx)
     model.train()
+    retention_batches = int(getattr(args, "retention_batches", 20))
+    old_before = None
+    if continual and old_data:
+        old_before = evaluate_loss(model, Path(old_data), wrap, args.ctx,
+                                   retention_batches)
+        print(f"[retention] old-domain loss before={old_before:.4f}")
     bx, by, step, toks, t0, since = [], [], 0, 0, time.perf_counter(), 0
     bad_steps = 0
     for x, y, _ in stream:
@@ -470,12 +562,20 @@ def main():
             continue
         xb, yb = torch.stack(bx), torch.stack(by)
         bx, by = [], []
-        opt.zero_grad(model)
+        for o in opts.values():
+            o.zero_grad(model)
         _, loss = model(xb, yb)
+        if is_moe and balance_w > 0:
+            aux_terms = [b.ffn.balance_loss(b.ffn.last_prob) for b in model.blocks
+                         if hasattr(b.ffn, "balance_loss")
+                         and getattr(b.ffn, "last_prob", None) is not None]
+            if aux_terms:
+                loss = loss + balance_w * torch.stack(list(aux_terms)).mean()
         if not torch.isfinite(loss):
             bad_steps += 1
             print(f"[warn] non-finite loss, skip step {step} ({bad_steps} consecutive)")
-            opt.zero_grad(model)
+            for o in opts.values():
+                o.zero_grad(model)
             if bad_steps >= 50:
                 print("[error] 50 consecutive non-finite losses; stopping to avoid infinite loop")
                 break
@@ -483,8 +583,9 @@ def main():
         loss.backward()
         # Release the FP32 gradient buffers before the step; the update math is
         # still FP32 (it widens per block). No-op for Lion.
-        if hasattr(opt, "narrow_grads_"):
-            opt.narrow_grads_(model)
+        for o in opts.values():
+            if hasattr(o, "narrow_grads_"):
+                o.narrow_grads_(model)
         # Sampled here, not at log time: opt.step() clears every FP8 _gw, so
         # afterwards the live-gradient figure would only see p.grad and
         # understate the peak by the largest single allocation in the model.
@@ -492,14 +593,36 @@ def main():
                           for p in model.parameters() if p.grad is not None)
                       + sum(m._gw.numel() * m._gw.element_size()
                             for _, m in fp8_modules(model) if m._gw is not None))
-        norm = opt.step(model)
-        if norm == float("inf"):
-            bad_steps += 1
-            print(f"[warn] non-finite grads, skip step {step} ({bad_steps} consecutive)")
-            if bad_steps >= 50:
-                print("[error] 50 consecutive non-finite grads; stopping")
-                break
-            continue
+        if continual:
+            norm = global_clip_scale(model, args.grad_clip)
+            if norm == float("inf"):
+                bad_steps += 1
+                print(f"[warn] non-finite grads, skip step {step} ({bad_steps} consecutive)")
+                if bad_steps >= 50:
+                    print("[error] 50 consecutive non-finite grads; stopping")
+                    break
+                continue
+            for g, o in opts.items():
+                with GwStash(model, parts[g]["fp8"]):
+                    norm = o.step(model)
+                    if norm == float("inf"):
+                        break
+            if norm == float("inf"):
+                bad_steps += 1
+                print(f"[warn] non-finite grads, skip step {step} ({bad_steps} consecutive)")
+                if bad_steps >= 50:
+                    print("[error] 50 consecutive non-finite grads; stopping")
+                    break
+                continue
+        else:
+            norm = opts["all"].step(model)
+            if norm == float("inf"):
+                bad_steps += 1
+                print(f"[warn] non-finite grads, skip step {step} ({bad_steps} consecutive)")
+                if bad_steps >= 50:
+                    print("[error] 50 consecutive non-finite grads; stopping")
+                    break
+                continue
         bad_steps = 0
         step += 1
         if step == 1:
@@ -511,20 +634,27 @@ def main():
             mem = sum(p.numel() * p.element_size() for p in model.parameters())
             mem += sum(b.numel() * b.element_size() for b in model.buffers())
             # Include optimizer state: otherwise the metric understates OOM risk.
-            mem += sum(v.numel() * v.element_size() for v in opt.m.values())
-            for _store in ("v", "v_row", "v_col"):
-                # v is the full-size form; v_row/v_col are the factored
-                # marginals, and with --factor-v (the default) v is empty, so
-                # counting only v reported almost none of the state.
-                _s = getattr(opt, _store, None)
-                if _s:
-                    mem += sum(v.numel() * v.element_size() for v in _s.values())
+            for o in opts.values():
+                mem += sum(v.numel() * v.element_size() for v in o.m.values())
+                for _store in ("v", "v_row", "v_col"):
+                    # v is the full-size form; v_row/v_col are the factored
+                    # marginals, and with --factor-v (the default) v is empty, so
+                    # counting only v reported almost none of the state.
+                    _s = getattr(o, _store, None)
+                    if _s:
+                        mem += sum(v.numel() * v.element_size() for v in _s.values())
+            extra = ""
+            if is_moe:
+                rs = moe_routing_summary(model)
+                extra = (f" moe_inactive={rs.get('inactive_experts', 0)} "
+                         f"max_use={rs.get('max_usage_frac', 0.0):.2f}")
             print(f"step {step} loss {loss.item():.4f} {since / max(el, 1e-9):.1f} tok/s "
-                  f"stored {mem / 1048576:.1f}MiB (+{grad_bytes / 1048576:.1f}MiB live grads)")
+                  f"stored {mem / 1048576:.1f}MiB (+{grad_bytes / 1048576:.1f}MiB live grads){extra}")
             t0, since = time.perf_counter(), 0
         if step % args.save_every == 0:
             model.save_pretrained(out)
-            _save_optimizer(out, opt, model)
+            for g, o in opts.items():
+                _save_optimizer(out, o, model, suffix="" if g == "all" else f"_{g}")
             print(f"[save] {out}")
     if STOP and (bx or by):
         print(f"[stop] dropped {len(bx)} buffered sample(s) from partial batch")
@@ -532,7 +662,16 @@ def main():
         print("[done] no steps completed; checkpoint not overwritten")
         return
     model.save_pretrained(out)
-    _save_optimizer(out, opt, model)
+    for g, o in opts.items():
+        _save_optimizer(out, o, model, suffix="" if g == "all" else f"_{g}")
+    if continual and old_data:
+        old_after = evaluate_loss(model, Path(old_data), wrap, args.ctx,
+                                  retention_batches)
+        new_after = evaluate_loss(model, Path(args.data), wrap, args.ctx,
+                                  retention_batches)
+        rep = retention_report(old_before, old_after, new_after)
+        print(f"[retention] old {rep['old_loss_before']:.4f} -> {rep['old_loss_after']:.4f} "
+              f"(delta {rep['old_loss_delta']:+.4f}) new {rep['new_loss_after']:.4f}")
     print(f"[done] steps={step} tokens={toks}")
 
 if __name__ == "__main__":
