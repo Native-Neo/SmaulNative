@@ -12,9 +12,12 @@ import torch.utils.checkpoint
 from kernel.compute import get_backend
 from kernel.fp8_tile import FP8Linear, fp8_modules
 
+BYTE_VOCAB_SIZE = 256
+
+
 @dataclass
 class LinearConfig:
-    vocab_size: int = 32000
+    vocab_size: int = BYTE_VOCAB_SIZE
     d_model: int = 512
     n_layer: int = 8
     n_heads: int = 8
@@ -24,6 +27,8 @@ class LinearConfig:
     is_moe: bool = False
     num_experts: int = 1
     num_experts_per_tok: int = 1
+    # Weight of the Switch-style load-balancing aux loss for the MoE router.
+    moe_balance_weight: float = 0.01
     precision: str = "fp8"
     tokenizer_sha256: str = ""
     dataset_fingerprint: str = ""
@@ -64,8 +69,11 @@ class LinearConfig:
         if self.is_moe and self.num_experts_per_tok > self.num_experts:
             raise ValueError(
                 f"num_experts_per_tok ({self.num_experts_per_tok}) > num_experts ({self.num_experts})")
-        if self.is_moe and self.architecture == "rawr":
-            raise ValueError("MoE upcycling is only supported with architecture='plain'")
+        if not isinstance(self.moe_balance_weight, (int, float)) \
+                or not math.isfinite(self.moe_balance_weight) \
+                or self.moe_balance_weight < 0:
+            raise ValueError(
+                f"moe_balance_weight must be non-negative finite, got {self.moe_balance_weight!r}")
         if not isinstance(self.rawr_sparsity, (int, float)) \
                 or not 0.0 <= float(self.rawr_sparsity) < 1.0:
             raise ValueError(f"rawr_sparsity must be in [0, 1), got {self.rawr_sparsity!r}")
@@ -496,7 +504,16 @@ class RawrFFN(nn.Module):
                 x.dtype if x.is_floating_point() else torch.float32))
 
 class SwiFFN_MoE(nn.Module):
-    def __init__(self, cfg: LinearConfig):
+    """Sparse MoE over the RAWR trunk: router picks top-k experts per token.
+
+    Experts are ``RawrFFN`` (graph-sparse) on architecture='rawr' and
+    ``SwiFFN`` (dense) on 'plain', so MoE reuses the same FFN the dense
+    trunk would run rather than a parallel implementation. Only experts
+    with at least one assigned token execute; the rest are skipped entirely
+    (no forward, hence no backward and no gradient).
+    """
+
+    def __init__(self, cfg: LinearConfig, rawr_graph=None):
         super().__init__()
         if cfg.num_experts < 1 or cfg.num_experts_per_tok < 1:
             raise ValueError("num_experts and num_experts_per_tok must be >= 1")
@@ -507,8 +524,23 @@ class SwiFFN_MoE(nn.Module):
         # different MoE than requested.
         self.top_k = cfg.num_experts_per_tok
         self.num_experts = cfg.num_experts
-        self.experts = nn.ModuleList([SwiFFN(cfg) for _ in range(cfg.num_experts)])
+        self.architecture = cfg.architecture
+        if cfg.architecture == "rawr":
+            if rawr_graph is None:
+                from rawr_graph import fallback_graph
+
+                rawr_graph = fallback_graph(cfg.vocab_size, cfg.rawr_min_degree)
+            self.experts = nn.ModuleList(
+                [RawrFFN(cfg, rawr_graph) for _ in range(cfg.num_experts)])
+        else:
+            self.experts = nn.ModuleList([SwiFFN(cfg) for _ in range(cfg.num_experts)])
         self.gate = nn.Linear(cfg.d_model, cfg.num_experts, bias=False)
+        # Routing diagnostics (plain attributes, not state): refreshed every
+        # forward, read by training logs and retention reports.
+        self.last_prob = None
+        self.last_topi = None
+        self.last_executed = [False] * cfg.num_experts
+        self.expert_token_counts = [0] * cfg.num_experts
 
     def balance_loss(self, prob: torch.Tensor) -> torch.Tensor:
         """Switch-Transformer load-balancing aux loss over the router softmax.
@@ -530,19 +562,48 @@ class SwiFFN_MoE(nn.Module):
         # balance_loss() exists to counteract.
         self.last_prob = prob
         topv, topi = torch.topk(prob, self.top_k, -1)
+        self.last_topi = topi.detach()
         denom = topv.sum(-1, keepdim=True)
         # Guard tiny denominators (would explode weights); fall back to uniform.
         tiny = denom.squeeze(-1) < 1e-6
         topv = torch.where(tiny.unsqueeze(-1), torch.full_like(topv, 1.0 / self.top_k),
                            topv / denom.clamp_min(1e-9))
         out = torch.zeros_like(x.float())
+        counts = [0] * self.num_experts
+        executed = [False] * self.num_experts
         for e, expert in enumerate(self.experts):
             w = torch.where(topi == e, topv, torch.zeros_like(topv)).sum(-1, keepdim=True)
             m = (w.squeeze(-1) > 0)
+            n = int(m.sum().item()) if m.numel() else 0
+            counts[e] = n
             if m.any():
+                executed[e] = True
                 xm = x[m].contiguous()
                 out[m] += expert(xm).float() * w[m]
+        self.last_executed = executed
+        self.expert_token_counts = counts
         return out.to(x.dtype if x.is_floating_point() else torch.float32)
+
+    def routing_stats(self) -> dict:
+        """Load-balancing diagnostics for the most recent forward."""
+        counts = list(self.expert_token_counts)
+        total = sum(counts)
+        usage = [(c / total) if total else 0.0 for c in counts]
+        return {
+            "num_experts": self.num_experts,
+            "top_k": self.top_k,
+            "token_counts": counts,
+            "usage_frac": usage,
+            "executed": list(self.last_executed),
+            "inactive_experts": sum(1 for c in counts if c == 0),
+            "max_usage_frac": max(usage) if usage else 0.0,
+        }
+
+    def reset_routing_stats(self) -> None:
+        self.last_prob = None
+        self.last_topi = None
+        self.last_executed = [False] * self.num_experts
+        self.expert_token_counts = [0] * self.num_experts
 
 class Block(nn.Module):
     def __init__(self, cfg, rawr_graph=None):
@@ -553,7 +614,7 @@ class Block(nn.Module):
         self.n2 = RMSNorm(d, cfg.eps)
         self.n3 = RMSNorm(d, cfg.eps)
         if cfg.is_moe:
-            self.ffn = SwiFFN_MoE(cfg)
+            self.ffn = SwiFFN_MoE(cfg, rawr_graph if cfg.architecture == "rawr" else None)
         elif cfg.architecture == "rawr":
             self.ffn = RawrFFN(cfg, rawr_graph)
         else:
@@ -596,6 +657,36 @@ class Block(nn.Module):
         """One decode step for a single position, advancing st in place."""
         ax, st = self.att.step(self.n1(x), st)
         return self._tail(x, ax), st
+
+
+def _check_legacy_tokenizer_file(d: Path, cfg) -> None:
+    """Refuse old word-level checkpoints explicitly instead of misloading them.
+
+    A pre-byte checkpoint carries a tokenizer.json with a string-keyed word
+    vocabulary (no ``kind == "byte"``). Its embedding rows and graph columns
+    index a different token space, so loading its tensors under a byte-level
+    config would silently produce a broken model. There is no faithful
+    migration (the token spaces are unrelated), hence a clear error telling
+    the user to retrain. Checkpoints without a tokenizer file (unit-test
+    fixtures, fresh saves) load normally.
+    """
+    tp = Path(d) / "tokenizer.json"
+    if not tp.exists():
+        return
+    try:
+        data = json.loads(tp.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, UnicodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    if data.get("kind") == "byte":
+        return
+    if isinstance(data.get("vocab"), dict):
+        raise ValueError(
+            f"checkpoint {d} bundles a legacy word-level tokenizer "
+            f"(version={data.get('version')!r}, vocab={len(data['vocab'])}); "
+            "byte-level models (vocab 256) cannot reuse its embedding rows. "
+            "Retrain the model; do not copy the old tokenizer.json forward.")
 
 
 class SmaulLinear(nn.Module):
@@ -787,9 +878,13 @@ class SmaulLinear(nn.Module):
         mac = dense + sparse_nnz
         # Projections only -- see the emb_dense_mac note above.
         total_dense = sparse_dense + dense
+        moe = [m for _, m in self.named_modules() if isinstance(m, SwiFFN_MoE)]
         return {
             "fp8_modules": len(fp8),
             "sparse_modules": len(sp),
+            "moe_blocks": len(moe),
+            "moe_experts": sum(m.num_experts for m in moe),
+            "moe_top_k": self.cfg.num_experts_per_tok if self.cfg.is_moe else 0,
             "fp8_dense_mac": fp8_dense + fp32_dense,
             "fp32_modules": len(dl),
             "fp32_dense_mac": fp32_dense,
@@ -854,6 +949,7 @@ class SmaulLinear(nn.Module):
         from safetensors.torch import load_file
         d = Path(d)
         cfg = LinearConfig.load(d / "config.json")
+        _check_legacy_tokenizer_file(d, cfg)
         if architecture is not None and architecture != cfg.architecture:
             raise ValueError(
                 f"checkpoint architecture is {cfg.architecture!r}, "
@@ -917,52 +1013,53 @@ class SmaulLinear(nn.Module):
 
 
 # Named model-size presets: preset name -> dict(vocab, d, layers, heads, ffn_mult).
+# Vocabulary is always the 256 byte values; width/depth carry the capacity.
 # Effective fp32-equivalent params ~= 2*vocab*d + (5*layers+2)*d
 #   + layers*(4*d*d + 3*d*int(d*ffn_mult)). FP8 per-tile scales add ~1-2% on top.
 # Presets are added one per commit, largest first.
 PRESETS: dict = {
-    # ~1,024M params (1.024B target, 64K vocab).
-    "1B": {"vocab": 65536, "d": 2048, "layers": 18, "heads": 16, "ffn_mult": 2.0},
-    # ~508M params (512M target, 64K vocab).
-    "512M": {"vocab": 65536, "d": 1536, "layers": 13, "heads": 12, "ffn_mult": 2.0},
-    # ~260M params (256M target, 64K vocab).
-    "256M": {"vocab": 65536, "d": 1024, "layers": 12, "heads": 8, "ffn_mult": 2.0},
+    # ~1,024M params (1.024B target).
+    "1B": {"vocab": 256, "d": 2048, "layers": 18, "heads": 16, "ffn_mult": 2.0},
+    # ~508M params (512M target).
+    "512M": {"vocab": 256, "d": 1536, "layers": 13, "heads": 12, "ffn_mult": 2.0},
+    # ~260M params (256M target).
+    "256M": {"vocab": 256, "d": 1024, "layers": 12, "heads": 8, "ffn_mult": 2.0},
     # ~132M params (128M target).
-    "128M": {"vocab": 8000, "d": 1024, "layers": 11, "heads": 8, "ffn_mult": 2.0},
+    "128M": {"vocab": 256, "d": 1024, "layers": 11, "heads": 8, "ffn_mult": 2.0},
     # ~65M params (64M target).
-    "64M": {"vocab": 8000, "d": 768, "layers": 9, "heads": 12, "ffn_mult": 2.0},
+    "64M": {"vocab": 256, "d": 768, "layers": 9, "heads": 12, "ffn_mult": 2.0},
     # ~32M params (32M target, matches previous defaults).
-    "32M": {"vocab": 8000, "d": 512, "layers": 8, "heads": 8, "ffn_mult": 2.5},
+    "32M": {"vocab": 256, "d": 512, "layers": 8, "heads": 8, "ffn_mult": 2.5},
     # ~16M params (16M target).
-    "16M": {"vocab": 4000, "d": 512, "layers": 4, "heads": 8, "ffn_mult": 2.5},
+    "16M": {"vocab": 256, "d": 512, "layers": 4, "heads": 8, "ffn_mult": 2.5},
     # ~7.8M params (8M target).
-    "8M": {"vocab": 2000, "d": 448, "layers": 3, "heads": 7, "ffn_mult": 2.0},
+    "8M": {"vocab": 256, "d": 448, "layers": 3, "heads": 7, "ffn_mult": 2.0},
     # ~4.2M params (4M target).
-    "4M": {"vocab": 512, "d": 256, "layers": 6, "heads": 4, "ffn_mult": 2.0},
+    "4M": {"vocab": 256, "d": 256, "layers": 6, "heads": 4, "ffn_mult": 2.0},
     # ~2.1M params (2M target).
     "2M": {"vocab": 256, "d": 256, "layers": 3, "heads": 4, "ffn_mult": 2.0},
     # ~1.05M params (1M target).
     "1M": {"vocab": 256, "d": 128, "layers": 6, "heads": 4, "ffn_mult": 2.0},
     # ~526K params (512K target).
-    "512K": {"vocab": 128, "d": 128, "layers": 3, "heads": 4, "ffn_mult": 2.0},
+    "512K": {"vocab": 256, "d": 128, "layers": 3, "heads": 4, "ffn_mult": 2.0},
     # ~256K params (256K target).
-    "256K": {"vocab": 64, "d": 64, "layers": 6, "heads": 4, "ffn_mult": 2.0},
+    "256K": {"vocab": 256, "d": 64, "layers": 6, "heads": 4, "ffn_mult": 2.0},
     # ~132K params (128K target).
-    "128K": {"vocab": 64, "d": 64, "layers": 3, "heads": 4, "ffn_mult": 2.0},
+    "128K": {"vocab": 256, "d": 64, "layers": 3, "heads": 4, "ffn_mult": 2.0},
     # ~67K params (64K target).
-    "64K": {"vocab": 32, "d": 56, "layers": 2, "heads": 4, "ffn_mult": 2.0},
+    "64K": {"vocab": 256, "d": 56, "layers": 2, "heads": 4, "ffn_mult": 2.0},
     # ~33K params (32K target).
-    "32K": {"vocab": 32, "d": 32, "layers": 3, "heads": 2, "ffn_mult": 2.0},
+    "32K": {"vocab": 256, "d": 32, "layers": 3, "heads": 2, "ffn_mult": 2.0},
     # ~16.6K params (16K target).
-    "16K": {"vocab": 96, "d": 32, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    "16K": {"vocab": 256, "d": 32, "layers": 1, "heads": 2, "ffn_mult": 2.0},
     # ~8.2K params (8K target).
-    "8K": {"vocab": 48, "d": 24, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    "8K": {"vocab": 256, "d": 24, "layers": 1, "heads": 2, "ffn_mult": 2.0},
     # ~4.2K params (4K target).
-    "4K": {"vocab": 48, "d": 16, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    "4K": {"vocab": 256, "d": 16, "layers": 1, "heads": 2, "ffn_mult": 2.0},
     # ~2.1K params (2K target).
-    "2K": {"vocab": 24, "d": 12, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    "2K": {"vocab": 256, "d": 12, "layers": 1, "heads": 2, "ffn_mult": 2.0},
     # ~1.08K params (1K target).
-    "1K": {"vocab": 24, "d": 8, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    "1K": {"vocab": 256, "d": 8, "layers": 1, "heads": 2, "ffn_mult": 2.0},
 }
 
 
