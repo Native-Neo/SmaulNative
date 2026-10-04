@@ -1881,3 +1881,83 @@ class SmaulOpt:
         # Checkpoints written before factoring existed have no factor_v key; they
         # are always full-v, so default the flag to False for them.
         self.checkpoint_factor_v = bool(fv) if fv is not None else False
+
+
+def build_model(args, tok, out, tokenizer_sha256="", dataset_fingerprint=""):
+    """Assemble LinearConfig, the optional Rawr graph, and SmaulLinear from CLI args.
+
+    Moved verbatim from train.main; train.py keeps the optimizer, stream,
+    and loop. Needs tok for graph edges and out for the mmap table path.
+    """
+    from dataset import discover_files, iter_texts
+
+    arch = getattr(args, "architecture", "rawr") or "rawr"
+    storage = getattr(args, "embedding_storage", "ram") or "ram"
+    if arch not in ("rawr", "plain"):
+        raise ValueError(f"--architecture must be rawr/plain, got {arch!r}")
+    if storage not in ("ram", "mmap"):
+        raise ValueError(f"--embedding-storage must be ram/mmap, got {storage!r}")
+    opt_name = getattr(args, "optimizer", "smaul") or "smaul"
+    if arch != "rawr":
+        # The whole rawr block below is skipped, so non-default rawr flags
+        # would silently do nothing. Warn rather than raise: defaults flow
+        # through here on every plain run and must stay quiet.
+        for _flag, _v, _dflt in (
+                ("--rawr-sparsity", getattr(args, "rawr_sparsity", 0.9), 0.9),
+                ("--rawr-min-degree", getattr(args, "rawr_min_degree", 4), 4),
+                ("--rawr-dict", getattr(args, "rawr_dict", None), None),
+                ("--rawr-graph-out", getattr(args, "rawr_graph_out", None), None),
+                ("--rawr-max-docs", getattr(args, "rawr_max_docs", 2000), 2000),
+                ("--rawr-max-tokens-per-doc", getattr(args, "rawr_max_tokens_per_doc", 1024), 1024)):
+            if _v != _dflt:
+                print(f"[WARN] {_flag}={_v} has no effect with --architecture {arch}")
+    if opt_name != "smaul":
+        # Lion keeps fixed built-in betas and no narrow state: SmaulOpt-only
+        # flags are validated above and then discarded. Same warn-not-raise.
+        for _flag, _v, _dflt in (
+                ("--beta-m", getattr(args, "beta_m", 0.9), 0.9),
+                ("--beta-v", getattr(args, "beta_v", 0.999), 0.999),
+                ("--epsilon", getattr(args, "epsilon", 1e-8), 1e-8),
+                ("--state-dtype", getattr(args, "state_dtype", "bf16"), "bf16"),
+                ("--grad-dtype", getattr(args, "grad_dtype", "bf16"), "bf16"),
+                ("--factor-v/--no-factor-v", getattr(args, "factor_v", True), True)):
+            if _v != _dflt:
+                print(f"[WARN] {_flag}={_v} has no effect with --optimizer {opt_name}")
+    rawr_graph = None
+    if arch == "rawr":
+        from rawr_graph import build_graph, print_stats, save_graph
+
+        extra_words = None
+        if getattr(args, "rawr_dict", None):
+            extra_words = [ln.strip() for ln in Path(args.rawr_dict).read_text(
+                encoding="utf-8-sig", errors="replace").splitlines() if ln.strip()]
+        data_files = discover_files(Path(args.data))
+        max_docs = int(getattr(args, "rawr_max_docs", 2000) or 0)
+        max_tpd = int(getattr(args, "rawr_max_tokens_per_doc", 1024) or 0)
+        corpus = (t for t, _, _ in iter_texts(data_files))
+        rawr_graph = build_graph(tok, corpus_texts=corpus, dict_words=extra_words,
+                                 window=1, min_degree=int(args.rawr_min_degree),
+                                 max_docs=max_docs, max_tokens_per_doc=max_tpd or 4096)
+        print(f"[rawr] graph digest={rawr_graph.digest} "
+              f"edges={len(rawr_graph.edges)} min_deg={args.rawr_min_degree}")
+        print_stats(rawr_graph)
+        if getattr(args, "rawr_graph_out", None):
+            save_graph(rawr_graph, Path(args.rawr_graph_out))
+    cfg = LinearConfig(vocab_size=args.vocab, d_model=args.d, n_layer=args.layers, n_heads=args.heads,
+                       ffn_mult=getattr(args, "ffn_mult", 2.5),
+                       precision=args.precision, tokenizer_sha256=tokenizer_sha256,
+                       dataset_fingerprint=dataset_fingerprint,
+                       architecture=arch, embedding_storage=storage,
+                       rawr_sparsity=float(getattr(args, "rawr_sparsity", 0.9)),
+                       rawr_min_degree=int(getattr(args, "rawr_min_degree", 4)))
+    emb_path = (out / "embeddings.dat") if storage == "mmap" else None
+    model = SmaulLinear(cfg, rawr_graph=rawr_graph, emb_path=emb_path)
+    if arch == "rawr":
+        # The graph stats printed above describe the token graph, not the
+        # model. Print what the built model actually executes, so the headline
+        # sparsity figure is not read as the model's. See
+        # rawr_graph.print_model_compute.
+        from rawr_graph import print_model_compute
+
+        print_model_compute(model.compute_profile())
+    return model
