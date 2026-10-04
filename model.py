@@ -2046,7 +2046,11 @@ def build_model(args, tok, out, tokenizer_sha256="", dataset_fingerprint=""):
                        dataset_fingerprint=dataset_fingerprint,
                        architecture=arch, embedding_storage=storage,
                        rawr_sparsity=float(getattr(args, "rawr_sparsity", 0.9)),
-                       rawr_min_degree=int(getattr(args, "rawr_min_degree", 4)))
+                       rawr_min_degree=int(getattr(args, "rawr_min_degree", 4)),
+                       is_moe=int(getattr(args, "moe_experts", 1) or 1) > 1,
+                       num_experts=int(getattr(args, "moe_experts", 1) or 1),
+                       num_experts_per_tok=int(getattr(args, "moe_top_k", 1) or 1),
+                       moe_balance_weight=float(getattr(args, "moe_balance_weight", 0.01)))
     emb_path = (out / "embeddings.dat") if storage == "mmap" else None
     model = SmaulLinear(cfg, rawr_graph=rawr_graph, emb_path=emb_path)
     if arch == "rawr":
