@@ -78,8 +78,7 @@ def run_full(argv=None):
 
     from kernel.compute import get_backend
     from kernel.fp8_tile import FP8Linear, decode_tile, fp8_modules
-    from smaul_linear import Block, LinearConfig, SmaulLinear  # noqa: F401
-    from train import Lion, SmaulOpt
+    from model import Block, LinearConfig, Lion, SmaulOpt, SmaulLinear  # noqa: F401
 
     be = get_backend()
     be.configure(args.threads)
@@ -209,8 +208,7 @@ def run_opt(argv=None):
     import torch
 
     from kernel.compute import get_backend
-    from smaul_linear import LinearConfig, SmaulLinear  # noqa: F401
-    from train import Lion, SmaulOpt
+    from model import LinearConfig, Lion, SmaulOpt, SmaulLinear  # noqa: F401
 
     be = get_backend()
     be.configure(args.threads)
@@ -368,8 +366,7 @@ def encode_all(tok, texts, ctx):
 
 
 def run_combo(arch, storage, tok, chunks, val_chunks, workdir: Path):
-    from smaul_linear import LinearConfig, SmaulLinear
-    from train import Lion
+    from model import LinearConfig, Lion, SmaulLinear
 
     torch.manual_seed(SEED)
     cfg = LinearConfig(precision="fp32", architecture=arch,
