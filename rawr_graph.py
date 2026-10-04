@@ -11,7 +11,7 @@ Workflow:
     -> valid token-sequence (consecutive-pair) relationships
     -> combine with corpus bigram relationships
     -> sparse connectivity graph (+ configurable fallback)
-    -> used by Rawr sparse computation (see smaul_linear.RawrFFN).
+    -> used by Rawr sparse computation (see model.RawrFFN).
 
 The graph is descriptive, not prescriptive: fallback connectivity (self-loop
 + ring neighbours up to ``min_degree``) guarantees every legitimate token
