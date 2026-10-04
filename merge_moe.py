@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from smaul_linear import LinearConfig, SmaulLinear
+from model import LinearConfig, SmaulLinear
 
 
 def _load(d: Path):
