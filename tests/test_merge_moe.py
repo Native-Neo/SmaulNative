@@ -21,7 +21,10 @@ def _ckpt(root, seed, tokenizer=None, **over):
     model = SmaulLinear(cfg)
     d = root / f"ck{seed}"
     model.save_pretrained(d)
-    if tokenizer is not None:
+    if tokenizer == "byte":
+        from tokenizer import SmaulTokenizer
+        SmaulTokenizer().save(d / "tokenizer.json")
+    elif tokenizer is not None:
         (d / "tokenizer.json").write_text(tokenizer, encoding="utf-8")
     return d
 
@@ -29,9 +32,13 @@ def _ckpt(root, seed, tokenizer=None, **over):
 @pytest.fixture
 def trio(tmp_path):
     """base + 2 branches, each with distinguishable weights."""
-    return (_ckpt(tmp_path, 1, tokenizer='{"vocab": {"a": 0}}'),
-            [_ckpt(tmp_path, 2, tokenizer='{"vocab": {"a": 0}}'),
-             _ckpt(tmp_path, 3, tokenizer='{"vocab": {"a": 0}}')])
+    from tokenizer import SmaulTokenizer
+    tok = SmaulTokenizer()
+    import json
+    raw = json.dumps(tok.data)
+    return (_ckpt(tmp_path, 1, tokenizer=raw),
+            [_ckpt(tmp_path, 2, tokenizer=raw),
+             _ckpt(tmp_path, 3, tokenizer=raw)])
 
 
 # --- the wiring, which is the whole point of the merge ---------------------
@@ -131,10 +138,11 @@ def test_merge_config_records_its_inputs(tmp_path, trio):
 
 
 def test_the_base_tokenizer_is_copied_so_the_dir_is_usable(tmp_path, trio):
+    from tokenizer import SmaulTokenizer
     base, branches = trio
     out = tmp_path / "merged"
     merge(base, branches, out)
-    assert json.loads((out / "tokenizer.json").read_text()) == {"vocab": {"a": 0}}
+    assert SmaulTokenizer.from_file(out / "tokenizer.json").get_vocab_size() == 256
 
 
 def test_a_missing_base_tokenizer_warns_rather_than_failing(tmp_path):
@@ -147,15 +155,20 @@ def test_a_missing_base_tokenizer_warns_rather_than_failing(tmp_path):
 
 def test_a_branch_tokenizer_mismatch_is_refused(tmp_path):
     """Otherwise the merged model tokenizes differently depending on the expert."""
-    base = _ckpt(tmp_path, 1, tokenizer='{"vocab": {"a": 0}}')
-    bad = _ckpt(tmp_path, 2, tokenizer='{"vocab": {"b": 0}}')
+    import json
+    from tokenizer import SmaulTokenizer
+    byte_raw = json.dumps(SmaulTokenizer().data)
+    base = _ckpt(tmp_path, 1, tokenizer=byte_raw)
+    bad = _ckpt(tmp_path, 2, tokenizer='{"kind": "other", "vocab_size": 256}')
     out = tmp_path / "merged"
     with pytest.raises(ValueError, match="tokenizer mismatch"):
         merge(base, [bad], out)
 
 
 def test_a_branch_without_a_tokenizer_only_warns(tmp_path, capsys):
-    base = _ckpt(tmp_path, 1, tokenizer='{"vocab": {"a": 0}}')
+    import json
+    from tokenizer import SmaulTokenizer
+    base = _ckpt(tmp_path, 1, tokenizer=json.dumps(SmaulTokenizer().data))
     branch = _ckpt(tmp_path, 2)
     out = tmp_path / "merged"
     merge(base, [branch], out)
@@ -311,3 +324,43 @@ def test_the_merged_dir_does_not_depend_on_where_it_is_written(tmp_path, trio):
     sb = load_file(str(b / "model.safetensors"), device="cpu")
     for k in sa:
         assert torch.equal(sa[k], sb[k]), k
+
+
+def test_rawr_merge_reuses_the_base_graph(tmp_path):
+    """Rawr experts are interpreted through the base graph's columns."""
+    from rawr_graph import fallback_graph, load_graph
+    torch.manual_seed(11)
+    kw = dict(vocab_size=32, d_model=32, n_layer=1, n_heads=2, ffn_mult=2.0,
+              precision="fp32", architecture="rawr", rawr_sparsity=0.5,
+              rawr_min_degree=2)
+    graph = fallback_graph(32, 2)
+    base = tmp_path / "rbase"
+    SmaulLinear(LinearConfig(**kw), rawr_graph=graph).save_pretrained(base)
+    branches = []
+    for i, seed in enumerate((12, 13)):
+        torch.manual_seed(seed)
+        d = tmp_path / f"rb{i}"
+        SmaulLinear(LinearConfig(**kw), rawr_graph=graph).save_pretrained(d)
+        branches.append(d)
+    out = tmp_path / "rmerged"
+    merge(base, branches, out, top_k=1)
+    assert load_graph(out / "rawr_graph.json").digest == graph.digest
+    model = SmaulLinear.from_pretrained(out)
+    assert model.cfg.is_moe and model.cfg.num_experts == 2
+    ids = torch.randint(0, 32, (1, 6))
+    assert torch.isfinite(model(ids, ids)[0]).all()
+
+
+def test_rawr_merge_refuses_a_branch_with_a_different_graph(tmp_path):
+    from rawr_graph import fallback_graph
+    kw = dict(vocab_size=32, d_model=32, n_layer=1, n_heads=2, ffn_mult=2.0,
+              precision="fp32", architecture="rawr", rawr_sparsity=0.5,
+              rawr_min_degree=2)
+    torch.manual_seed(21)
+    base = tmp_path / "gbase"
+    SmaulLinear(LinearConfig(**kw), rawr_graph=fallback_graph(32, 2)).save_pretrained(base)
+    torch.manual_seed(22)
+    other = tmp_path / "gother"
+    SmaulLinear(LinearConfig(**kw), rawr_graph=fallback_graph(32, 3)).save_pretrained(other)
+    with pytest.raises(ValueError, match="graph"):
+        merge(base, [other], tmp_path / "gmerged")
