@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from dataset import PretrainStream, TokenizerWrapper, discover_files, iter_texts
+from dataset import PretrainStream, TokenizerWrapper, discover_files
 from kernel.fp8_tile import fp8_modules
 from model import Lion, PRESETS, SmaulOpt, apply_preset, build_model, estimate_params
 from tokenizer import BYTE_VOCAB_SIZE, ensure_tokenizer
