@@ -65,62 +65,38 @@ def test_repetition_penalty_and_validation():
 
 
 def test_incremental_decoder_matches_tokenizer_decode():
-    data = {
-        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "<cap>": 4, "<upper>": 5, "hello": 6, "world": 7, " ": 8, "!": 9},
-        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
-        "case_tokens": ["<cap>", "<upper>"],
-        "case_stats": {},
-        "unk_id": 1,
-        "stats": {"vocab_size": 10},
-    }
-    tokenizer = SmaulTokenizer(data)
-    ids = [4, 6, 8, 5, 7, 9]
-    decoder = _IncrementalDecoder(tokenizer)
-    incremental = "".join(decoder.push(token) for token in ids)
+    tokenizer = SmaulTokenizer()
+    ids = list("Hello, world! नमस्ते".encode("utf-8"))
+    decoder = _IncrementalDecoder()
+    incremental = "".join(decoder.push(token) for token in ids) + decoder.flush()
     assert incremental == tokenizer.decode(ids)
 
 
 def test_stream_stop_sequence_can_cross_tokens(monkeypatch):
-    data = {
-        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "h": 4, "e": 5, "l": 6, "o": 7, "!": 8},
-        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
-        "case_tokens": [],
-        "case_stats": {},
-        "unk_id": 1,
-        "stats": {"vocab_size": 9},
-    }
     obj = LinearInference.__new__(LinearInference)
     obj.device = torch.device("cpu")
-    obj.tokenizer = SmaulTokenizer(data)
-    obj.eos_id = 3
-    obj.bos_id = 2
+    obj.tokenizer = SmaulTokenizer()
+    obj.eos_id = None
+    obj.bos_id = None
     obj.last_prompt_tokens = 0
-    monkeypatch.setattr(obj, "_prepare", lambda prompt: [2])
-    monkeypatch.setattr(obj, "_forward", lambda tokens: (torch.zeros(1, 1, 9), None))
-    tokens = iter([4, 5, 6, 6, 7, 8])
+    monkeypatch.setattr(obj, "_prepare", lambda prompt: [10])
+    monkeypatch.setattr(obj, "_forward", lambda tokens: (torch.zeros(1, 1, 256), None))
+    tokens = iter([104, 101, 108, 108, 111, 33])  # "hello!"
     monkeypatch.setattr(obj, "_sample", lambda *args: next(tokens))
     output = "".join(obj.stream("", max_new_tokens=6, temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0, stop=["hello"]))
     assert output == ""
 
 
 def test_stream_stop_sequence_preserves_text_before_boundary(monkeypatch):
-    data = {
-        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "z": 4, "h": 5, "e": 6, "l": 7, "o": 8},
-        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
-        "case_tokens": [],
-        "case_stats": {},
-        "unk_id": 1,
-        "stats": {"vocab_size": 9},
-    }
     obj = LinearInference.__new__(LinearInference)
     obj.device = torch.device("cpu")
-    obj.tokenizer = SmaulTokenizer(data)
-    obj.eos_id = 3
-    obj.bos_id = 2
+    obj.tokenizer = SmaulTokenizer()
+    obj.eos_id = None
+    obj.bos_id = None
     obj.last_prompt_tokens = 0
-    monkeypatch.setattr(obj, "_prepare", lambda prompt: [2])
-    monkeypatch.setattr(obj, "_forward", lambda tokens: (torch.zeros(1, 1, 9), None))
-    tokens = iter([4, 5, 6, 7, 7, 8, 3])
+    monkeypatch.setattr(obj, "_prepare", lambda prompt: [10])
+    monkeypatch.setattr(obj, "_forward", lambda tokens: (torch.zeros(1, 1, 256), None))
+    tokens = iter([122, 104, 101, 108, 108, 111, 33])  # "zhello!"
     monkeypatch.setattr(obj, "_sample", lambda *args: next(tokens))
     output = "".join(obj.stream("", max_new_tokens=7, temperature=0, top_k=0, top_p=1.0, repetition_penalty=1.0, stop=["hello"]))
     assert output == "z"
@@ -356,12 +332,9 @@ def test_prepare_rejects_an_over_long_prompt():
     assert "prompt too long" in str(e.value)
 
 
-def test_prepare_falls_back_to_bos_for_an_empty_prompt():
+def test_prepare_falls_back_to_a_newline_byte_for_an_empty_prompt():
     obj = _engine_with_ids([])
-    assert obj._prepare("") == [2]
-    obj = _engine_with_ids([])
-    obj.bos_id = None
-    assert obj._prepare("") == [3]      # eos as the last resort
+    assert obj._prepare("") == [10]
 
 
 def test_prepare_records_length_and_truncation_flag():
@@ -416,53 +389,35 @@ def test_model_window_is_unreachable_for_prompts():
 # ---------------------------------------------------------------------------
 
 def _decoder():
-    data = {
-        "vocab": {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3, "<cap>": 4,
-                  "<upper>": 5, "a": 6, "b": 7, "<unused_9": 8},
-        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
-        "case_tokens": ["<cap>", "<upper>"],
-        "case_stats": {},
-        "unk_id": 1,
-        "stats": {"vocab_size": 9},
-    }
-    return _IncrementalDecoder(SmaulTokenizer(data))
+    return _IncrementalDecoder()
 
 
-def test_incremental_decoder_emits_nothing_for_a_case_marker_alone():
+def test_incremental_decoder_buffers_a_split_multibyte_char():
     d = _decoder()
-    assert d.push(4) == ""      # <cap> with nothing to capitalize yet
-    assert d.push(5) == ""      # <upper> likewise
-    assert d.push(6) == "A"     # and the marker is consumed, not repeated
-    assert d.case is None
+    raw = list("€".encode("utf-8"))
+    assert d.push(raw[0]) == ""
+    assert d.push(raw[1]) == ""
+    assert d.push(raw[2]) == "€"
 
 
-def test_incremental_decoder_skips_specials_and_surfaces_unused():
+def test_incremental_decoder_replaces_invalid_bytes():
     d = _decoder()
-    assert d.push(0) == ""      # <pad>
-    assert d.push(2) == ""      # <bos>
-    assert d.push(3) == ""      # <eos>
-    assert d.push(8) == "<unk>" # an id outside the real vocab
-    # And it resets the case marker, so it cannot leak into the next token.
-    d = _decoder()
-    d.push(4)
-    assert d.push(8) == "<unk>"
-    assert d.case is None
+    assert d.push(0xFF) == "\ufffd"
 
 
-def test_incremental_decoder_upper_applies_to_a_whole_token():
+def test_incremental_decoder_flush_ends_a_dangling_tail():
     d = _decoder()
-    assert d.push(5) == "" and d.push(6) == "A"
-    d = _decoder()
-    assert d.push(5) == "" and d.push(8) == "<unk>"
+    d.push(list("€".encode("utf-8"))[0])
+    assert d.flush() == "\ufffd"
 
 
 def test_engine_vocab_size_encode_decode_round_trip(tmp_path):
     from test_last_token import _model_dir, _plain_cfg
     d = _model_dir(tmp_path, "plain")
     engine = LinearInference(str(d), device="cpu")
-    assert engine.vocab_size == _plain_cfg().vocab_size
-    ids = engine.encode("hello world")
+    assert engine.vocab_size == _plain_cfg().vocab_size == 256
+    ids = engine.encode("hello world नमस्ते")
     assert isinstance(ids, list) and ids
-    assert isinstance(engine.decode(ids), str)
-    # Decoding is total: an out-of-range id must not raise.
-    assert isinstance(engine.decode([99999]), str)
+    assert engine.decode(ids) == "hello world नमस्ते"
+    # Decoding is total: arbitrary bytes must not raise.
+    assert isinstance(engine.decode([0, 255, 128]), str)
