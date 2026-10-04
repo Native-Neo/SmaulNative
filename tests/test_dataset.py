@@ -375,19 +375,18 @@ def test_discover_files_skips_an_escaping_symlink(tmp_path, capsys):
 
 def test_load_tokenizer_reports_a_missing_file(tmp_path):
     from dataset import load_tokenizer
-    with pytest.raises(FileNotFoundError, match="Run tokenizer.py first"):
+    with pytest.raises(FileNotFoundError, match="No byte tokenizer found"):
         load_tokenizer(tmp_path / "nope.json")
 
 
 def test_load_tokenizer_round_trips_a_real_tokenizer(tmp_path):
     import dataset as ds
-    from tokenizer import SmaulTokenizer, _build
-    data = _build(iter(["hello world " * 50]), 64, 20, 0)
+    from tokenizer import SmaulTokenizer
     p = tmp_path / "tok.json"
-    SmaulTokenizer(data).save(p)
+    SmaulTokenizer().save(p)
     tok = ds.load_tokenizer(p)
-    assert tok.get_vocab_size() == len(data["vocab"])
-    assert tok.eos_token_id is not None and tok.pad_token_id is not None
+    assert tok.get_vocab_size() == 256
+    assert tok.eos_token_id is None and tok.pad_token_id == 0
     assert ds.tokenizer_vocab_size(tok) == tok.get_vocab_size()
     assert ds.tokenizer_vocab_size(p) == tok.get_vocab_size()   # accepts a path
 
