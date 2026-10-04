@@ -8,7 +8,7 @@ import torch
 from safetensors.torch import load_file
 
 from merge_moe import merge
-from smaul_linear import LinearConfig, SmaulLinear
+from model import LinearConfig, SmaulLinear
 
 
 def _ckpt(root, seed, tokenizer=None, **over):
