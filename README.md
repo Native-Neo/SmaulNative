@@ -4,7 +4,7 @@ A compact SmaulLinear training and inference repository with English-Hindi data 
 
 ## Overview
 
-- **SmaulLinear Architecture**: Linear-attention blocks with SwiGLU FFN/MoE and tiled E4M3 FP8 weights (`smaul_linear.py`, `fp8_tile.py`).
+- **SmaulLinear Architecture**: Linear-attention blocks with SwiGLU FFN/MoE and tiled E4M3 FP8 weights (`model.py`, `kernel/fp8_tile.py`).
 - **Native CPU Backend**: Tiled FP8 kernels with a torch fallback plus a training-step benchmark (`kernel/compute.py`, `kernel/fp8_tile.py`, `kernel/fp8_cpu.cpp`, `kernel/attn_cpu.cpp`, `kernel/sparse_cpu.cpp`, `kernel/quant_cpu.cpp`, `benchmark.py`).
 - **Bilingual Tokenizer**: A custom word/character tokenizer with Devanagari grapheme fallback, case markers, and special tokens (`tokenizer.py`).
 - **Unified Training Pipeline**: `train.py` pretrains SmaulLinear with tiled FP8 weights, an FP32 Lion or SmaulOpt optimizer (`--optimizer smaul`, default), automatic tokenizer builds, and resume-free (Lion) / resumable (SmaulOpt) checkpoints.
@@ -26,7 +26,7 @@ A compact SmaulLinear training and inference repository with English-Hindi data 
 ├── docs/                  # Detailed guides and command references
 ├── tests/                 # Unit and optimization regression tests
 ├── USEME.md               # CLI cheat sheet
-├── smaul_linear.py        # SmaulLinear model definition
+├── model.py               # SmaulLinear model definition, presets, optimizers, build_model()
 ├── train.py               # SmaulLinear FP8 trainer
 ├── inference.py           # Inference engine for SmaulLinear checkpoints
 ├── infer_cli.py           # Interactive chat CLI
