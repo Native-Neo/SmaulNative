@@ -13,12 +13,23 @@ IGNORE_INDEX = -100
 
 
 class TokenizerWrapper:
+    """Byte-level wrapper: text -> raw UTF-8 byte IDs.
+
+    There are no special tokens in the 256-entry byte vocabulary, so padding
+    uses byte 0 (masked in the loss via IGNORE_INDEX) and no EOS id is
+    appended by the stream unless the tokenizer provides one.
+    """
+
     def __init__(self, tokenizer):
         self._tok = tokenizer
-        self.pad_token_id = tokenizer.token_to_id("<pad>")
-        self.eos_token_id = tokenizer.token_to_id("<eos>")
-        if self.pad_token_id is None or self.eos_token_id is None:
-            raise ValueError("tokenizer.json is missing <pad>/<eos> special tokens")
+        pad = tokenizer.token_to_id("<pad>")
+        self.pad_token_id = pad if pad is not None else 0
+        try:
+            self.eos_token_id = tokenizer.token_to_id("<eos>")
+        except AttributeError:
+            self.eos_token_id = None
+        if self.eos_token_id is None:
+            self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
 
     def encode(self, text: str) -> List[int]:
         return self._tok.encode(text)
@@ -32,7 +43,7 @@ class TokenizerWrapper:
 
 def load_tokenizer(path: Path) -> TokenizerWrapper:
     if not Path(path).exists():
-        raise FileNotFoundError(f"No tokenizer found at {path}. Run tokenizer.py first")
+        raise FileNotFoundError(f"No byte tokenizer found at {path}. Delete any legacy file and re-run: it is written automatically")
     try:
         from tokenizer import SmaulTokenizer
     except ImportError:
@@ -337,7 +348,9 @@ class PretrainStream(IterableDataset):
             if len(text) > max_doc_chars:
                 print(f"[WARN] truncating oversized document ({len(text)} chars) from {path}")
                 text = text[:max_doc_chars]
-            ids = self.tokenizer.encode(text) + [self.tokenizer.eos_token_id]
+            ids = list(self.tokenizer.encode(text))
+            if getattr(self.tokenizer, "eos_token_id", None) is not None:
+                ids = ids + [self.tokenizer.eos_token_id]
             # rec_idx is already the 1-based record number that iter_texts
             # resumes from (it skips record <= resume_record / record < start).
             # Storing rec_idx (not +1) resumes at the next record; +1 would
