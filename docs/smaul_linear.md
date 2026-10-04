@@ -32,7 +32,7 @@ model = SmaulLinear.from_pretrained("./runs/linear")
 | `embedding_storage` | `ram` | `ram` (`nn.Embedding`) or `mmap` (file-backed) |
 | `rawr_sparsity` | `0.5` | Rawr: fraction of hidden/head connections omitted. Really a column-count knob — see `train.md` |
 | `rawr_min_degree` | `4` | Rawr: connectivity floor per token (>= 1) |
-| `rawr_graph_hash` / `rawr_edge_count` | `""` / `0` | recorded on save, verified on load; a mismatched graph is refused |
+| `rawr_graph_hash` / `rawr_edge_count` | `""` / `0` | both recorded on save; the hash is verified on load and a mismatched graph is refused, while the edge count is informational and never compared |
 
 `precision` is validated on construction and persisted in `config.json`, so
 checkpoints self-describe. In `fp32` mode every projection is a plain FP32 linear with
