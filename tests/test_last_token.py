@@ -16,7 +16,7 @@ from inference import LinearInference
 from model import LinearConfig, SmaulLinear
 from tokenizer import SmaulTokenizer
 
-_VOCAB = 64
+_VOCAB = 256
 _D = 32
 
 
@@ -32,26 +32,7 @@ def _rawr_cfg():
 
 
 def _mini_tokenizer():
-    vocab = {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3,
-             "hello": 4, "world": 5, " ": 6, "!": 7}
-    # Pad out to _VOCAB single-char tokens so checkpoint/tokenizer vocabs agree.
-    filler = [c for c in "abcdefghijklmnopqrstuvwxyz0123456789.,!?;:'\"-_/\\|@#$%*+=<>()[]{}"
-              if c not in vocab]
-    i = len(vocab)
-    for c in filler:
-        if i >= _VOCAB:
-            break
-        vocab[c] = i
-        i += 1
-    assert len(vocab) == _VOCAB, len(vocab)
-    data = {
-        "vocab": vocab,
-        "special_tokens": ["<pad>", "<unk>", "<bos>", "<eos>"],
-        "case_tokens": ["<cap>", "<upper>"],
-        "unk_id": 1,
-        "stats": {"vocab_size": _VOCAB},
-    }
-    return SmaulTokenizer(data)
+    return SmaulTokenizer()
 
 
 def _model_dir(tmp_path, arch):
@@ -316,14 +297,14 @@ def test_incremental_decode_re_prefills_instead_of_stepping_a_sliding_window(tmp
     a sum over everything it has absorbed, so the decoder must re-prefill -- and
     must never step -- once the window is full.
 
-    MODEL_WINDOW is patched to 4 with a 5-token prompt so the full branch runs
+    MODEL_WINDOW is patched to 4 with a 2-byte prompt so the full branch runs
     without allocating a 262144-token context.
     """
     d = _model_dir(tmp_path, arch)
     engine = LinearInference(str(d), device="cpu")
     window, n = 4, 6
-    plen = len(engine.encode("hello world"))
-    calls = _count_decoder_calls(engine, "hello world", n, window)
+    plen = len(engine.encode("hi"))
+    calls = _count_decoder_calls(engine, "hi", n, window)
     # The window has room for `window - plen` appends before it is full; a step
     # is valid exactly while the state still covers the whole required window,
     # so that is precisely how many steps may happen. Every later token must
