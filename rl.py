@@ -613,10 +613,18 @@ class AutoRL(SmaulRL):
             print("Please answer yes or no.")
 
     def _save_preference(self, prompt: str, candidates: List[Dict], chosen: int, predicted: int):
+        import os
         record = {"prompt": prompt, "responses": [c["text"] for c in candidates], "chosen": chosen,
                   "source": "auto_confirmed" if chosen == predicted else "human_correction", "predicted": predicted}
+        # Same flush+fsync as SmaulRL._save: the hash-based resume scheme treats
+        # every record as durable, so a lost tail would resume from a stale hash.
         with self.preference_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
 
     def run(self, prompts: List[str], count: int, max_new_tokens: int, temperature: float, top_k: int, top_p: float,
             preference_epochs: int, preference_lr: float, rl_lr: float, clip: float, kl_coef: float, verify: bool):
