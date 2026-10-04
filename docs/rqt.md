@@ -37,13 +37,13 @@ in; consumers read it blockwise and must not widen it whole.
 
 ## Training step
 
-`train.Lion` clips the global grad norm to `1.0`, then each FP8 module applies its sign
+`model.Lion` clips the global grad norm to `1.0`, then each FP8 module applies its sign
 update blockwise via `fused_lion_requant`: per 64-row output block, the Lion step is
 computed from the FP32 momentum slice, the block's tiles are decoded, decay and update
 are applied in FP32, and the block is re-quantized in place. Full-matrix `upd`
 temporaries are never built. `_gw` is cleared afterwards.
 
-`train.SmaulOpt` (`--optimizer smaul`) reuses the same blockwise requant path: its FP32
+`model.SmaulOpt` (`--optimizer smaul`) reuses the same blockwise requant path: its FP32
 `m`/`v` states are updated over the full matrix, then each 64-row block decodes its tiles,
 applies the normalized update `lr * m_hat / (v_hat + epsilon)` and the decoupled decay
 `lr * wd`, and re-quantizes in place. No FP32 master weight copy, no new quantization
