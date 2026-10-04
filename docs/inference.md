@@ -81,3 +81,4 @@ python infer_cli.py --model ./runs/linear --prompt "Hello world" --max 64 \
 | `--max` | `64` | new tokens, `[1, 65536]` |
 | `--temp` / `--topk` / `--topp` / `--rep` | `0.7` / `50` / `0.95` / `1.05` | sampling (validated) |
 | `--device` / `--dtype` | `auto` | forwarded to `LinearInference` |
+| `--architecture` / `--embedding-storage` | auto (from checkpoint) | expected architecture / embedding backend override |
