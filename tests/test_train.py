@@ -54,7 +54,7 @@ def test_checkpoint_round_trip_uses_same_names(tmp_path):
 def _args(**kw):
     """A namespace with the defaults main() would have parsed."""
     import argparse
-    base = dict(vocab=8000, d=512, layers=8, heads=8, ffn_mult=2.5, batch=2,
+    base = dict(vocab=256, d=512, layers=8, heads=8, ffn_mult=2.5, batch=2,
                 ctx=256, steps=1000, lr=2e-4, wd=0.01, threads=2, log_every=10,
                 save_every=200, optimizer="smaul", architecture="rawr",
                 embedding_storage="ram", rawr_sparsity=0.9, rawr_min_degree=4)
@@ -246,8 +246,8 @@ def _train_argv(out, data, extra=()):
             "--d", "32", "--layers", "1", "--heads", "2", "--ffn_mult", "2.0",
             "--ctx", "32", "--batch", "2", "--steps", "2", "--log_every", "1",
             "--save_every", "1000", "--rawr-max-docs", "1",
-            "--rawr-max-tokens-per-doc", "64", "--tok_records", "2000",
-            "--vocab", "64", "--threads", "1", *extra]
+            "--rawr-max-tokens-per-doc", "64",
+            "--vocab", "256", "--threads", "1", *extra]
 
 
 def _run_main(monkeypatch, argv):
@@ -336,7 +336,7 @@ def test_main_respects_rawr_sparsity_in_what_it_reports(tmp_path, monkeypatch, c
 
 
 def test_main_rejects_a_missing_data_dir(tmp_path, monkeypatch):
-    with pytest.raises((ValueError, RuntimeError)) as e:
+    with pytest.raises((ValueError, RuntimeError, FileNotFoundError)) as e:
         _run_main(monkeypatch, _train_argv(tmp_path / "run", tmp_path / "nope"))
     assert "data" in str(e.value).lower()
 
@@ -366,11 +366,17 @@ def test_main_rejects_an_empty_data_dir(tmp_path, monkeypatch):
     ("--grad_clip", "0"),
     ("--epsilon", "0"), ("--epsilon", "inf"),
     ("--beta-m", "-1"), ("--beta-v", "-1"), ("--beta-m", "1.0"),
-    ("--tok_records", "-1"),
     ("--threads", "0"),
     ("--rawr-sparsity", "-0.1"), ("--rawr-sparsity", "1.5"),
     ("--rawr-min-degree", "0"),
     ("--vocab", "0"),
+    ("--vocab", "64"),
+    ("--moe-experts", "0"), ("--moe-top-k", "0"), ("--moe-top-k", "5"),
+    ("--moe-balance-weight", "-0.1"),
+    ("--replay-rate", "-0.1"), ("--replay-rate", "1.5"),
+    ("--replay-size", "-1"),
+    ("--trunk-lr-mult", "0"), ("--expert-lr", "0"), ("--router-lr", "-1"),
+    ("--retention-batches", "0"),
 ])
 def test_main_validates_numeric_arguments(tmp_path, monkeypatch, flag, value):
     """The ValueError names the flag, so the user knows which one to fix."""
@@ -453,8 +459,8 @@ def _train_argv(out, data, extra=()):
             "--d", "32", "--layers", "1", "--heads", "2", "--ffn_mult", "2.0",
             "--ctx", "32", "--batch", "2", "--steps", "2", "--log_every", "1",
             "--save_every", "1000", "--rawr-max-docs", "1",
-            "--rawr-max-tokens-per-doc", "64", "--tok_records", "2000",
-            "--vocab", "64", "--threads", "1", *extra]
+            "--rawr-max-tokens-per-doc", "64",
+            "--vocab", "256", "--threads", "1", *extra]
 
 
 def _run_main(monkeypatch, argv):
@@ -578,14 +584,16 @@ def test_tokenizer_is_reused_when_it_matches(monkeypatch, capsys, tmp_path):
     assert tok.read_bytes() == first, "a matching tokenizer was rebuilt"
 
 
-def test_a_mismatched_tokenizer_is_rebuilt(tmp_path, monkeypatch, capsys):
+def test_a_legacy_tokenizer_is_rewritten_to_bytes(tmp_path, monkeypatch, capsys):
     data = _corpus(tmp_path)
     out = tmp_path / "run"
     _run_main(monkeypatch, _train_argv(out, data))
     capsys.readouterr()
-    # A tokenizer for a different vocab must not be used as-is.
-    _run_main(monkeypatch, _train_argv(out, data, ("--vocab", "48")))
-    assert "rebuilding" in capsys.readouterr().out
+    # A legacy word-level file must not be used as-is.
+    (out / "tokenizer.json").write_text('{"version": 8, "vocab": {"a": 0}}')
+    with pytest.raises((RuntimeError, ValueError)) as e:
+        _run_main(monkeypatch, _train_argv(out, data))
+    assert "tokenizer" in str(e.value).lower()
 
 
 def test_a_corrupt_tokenizer_is_reported_clearly(tmp_path, monkeypatch):
@@ -660,3 +668,72 @@ def test_main_survives_an_unreadable_dataset_for_fingerprinting(tmp_path, monkey
     _run_main(monkeypatch, _train_argv(out, data))
     assert (out / "config.json").exists()
     monkeypatch.setattr(train_mod, "_dataset_fingerprint", original)
+
+
+def test_byte_logits_shape_is_256(tmp_path, monkeypatch):
+    """The output head produces exactly 256 logits on a real trained model."""
+    import json
+    import torch
+    from model import SmaulLinear
+    out = tmp_path / "run"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path)))
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["vocab_size"] == 256
+    model = SmaulLinear.from_pretrained(out)
+    model.eval()
+    ids = torch.tensor([[104, 105, 230, 164, 185]], dtype=torch.long)
+    with torch.no_grad():
+        logits, _ = model(ids)
+    assert logits.shape == (1, 5, 256)
+
+
+def test_main_trains_a_rawr_moe(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "run_moe"
+    _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path),
+                                      ("--moe-experts", "2", "--moe-top-k", "1",
+                                       "--precision", "fp32")))
+    printed = capsys.readouterr().out
+    assert "[done]" in printed
+    assert "moe_inactive=" in printed
+    import json
+    cfg = json.loads((out / "config.json").read_text())
+    assert cfg["is_moe"] and cfg["num_experts"] == 2
+
+
+def test_main_continual_trains_with_replay_and_reports_retention(
+        tmp_path, monkeypatch, capsys):
+    import torch
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "a.txt").write_text("old domain english sentences here. " * 40)
+    new = tmp_path / "new"
+    new.mkdir()
+    (new / "a.txt").write_text("new domain byte stream here. " * 40)
+    out = tmp_path / "run_cont"
+    _run_main(monkeypatch, _train_argv(
+        out, new, ("--continual", "--old-data", str(old),
+                   "--replay-size", "16", "--replay-rate", "0.3",
+                   "--retention-batches", "2", "--steps", "3",
+                   "--precision", "fp32")))
+    printed = capsys.readouterr().out
+    assert "[continual]" in printed
+    assert "old-domain loss before=" in printed
+    assert "[retention] old" in printed and "new" in printed
+    assert "[done] steps=3" in printed
+    assert (out / "model.safetensors").exists()
+    # Per-group optimizer states are saved alongside the model.
+    assert (out / "optimizer_trunk.json").exists()
+
+
+def test_main_continual_multi_domain_stream(tmp_path, monkeypatch, capsys):
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "x.txt").write_text("domain one text. " * 40)
+    b = tmp_path / "b"
+    b.mkdir()
+    (b / "x.txt").write_text("domain two text. " * 40)
+    out = tmp_path / "run_multi"
+    _run_main(monkeypatch, _train_argv(
+        out, a, ("--continual", "--domains", f"{a},{b}",
+                 "--reset-state", "--steps", "2", "--precision", "fp32")))
+    assert "[done] steps=2" in capsys.readouterr().out
