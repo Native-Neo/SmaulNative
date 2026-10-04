@@ -914,3 +914,75 @@ class SmaulLinear(nn.Module):
         # A rawr checkpoint loaded as plain (or vice versa) can never reach
         # here: key shapes/names differ and strict/explicit checks fail first.
         return m
+
+
+# Named model-size presets: preset name -> dict(vocab, d, layers, heads, ffn_mult).
+# Effective fp32-equivalent params ~= 2*vocab*d + (5*layers+2)*d
+#   + layers*(4*d*d + 3*d*int(d*ffn_mult)). FP8 per-tile scales add ~1-2% on top.
+# Presets are added one per commit, largest first.
+PRESETS: dict = {
+    # ~1,024M params (1.024B target, 64K vocab).
+    "1B": {"vocab": 65536, "d": 2048, "layers": 18, "heads": 16, "ffn_mult": 2.0},
+    # ~508M params (512M target, 64K vocab).
+    "512M": {"vocab": 65536, "d": 1536, "layers": 13, "heads": 12, "ffn_mult": 2.0},
+    # ~260M params (256M target, 64K vocab).
+    "256M": {"vocab": 65536, "d": 1024, "layers": 12, "heads": 8, "ffn_mult": 2.0},
+    # ~132M params (128M target).
+    "128M": {"vocab": 8000, "d": 1024, "layers": 11, "heads": 8, "ffn_mult": 2.0},
+    # ~65M params (64M target).
+    "64M": {"vocab": 8000, "d": 768, "layers": 9, "heads": 12, "ffn_mult": 2.0},
+    # ~32M params (32M target, matches previous defaults).
+    "32M": {"vocab": 8000, "d": 512, "layers": 8, "heads": 8, "ffn_mult": 2.5},
+    # ~16M params (16M target).
+    "16M": {"vocab": 4000, "d": 512, "layers": 4, "heads": 8, "ffn_mult": 2.5},
+    # ~7.8M params (8M target).
+    "8M": {"vocab": 2000, "d": 448, "layers": 3, "heads": 7, "ffn_mult": 2.0},
+    # ~4.2M params (4M target).
+    "4M": {"vocab": 512, "d": 256, "layers": 6, "heads": 4, "ffn_mult": 2.0},
+    # ~2.1M params (2M target).
+    "2M": {"vocab": 256, "d": 256, "layers": 3, "heads": 4, "ffn_mult": 2.0},
+    # ~1.05M params (1M target).
+    "1M": {"vocab": 256, "d": 128, "layers": 6, "heads": 4, "ffn_mult": 2.0},
+    # ~526K params (512K target).
+    "512K": {"vocab": 128, "d": 128, "layers": 3, "heads": 4, "ffn_mult": 2.0},
+    # ~256K params (256K target).
+    "256K": {"vocab": 64, "d": 64, "layers": 6, "heads": 4, "ffn_mult": 2.0},
+    # ~132K params (128K target).
+    "128K": {"vocab": 64, "d": 64, "layers": 3, "heads": 4, "ffn_mult": 2.0},
+    # ~67K params (64K target).
+    "64K": {"vocab": 32, "d": 56, "layers": 2, "heads": 4, "ffn_mult": 2.0},
+    # ~33K params (32K target).
+    "32K": {"vocab": 32, "d": 32, "layers": 3, "heads": 2, "ffn_mult": 2.0},
+    # ~16.6K params (16K target).
+    "16K": {"vocab": 96, "d": 32, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    # ~8.2K params (8K target).
+    "8K": {"vocab": 48, "d": 24, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    # ~4.2K params (4K target).
+    "4K": {"vocab": 48, "d": 16, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    # ~2.1K params (2K target).
+    "2K": {"vocab": 24, "d": 12, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+    # ~1.08K params (1K target).
+    "1K": {"vocab": 24, "d": 8, "layers": 1, "heads": 2, "ffn_mult": 2.0},
+}
+
+
+def list_presets() -> dict:
+    return dict(PRESETS)
+
+
+def estimate_params(vocab: int, d: int, layers: int, ffn_mult: float) -> int:
+    h = int(d * ffn_mult)
+    return 2 * vocab * d + (5 * layers + 2) * d + layers * (4 * d * d + 3 * d * h)
+
+
+def apply_preset(args) -> None:
+    name = getattr(args, "preset", None)
+    if not name:
+        return
+    try:
+        p = PRESETS[name]
+    except KeyError:
+        raise ValueError(f"unknown --preset {name!r}; use --list-presets (have {sorted(PRESETS)})") from None
+    for k in ("vocab", "d", "layers", "heads", "ffn_mult"):
+        if k in p:
+            setattr(args, k, p[k])
