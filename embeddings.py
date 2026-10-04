@@ -66,7 +66,9 @@ class RamEmbedding(nn.Module):
         return self.emb.weight.numel()
 
     def weight_nbytes(self) -> int:
-        return self.emb.weight.numel() * 4
+        # Derived from the live dtype, not hardcoded: inference casts the
+        # table (e.g. to bf16) and a *4 would over-report 2x afterwards.
+        return self.emb.weight.numel() * self.emb.weight.element_size()
 
 
 class MmapEmbedding(nn.Module):
