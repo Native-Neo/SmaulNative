@@ -109,9 +109,9 @@ Any optimizer added here must satisfy this, because the training loop depends on
 
 - `tests/test_rl.py` used to import `autorl`, which does not exist (folded into
   `rl.py` in 511d585), which is why plain `pytest -q` failed at collection. Fixed
-  in 4d81541 -- a one-word import, nothing else. `rl.py` is still only 26%
-  covered and three of that file's five tests assert torch algebra without
-  calling `rl.py` at all, so do not read a green `test_rl.py` as RL coverage.
+  in 4d81541 -- a one-word import, nothing else. The file has since grown to
+  100+ tests on a real tiny model, and the two KL tests pin the real
+  `grpo_step` KL term rather than torch algebra.
   `tests/test_autorl.py` (four tests, pre-fold leftover) was deleted outright;
   `test_rl.py` superseded all of it with real-model coverage.
 - `.github/workflows/test.yml` used to run `from compute import get_backend`, but
