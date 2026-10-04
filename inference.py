@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List, Optional
 
 import torch
 
-from smaul_linear import SmaulLinear
+from model import SmaulLinear
 from tokenizer import SmaulTokenizer
 
 MODEL_WINDOW = 262144
