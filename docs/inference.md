@@ -17,6 +17,10 @@ for chunk in engine.stream("Hello world", max_new_tokens=64, seed=0):
   `ValueError` instead of silently mistokenizing) and accepts `device` (`auto`/`cpu`/`cuda`),
   `dtype` (`auto`/`fp32`/`bf16`), plus optional `architecture` / `embedding_storage`
   overrides that are validated against the checkpoint rather than trusted.
+  Prompts encode as raw UTF-8 bytes (vocabulary is exactly 256); generation pushes
+  one byte at a time through an incremental decoder that buffers split multi-byte
+  sequences instead of dropping them. There are no EOS/BOS tokens: generation ends
+  on `max_new_tokens` or a stop sequence.
 - The model window is 262144 tokens (`MODEL_WINDOW`): prompts longer than that warn and use
   the last 262144; prompts over `MAX_PROMPT_TOKENS` (65536) raise `ValueError`.
 - `max_new_tokens` must be in `[1, 65536]`. Over-aggressive `top_k`/`top_p` filtering that
