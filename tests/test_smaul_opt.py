@@ -1693,7 +1693,7 @@ def test_fp8_training_with_bf16_gw_and_narrowed_grads():
 
 
 # ---------------------------------------------------------------------------
-# Global grad norm (train._grad_norm, used by Lion._clip and SmaulOpt._clip)
+# Global grad norm (model._grad_norm, used by Lion._clip and SmaulOpt._clip)
 # ---------------------------------------------------------------------------
 
 def _exact_norm(grads):
@@ -1729,13 +1729,13 @@ def test_grad_norm_is_exact_enough_to_not_regress_toward_float32():
 
 def test_grad_norm_blocks_large_tensors_without_changing_the_result():
     """Crossing _NORM_BLOCK must not perturb the value."""
-    import train as _train
+    import model as _model
     torch.manual_seed(2)
-    base = torch.randn(_train._NORM_BLOCK + 7, dtype=torch.bfloat16)
+    base = torch.randn(_model._NORM_BLOCK + 7, dtype=torch.bfloat16)
     want = _exact_norm([base])
     assert _grad_norm([base]) == pytest.approx(want, rel=1e-9)
-    for n in (0, 1, 2, _train._NORM_BLOCK - 1, _train._NORM_BLOCK,
-              _train._NORM_BLOCK + 1, 4 * _train._NORM_BLOCK):
+    for n in (0, 1, 2, _model._NORM_BLOCK - 1, _model._NORM_BLOCK,
+              _model._NORM_BLOCK + 1, 4 * _model._NORM_BLOCK):
         g = torch.randn(n, dtype=torch.bfloat16)
         assert _grad_norm([g]) == pytest.approx(_exact_norm([g]), rel=1e-6, abs=1e-9), n
 
