@@ -4,7 +4,7 @@ import csv
 import json
 import re
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"]
@@ -306,7 +306,6 @@ def _build(texts, vocab_size, word_budget=40000, max_records=0):
     if word_budget < 0 or max_records < 0:
         raise ValueError("word_budget and max_records must be non-negative")
     words, graphemes, chars, symbols = Counter(), Counter(), Counter(), Counter()
-    cases = defaultdict(Counter)
     total_words = total_tokens = seen = 0
     for text in texts:
         seen += 1
@@ -317,8 +316,6 @@ def _build(texts, vocab_size, word_budget=40000, max_records=0):
             if token.isspace(): continue
             if token.isalpha() or token.isdigit():
                 base = canonical(token); words[base] += 1; total_words += 1
-                case = case_type(token)
-                if case: cases[base][case] += 1
                 if DEV_BASE.search(token): graphemes.update(devanagari_units(token))
             else:
                 symbols[token] += 1
