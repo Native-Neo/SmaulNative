@@ -1,9 +1,11 @@
 # merge_moe.py
 
 Merges one base SmaulLinear checkpoint plus one or more branch checkpoints (same
-architecture, e.g. trained on different domains) into one SwiGLU-MoE model: each
+architecture, e.g. trained on different domains) into one sparse-MoE model: each
 branch's block FFN becomes one expert; attention, embeddings, norms, and head come
-from the base; the router is freshly initialized.
+from the base; the router is freshly initialized. On `architecture="rawr"` the
+experts are graph-sparse `RawrFFN` and the merged model reuses the base
+`rawr_graph.json` (branch graphs must match it exactly).
 
 ## Run it
 
@@ -23,9 +25,10 @@ python merge_moe.py --base ./runs/base --branches ./runs/branch1 ./runs/branch2 
 ## Requirements
 
 - Base and branch checkpoints must be **dense** (already-MoE inputs are rejected) and share
-  `vocab_size`, `d_model`, `n_layer`, `n_heads`, `precision`, `ffn_mult`, `tile`, **and `eps`**
+  `vocab_size`, `d_model`, `n_layer`, `n_heads`, `precision`, `ffn_mult`, `tile`, `eps`,
+  `architecture`, `rawr_sparsity` **and `rawr_min_degree`**
   -- a mismatch raises `ValueError`. Tokenizers are *not* unioned, so the vocabularies must
-  already agree.
+  already agree (byte checkpoints all carry the identical 256-entry file).
 - `top_k` must be `>= 1` and `<=` the number of experts.
 - Every checkpoint dir needs `config.json` + `model.safetensors` (any `train.py` run
   produces both).
