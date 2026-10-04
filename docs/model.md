@@ -17,16 +17,17 @@ model = SmaulLinear.from_pretrained("./runs/linear")
 
 | Field | Default | Meaning |
 |---|---|---|
-| `vocab_size` | `32000` | vocabulary size |
+| `vocab_size` | `256` | byte vocabulary (exactly the 256 UTF-8 byte values) |
 | `d_model` | `512` | model width; must be divisible by `n_heads` |
 | `n_layer` | `8` | block count |
 | `n_heads` | `8` | linear-attention head count |
-| `ffn_mult` | `2.5` | FFN hidden width multiplier |
+| `ffn_mult` | `2.5` | FFN hidden width multiplier (also the MoE expert hidden-dim knob) |
 | `eps` | `1e-6` | RMSNorm epsilon |
 | `tile` | `64` | FP8 quantization tile width |
-| `is_moe` | `False` | use `SwiFFN_MoE` instead of `SwiFFN` |
-| `num_experts` | `1` | expert count (MoE) |
-| `num_experts_per_tok` | `1` | active experts per token (MoE) |
+| `is_moe` | `False` | use `SwiFFN_MoE` instead of the dense FFN |
+| `num_experts` | `1` | total MoE experts per block |
+| `num_experts_per_tok` | `1` | active (top-k) experts per token; only these execute |
+| `moe_balance_weight` | `0.01` | router load-balancing aux-loss weight |
 | `precision` | `fp8` | `fp8` (tiled E4M3) or `fp32` (plain) linear weights |
 | `architecture` | `plain` | `plain` (dense) or `rawr` (graph-sparse FFN + head). The train/infer CLIs default to `rawr`; the code default stays `plain` so library callers and legacy checkpoints are unaffected. |
 | `embedding_storage` | `ram` | `ram` (`nn.Embedding`) or `mmap` (file-backed) |
@@ -50,8 +51,15 @@ Lion, inference, and export paths are shared.
   two-pass backward with the same fallback.
 - **`SwiFFN`** -- gated feed-forward (`silu(gate(x)) * up(x)` through `down`), all
   three projections `FP8Linear`.
-- **`SwiFFN_MoE`** -- one `SwiFFN` per expert plus a softmax router; the top-k experts
-  per token are renormalized and only tokens routed to an expert are computed by it.
+- **`SwiFFN_MoE`** -- sparse MoE over the RAWR trunk: a softmax router picks the
+  top-k experts per token, the weights are renormalized, and only experts with
+  at least one assigned token execute (the rest run no forward, hence no
+  backward and no gradient). Experts are `RawrFFN` (graph-sparse) on
+  `architecture="rawr"` and `SwiFFN` (dense) on `"plain"` -- one FFN
+  implementation per architecture, not a parallel MoE codebase. `balance_loss`
+  is the Switch-style load-balancing aux loss (weighted by
+  `moe_balance_weight`); `routing_stats()` reports per-forward token counts,
+  usage fractions, executed flags, and inactive experts.
 - **`RawrFFN` / `SparseLinear`** (`architecture="rawr"`) -- the FFN and LM head project
   through graph-derived column sets from `rawr_graph.hidden_cols`, stored as an
   `[out_f, K]` `values` parameter with the indices in a non-persistent `cols` buffer (rebuilt
@@ -100,4 +108,6 @@ with the window and every step re-prefills, which is where that path's speedup g
 
 `save_pretrained(dir)` writes `model.safetensors` + `config.json` (plus `rawr_graph.json` and
 `embeddings.dat` for the rawr/mmap combinations); `from_pretrained(dir)` loads them back with
-`strict=True`.
+`strict=True`. A checkpoint bundling a legacy word-level `tokenizer.json` is refused with
+an explicit error: its embedding rows index a different token space and cannot be migrated,
+so retrain instead of copying the old file forward.
