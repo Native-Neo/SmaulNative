@@ -14,7 +14,7 @@ the same directory. This is the single hard rule on this repository.
   with its call sites, a generated artifact), stop and ask before committing.
 - Commit messages are prose describing *why*; the file list should be self-explanatory.
 - Verify each commit leaves the tree working where that is possible:
-  `python -m pytest -q` after anything touching a kernel, `smaul_linear.py`,
+  `python -m pytest -q` after anything touching a kernel, `model.py`,
   `train.py` or `rawr_graph.py`.
 - Nothing is pushed unless asked.
 
@@ -76,7 +76,7 @@ python benchmark.py --mode full|opt|arch --d 512 --layers 4 --ctx 256 --batch 2 
 - `kernel/` has no `__init__.py` (implicit namespace package); imports are
   `from kernel.compute import get_backend`.
 
-## Optimizer contract (`train.py`)
+## Optimizer contract (`model.py`)
 
 Any optimizer added here must satisfy this, because the training loop depends on it:
 
