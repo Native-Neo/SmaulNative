@@ -2040,6 +2040,10 @@ def build_model(args, tok, out, tokenizer_sha256="", dataset_fingerprint=""):
         print_stats(rawr_graph)
         if getattr(args, "rawr_graph_out", None):
             save_graph(rawr_graph, Path(args.rawr_graph_out))
+    _ne = getattr(args, "moe_experts", 1)
+    _ne = 1 if _ne is None else int(_ne)
+    _tk = getattr(args, "moe_top_k", 1)
+    _tk = 1 if _tk is None else int(_tk)
     cfg = LinearConfig(vocab_size=args.vocab, d_model=args.d, n_layer=args.layers, n_heads=args.heads,
                        ffn_mult=getattr(args, "ffn_mult", 2.5),
                        precision=args.precision, tokenizer_sha256=tokenizer_sha256,
@@ -2047,9 +2051,9 @@ def build_model(args, tok, out, tokenizer_sha256="", dataset_fingerprint=""):
                        architecture=arch, embedding_storage=storage,
                        rawr_sparsity=float(getattr(args, "rawr_sparsity", 0.9)),
                        rawr_min_degree=int(getattr(args, "rawr_min_degree", 4)),
-                       is_moe=int(getattr(args, "moe_experts", 1) or 1) > 1,
-                       num_experts=int(getattr(args, "moe_experts", 1) or 1),
-                       num_experts_per_tok=int(getattr(args, "moe_top_k", 1) or 1),
+                       is_moe=_ne > 1,
+                       num_experts=_ne,
+                       num_experts_per_tok=_tk,
                        moe_balance_weight=float(getattr(args, "moe_balance_weight", 0.01)))
     emb_path = (out / "embeddings.dat") if storage == "mmap" else None
     model = SmaulLinear(cfg, rawr_graph=rawr_graph, emb_path=emb_path)
