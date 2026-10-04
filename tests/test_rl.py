@@ -131,7 +131,7 @@ CORPUS = "hello world this is a small english corpus for the rl tests. " * 30
 
 
 def _model_dir(tmp_path, vocab=64):
-    from smaul_linear import LinearConfig, SmaulLinear
+    from model import LinearConfig, SmaulLinear
     from tokenizer import SmaulTokenizer, _build
     d = tmp_path / "model"
     d.mkdir(exist_ok=True)
@@ -212,7 +212,7 @@ def test_init_resumes_the_policy_from_the_work_dir(tmp_path, capsys):
     policy = tmp_path / "work" / "policy"
     rl._save("hello", [{"text": "a"}, {"text": "b"}], 0)
     import json
-    from smaul_linear import SmaulLinear
+    from model import SmaulLinear
     # Point the work dir's policy at a *different* set of weights.
     from tokenizer import SmaulTokenizer, _build
     alt = tmp_path / "alt"
@@ -620,7 +620,7 @@ def test_grpo_step_trains_and_saves_a_policy(tmp_path):
     # from_pretrained, which needs a tokenizer with a matching vocab.
     assert (policy / "tokenizer.json").exists()
     assert (policy / "config.json").exists()
-    from smaul_linear import SmaulLinear
+    from model import SmaulLinear
     from tokenizer import SmaulTokenizer
     reloaded = SmaulLinear.from_pretrained(policy)
     assert reloaded.cfg.vocab_size == rl.model.cfg.vocab_size
