@@ -149,7 +149,7 @@ Two optimizers are selectable with `--optimizer`. The default is `smaul`.
 
 ### `smaul` (SmaulOpt, default)
 
-`SmaulOpt` (`train.SmaulOpt`) is a small deterministic FP32 adaptive optimizer holding
+`SmaulOpt` (`model.SmaulOpt`) is a small deterministic FP32 adaptive optimizer holding
 exactly two persistent FP32 states per trainable parameter/FP8 module — `m` (momentum) and
 `v` (EMA of `|g|`) — plus a global step counter for bias correction. For gradient `g_t`:
 
