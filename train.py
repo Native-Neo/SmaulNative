@@ -1371,9 +1371,9 @@ def main():
     if args.list_presets:
         for _name in sorted(PRESETS):
             _p = PRESETS[_name]
-            _est = estimate_params(_p["vocab"], _p["d"], _p["layers"], _p.get("ffn_mult", 2.5))
+            _est = estimate_params(_p["vocab"], _p["d"], _p["layers"], _p["ffn_mult"])
             print(f"{_name}: vocab={_p['vocab']} d={_p['d']} layers={_p['layers']} "
-                  f"heads={_p['heads']} ffn_mult={_p.get('ffn_mult', 2.5)} ~{_est:,} params")
+                  f"heads={_p['heads']} ffn_mult={_p['ffn_mult']} ~{_est:,} params")
         return
     apply_preset(args)
     _validate_args(args)
