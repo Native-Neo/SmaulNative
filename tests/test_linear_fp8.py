@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from kernel.fp8_tile import FP8Linear, fp8_modules, quantize_tiles
-from smaul_linear import LinearConfig, SmaulLinear
+from model import LinearConfig, SmaulLinear
 
 
 def test_quant_error_bounded():
@@ -318,7 +318,7 @@ def test_no_fp32_master_weights():
 
 
 def test_fp32_precision_trains_and_roundtrips(tmp_path):
-    from train import Lion
+    from model import Lion
     torch.manual_seed(21)
     cfg = LinearConfig(vocab_size=256, d_model=64, n_layer=1, n_heads=2, tile=32, precision="fp32")
     m = SmaulLinear(cfg)
@@ -372,7 +372,7 @@ def test_merge_precision_rules(tmp_path):
 
 def test_attn_native_matches_reference():
     from kernel.compute import get_backend
-    from smaul_linear import _attn_reference, _LinearAttnFn
+    from model import _attn_reference, _LinearAttnFn
     be = get_backend()
     torch.manual_seed(7)
     for B, T, H, D in _attn_cases():
@@ -388,7 +388,7 @@ def test_attn_native_matches_reference():
 
 
 def test_attn_backward_matches_autograd():
-    from smaul_linear import _attn_reference, _LinearAttnFn
+    from model import _attn_reference, _LinearAttnFn
     torch.manual_seed(8)
     for B, T, H, D in [(1, 17, 2, 16), (2, 65, 4, 40)]:
         Q = (torch.nn.functional.elu(torch.randn(B, T, H, D)) + 1.0).requires_grad_()
@@ -409,7 +409,7 @@ def test_attn_backward_matches_autograd():
 
 def test_attn_fallback_matches_native():
     from kernel.compute import get_backend
-    from smaul_linear import _attn_reference, _LinearAttnFn
+    from model import _attn_reference, _LinearAttnFn
     be = get_backend()
     if not be.has_attn_native:
         pytest.skip("smaul_attn extension did not build")
@@ -615,7 +615,7 @@ def test_incremental_decode_matches_a_full_forward_every_step():
     the per-step path could silently drift and generation would quietly go
     off-distribution.
     """
-    from smaul_linear import LinearConfig, SmaulLinear
+    from model import LinearConfig, SmaulLinear
     torch.manual_seed(12)
     for arch in ("rawr", "plain"):
         cfg = LinearConfig(vocab_size=96, d_model=32, n_layer=2, n_heads=2,
@@ -639,7 +639,7 @@ def test_incremental_decode_matches_a_full_forward_every_step():
 
 
 def test_prefill_and_step_reject_bad_shapes():
-    from smaul_linear import LinearConfig, SmaulLinear
+    from model import LinearConfig, SmaulLinear
     m = SmaulLinear(LinearConfig(vocab_size=64, d_model=32, n_layer=1, n_heads=2,
                                  ffn_mult=2.0, architecture="rawr",
                                  rawr_sparsity=0.5)).eval()
@@ -754,7 +754,7 @@ def test_attn_torch_fallback_backward_is_used_and_correct():
     appear for a user who cannot compile the extension.
     """
     from kernel.compute import get_backend
-    from smaul_linear import _LinearAttnFn, _attn_reference
+    from model import _LinearAttnFn, _attn_reference
     be = get_backend()
     if not be.has_attn_native:
         pytest.skip("native attention ext unavailable; fallback is the only path")
