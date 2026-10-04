@@ -315,8 +315,8 @@ if _ROOT not in sys.path:
 
 import torch
 
-# Fixed tiny experiment (same for all four combos).
-DIMS = dict(vocab_size=64, d_model=32, n_layer=2, n_heads=2, ffn_mult=2.0)
+# Fixed tiny experiment (same for all four combos). Byte vocabulary is fixed.
+DIMS = dict(vocab_size=256, d_model=32, n_layer=2, n_heads=2, ffn_mult=2.0)
 CTX, BATCH, STEPS, LR = 32, 2, 8, 1e-4
 SEED = 1234
 
@@ -337,25 +337,15 @@ VAL_TEXTS = [
 
 
 def build_tokenizer():
-    from tokenizer import _build
-
-    texts = list(TRAIN_TEXTS) + list(VAL_TEXTS)
-    # NOTE: _build always emits the guaranteed single-char set first, so the
-    # realized vocab is larger than small requests; the model dims follow it.
-    data = _build(iter(texts), DIMS["vocab_size"], 20000, 0)
     from tokenizer import SmaulTokenizer
 
-    tok = SmaulTokenizer(data)
-    DIMS["vocab_size"] = tok.get_vocab_size()
-    return tok
+    return SmaulTokenizer()
 
 
 def encode_all(tok, texts, ctx):
     out = []
     for t in texts:
-        ids = list(tok.encode(t).ids) if hasattr(tok.encode(t), "ids") else list(tok.encode(t))
-        ids = ids + [tok.eos_token_id]
-        out.extend(ids)
+        out.extend(tok.encode(t).ids)
     # Chunk into ctx+1 windows (shared, identical order for every combo).
     chunks = []
     for i in range(0, len(out) - ctx, ctx):
