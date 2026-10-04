@@ -51,8 +51,10 @@ class SmaulRL:
         if tok_vocab != self.model.cfg.vocab_size:
             raise ValueError(f"tokenizer vocab ({tok_vocab}) != model vocab ({self.model.cfg.vocab_size})")
         self.model.train()
-        self.eos_id = self.tokenizer.eos_token_id
-        self.bos_id = self.tokenizer.bos_token_id
+        # Byte vocabulary has no special tokens: empty prompts fall back to a
+        # newline byte and generations end on the token budget.
+        self.eos_id = None
+        self.bos_id = None
         self.preference_path = self.work_dir / "preferences.jsonl"
         self._opt: Optional[Lion] = None
 
@@ -120,7 +122,7 @@ class SmaulRL:
         was_training = self.model.training
         self.model.eval()
         try:
-            prompt_ids = self._encode(prompt) or [self.bos_id if self.bos_id is not None else self.eos_id]
+            prompt_ids = self._encode(prompt) or [10]
             if len(prompt_ids) > self.MODEL_WINDOW:
                 print(f"[WARN] prompt truncated to last {self.MODEL_WINDOW} tokens ({len(prompt_ids)} provided)")
             ids = prompt_ids[-self.MODEL_WINDOW:]
