@@ -432,8 +432,13 @@ class SparseLinear(nn.Module):
     def _csr_t_parts(self):
         """Cached S^T index layout, rebuilt if ``cols`` is ever replaced.
 
-        Keyed on the buffer identity so ``.to(device)`` (which gives a new
-        ``cols`` tensor) is picked up rather than silently reusing a stale
+        Keyed on the buffer's address, shape, device and dtype -- not its
+        identity, despite what an earlier version of this comment claimed. An
+        address can be reused after the old tensor is freed, so a replaced
+        ``cols`` of identical shape/dtype on the same device could hit a stale
+        layout; in practice ``cols`` is built once in ``__init__`` and only
+        ``.to(device)`` (new address, and usually a new device) exercises the
+        rebuild, which is picked up rather than silently reusing a stale
         layout on the wrong device.
 
         The cache additionally refuses to cross the inference-mode boundary.
