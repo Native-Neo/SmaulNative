@@ -8,8 +8,7 @@ import subprocess
 import pytest
 import torch
 from kernel.fp8_tile import fp8_modules
-from smaul_linear import LinearConfig, SmaulLinear
-from train import Lion
+from model import LinearConfig, Lion, SmaulLinear
 
 
 def test_lion_step_keeps_fp8_storage_and_finite_loss():
@@ -96,7 +95,7 @@ def test_validate_args_rejects_bad_input(kw, frag):
 
 
 def test_apply_preset_sets_every_dimension_and_leaves_the_rest_alone():
-    from train import apply_preset, estimate_params, list_presets
+    from model import apply_preset, estimate_params, list_presets
     a = _args(preset="32M", d=1, layers=1, heads=1, ffn_mult=1.0, vocab=1)
     apply_preset(a)
     p = list_presets()["32M"]
@@ -108,7 +107,7 @@ def test_apply_preset_sets_every_dimension_and_leaves_the_rest_alone():
 
 
 def test_apply_preset_is_a_noop_without_one_and_names_the_alternatives():
-    from train import apply_preset, list_presets
+    from model import apply_preset, list_presets
     a = _args(preset=None)
     apply_preset(a)
     assert a.d == 512
@@ -121,7 +120,7 @@ def test_apply_preset_is_a_noop_without_one_and_names_the_alternatives():
 
 
 def test_estimate_params_is_monotone_and_sane():
-    from train import PRESETS, estimate_params
+    from model import PRESETS, estimate_params
     small = estimate_params(vocab=256, d=64, layers=2, ffn_mult=2.0)
     big = estimate_params(vocab=65536, d=2048, layers=18, ffn_mult=2.0)
     assert 0 < small < big
@@ -160,7 +159,7 @@ def test_install_handlers_is_only_called_from_main():
 
     Checked in a subprocess on purpose. importlib.reload() in-process rebuilds
     every class in the module, so test_smaul_opt.py's top-level
-    `from train import SmaulOpt` would keep pointing at the *old* class while
+    `from model import SmaulOpt` would keep pointing at the *old* class while
     train._save_optimizer's isinstance check sees the new one -- and every
     checkpoint test after it in the same session fails on missing state files.
     The subprocess asks the same question without disturbing the interpreter.
@@ -186,7 +185,7 @@ def test_dense_block_size_is_a_performance_knob_not_a_semantic_one():
     Blocks are independent, so this is free to tune; a test that pins the
     result makes it safe to tune.
     """
-    from train import SmaulOpt
+    from model import SmaulOpt
 
     def run(dense_ob):
         torch.manual_seed(0)
@@ -425,7 +424,7 @@ def test_main_uses_the_preset_when_given(tmp_path, monkeypatch, capsys):
     _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path), ("--preset", "2K")))
     import json
     cfg = json.loads((out / "config.json").read_text())
-    from train import PRESETS
+    from model import PRESETS
     p = PRESETS["2K"]
     assert (cfg["d_model"], cfg["n_layer"], cfg["n_heads"]) == (p["d"], p["layers"], p["heads"])
 
@@ -477,7 +476,7 @@ class _NaNLoss(SmaulLinear):
 
 
 def _patch_model(monkeypatch, cls):
-    monkeypatch.setattr("train.SmaulLinear", cls)
+    monkeypatch.setattr("model.SmaulLinear", cls)
 
 
 def test_a_non_finite_loss_step_is_skipped_and_counted(tmp_path, monkeypatch, capsys):
@@ -510,7 +509,7 @@ def test_fifty_consecutive_bad_grads_abort(tmp_path, monkeypatch, capsys):
     attempt corrupted the gradients from inside forward(), which called
     backward() a second time and raised.
     """
-    monkeypatch.setattr("train._grad_norm", lambda grads: float("inf"))
+    monkeypatch.setattr("model._grad_norm", lambda grads: float("inf"))
     out = tmp_path / "run"
     _run_main(monkeypatch, _train_argv(out, _corpus(tmp_path), ("--steps", "500",)))
     printed = capsys.readouterr().out
