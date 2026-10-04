@@ -22,21 +22,20 @@ python download.py --languages hindi english --max_rows 100000
 
 ## Tokenizer
 
-Train one explicitly (or let `train.py` build it automatically):
+None needed: the model is byte-level with a fixed 256-entry codec.
+`train.py` writes `./runs/linear/tokenizer.json` automatically; `tokenizer.py`
+only encodes/decodes for inspection:
 
 ```bash
-python tokenizer.py train --fromdataset ./datasets \
-    --vocab-size 8000 --output ./runs/linear/tokenizer.json
+python tokenizer.py encode --text "Hello नमस्ते"
+python tokenizer.py decode --ids "72 101 108 108 111"
 ```
-
-`--vocab-size` must equal the `--vocab` you pass to `train.py`.
 
 ## Train
 
 ```bash
 python train.py --data ./datasets --out ./runs/linear \
-    --tokenizer ./runs/linear/tokenizer.json \
-    --d 512 --layers 8 --heads 8 --vocab 8000 \
+    --d 512 --layers 8 --heads 8 --vocab 256 \
     --ctx 256 --batch 2 --steps 1000 --threads 2
 ```
 
