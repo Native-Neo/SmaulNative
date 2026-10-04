@@ -16,7 +16,7 @@ import torch
 
 from dataset import PretrainStream, TokenizerWrapper, discover_files, iter_texts
 from kernel.fp8_tile import fp8_modules
-from model import Lion, PRESETS, SmaulOpt, build_model, estimate_params
+from model import Lion, PRESETS, SmaulOpt, apply_preset, build_model, estimate_params
 from tokenizer import ensure_tokenizer
 
 
