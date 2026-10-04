@@ -17,12 +17,8 @@ def test_sample_logprob_matches_sampling_distribution():
 
 
 def test_filter_rejects_nonpositive_temperature():
-    try:
+    with pytest.raises(ValueError, match="temperature must be > 0"):
         SmaulRL._filter_logits(torch.ones(4), 0.0, 0, 1.0)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("temperature=0 must fail")
 
 
 def _grpo_candidates(a, prompt="hello world", seed=0):
