@@ -147,6 +147,7 @@ torch::Tensor sgemm(torch::Tensor A, torch::Tensor B) {
     const int64_t N = B.size(1);
     auto C = torch::empty({M, N}, A.options());
     if (!M || !N) return C;
+    if (!K) return torch::zeros({M, N}, A.options());
 
     const float* ap = A.data_ptr<float>();
     const float* bp = B.data_ptr<float>();
