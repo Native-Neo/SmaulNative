@@ -5,9 +5,8 @@
 #include <torch/extension.h>
 
 // Small Ivy Bridge BLAS subset for SmaulNative.
-// Ivy Bridge has AVX1 but no AVX2/FMA. The hot GEMM path therefore uses
-// cache tiling plus a small SSE microkernel; this keeps register pressure low
-// while reusing each B vector across two A rows.
+// Ivy Bridge has AVX1 but no AVX2/FMA. Keep the hot path explicitly
+// specialized for that ISA; this is intentionally not a generic BLAS.
 
 namespace {
 
