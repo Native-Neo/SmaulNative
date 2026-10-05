@@ -10,15 +10,18 @@
 
 namespace {
 
-inline void kernel_4x8(const float* a0, const float* a1,
+inline void kernel_6x8(const float* a0, const float* a1,
                        const float* a2, const float* a3,
+                       const float* a4, const float* a5,
                        const float* b, float* c0, float* c1,
-                       float* c2, float* c3, int64_t K, int64_t N,
-                       int64_t j, bool accumulate) {
+                       float* c2, float* c3, float* c4, float* c5,
+                       int64_t K, int64_t N, int64_t j, bool accumulate) {
     __m256 r0 = accumulate ? _mm256_loadu_ps(c0+j) : _mm256_setzero_ps();
     __m256 r1 = accumulate ? _mm256_loadu_ps(c1+j) : _mm256_setzero_ps();
     __m256 r2 = accumulate ? _mm256_loadu_ps(c2+j) : _mm256_setzero_ps();
     __m256 r3 = accumulate ? _mm256_loadu_ps(c3+j) : _mm256_setzero_ps();
+    __m256 r4 = accumulate ? _mm256_loadu_ps(c4+j) : _mm256_setzero_ps();
+    __m256 r5 = accumulate ? _mm256_loadu_ps(c5+j) : _mm256_setzero_ps();
 
     for (int64_t k=0; k<K; ++k) {
         const __m256 bv = _mm256_loadu_ps(b+k*N+j);
@@ -26,10 +29,36 @@ inline void kernel_4x8(const float* a0, const float* a1,
         r1 = _mm256_add_ps(r1, _mm256_mul_ps(_mm256_broadcast_ss(a1+k), bv));
         r2 = _mm256_add_ps(r2, _mm256_mul_ps(_mm256_broadcast_ss(a2+k), bv));
         r3 = _mm256_add_ps(r3, _mm256_mul_ps(_mm256_broadcast_ss(a3+k), bv));
+        r4 = _mm256_add_ps(r4, _mm256_mul_ps(_mm256_broadcast_ss(a4+k), bv));
+        r5 = _mm256_add_ps(r5, _mm256_mul_ps(_mm256_broadcast_ss(a5+k), bv));
     }
 
     _mm256_storeu_ps(c0+j,r0); _mm256_storeu_ps(c1+j,r1);
     _mm256_storeu_ps(c2+j,r2); _mm256_storeu_ps(c3+j,r3);
+    _mm256_storeu_ps(c4+j,r4); _mm256_storeu_ps(c5+j,r5);
+}
+
+inline void kernel_6x8_range(const float* a0, const float* a1,
+                             const float* a2, const float* a3,
+                             const float* a4, const float* a5,
+                             const float* b, float* c0, float* c1,
+                             float* c2, float* c3, float* c4, float* c5,
+                             int64_t K, int64_t N, int64_t j0, int64_t j1,
+                             bool accumulate) {
+    int64_t j=j0;
+    for(; j+8<=j1; j+=8)
+        kernel_6x8(a0,a1,a2,a3,a4,a5,b,c0,c1,c2,c3,c4,c5,K,N,j,accumulate);
+    for(;j<j1;++j) {
+        float s0=accumulate?c0[j]:0.0f, s1=accumulate?c1[j]:0.0f;
+        float s2=accumulate?c2[j]:0.0f, s3=accumulate?c3[j]:0.0f;
+        float s4=accumulate?c4[j]:0.0f, s5=accumulate?c5[j]:0.0f;
+        for(int64_t k=0;k<K;++k) {
+            const float x=b[k*N+j];
+            s0+=a0[k]*x; s1+=a1[k]*x; s2+=a2[k]*x;
+            s3+=a3[k]*x; s4+=a4[k]*x; s5+=a5[k]*x;
+        }
+        c0[j]=s0;c1[j]=s1;c2[j]=s2;c3[j]=s3;c4[j]=s4;c5[j]=s5;
+    }
 }
 
 inline void kernel_4x8_range(const float* a0, const float* a1,
@@ -142,16 +171,19 @@ torch::Tensor sgemm(torch::Tensor A, torch::Tensor B) {
                 int64_t i = i0;
 
                 constexpr int64_t KC = 128;
-                for (; i + 3 < i1; i += 4) {
+                for (; i + 5 < i1; i += 6) {
                     const float* a0=ap+i*K, *a1=ap+(i+1)*K;
                     const float* a2=ap+(i+2)*K, *a3=ap+(i+3)*K;
+                    const float* a4=ap+(i+4)*K, *a5=ap+(i+5)*K;
                     float* c0=cp+i*N, *c1=cp+(i+1)*N;
                     float* c2=cp+(i+2)*N, *c3=cp+(i+3)*N;
+                    float* c4=cp+(i+4)*N, *c5=cp+(i+5)*N;
                     bool accumulate=false;
                     for(int64_t k0=0;k0<K;k0+=KC) {
                         const int64_t kc=std::min(K,k0+KC)-k0;
-                        kernel_4x8_range(a0+k0,a1+k0,a2+k0,a3+k0,bp+k0*N,
-                                         c0,c1,c2,c3,kc,N,j0,j1,accumulate);
+                        kernel_6x8_range(a0+k0,a1+k0,a2+k0,a3+k0,a4+k0,a5+k0,
+                                         bp+k0*N,c0,c1,c2,c3,c4,c5,
+                                         kc,N,j0,j1,accumulate);
                         accumulate=true;
                     }
                 }
