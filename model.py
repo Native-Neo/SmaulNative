@@ -107,19 +107,46 @@ def _linear(cfg: LinearConfig, in_f: int, out_f: int, bias: bool = False) -> nn.
         return _DenseLinear(in_f, out_f, bias=bias)
     raise ValueError(f"unknown precision {cfg.precision!r}; expected 'fp8' or 'fp32'")
 
-class _DenseLinear(nn.Module):
-    """Plain-FP32 linear with FP8Linear-compatible dtype behavior.
+class _DenseLinearFn(torch.autograd.Function):
+    """FP32 dense projection backed by SmaulNative's AVX1 SGEMM."""
 
-    Computes in float32 and returns the input dtype, so the surrounding model
-    code (bf16 activations, fp32 attention core) is identical in both modes.
-    """
+    @staticmethod
+    def forward(ctx, x, weight, bias):
+        x2 = x.float().reshape(-1, weight.shape[1]).contiguous()
+        y2 = get_backend().sgemm_bt(x2, weight.contiguous())
+        ctx.save_for_backward(x2, weight)
+        ctx.xshape = tuple(x.shape)
+        ctx.xdtype = x.dtype
+        ctx.has_bias = bias is not None
+        if bias is not None:
+            y2 = y2 + bias
+        return y2.reshape(*x.shape[:-1], weight.shape[0]).to(
+            x.dtype if x.is_floating_point() else torch.float32
+        )
+
+    @staticmethod
+    def backward(ctx, grad):
+        x2, weight = ctx.saved_tensors
+        g2 = grad.float().reshape(-1, weight.shape[0]).contiguous()
+        gx = gw = gb = None
+        if ctx.needs_input_grad[0]:
+            gx = get_backend().sgemm(g2, weight.contiguous()).reshape(ctx.xshape).to(ctx.xdtype)
+        if ctx.needs_input_grad[1]:
+            gw = get_backend().sgemm(g2.transpose(0, 1).contiguous(), x2)
+        if ctx.needs_input_grad[2] and ctx.has_bias:
+            gb = g2.sum(0)
+        return gx, gw, gb
+
+
+class _DenseLinear(nn.Module):
+    """Plain-FP32 linear using the Ivy Bridge AVX1 backend."""
 
     def __init__(self, in_f: int, out_f: int, bias: bool = False):
         super().__init__()
         self.lin = nn.Linear(in_f, out_f, bias=bias)
 
     def forward(self, x):
-        return self.lin(x.float()).to(x.dtype if x.is_floating_point() else torch.float32)
+        return _DenseLinearFn.apply(x, self.lin.weight, self.lin.bias)
 
 class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-6):
