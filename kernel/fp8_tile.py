@@ -193,7 +193,10 @@ class _Fn(torch.autograd.Function):
                     # RHS is FP32; the destination may be narrower, so this rounds
                     # the block product exactly once. Opt.step() must therefore
                     # consume _gw blockwise and never materialize a full FP32 copy.
-                    gw[o0:o1].add_(g2[:, o0:o1].T @ x2)
+                    block = get_backend().sgemm(
+                        g2[:, o0:o1].transpose(0, 1).contiguous(), x2
+                    )
+                    gw[o0:o1].add_(block.to(gw.dtype))
         return gx, None, None, None, None, None, None
 
 class FP8Linear(nn.Module):
