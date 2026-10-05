@@ -5,10 +5,77 @@
 #include <torch/extension.h>
 
 // Small Ivy Bridge BLAS subset for SmaulNative.
-// AVX1 only: Ivy Bridge has no AVX2/FMA, so the kernels use separate
-// multiply/add instructions and keep the hot loops cache-friendly.
+// Ivy Bridge has AVX1 but no AVX2/FMA. The hot GEMM path therefore uses
+// cache tiling plus a small SSE microkernel; this keeps register pressure low
+// while reusing each B vector across two A rows.
 
 namespace {
+
+inline void kernel_2x4(const float* a0, const float* a1,
+                       const float* b, float* c0, float* c1,
+                       int64_t K, int64_t N, int64_t j) {
+    __m128 c00 = _mm_setzero_ps();
+    __m128 c01 = _mm_setzero_ps();
+    __m128 c10 = _mm_setzero_ps();
+    __m128 c11 = _mm_setzero_ps();
+
+    int64_t k = 0;
+    for (; k + 4 <= K; k += 4) {
+        __m128 bv = _mm_loadu_ps(b + k * N + j);
+        c00 = _mm_add_ps(c00, _mm_mul_ps(_mm_set1_ps(a0[k]), bv));
+        c01 = _mm_add_ps(c01, _mm_mul_ps(_mm_set1_ps(a1[k]), bv));
+
+        bv = _mm_loadu_ps(b + (k + 1) * N + j);
+        c00 = _mm_add_ps(c00, _mm_mul_ps(_mm_set1_ps(a0[k + 1]), bv));
+        c01 = _mm_add_ps(c01, _mm_mul_ps(_mm_set1_ps(a1[k + 1]), bv));
+
+        bv = _mm_loadu_ps(b + (k + 2) * N + j);
+        c10 = _mm_add_ps(c10, _mm_mul_ps(_mm_set1_ps(a0[k + 2]), bv));
+        c11 = _mm_add_ps(c11, _mm_mul_ps(_mm_set1_ps(a1[k + 2]), bv));
+
+        bv = _mm_loadu_ps(b + (k + 3) * N + j);
+        c10 = _mm_add_ps(c10, _mm_mul_ps(_mm_set1_ps(a0[k + 3]), bv));
+        c11 = _mm_add_ps(c11, _mm_mul_ps(_mm_set1_ps(a1[k + 3]), bv));
+    }
+
+    __m128 s0 = _mm_add_ps(c00, c10);
+    __m128 s1 = _mm_add_ps(c01, c11);
+    _mm_storeu_ps(c0 + j, s0);
+    _mm_storeu_ps(c1 + j, s1);
+
+    if (k < K) {
+        // K is normally a multiple of 4 in SmaulNative, but keep the kernel
+        // correct for arbitrary dimensions.
+        for (; k < K; ++k) {
+            const float x0 = a0[k];
+            const float x1 = a1[k];
+            for (int q = 0; q < 4; ++q) {
+                c0[j + q] += x0 * b[k * N + j + q];
+                c1[j + q] += x1 * b[k * N + j + q];
+            }
+        }
+    }
+}
+
+inline void kernel_2x4_range(const float* a0, const float* a1,
+                             const float* b, float* c0, float* c1,
+                             int64_t K, int64_t N, int64_t j0, int64_t j1) {
+    int64_t j = j0;
+    for (; j + 4 <= j1; j += 4)
+        kernel_2x4(a0, a1, b, c0, c1, K, N, j);
+
+    // Scalar tail.
+    for (; j < j1; ++j) {
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+            s0 += a0[k] * b[k * N + j];
+            s1 += a1[k] * b[k * N + j];
+        }
+        c0[j] = s0;
+        c1[j] = s1;
+    }
+}
 
 inline float hsum8(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
@@ -19,89 +86,47 @@ inline float hsum8(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
-inline void gemm_row8(const float* a, const float* b, float* c,
-                      int64_t k, int64_t n, int64_t j0, int64_t j1) {
-    for (int64_t j = j0; j < j1; j += 8) {
-        if (j + 8 <= j1) {
-            __m256 a0 = _mm256_setzero_ps();
-            __m256 a1 = _mm256_setzero_ps();
-            __m256 a2 = _mm256_setzero_ps();
-            __m256 a3 = _mm256_setzero_ps();
-            int64_t p = 0;
-
-            // Four independent accumulators hide AVX multiply/add latency.
-            for (; p + 4 <= k; p += 4) {
-                a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_set1_ps(a[p]),
-                                                     _mm256_loadu_ps(b + p*n + j)));
-                a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_set1_ps(a[p+1]),
-                                                     _mm256_loadu_ps(b + (p+1)*n + j)));
-                a2 = _mm256_add_ps(a2, _mm256_mul_ps(_mm256_set1_ps(a[p+2]),
-                                                     _mm256_loadu_ps(b + (p+2)*n + j)));
-                a3 = _mm256_add_ps(a3, _mm256_mul_ps(_mm256_set1_ps(a[p+3]),
-                                                     _mm256_loadu_ps(b + (p+3)*n + j)));
-            }
-
-            __m256 acc = _mm256_add_ps(_mm256_add_ps(a0, a1),
-                                        _mm256_add_ps(a2, a3));
-            for (; p < k; ++p) {
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(
-                    _mm256_set1_ps(a[p]), _mm256_loadu_ps(b + p*n + j)));
-            }
-            _mm256_storeu_ps(c + j, acc);
-        } else {
-            for (int64_t j2 = j; j2 < j1; ++j2) {
-                float s = 0.0f;
-                for (int64_t p = 0; p < k; ++p)
-                    s += a[p] * b[p*n + j2];
-                c[j2] = s;
-            }
-        }
-    }
-}
-
-// A 4-output kernel for A @ B^T. Each accumulator computes one output
-// dot product while the same A vector loads are reused across four rows of B.
-inline void gemm_bt_row4(const float* a, const float* b, float* c,
-                         int64_t k, int64_t n0, int64_t n1) {
-    for (int64_t j = n0; j < n1; j += 4) {
-        int64_t count = std::min<int64_t>(4, n1 - j);
+inline void dot4_rows(const float* a, const float* b, float* c,
+                      int64_t K, int64_t N, int64_t j0, int64_t j1) {
+    for (int64_t j = j0; j < j1; j += 4) {
+        const int64_t count = std::min<int64_t>(4, j1 - j);
         if (count == 4) {
             __m256 s0 = _mm256_setzero_ps();
             __m256 s1 = _mm256_setzero_ps();
             __m256 s2 = _mm256_setzero_ps();
             __m256 s3 = _mm256_setzero_ps();
-            int64_t p = 0;
+            int64_t k = 0;
 
-            for (; p + 8 <= k; p += 8) {
-                __m256 av = _mm256_loadu_ps(a + p);
-                s0 = _mm256_add_ps(s0, _mm256_mul_ps(av, _mm256_loadu_ps(b + (j+0)*k + p)));
-                s1 = _mm256_add_ps(s1, _mm256_mul_ps(av, _mm256_loadu_ps(b + (j+1)*k + p)));
-                s2 = _mm256_add_ps(s2, _mm256_mul_ps(av, _mm256_loadu_ps(b + (j+2)*k + p)));
-                s3 = _mm256_add_ps(s3, _mm256_mul_ps(av, _mm256_loadu_ps(b + (j+3)*k + p)));
+            for (; k + 8 <= K; k += 8) {
+                __m256 av = _mm256_loadu_ps(a + k);
+                s0 = _mm256_add_ps(s0, _mm256_mul_ps(av, _mm256_loadu_ps(b + (j+0)*K + k)));
+                s1 = _mm256_add_ps(s1, _mm256_mul_ps(av, _mm256_loadu_ps(b + (j+1)*K + k)));
+                s2 = _mm256_add_ps(s2, _mm256_mul_ps(av, _mm256_loadu_ps(b + (j+2)*K + k)));
+                s3 = _mm256_add_ps(s3, _mm256_mul_ps(av, _mm256_loadu_ps(b + (j+3)*K + k)));
             }
 
-            float out0 = hsum8(s0);
-            float out1 = hsum8(s1);
-            float out2 = hsum8(s2);
-            float out3 = hsum8(s3);
-            for (; p < k; ++p) {
-                const float av = a[p];
-                out0 += av * b[(j+0)*k + p];
-                out1 += av * b[(j+1)*k + p];
-                out2 += av * b[(j+2)*k + p];
-                out3 += av * b[(j+3)*k + p];
+            float o0 = hsum8(s0);
+            float o1 = hsum8(s1);
+            float o2 = hsum8(s2);
+            float o3 = hsum8(s3);
+            for (; k < K; ++k) {
+                const float x = a[k];
+                o0 += x * b[(j+0)*K + k];
+                o1 += x * b[(j+1)*K + k];
+                o2 += x * b[(j+2)*K + k];
+                o3 += x * b[(j+3)*K + k];
             }
-            c[j+0] = out0;
-            c[j+1] = out1;
-            c[j+2] = out2;
-            c[j+3] = out3;
+            c[j+0] = o0;
+            c[j+1] = o1;
+            c[j+2] = o2;
+            c[j+3] = o3;
         } else {
             for (int64_t q = 0; q < count; ++q) {
                 float s = 0.0f;
-                const float* br = b + (j+q)*k;
-                for (int64_t p = 0; p < k; ++p)
-                    s += a[p] * br[p];
-                c[j+q] = s;
+                const float* br = b + (j + q) * K;
+                for (int64_t k = 0; k < K; ++k)
+                    s += a[k] * br[k];
+                c[j + q] = s;
             }
         }
     }
@@ -125,11 +150,42 @@ torch::Tensor sgemm(torch::Tensor A, torch::Tensor B) {
     const float* bp = B.data_ptr<float>();
     float* cp = C.data_ptr<float>();
 
-    // One coarse task per output row. The previous M*N-block task grid
-    // created thousands of tiny tasks on a 2-thread Ivy Bridge CPU.
-    at::parallel_for(0, M, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i)
-            gemm_row8(ap + i*K, bp, cp + i*N, K, N, 0, N);
+    // A 16xN tile keeps the working A rows small enough for the L2 while
+    // exposing only M/16 coarse parallel tasks. Within each tile, a 2x4
+    // microkernel reuses B loads across two rows.
+    constexpr int64_t MB = 16;
+    constexpr int64_t NB = 64;
+    const int64_t mt = (M + MB - 1) / MB;
+
+    at::parallel_for(0, mt, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t mb = begin; mb < end; ++mb) {
+            const int64_t i0 = mb * MB;
+            const int64_t i1 = std::min(M, i0 + MB);
+
+            for (int64_t j0 = 0; j0 < N; j0 += NB) {
+                const int64_t j1 = std::min(N, j0 + NB);
+                int64_t i = i0;
+
+                for (; i + 1 < i1; i += 2) {
+                    const float* a0 = ap + i * K;
+                    const float* a1 = ap + (i + 1) * K;
+                    float* c0 = cp + i * N;
+                    float* c1 = cp + (i + 1) * N;
+                    kernel_2x4_range(a0, a1, bp, c0, c1, K, N, j0, j1);
+                }
+
+                if (i < i1) {
+                    const float* a = ap + i * K;
+                    float* c = cp + i * N;
+                    for (int64_t j = j0; j < j1; ++j) {
+                        float s = 0.0f;
+                        for (int64_t k = 0; k < K; ++k)
+                            s += a[k] * bp[k * N + j];
+                        c[j] = s;
+                    }
+                }
+            }
+        }
     });
     return C;
 }
@@ -152,11 +208,18 @@ torch::Tensor sgemm_bt(torch::Tensor A, torch::Tensor B) {
     const float* bp = B.data_ptr<float>();
     float* cp = C.data_ptr<float>();
 
-    // B rows are already contiguous, so A @ B^T can stream both operands.
-    // Process four output rows together to reuse each A vector load.
-    at::parallel_for(0, M, 1, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i)
-            gemm_bt_row4(ap + i*K, bp, cp + i*N, K, 0, N);
+    // Each A row is independent. Use a coarse row tile rather than one task
+    // per output element; the 4-output AVX kernel reuses A loads.
+    constexpr int64_t MB = 16;
+    const int64_t mt = (M + MB - 1) / MB;
+
+    at::parallel_for(0, mt, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t mb = begin; mb < end; ++mb) {
+            const int64_t i0 = mb * MB;
+            const int64_t i1 = std::min(M, i0 + MB);
+            for (int64_t i = i0; i < i1; ++i)
+                dot4_rows(ap + i*K, bp, cp + i*N, K, N, 0, N);
+        }
     });
     return C;
 }
