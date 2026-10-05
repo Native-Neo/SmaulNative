@@ -89,7 +89,7 @@ torch::Tensor sgemm(torch::Tensor A, torch::Tensor B) {
     if (!M || !N) return C;
     const int64_t NB=64, blocks=(N+NB-1)/NB;
     const float* ap=A.data_ptr<float>(); const float* bp=B.data_ptr<float>(); float* cp=C.data_ptr<float>();
-    at::parallel_for(0,M*blocks,1,[&](int64_t begin,int64_t end) {
+    at::parallel_for(0,M*blocks,16,[&](int64_t begin,int64_t end) {
         for (int64_t task=begin;task<end;++task) {
             int64_t i=task/blocks, nb=task%blocks;
             gemm(ap,bp,cp,M,K,N,i,i+1,nb*NB,std::min(N,(nb+1)*NB));
