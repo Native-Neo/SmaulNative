@@ -14,6 +14,7 @@ def _native_backend():
 @pytest.mark.parametrize("m,k,n", [
     (1, 1, 1),
     (7, 13, 9),
+    (17, 3, 67),
     (32, 64, 128),
     (128, 257, 73),
 ])
@@ -30,6 +31,7 @@ def test_sgemm_matches_torch(m, k, n):
 @pytest.mark.parametrize("m,k,n", [
     (1, 1, 1),
     (7, 13, 9),
+    (17, 3, 67),
     (32, 64, 128),
     (128, 257, 73),
 ])
