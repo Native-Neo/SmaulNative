@@ -71,6 +71,7 @@ class CpuBackend:
         self._attn = None
         self._sparse = None
         self._quant = None
+        self._blas = None
         self._lock = threading.Lock()
         self._warned_fallback = set()
 
@@ -167,6 +168,55 @@ class CpuBackend:
                 self._attn = False
                 warnings.warn(f"linear-attention native ext unavailable; python reference fallback ({type(exc).__name__})", RuntimeWarning, stacklevel=2)
         return None if self._attn is False else self._attn
+
+    def _load_blas(self):
+        if self._blas is not None:
+            return None if self._blas is False else self._blas
+        with self._lock:
+            if self._blas is not None:
+                return None if self._blas is False else self._blas
+            try:
+                from torch.utils.cpp_extension import load
+                root = Path(__file__).resolve().parent
+                self._blas = load(
+                    name="smaul_blas_ivb",
+                    sources=[str(root / "blas_cpu.cpp")],
+                    extra_cflags=_native_cflags(),
+                    verbose=False,
+                )
+            except Exception as exc:
+                self._blas = False
+                warnings.warn(
+                    f"AVX1 BLAS extension unavailable; torch fallback ({type(exc).__name__})",
+                    RuntimeWarning, stacklevel=2,
+                )
+        return None if self._blas is False else self._blas
+
+    @property
+    def has_blas_native(self):
+        return self._load_blas() is not None
+
+    def sgemm(self, a, b):
+        if a.dim() != 2 or b.dim() != 2:
+            raise ValueError(f"sgemm expects 2-D tensors, got {tuple(a.shape)} and {tuple(b.shape)}")
+        if a.shape[1] != b.shape[0]:
+            raise ValueError(f"sgemm shape mismatch: {tuple(a.shape)} @ {tuple(b.shape)}")
+        e = self._load_blas()
+        if e is not None and a.device.type == "cpu" and b.device.type == "cpu" and a.dtype == torch.float32 and b.dtype == torch.float32:
+            return e.sgemm(a.contiguous(), b.contiguous())
+        self._warn_fallback_once("sgemm torch fallback (native missing or unsupported dtype)")
+        return a @ b
+
+    def sgemm_bt(self, a, b):
+        if a.dim() != 2 or b.dim() != 2:
+            raise ValueError(f"sgemm_bt expects 2-D tensors, got {tuple(a.shape)} and {tuple(b.shape)}")
+        if a.shape[1] != b.shape[1]:
+            raise ValueError(f"sgemm_bt shape mismatch: {tuple(a.shape)} @ {tuple(b.shape)}^T")
+        e = self._load_blas()
+        if e is not None and a.device.type == "cpu" and b.device.type == "cpu" and a.dtype == torch.float32 and b.dtype == torch.float32:
+            return e.sgemm_bt(a.contiguous(), b.contiguous())
+        self._warn_fallback_once("sgemm_bt torch fallback (native missing or unsupported dtype)")
+        return a @ b.transpose(0, 1)
 
     @property
     def has_attn_native(self):
