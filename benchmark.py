@@ -193,6 +193,58 @@ def run_full(argv=None):
           f"checkpoint {stored/1048576:.1f}MiB = FP8 {fp8b/1048576:.1f}MiB "
           f"(same weights in fp32: {fpb/1048576:.1f}MiB) + {other/1048576:.1f}MiB other")
 
+def run_blas(argv=None):
+    """Benchmark the tiny AVX1 BLAS subset against torch's CPU matmul."""
+    _root = str(Path(__file__).resolve().parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    args = parse_args(argv)
+
+    import torch
+    from kernel.compute import get_backend
+
+    be = get_backend()
+    be.configure(args.threads)
+    if not be.has_blas_native:
+        raise RuntimeError("AVX1 BLAS extension could not be built; see the compiler warning above")
+
+    torch.manual_seed(1234)
+    cases = [
+        ("linear", args.batch * args.ctx, args.d, args.d),
+        ("wide", 512, args.d, max(args.d, args.d * 2)),
+        ("small", 256, 128, 128),
+    ]
+
+    def med(fn):
+        for _ in range(3):
+            fn()
+        ts = []
+        for _ in range(args.iters):
+            t0 = time.perf_counter()
+            fn()
+            ts.append((time.perf_counter() - t0) * 1e3)
+        return statistics.median(ts)
+
+    print(f"backend={be.name} avx1_blas={be.has_blas_native} threads={args.threads}")
+    print(f"{'case':10s} {'shape':20s} {'AVX1 ms':>10s} {'torch ms':>10s} {'ratio':>8s}")
+    for name, m, k, n in cases:
+        a = torch.randn(m, k, dtype=torch.float32)
+        b = torch.randn(k, n, dtype=torch.float32)
+        custom = med(lambda: be.sgemm(a, b))
+        torch_ms = med(lambda: a @ b)
+        print(f"{name:10s} {m}x{k}x{n:<10d} {custom:10.3f} {torch_ms:10.3f} "
+              f"{torch_ms / custom if custom else float('nan'):8.2f}x")
+
+    a = torch.randn(args.batch * args.ctx, args.d, dtype=torch.float32)
+    w = torch.randn(args.d, args.d, dtype=torch.float32)
+    custom = med(lambda: be.sgemm_bt(a, w))
+    torch_ms = med(lambda: a @ w.t())
+    print(f"{'linear_bt':10s} {a.shape[0]}x{a.shape[1]}x{w.shape[0]:<6d} "
+          f"{custom:10.3f} {torch_ms:10.3f} "
+          f"{torch_ms / custom if custom else float('nan'):8.2f}x")
+    print("ratio > 1 means the SmaulNative AVX1 kernel was faster; this is a measurement, not a claim.")
+    
+
 def run_opt(argv=None):
     """Lion vs SmaulOpt on identical tensors/conditions.
 
@@ -497,7 +549,7 @@ def main():
     if "--mode" in sys.argv:
         i = sys.argv.index("--mode")
         if i + 1 >= len(sys.argv):
-            raise SystemExit("--mode requires full, opt, or arch")
+            raise SystemExit("--mode requires full, opt, arch, or blas")
         mode = sys.argv[i + 1]
         del sys.argv[i:i + 2]
     if mode == "full":
@@ -506,6 +558,8 @@ def main():
         run_opt(sys.argv[1:])
     elif mode == "arch":
         run_arch(sys.argv[1:])
+    elif mode == "blas":
+        run_blas(sys.argv[1:])
     else:
         raise SystemExit(f"unknown --mode {mode!r}; expected full, opt, or arch")
 
