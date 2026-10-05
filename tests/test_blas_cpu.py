@@ -17,6 +17,8 @@ def _native_backend():
     (17, 3, 67),
     (32, 64, 128),
     (128, 257, 73),
+    (19, 513, 61),
+    (19, 513, 61),
 ])
 def test_sgemm_matches_torch(m, k, n):
     be = _native_backend()
