@@ -10,71 +10,44 @@
 
 namespace {
 
-inline void kernel_2x4(const float* a0, const float* a1,
+inline void kernel_4x8(const float* a0, const float* a1,
+                       const float* a2, const float* a3,
                        const float* b, float* c0, float* c1,
-                       int64_t K, int64_t N, int64_t j,
-                       bool accumulate) {
-    __m128 c00 = accumulate ? _mm_loadu_ps(c0 + j) : _mm_setzero_ps();
-    __m128 c01 = accumulate ? _mm_loadu_ps(c1 + j) : _mm_setzero_ps();
-    __m128 c10 = _mm_setzero_ps();
-    __m128 c11 = _mm_setzero_ps();
+                       float* c2, float* c3, int64_t K, int64_t N,
+                       int64_t j, bool accumulate) {
+    __m256 r0 = accumulate ? _mm256_loadu_ps(c0+j) : _mm256_setzero_ps();
+    __m256 r1 = accumulate ? _mm256_loadu_ps(c1+j) : _mm256_setzero_ps();
+    __m256 r2 = accumulate ? _mm256_loadu_ps(c2+j) : _mm256_setzero_ps();
+    __m256 r3 = accumulate ? _mm256_loadu_ps(c3+j) : _mm256_setzero_ps();
 
-    int64_t k = 0;
-    for (; k + 4 <= K; k += 4) {
-        __m128 bv = _mm_loadu_ps(b + k * N + j);
-        c00 = _mm_add_ps(c00, _mm_mul_ps(_mm_set1_ps(a0[k]), bv));
-        c01 = _mm_add_ps(c01, _mm_mul_ps(_mm_set1_ps(a1[k]), bv));
-
-        bv = _mm_loadu_ps(b + (k + 1) * N + j);
-        c00 = _mm_add_ps(c00, _mm_mul_ps(_mm_set1_ps(a0[k + 1]), bv));
-        c01 = _mm_add_ps(c01, _mm_mul_ps(_mm_set1_ps(a1[k + 1]), bv));
-
-        bv = _mm_loadu_ps(b + (k + 2) * N + j);
-        c10 = _mm_add_ps(c10, _mm_mul_ps(_mm_set1_ps(a0[k + 2]), bv));
-        c11 = _mm_add_ps(c11, _mm_mul_ps(_mm_set1_ps(a1[k + 2]), bv));
-
-        bv = _mm_loadu_ps(b + (k + 3) * N + j);
-        c10 = _mm_add_ps(c10, _mm_mul_ps(_mm_set1_ps(a0[k + 3]), bv));
-        c11 = _mm_add_ps(c11, _mm_mul_ps(_mm_set1_ps(a1[k + 3]), bv));
+    for (int64_t k=0; k<K; ++k) {
+        const __m256 bv = _mm256_loadu_ps(b+k*N+j);
+        r0 = _mm256_add_ps(r0, _mm256_mul_ps(_mm256_broadcast_ss(a0+k), bv));
+        r1 = _mm256_add_ps(r1, _mm256_mul_ps(_mm256_broadcast_ss(a1+k), bv));
+        r2 = _mm256_add_ps(r2, _mm256_mul_ps(_mm256_broadcast_ss(a2+k), bv));
+        r3 = _mm256_add_ps(r3, _mm256_mul_ps(_mm256_broadcast_ss(a3+k), bv));
     }
 
-    __m128 s0 = _mm_add_ps(c00, c10);
-    __m128 s1 = _mm_add_ps(c01, c11);
-    _mm_storeu_ps(c0 + j, s0);
-    _mm_storeu_ps(c1 + j, s1);
-
-    if (k < K) {
-        // K is normally a multiple of 4 in SmaulNative, but keep the kernel
-        // correct for arbitrary dimensions.
-        for (; k < K; ++k) {
-            const float x0 = a0[k];
-            const float x1 = a1[k];
-            for (int q = 0; q < 4; ++q) {
-                c0[j + q] += x0 * b[k * N + j + q];
-                c1[j + q] += x1 * b[k * N + j + q];
-            }
-        }
-    }
+    _mm256_storeu_ps(c0+j,r0); _mm256_storeu_ps(c1+j,r1);
+    _mm256_storeu_ps(c2+j,r2); _mm256_storeu_ps(c3+j,r3);
 }
 
-inline void kernel_2x4_range(const float* a0, const float* a1,
+inline void kernel_4x8_range(const float* a0, const float* a1,
+                             const float* a2, const float* a3,
                              const float* b, float* c0, float* c1,
-                             int64_t K, int64_t N, int64_t j0, int64_t j1,
-                             bool accumulate) {
-    int64_t j = j0;
-    for (; j + 4 <= j1; j += 4)
-        kernel_2x4(a0, a1, b, c0, c1, K, N, j, accumulate);
-
-    // Scalar tail.
-    for (; j < j1; ++j) {
-        float s0 = accumulate ? c0[j] : 0.0f;
-        float s1 = accumulate ? c1[j] : 0.0f;
-        for (int64_t k = 0; k < K; ++k) {
-            s0 += a0[k] * b[k * N + j];
-            s1 += a1[k] * b[k * N + j];
+                             float* c2, float* c3, int64_t K, int64_t N,
+                             int64_t j0, int64_t j1, bool accumulate) {
+    int64_t j=j0;
+    for(; j+8<=j1; j+=8)
+        kernel_4x8(a0,a1,a2,a3,b,c0,c1,c2,c3,K,N,j,accumulate);
+    for(;j<j1;++j) {
+        float s0=accumulate?c0[j]:0.0f, s1=accumulate?c1[j]:0.0f;
+        float s2=accumulate?c2[j]:0.0f, s3=accumulate?c3[j]:0.0f;
+        for(int64_t k=0;k<K;++k) {
+            const float x=b[k*N+j];
+            s0+=a0[k]*x; s1+=a1[k]*x; s2+=a2[k]*x; s3+=a3[k]*x;
         }
-        c0[j] = s0;
-        c1[j] = s1;
+        c0[j]=s0;c1[j]=s1;c2[j]=s2;c3[j]=s3;
     }
 }
 
@@ -168,29 +141,26 @@ torch::Tensor sgemm(torch::Tensor A, torch::Tensor B) {
                 const int64_t j1 = std::min(N, j0 + NB);
                 int64_t i = i0;
 
-                for (; i + 1 < i1; i += 2) {
-                    const float* a0 = ap + i * K;
-                    const float* a1 = ap + (i + 1) * K;
-                    float* c0 = cp + i * N;
-                    float* c1 = cp + (i + 1) * N;
-                    constexpr int64_t KC = 128;
-                    bool accumulate = false;
-                    for (int64_t k0 = 0; k0 < K; k0 += KC) {
-                        const int64_t kc = std::min(K, k0 + KC) - k0;
-                        kernel_2x4_range(a0 + k0, a1 + k0, bp + k0 * N,
-                                         c0, c1, kc, N, j0, j1, accumulate);
-                        accumulate = true;
+                constexpr int64_t KC = 128;
+                for (; i + 3 < i1; i += 4) {
+                    const float* a0=ap+i*K, *a1=ap+(i+1)*K;
+                    const float* a2=ap+(i+2)*K, *a3=ap+(i+3)*K;
+                    float* c0=cp+i*N, *c1=cp+(i+1)*N;
+                    float* c2=cp+(i+2)*N, *c3=cp+(i+3)*N;
+                    bool accumulate=false;
+                    for(int64_t k0=0;k0<K;k0+=KC) {
+                        const int64_t kc=std::min(K,k0+KC)-k0;
+                        kernel_4x8_range(a0+k0,a1+k0,a2+k0,a3+k0,bp+k0*N,
+                                         c0,c1,c2,c3,kc,N,j0,j1,accumulate);
+                        accumulate=true;
                     }
                 }
-
-                if (i < i1) {
-                    const float* a = ap + i * K;
-                    float* c = cp + i * N;
-                    for (int64_t j = j0; j < j1; ++j) {
-                        float s = 0.0f;
-                        for (int64_t k = 0; k < K; ++k)
-                            s += a[k] * bp[k * N + j];
-                        c[j] = s;
+                for(; i<i1; ++i) {
+                    const float* a=ap+i*K; float* c=cp+i*N;
+                    for(int64_t j=j0;j<j1;++j) {
+                        float sum=0.0f;
+                        for(int64_t k=0;k<K;++k) sum+=a[k]*bp[k*N+j];
+                        c[j]=sum;
                     }
                 }
             }
