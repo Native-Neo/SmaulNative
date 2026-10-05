@@ -23,7 +23,7 @@ inline void kernel_6x8(const float* a0, const float* a1,
     __m256 r4 = accumulate ? _mm256_loadu_ps(c4+j) : _mm256_setzero_ps();
     __m256 r5 = accumulate ? _mm256_loadu_ps(c5+j) : _mm256_setzero_ps();
 
-    for (int64_t k=0; k<K; ++k) {
+    // Unroll the K loop to reduce branch/index overhead on Ivy Bridge.\n    #pragma GCC unroll 4\n    for (int64_t k=0; k<K; ++k) {
         const __m256 bv = _mm256_loadu_ps(b+k*N+j);
         r0 = _mm256_add_ps(r0, _mm256_mul_ps(_mm256_broadcast_ss(a0+k), bv));
         r1 = _mm256_add_ps(r1, _mm256_mul_ps(_mm256_broadcast_ss(a1+k), bv));
