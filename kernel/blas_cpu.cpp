@@ -13,9 +13,10 @@ namespace {
 
 inline void kernel_2x4(const float* a0, const float* a1,
                        const float* b, float* c0, float* c1,
-                       int64_t K, int64_t N, int64_t j) {
-    __m128 c00 = _mm_setzero_ps();
-    __m128 c01 = _mm_setzero_ps();
+                       int64_t K, int64_t N, int64_t j,
+                       bool accumulate) {
+    __m128 c00 = accumulate ? _mm_loadu_ps(c0 + j) : _mm_setzero_ps();
+    __m128 c01 = accumulate ? _mm_loadu_ps(c1 + j) : _mm_setzero_ps();
     __m128 c10 = _mm_setzero_ps();
     __m128 c11 = _mm_setzero_ps();
 
@@ -59,15 +60,16 @@ inline void kernel_2x4(const float* a0, const float* a1,
 
 inline void kernel_2x4_range(const float* a0, const float* a1,
                              const float* b, float* c0, float* c1,
-                             int64_t K, int64_t N, int64_t j0, int64_t j1) {
+                             int64_t K, int64_t N, int64_t j0, int64_t j1,
+                             bool accumulate) {
     int64_t j = j0;
     for (; j + 4 <= j1; j += 4)
-        kernel_2x4(a0, a1, b, c0, c1, K, N, j);
+        kernel_2x4(a0, a1, b, c0, c1, K, N, j, accumulate);
 
     // Scalar tail.
     for (; j < j1; ++j) {
-        float s0 = 0.0f;
-        float s1 = 0.0f;
+        float s0 = accumulate ? c0[j] : 0.0f;
+        float s1 = accumulate ? c1[j] : 0.0f;
         for (int64_t k = 0; k < K; ++k) {
             s0 += a0[k] * b[k * N + j];
             s1 += a1[k] * b[k * N + j];
@@ -150,9 +152,9 @@ torch::Tensor sgemm(torch::Tensor A, torch::Tensor B) {
     const float* bp = B.data_ptr<float>();
     float* cp = C.data_ptr<float>();
 
-    // A 16xN tile keeps the working A rows small enough for the L2 while
-    // exposing only M/16 coarse parallel tasks. Within each tile, a 2x4
-    // microkernel reuses B loads across two rows.
+    // A 16x64 C tile is paired with a 128-column K panel. The K panel keeps
+    // the active A/B working set small enough for Ivy Bridge caches while
+    // the 2x4 microkernel reuses each B vector across two A rows.
     constexpr int64_t MB = 16;
     constexpr int64_t NB = 64;
     const int64_t mt = (M + MB - 1) / MB;
@@ -171,7 +173,14 @@ torch::Tensor sgemm(torch::Tensor A, torch::Tensor B) {
                     const float* a1 = ap + (i + 1) * K;
                     float* c0 = cp + i * N;
                     float* c1 = cp + (i + 1) * N;
-                    kernel_2x4_range(a0, a1, bp, c0, c1, K, N, j0, j1);
+                    constexpr int64_t KC = 128;
+                    bool accumulate = false;
+                    for (int64_t k0 = 0; k0 < K; k0 += KC) {
+                        const int64_t kc = std::min(K, k0 + KC) - k0;
+                        kernel_2x4_range(a0 + k0, a1 + k0, bp + k0 * N,
+                                         c0, c1, kc, N, j0, j1, accumulate);
+                        accumulate = true;
+                    }
                 }
 
                 if (i < i1) {
