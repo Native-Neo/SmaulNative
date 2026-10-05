@@ -61,25 +61,6 @@ inline void kernel_6x8_range(const float* a0, const float* a1,
     }
 }
 
-inline void kernel_4x8_range(const float* a0, const float* a1,
-                             const float* a2, const float* a3,
-                             const float* b, float* c0, float* c1,
-                             float* c2, float* c3, int64_t K, int64_t N,
-                             int64_t j0, int64_t j1, bool accumulate) {
-    int64_t j=j0;
-    for(; j+8<=j1; j+=8)
-        kernel_4x8(a0,a1,a2,a3,b,c0,c1,c2,c3,K,N,j,accumulate);
-    for(;j<j1;++j) {
-        float s0=accumulate?c0[j]:0.0f, s1=accumulate?c1[j]:0.0f;
-        float s2=accumulate?c2[j]:0.0f, s3=accumulate?c3[j]:0.0f;
-        for(int64_t k=0;k<K;++k) {
-            const float x=b[k*N+j];
-            s0+=a0[k]*x; s1+=a1[k]*x; s2+=a2[k]*x; s3+=a3[k]*x;
-        }
-        c0[j]=s0;c1[j]=s1;c2[j]=s2;c3[j]=s3;
-    }
-}
-
 inline float hsum8(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
     __m128 hi = _mm256_extractf128_ps(v, 1);
